@@ -1,0 +1,73 @@
+:root {
+  color-scheme: light;
+  color: hsl(222 47% 11%);
+  background: hsl(210 20% 98%);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --background: hsl(210 20% 98%);
+  --foreground: hsl(222 47% 11%);
+  --surface: hsl(0 0% 100% / 0.72);
+  --surface-solid: hsl(0 0% 100%);
+  --sidebar: hsl(0 0% 100% / 0.62);
+  --muted: hsl(215 16% 47%);
+  --muted-bg: hsl(214 32% 91% / 0.68);
+  --border: hsl(214 32% 88%);
+  --primary: hsl(222 47% 11%);
+  --primary-foreground: hsl(210 40% 98%);
+  --accent: hsl(174 62% 42%);
+  --danger: hsl(0 72% 42%);
+  --warn: hsl(38 92% 50%);
+  --ok: hsl(142 71% 42%);
+  --ring: hsl(222 47% 11% / 0.14);
+  --shadow: hsl(222 47% 11% / 0.07);
+  --radius: 14px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    color-scheme: dark;
+    --background: hsl(224 24% 9%);
+    --foreground: hsl(210 40% 96%);
+    --surface: hsl(222 21% 15% / 0.76);
+    --surface-solid: hsl(222 21% 15%);
+    --sidebar: hsl(222 24% 13% / 0.72);
+    --muted: hsl(215 16% 67%);
+    --muted-bg: hsl(220 18% 22% / 0.8);
+    --border: hsl(220 18% 25%);
+    --primary: hsl(210 40% 96%);
+    --primary-foreground: hsl(222 47% 11%);
+    --accent: hsl(174 62% 48%);
+    --danger: hsl(0 74% 58%);
+    --warn: hsl(38 92% 55%);
+    --ok: hsl(142 70% 48%);
+    --ring: hsl(210 40% 96% / 0.16);
+    --shadow: hsl(0 0% 0% / 0.24);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --background: hsl(224 24% 9%);
+  --foreground: hsl(210 40% 96%);
+  --surface: hsl(222 21% 15% / 0.76);
+  --surface-solid: hsl(222 21% 15%);
+  --sidebar: hsl(222 24% 13% / 0.72);
+  --muted: hsl(215 16% 67%);
+  --muted-bg: hsl(220 18% 22% / 0.8);
+  --border: hsl(220 18% 25%);
+  --primary: hsl(210 40% 96%);
+  --primary-foreground: hsl(222 47% 11%);
+  --accent: hsl(174 62% 48%);
+  --danger: hsl(0 74% 58%);
+  --warn: hsl(38 92% 55%);
+  --ok: hsl(142 70% 48%);
+  --ring: hsl(210 40% 96% / 0.16);
+  --shadow: hsl(0 0% 0% / 0.24);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+

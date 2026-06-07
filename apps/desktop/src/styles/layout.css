@@ -1,0 +1,197 @@
+.app-shell {
+  display: grid;
+  grid-template-columns: 172px minmax(0, 1fr);
+  min-height: 100vh;
+  background:
+    linear-gradient(135deg, hsl(210 32% 96% / 0.95), transparent 42%),
+    linear-gradient(315deg, hsl(170 28% 93% / 0.78), transparent 38%),
+    var(--background);
+}
+
+:root[data-theme="dark"] .app-shell,
+:root[data-theme="system"] .app-shell {
+  background:
+    linear-gradient(135deg, hsl(220 22% 13% / 0.9), transparent 46%),
+    linear-gradient(315deg, hsl(180 18% 14% / 0.74), transparent 42%),
+    var(--background);
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  border-right: 1px solid var(--border);
+  padding: 18px 12px;
+  background: var(--sidebar);
+  backdrop-filter: blur(18px);
+}
+
+.brand {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 8px 0 4px;
+}
+
+.brand-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 12px;
+  color: var(--primary-foreground);
+  background: var(--primary);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.side-card strong,
+.side-card span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.side-card span,
+.topbar p,
+.empty,
+.empty-state p,
+.table-row span,
+.table-row small,
+.panel-eyebrow,
+dd,
+.field span {
+  color: var(--muted);
+}
+
+.topbar p,
+.table-row small,
+.side-card span {
+  font-size: 12px;
+}
+
+.side-card {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 13px;
+  background: var(--surface);
+  box-shadow: 0 14px 32px var(--shadow);
+}
+
+.workspace {
+  min-width: 0;
+  padding: 22px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.topbar h1 {
+  margin: 0 0 3px;
+  font-size: 24px;
+  letter-spacing: 0;
+}
+
+.topbar p {
+  margin: 0;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.content-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.12fr) minmax(320px, 0.88fr);
+  gap: 14px;
+}
+
+.loading-panel {
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+  color: var(--muted);
+  background: var(--surface);
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.95fr) minmax(360px, 1.05fr);
+  gap: 14px;
+}
+
+.dashboard-grid .panel:first-child {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 860px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 10px 16px;
+  }
+
+  .brand {
+    padding: 0;
+  }
+
+  .workspace {
+    padding: 16px;
+  }
+
+  .topbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .content-grid,
+  .dashboard-grid,
+  .form-grid,
+  .metric-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .provider-card,
+  .provider-list-card,
+  .provider-card-row,
+  .launch-card,
+  .relay-event-row,
+  .account-meta-grid,
+  .status-chip-grid,
+  .provider-card-grid,
+  .group-card-grid,
+  .order-row {
+    grid-template-columns: 1fr;
+  }
+
+  .provider-compact-list {
+    grid-template-columns: 1fr;
+  }
+
+  .provider-list-actions,
+  .provider-row-actions,
+  .badge-row {
+    justify-content: flex-start;
+  }
+
+  .group-card-head,
+  .launch-card {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

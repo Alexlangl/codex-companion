@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Codex Companion">
+  <rect x="96" y="96" width="832" height="832" rx="224" fill="#0f172a"/>
+  <text
+    x="512"
+    y="528"
+    fill="#f8fafc"
+    font-family="Inter, Avenir Next, Arial, sans-serif"
+    font-size="248"
+    font-weight="800"
+    text-anchor="middle"
+    dominant-baseline="middle"
+  >CC</text>
+</svg>

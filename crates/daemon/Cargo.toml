@@ -1,0 +1,19 @@
+[package]
+name = "codex-companion-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+codex-companion-core.workspace = true
+codex-companion-provider.workspace = true
+codex-companion-relay.workspace = true
+codex-companion-state.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

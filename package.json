@@ -1,0 +1,19 @@
+{
+  "name": "codex-companion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @codex-companion/desktop dev",
+    "build": "pnpm --filter @codex-companion/desktop build",
+    "build:tauri": "pnpm --filter @codex-companion/desktop build:tauri",
+    "check": "pnpm --filter @codex-companion/desktop check",
+    "rust:check": "cargo check --workspace",
+    "test": "cargo test --workspace"
+  },
+  "packageManager": "pnpm@10.23.0",
+  "engines": {
+    "node": ">=22"
+  }
+}
+

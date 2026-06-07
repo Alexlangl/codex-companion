@@ -1,0 +1,21 @@
+[package]
+name = "codex-companion-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "codex-companion-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+codex-companion-core.workspace = true
+codex-companion-daemon.workspace = true
+codex-companion-provider.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+tokio.workspace = true

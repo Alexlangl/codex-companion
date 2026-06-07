@@ -1,0 +1,27 @@
+[package]
+name = "codex-companion-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[lib]
+name = "codex_companion_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "codex-companion-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+codex-companion-core.workspace = true
+codex-companion-daemon.workspace = true
+codex-companion-provider.workspace = true
+serde.workspace = true
+tauri.workspace = true
+

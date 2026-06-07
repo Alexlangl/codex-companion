@@ -1,0 +1,22 @@
+[package]
+name = "codex-companion-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "codex-companion"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+codex-companion-core.workspace = true
+codex-companion-daemon.workspace = true
+codex-companion-provider.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

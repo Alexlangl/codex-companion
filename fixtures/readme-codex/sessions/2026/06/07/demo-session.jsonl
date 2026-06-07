@@ -1,0 +1,6 @@
+{"type":"session_meta","payload":{"id":"readme-demo","model_provider":"codex-companion"}}
+{"type":"turn_context","payload":{"model":"gpt-5-codex","model_provider":"codex-companion"}}
+{"timestamp":"2026-06-07T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120000,"cached_input_tokens":48000,"output_tokens":18000}}}}
+{"timestamp":"2026-06-07T10:08:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":254000,"cached_input_tokens":116000,"output_tokens":42000}}}}
+{"type":"turn_context","payload":{"model":"gpt-5-mini","model_provider":"openrouter-demo"}}
+{"timestamp":"2026-06-07T10:20:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":86000,"cached_input_tokens":32000,"output_tokens":24000}}}}

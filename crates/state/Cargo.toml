@@ -1,0 +1,21 @@
+[package]
+name = "codex-companion-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[dependencies]
+chrono.workspace = true
+codex-companion-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml_edit.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
