@@ -1,91 +1,141 @@
 # Codex Companion
 
-> English version: [README.en.md](README.en.md)
+中文 | [English](./README.en.md)
 
-Codex Companion 是 Codex Desktop / CLI 的本地 provider runtime。
+`codex-companion` 是给 Codex Desktop / CLI 使用的本地账号与转发工具。
 
-Codex Desktop / CLI 只需要配置一个稳定的本地 `base_url`。Companion 在本地统一承接官方 Codex 账号、API Key 中转、OpenAI-compatible provider、relay provider、provider group、fallback、cooldown、健康刷新、token 用量统计，以及 Codex 历史会话/插件 namespace 修复。
+它让 Codex 只需要接入一个 Companion，本地就可以管理官方 Codex 账号、API Key 中转、第三方 OpenAI-compatible provider，并支持账号分组、失败切换、健康刷新、历史会话修复和 token 用量统计。
 
-> 下方截图使用的是浏览器预览里的脱敏 demo 数据，不包含真实账号 token 或真实 Codex 用量。
+它提供：
 
-### 它解决什么
+- 桌面 App。
+- CLI 命令行。
+- TUI 终端界面。
 
-Codex 原生 provider 配置适合单个 provider，但不适合在官方账号、中转站、第三方 OpenAI-compatible provider 之间热切换。Codex Companion 把这些 provider 收到一个本地 runtime 里：
+> 截图使用的是脱敏 demo 数据，不包含真实账号 token 或真实 Codex 用量。
 
-```text
-Codex Desktop / CLI
-        |
-        v
-http://127.0.0.1:17687/v1
-        |
-        v
-Codex Companion Relay
-        |
-        v
-official_codex / openai_compatible / relay_provider
-```
+## 它做什么
 
-核心目标：
+- 导入官方 Codex 账号 JSON，例如 CPA、sub2api、cockpit 导出的账号。
+- 导入 API Key 账号 JSON，或手动添加 OpenAI-compatible provider。
+- 把多个账号编排成 Provider Group，按优先级失败切换。
+- 单个 API Key 账号可以选择直连中转站，也可以选择走本地代理。
+- 官方 Codex 账号由 Companion 负责 token 刷新和请求头处理。
+- 自动刷新账号健康度、订阅状态和可识别的额度信息。
+- 启动 Codex 前修复历史会话和插件状态，减少切换 provider 后上下文丢失的问题。
+- 从本地 Codex 会话记录里统计 token 用量。
 
-- 使用 Provider Group 时，Codex 固定指向 `codex-companion` 本地 `base_url`。
-- group 内 provider 按优先级 fallback、cooldown、健康刷新和热切换，不需要重启 Codex。
-- 单 Provider 可选择直连中转站或走本地代理。
-- 官方 Codex 账号必须走 Companion relay，因为它需要 Companion 维护 OAuth token、refresh token、`ChatGPT-Account-Id` 和 Codex 请求头。
-- 通过 Companion 启动 Codex 前，自动 dry-run/repair 历史会话和插件 provider namespace，避免上下文断裂。
+## 截图
 
-### 功能截图
-
-#### 总览
+### 总览
 
 查看当前分组、本地转发地址、可用账号和 Codex 接入状态。
 
 <img src="assets/readme/dashboard.jpg" alt="Codex Companion dashboard" width="720">
 
-#### 账号
+### 账号
 
-紧凑展示大量 provider，支持刷新健康度、切换启动方式、直连或本地代理。
+集中管理官方账号、API Key 账号和中转 provider。每个账号可以刷新状态，也可以选择启动方式。
 
 <img src="assets/readme/providers-compact.jpg" alt="Provider compact list" width="720">
 
-#### 添加账号
+### 添加账号
 
-支持 API Key、Token / JSON、CPA/sub2api/cockpit JSON 批量导入，以及本机 Codex 账号导入。
+支持 API Key、Token / JSON、本机 Codex 账号导入，也支持多个 JSON 批量导入。
 
 <img src="assets/readme/provider-add-dialog.jpg" alt="Add provider dialog" width="720">
 
-#### 分组
+### 分组
 
-按顺序编排 provider，fallback 顺序以 `provider_order` 为准。
+把多个账号放进一个分组，按顺序执行失败切换。
 
 <img src="assets/readme/groups.jpg" alt="Provider groups" width="720">
 
-#### 转发
+### 本地转发
 
-查看本地 relay 地址、启动模式说明和请求/fallback/错误日志。
+查看 Companion 本地转发服务、请求记录、上游错误和切换事件。
 
 <img src="assets/readme/relay.jpg" alt="Relay page" width="720">
 
-#### 修复
+### 修复
 
-对历史会话和插件状态做 dry-run、备份和 namespace 修复，目标 provider 可选。
+预览或修复 Codex 历史会话和插件状态，执行修复前会创建备份。
 
 <img src="assets/readme/repair.jpg" alt="Repair page" width="720">
 
-#### 用量
+### 用量
 
-扫描 Codex session JSONL，按日期、模型和 provider 聚合 token 使用量。
+从 Codex 本地会话记录中统计 token 使用量。
 
 <img src="assets/readme/token-usage.jpg" alt="Token usage page" width="720">
 
-### 支持的 provider
+## App 用法
 
-| kind | 用途 | 是否可直连 |
-| --- | --- | --- |
-| `official_codex` | Codex 官方账号，来自 CPA/sub2api/cockpit OAuth JSON 或本机 Codex auth | 否，必须通过 Companion relay |
-| `openai_compatible` | OpenRouter、New API、中转站、自建 OpenAI-compatible API | 可以直连，也可以走本地代理 |
-| `relay_provider` | 已经是另一个本地/远端 relay 的 provider | 视认证方式决定 |
+打开桌面 App 后：
 
-API Key JSON 导入支持类似下面的格式：
+- 使用 `账号` 添加或导入 provider。
+- 使用 `分组` 编排 fallback 顺序。
+- 使用 `转发` 查看本地转发状态和请求记录。
+- 使用 `修复` 预览或修复 Codex 历史会话和插件状态。
+- 使用 `用量` 查看本地 token 统计。
+- 使用 `设置` 写入或恢复 Codex 配置。
+
+## CLI 用法
+
+查看状态：
+
+```bash
+codex-companion status
+```
+
+导入账号 JSON：
+
+```bash
+codex-companion provider import --json-file ./account.json
+```
+
+导入本机已有 Codex 账号：
+
+```bash
+codex-companion provider import-local
+```
+
+刷新账号状态：
+
+```bash
+codex-companion provider refresh-all
+```
+
+预览修复：
+
+```bash
+codex-companion repair --history --plugins --dry-run
+```
+
+启动本地转发：
+
+```bash
+codex-companion relay start
+```
+
+## TUI 用法
+
+```bash
+codex-companion-tui
+```
+
+在 TUI 里按 `?` 查看快捷键。
+
+## 支持的账号
+
+- 官方 Codex 账号 JSON。
+- sub2api `accounts[]` OpenAI OAuth 账号。
+- cockpit / CPA 风格 Codex OAuth 账号。
+- API Key 账号 JSON。
+- 手动添加的 OpenAI-compatible provider。
+- 本机已有 Codex 账号。
+
+API Key JSON 示例：
 
 ```json
 {
@@ -98,104 +148,13 @@ API Key JSON 导入支持类似下面的格式：
 }
 ```
 
-### 启动模式
+## 安全说明
 
-| 模式 | Codex 配置 | repair 目标 | 适用场景 |
-| --- | --- | --- | --- |
-| Provider Group / Relay | `codex-companion` 本地 `base_url` | `codex-companion` | 多 provider fallback、cooldown、热切换 |
-| Single Provider / Direct | provider 自己的 `base_url + env api key` | provider id | API Key provider 单独直连中转站 |
-| Single Provider / Relay | `codex-companion` 本地 `base_url` | `codex-companion` | 官方账号，或密钥由 Companion 本地文件注入的 provider |
+- 修复前可以先 dry-run 预览影响。
+- 正式修复前会备份本地 Codex 数据。
+- 导入的账号材料只保存在本机。
+- Token 用量统计只读取本地 Codex 会话记录。
 
-Relay fallback 规则很明确：只有在 stream 尚未开始写回 Codex 前才会自动切换到下一个 provider。一旦第一个 stream chunk 已经返回，就不会静默 fallback，避免破坏当前上下文流。
+## 开发者文档
 
-### 目录结构
-
-```text
-apps/desktop          Tauri v2 + React + Vite + Radix UI
-crates/core           共享类型、配置、路径、错误
-crates/provider       provider registry、JSON 导入、账号刷新、group 选择
-crates/relay          本地 HTTP relay、proxy、stream passthrough、fallback
-crates/health         错误分类、健康状态、cooldown
-crates/state          Codex 安装、doctor、history/plugin repair、token usage
-crates/daemon         App / CLI / TUI 共用 runtime facade
-crates/cli            命令行入口
-crates/tui            ratatui 终端入口
-ARCHITECTURE.md       架构细节
-```
-
-### 开发
-
-需要 Node 22：
-
-```bash
-source ~/.nvm/nvm.sh
-nvm use 22
-pnpm install
-```
-
-启动桌面开发版：
-
-```bash
-pnpm dev
-```
-
-`pnpm dev` 会优先使用 `127.0.0.1:1420`。如果端口被占用，开发脚本会自动寻找后续空端口，并把同一个 dev URL 注入给 Tauri 和 Vite。正式打包使用内置前端资源，不会占用 1420。本地 relay 默认端口是 `17687`。
-
-指定开发端口：
-
-```bash
-CODEX_COMPANION_DEV_PORT=15000 pnpm dev
-```
-
-检查和测试：
-
-```bash
-pnpm check
-pnpm build
-cargo check --workspace
-cargo test --workspace
-```
-
-### CLI
-
-```bash
-cargo run -p codex-companion-cli -- status
-cargo run -p codex-companion-cli -- install
-cargo run -p codex-companion-cli -- doctor
-
-cargo run -p codex-companion-cli -- provider import --json-file ./account.json
-cargo run -p codex-companion-cli -- provider import-local
-cargo run -p codex-companion-cli -- provider refresh-all
-cargo run -p codex-companion-cli -- provider list
-
-cargo run -p codex-companion-cli -- group create \
-  --id daily \
-  --name Daily \
-  --providers openrouter_demo,codex_team
-cargo run -p codex-companion-cli -- group use daily
-
-cargo run -p codex-companion-cli -- repair \
-  --history \
-  --plugins \
-  --dry-run \
-  --target-provider-id codex-companion
-
-cargo run -p codex-companion-cli -- token-stats
-cargo run -p codex-companion-cli -- relay start
-```
-
-### TUI
-
-```bash
-cargo run -p codex-companion-tui
-```
-
-TUI 支持账号导入/刷新、分组编排、repair、token 扫描和启动动作。快捷键在 TUI 内按 `?` 查看。
-
-### 数据与安全边界
-
-- Companion 配置保存在自己的数据目录。
-- 普通 provider 配置只保存 `auth_ref`，不会把完整 token 直接塞进 provider 列表。
-- API key 可以使用 `env:<VAR>`，也可以保存到 Companion 本地 auth 文件后由 relay 注入。
-- repair 正式写入前会先生成计划；正式执行会创建备份。
-- token usage 只读取本机 Codex session JSONL，不做价格估算。
+如果你想从源码运行或参与开发，可以查看 [ARCHITECTURE.md](./ARCHITECTURE.md)。
