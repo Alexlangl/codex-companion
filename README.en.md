@@ -154,7 +154,3 @@ API Key JSON example:
 - Real repair backs up local Codex data first.
 - Imported account material stays on your machine.
 - Token usage stats only read local Codex session logs.
-
-## Developer Docs
-
-If you want to run from source or contribute, see [ARCHITECTURE.md](./ARCHITECTURE.md).

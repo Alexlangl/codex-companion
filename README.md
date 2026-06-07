@@ -154,7 +154,3 @@ API Key JSON 示例：
 - 正式修复前会备份本地 Codex 数据。
 - 导入的账号材料只保存在本机。
 - Token 用量统计只读取本地 Codex 会话记录。
-
-## 开发者文档
-
-如果你想从源码运行或参与开发，可以查看 [ARCHITECTURE.md](./ARCHITECTURE.md)。
