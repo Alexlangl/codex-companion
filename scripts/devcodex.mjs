@@ -76,12 +76,38 @@ function defaultKind() {
 
 function resolveLanguage() {
   const configured = process.env.DEVCODEX_LANG?.trim();
-  if (!configured || /^(system|auto|none|off|0)$/i.test(configured)) return "";
+  if (/^(system|none|off|0)$/i.test(configured || "")) return "";
+  if (!configured || /^auto$/i.test(configured)) return detectSystemLocale();
   return normalizeLocale(configured);
 }
 
 function normalizeLocale(locale) {
-  return locale.trim().replaceAll("_", "-");
+  return locale.trim().split(".")[0].replaceAll("_", "-");
+}
+
+function detectSystemLocale() {
+  if (isMac) {
+    const result = spawnSync("defaults", ["read", "-g", "AppleLocale"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const locale = normalizeLocale(result.stdout || "");
+    if (usableLocale(locale)) return locale;
+  }
+  for (const value of [
+    process.env.LC_ALL,
+    process.env.LC_MESSAGES,
+    process.env.LANG,
+    Intl.DateTimeFormat().resolvedOptions().locale,
+  ]) {
+    const locale = normalizeLocale(value || "");
+    if (usableLocale(locale)) return locale;
+  }
+  return "";
+}
+
+function usableLocale(locale) {
+  return Boolean(locale) && !/^(c|posix)$/i.test(locale);
 }
 
 function resolveAppExecutable() {

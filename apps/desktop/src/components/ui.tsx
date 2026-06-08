@@ -3,21 +3,27 @@ import type { ReactNode } from "react";
 export function Button({
   children,
   disabled,
+  iconOnly,
+  label,
   onClick,
   variant = "default",
   type = "button",
 }: {
   children: ReactNode;
   disabled?: boolean;
+  iconOnly?: boolean;
+  label?: string;
   onClick?: () => void;
   variant?: "default" | "secondary" | "danger" | "ghost";
   type?: "button" | "submit";
 }) {
   return (
     <button
-      className={`button button-${variant}`}
+      aria-label={label}
+      className={`button button-${variant}${iconOnly ? " button-icon-only" : ""}`}
       disabled={disabled}
       onClick={onClick}
+      title={label}
       type={type}
     >
       {children}

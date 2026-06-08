@@ -7,7 +7,7 @@ export function providerKindLabel(kind: ProviderKind) {
     case "openai_compatible":
       return "OpenAI 兼容";
     case "relay_provider":
-      return "中转 Provider";
+      return "中转站";
   }
 }
 

@@ -2,7 +2,7 @@
 
 中文 | [English](./README.en.md)
 
-`codex-companion` 是给 Codex Desktop / CLI 使用的本地账号与转发工具。
+`codex-companion` 是给 Codex Desktop / CLI 使用的本地账号与代理工具。
 
 它让 Codex 只需要接入一个 Companion，本地就可以管理官方 Codex 账号、API Key 中转、第三方 OpenAI-compatible provider，并支持账号分组、失败切换、健康刷新、历史会话修复和 token 用量统计。
 
@@ -16,10 +16,10 @@
 
 ## 它做什么
 
-- 导入官方 Codex 账号 JSON，例如 CPA、sub2api、cockpit 导出的账号。
+- 导入官方 Codex 账号 JSON，例如 Codex Companion、CPA 或 sub2api 格式。
 - 导入 API Key 账号 JSON，或手动添加 OpenAI-compatible provider。
 - 把多个账号编排成 Provider Group，按优先级失败切换。
-- 单个 API Key 账号可以选择直连中转站，也可以选择走本地代理。
+- 单个账号默认直连，也可以在账号卡片里切换为本地代理。
 - 官方 Codex 账号由 Companion 负责 token 刷新和请求头处理。
 - 自动刷新账号健康度、订阅状态和可识别的额度信息。
 - 启动 Codex 前修复历史会话和插件状态，减少切换 provider 后上下文丢失的问题。
@@ -29,7 +29,7 @@
 
 ### 总览
 
-查看当前分组、本地转发地址、可用账号和 Codex 接入状态。
+查看当前分组、本地代理地址、可用账号和 Codex 接入状态。
 
 <img src="assets/readme/dashboard.jpg" alt="Codex Companion dashboard" width="720">
 
@@ -51,9 +51,9 @@
 
 <img src="assets/readme/groups.jpg" alt="Provider groups" width="720">
 
-### 本地转发
+### 本地代理
 
-查看 Companion 本地转发服务、请求记录、上游错误和切换事件。
+查看 Companion 本地代理服务、请求记录、上游错误和切换事件。
 
 <img src="assets/readme/relay.jpg" alt="Relay page" width="720">
 
@@ -75,7 +75,7 @@
 
 - 使用 `账号` 添加或导入 provider。
 - 使用 `分组` 编排 fallback 顺序。
-- 使用 `转发` 查看本地转发状态和请求记录。
+- 使用 `转发` 查看本地代理状态和请求记录。
 - 使用 `修复` 预览或修复 Codex 历史会话和插件状态。
 - 使用 `用量` 查看本地 token 统计。
 - 使用 `设置` 写入或恢复 Codex 配置。
@@ -112,7 +112,7 @@ codex-companion provider refresh-all
 codex-companion repair --history --plugins --dry-run
 ```
 
-启动本地转发：
+启动本地代理：
 
 ```bash
 codex-companion relay start
@@ -130,7 +130,7 @@ codex-companion-tui
 
 - 官方 Codex 账号 JSON。
 - sub2api `accounts[]` OpenAI OAuth 账号。
-- cockpit / CPA 风格 Codex OAuth 账号。
+- Codex Companion / CPA 风格 Codex OAuth 账号。
 - API Key 账号 JSON。
 - 手动添加的 OpenAI-compatible provider。
 - 本机已有 Codex 账号。

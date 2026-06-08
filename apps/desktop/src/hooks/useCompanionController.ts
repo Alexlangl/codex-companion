@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  exportProviderJson,
   getStatus,
   getTokenUsage,
   importApiKeyProvider,
@@ -17,13 +18,17 @@ import {
   setProviderViewMode,
   setTheme,
   uninstall,
+  updateApiKeyProvider,
   upsertGroup,
   useGroup,
 } from "../lib/api";
 import type {
+  ApiKeyProviderUpdate,
   BusyState,
   CompanionStatus,
   GroupUpsert,
+  ProviderExportFormat,
+  ProviderExportOutput,
   ProviderLaunchMode,
   ProviderViewMode,
   RepairOutcome,
@@ -78,12 +83,12 @@ export function useCompanionController() {
     }
   }, [status]);
 
-  async function run(label: string, state: BusyState, action: () => Promise<void>) {
+  async function run(label: string, state: BusyState, action: () => Promise<void | string>) {
     setBusy(state);
     setError(null);
     try {
-      await action();
-      setToast(label);
+      const nextLabel = await action();
+      setToast(nextLabel || label);
       await refresh();
     } catch (unknownError) {
       setError(String(unknownError));
@@ -155,6 +160,19 @@ export function useCompanionController() {
     });
   }
 
+  async function exportProvider(id: string, format?: ProviderExportFormat | null): Promise<ProviderExportOutput> {
+    setBusy("saving");
+    setError(null);
+    try {
+      return await exportProviderJson(id, format);
+    } catch (unknownError) {
+      setError(String(unknownError));
+      throw unknownError;
+    } finally {
+      setBusy("idle");
+    }
+  }
+
   async function toggleTheme() {
     const current = status?.config.app.theme === "dark" ? "dark" : "light";
     await changeTheme(current === "dark" ? "light" : "dark");
@@ -178,6 +196,11 @@ export function useCompanionController() {
         run("API Key Provider 已添加", "saving", async () => {
           await importApiKeyProvider(input);
         }),
+      updateApiKeyProvider: (input: ApiKeyProviderUpdate) =>
+        run("API Key Provider 已更新", "saving", async () => {
+          await updateApiKeyProvider(input);
+        }),
+      exportProvider,
       importJsonBatch: (jsonFiles: JsonImportFile[]) =>
         run(`已导入 ${jsonFiles.length} 个 JSON 文件`, "saving", async () => {
           for (const file of jsonFiles) {
@@ -194,11 +217,13 @@ export function useCompanionController() {
         }),
       launchGroup: (id: string) =>
         run("已按当前分组启动 Codex", "launching", async () => {
-          await launchGroup(id);
+          const outcome = await launchGroup(id);
+          return outcome.message;
         }),
       launchProvider: (id: string, mode?: ProviderLaunchMode) =>
         run("已按单 Provider 启动 Codex", "launching", async () => {
-          await launchProvider(id, mode ?? status?.config.app.providerLaunchModes[id] ?? "auto");
+          const outcome = await launchProvider(id, mode ?? status?.config.app.providerLaunchModes[id] ?? "auto");
+          return outcome.message;
         }),
       loadTokenUsage: getTokenUsage,
       refreshAllProviders: () =>

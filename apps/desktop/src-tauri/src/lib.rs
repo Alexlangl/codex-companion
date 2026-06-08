@@ -2,7 +2,9 @@ use codex_companion_core::{
     default_codex_dir, ProviderKind, ProviderLaunchMode, ProviderViewMode, RepairOptions, ThemeMode,
 };
 use codex_companion_daemon::CompanionDaemon;
-use codex_companion_provider::{GroupUpsert, ProviderUpsert};
+use codex_companion_provider::{
+    ApiKeyProviderUpdate, GroupUpsert, ProviderExportFormat, ProviderUpsert,
+};
 use std::path::PathBuf;
 
 fn daemon() -> Result<CompanionDaemon, String> {
@@ -34,6 +36,25 @@ fn uninstall(
 fn add_provider(input: ProviderUpsert) -> Result<codex_companion_core::ProviderConfig, String> {
     daemon()?
         .add_provider(input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn update_api_key_provider(
+    input: ApiKeyProviderUpdate,
+) -> Result<codex_companion_core::ProviderConfig, String> {
+    daemon()?
+        .update_api_key_provider(input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn export_provider_json(
+    id: String,
+    format: Option<ProviderExportFormat>,
+) -> Result<codex_companion_provider::ProviderExportOutput, String> {
+    daemon()?
+        .export_provider_json(&id, format)
         .map_err(|error| error.to_string())
 }
 
@@ -255,6 +276,8 @@ pub fn run() {
             install,
             uninstall,
             add_provider,
+            update_api_key_provider,
+            export_provider_json,
             import_provider_json,
             import_provider_json_many,
             import_api_key_provider,

@@ -186,10 +186,7 @@ fn import_api_key_provider_with_metadata(
             "API Key 和环境变量名至少需要填写一个".to_string(),
         ));
     }
-    let model = model
-        .as_deref()
-        .and_then(normalize_non_empty)
-        .unwrap_or_else(|| "default".to_string());
+    let model = model.as_deref().and_then(normalize_non_empty);
     let provider_id = provider_id
         .as_deref()
         .and_then(sanitize_provider_id)
@@ -219,7 +216,9 @@ fn import_api_key_provider_with_metadata(
     let direct_auth_ref = env_var.as_ref().map(|value| format!("env:{value}"));
 
     let mut model_map = BTreeMap::new();
-    model_map.insert(model.clone(), model);
+    if let Some(model) = model {
+        model_map.insert(model.clone(), model);
+    }
     let existed = store.load()?.providers.contains_key(&provider_id);
     let provider = add_provider(
         store,
@@ -290,12 +289,13 @@ fn import_api_key_provider_from_json(
         .or_else(|| pick_string(value, &[&["api_provider_id"], &["apiProviderId"]]));
     let email = pick_string(value, &[&["email"], &["account", "email"]]);
     let model = extract_model(value);
+    let kind = infer_api_key_provider_kind(value, &base_url);
 
     import_api_key_provider_with_metadata(
         store,
         provider_id,
         provider_name,
-        ProviderKind::OpenAiCompatible,
+        kind,
         base_url,
         api_key,
         None,
@@ -303,6 +303,30 @@ fn import_api_key_provider_from_json(
         None,
         email,
     )
+}
+
+fn infer_api_key_provider_kind(value: &serde_json::Value, base_url: &str) -> ProviderKind {
+    let provider_hint = [
+        pick_string(value, &[&["api_provider_id"], &["apiProviderId"]]),
+        pick_string(value, &[&["api_provider_name"], &["apiProviderName"]]),
+        pick_string(value, &[&["provider_name"], &["providerName"], &["name"]]),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    let base_url = base_url.trim().to_ascii_lowercase();
+
+    if provider_hint.contains("new_api")
+        || provider_hint.contains("new-api")
+        || provider_hint.contains("one-api")
+        || !base_url.starts_with("https://api.openai.com/")
+    {
+        ProviderKind::RelayProvider
+    } else {
+        ProviderKind::OpenAiCompatible
+    }
 }
 
 pub fn import_local_codex_provider(
@@ -408,7 +432,7 @@ pub fn parse_provider_import_draft(
 
 fn unsupported_import_error() -> CompanionError {
     CompanionError::InvalidConfig(
-        "仅支持 CPA/cockpit/sub2api 的 Codex OAuth 或 API Key 账号 JSON".to_string(),
+        "仅支持 Codex Companion/CPA/sub2api 的 Codex OAuth 或 API Key 账号 JSON".to_string(),
     )
 }
 
@@ -1392,7 +1416,7 @@ base_url = "https://api.deepseek.com/v1"
     }
 
     #[test]
-    fn imports_cockpit_api_key_json() {
+    fn imports_api_key_json_with_provider_metadata() {
         let temp = tempfile::tempdir().expect("temp");
         let store = ConfigStore::new(temp.path().join("config.json"));
         let value = serde_json::json!({
@@ -1406,7 +1430,7 @@ base_url = "https://api.deepseek.com/v1"
         let outcome = import_provider_json(&store, &value.to_string(), None, None).expect("import");
         assert_eq!(outcome.provider.id, "sub2api_test");
         assert_eq!(outcome.provider.name, "Sub2API Test");
-        assert_eq!(outcome.provider.kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(outcome.provider.kind, ProviderKind::RelayProvider);
         assert_eq!(outcome.provider.base_url, "https://sub2api.example.com/v1");
         assert_eq!(
             outcome.provider.account.unwrap().email.as_deref(),

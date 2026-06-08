@@ -80,6 +80,9 @@ export interface AppSettings {
   theme: ThemeMode;
   providerViewMode: ProviderViewMode;
   providerLaunchModes: Record<string, ProviderLaunchMode>;
+  lastCodexLaunchMode?: CodexLaunchMode | null;
+  lastCodexTargetProviderId?: string | null;
+  codexRestartRequiredOnNextRelay?: boolean;
 }
 
 export interface CodexInstallStatus {
@@ -99,6 +102,7 @@ export interface CodexLaunchOutcome {
   targetProviderId: string;
   codex: CodexInstallStatus;
   repair: RepairOutcome;
+  restartRequired: boolean;
   codexStarted: boolean;
   message: string;
 }
@@ -168,6 +172,24 @@ export interface ProviderUpsert {
   enabled: boolean;
   refreshIntervalSeconds: number;
   account?: ProviderAccountInfo | null;
+}
+
+export interface ApiKeyProviderUpdate {
+  id: string;
+  providerDisplayName?: string | null;
+  providerName: string;
+  kind: Extract<ProviderKind, "openai_compatible" | "relay_provider">;
+  baseUrl: string;
+  apiKey?: string | null;
+  envVar?: string | null;
+  refreshIntervalSeconds: number;
+}
+
+export type ProviderExportFormat = "codex_companion" | "sub2api" | "cpa";
+
+export interface ProviderExportOutput {
+  fileNameBase: string;
+  jsonContent: string;
 }
 
 export interface ProviderImportOutcome {

@@ -35,9 +35,10 @@ if (devTarget === "sandbox") {
   process.env.DEV_CODEX_APP_DATA = devCodexAppData;
   process.env.CODEX_COMPANION_CODEX_DIR = devCodexHome;
   process.env.CODEX_COMPANION_CODEX_COMMAND = `${shellQuote(process.execPath)} ${shellQuote(devcodexScript)}`;
+  process.env.CODEX_COMPANION_CODEX_APP_DATA = devCodexAppData;
+  process.env.CODEX_COMPANION_CODEX_PROCESS_MATCH = `--user-data-dir=${devCodexAppData}`;
 
   if (truthy(process.env.CODEX_COMPANION_START_DEVCODEX) || process.env.DEVCODEX_COMMAND?.trim()) {
-    process.env.CODEX_COMPANION_SKIP_CODEX_RESTART ||= "1";
     const child = spawn(process.env.CODEX_COMPANION_CODEX_COMMAND, {
       cwd: repoRoot,
       env: process.env,
@@ -51,6 +52,8 @@ if (devTarget === "sandbox") {
 } else {
   delete process.env.CODEX_COMPANION_CODEX_DIR;
   delete process.env.CODEX_COMPANION_CODEX_COMMAND;
+  delete process.env.CODEX_COMPANION_CODEX_APP_DATA;
+  delete process.env.CODEX_COMPANION_CODEX_PROCESS_MATCH;
   delete process.env.CODEX_COMPANION_SKIP_CODEX_RESTART;
 }
 

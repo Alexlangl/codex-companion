@@ -119,6 +119,14 @@
   width: min(760px, calc(100vw - 32px));
 }
 
+.api-key-edit-dialog {
+  width: min(620px, calc(100vw - 32px));
+}
+
+.provider-export-dialog {
+  width: min(760px, calc(100vw - 32px));
+}
+
 .dialog-header {
   display: flex;
   justify-content: space-between;

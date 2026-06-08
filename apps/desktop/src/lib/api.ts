@@ -1,11 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ApiKeyProviderUpdate,
   AppSettings,
   CodexLaunchOutcome,
   CodexInstallStatus,
   CompanionStatus,
   GroupUpsert,
   ProviderConfig,
+  ProviderExportFormat,
+  ProviderExportOutput,
   ProviderHealth,
   ProviderImportOutcome,
   ProviderGroup,
@@ -35,7 +38,7 @@ export function install(codexDir?: string) {
       codex: {
         ...mockStatus.codex,
         installed: true,
-        message: "Codex 已配置为使用 Codex Companion",
+        message: "Codex 已配置为使用本地代理",
       },
     };
     return Promise.resolve(mockStatus.codex);
@@ -88,6 +91,130 @@ export function addProvider(input: ProviderUpsert) {
   return invoke<ProviderConfig>("add_provider", { input });
 }
 
+export function updateApiKeyProvider(input: ApiKeyProviderUpdate) {
+  if (!isTauri()) {
+    const existing = mockStatus.config.providers[input.id];
+    if (!existing) return Promise.reject(new Error(`unknown provider: ${input.id}`));
+    if (existing.kind === "official_codex") {
+      return Promise.reject(new Error("官方 Codex 账号不能按 API Key provider 编辑"));
+    }
+    const authRef =
+      input.apiKey && input.apiKey.trim()
+        ? `file:${mockStatus.dataDir}/auth/api-keys/${input.id}.json`
+        : input.envVar && input.envVar.trim()
+          ? `env:${input.envVar.trim()}`
+          : existing.authRef;
+    const directAuthRef =
+      input.apiKey && input.apiKey.trim()
+        ? null
+        : input.envVar && input.envVar.trim()
+          ? `env:${input.envVar.trim()}`
+          : existing.directAuthRef;
+    const provider: ProviderConfig = {
+      ...existing,
+      name: input.providerName.trim(),
+      kind: input.kind,
+      baseUrl: input.baseUrl.trim().replace(/\/+$/, ""),
+      authRef,
+      directAuthRef,
+      refreshIntervalSeconds: input.refreshIntervalSeconds || existing.refreshIntervalSeconds,
+      account: {
+        ...(existing.account ?? {}),
+        email: input.providerDisplayName?.trim() || existing.account?.email || null,
+        displayName: input.providerName.trim(),
+        subscriptionType: "API Key",
+      },
+    };
+    mockStatus = {
+      ...mockStatus,
+      config: {
+        ...mockStatus.config,
+        providers: {
+          ...mockStatus.config.providers,
+          [input.id]: provider,
+        },
+      },
+    };
+    mockStatus = syncMockDerived(mockStatus);
+    return Promise.resolve(provider);
+  }
+  return invoke<ProviderConfig>("update_api_key_provider", { input });
+}
+
+export function exportProviderJson(id: string, format?: ProviderExportFormat | null) {
+  if (!isTauri()) {
+    const provider = mockStatus.config.providers[id];
+    if (!provider) return Promise.reject(new Error(`unknown provider: ${id}`));
+    const fileNameBase = `${sanitizeProviderId(provider.name)}${format && format !== "codex_companion" ? `_${format}` : ""}`;
+    if (provider.kind !== "official_codex") {
+      return Promise.resolve<ProviderExportOutput>({
+        fileNameBase,
+        jsonContent: JSON.stringify(
+          [
+            {
+              auth_mode: "apikey",
+              OPENAI_API_KEY: "sk-mock-api-key",
+              email: provider.account?.email || provider.account?.displayName || provider.name,
+              api_base_url: provider.baseUrl,
+              api_provider_id: provider.id,
+              api_provider_name: provider.name,
+            },
+          ],
+          null,
+          2,
+        ),
+      });
+    }
+    const cpa = {
+      id_token: "mock-id-token",
+      access_token: "mock-access-token",
+      refresh_token: "mock-refresh-token",
+      account_id: provider.account?.accountId || provider.id,
+      last_refresh: new Date().toISOString(),
+      email: provider.account?.email || provider.name,
+      type: "codex",
+      expired: provider.account?.validUntil || "",
+    };
+    if (format === "sub2api") {
+      return Promise.resolve<ProviderExportOutput>({
+        fileNameBase,
+        jsonContent: JSON.stringify(
+          {
+            exported_at: new Date().toISOString(),
+            proxies: [],
+            accounts: [
+              {
+                name: provider.account?.displayName || provider.name,
+                platform: "openai",
+                type: "oauth",
+                credentials: {
+                  access_token: cpa.access_token,
+                  refresh_token: cpa.refresh_token,
+                  id_token: cpa.id_token,
+                  email: cpa.email,
+                  chatgpt_account_id: cpa.account_id,
+                  plan_type: provider.account?.subscriptionType,
+                },
+                concurrency: 0,
+                priority: 0,
+              },
+            ],
+            type: "sub2api-data",
+            version: 1,
+          },
+          null,
+          2,
+        ),
+      });
+    }
+    return Promise.resolve<ProviderExportOutput>({
+      fileNameBase,
+      jsonContent: JSON.stringify(cpa, null, 2),
+    });
+  }
+  return invoke<ProviderExportOutput>("export_provider_json", { id, format: format ?? null });
+}
+
 export function importApiKeyProvider(input: {
   providerName: string;
   kind: "openai_compatible" | "relay_provider";
@@ -106,7 +233,7 @@ export function importApiKeyProvider(input: {
       baseUrl: input.baseUrl.replace(/\/+$/, ""),
       authRef: input.apiKey ? `file:${mockStatus.dataDir}/auth/api-keys/${id}.json` : input.envVar ? `env:${input.envVar}` : null,
       directAuthRef: input.envVar ? `env:${input.envVar}` : null,
-      modelMap: { [input.model || "default"]: input.model || "default" },
+      modelMap: input.model ? { [input.model]: input.model } : {},
       priority: 100,
       enabled: true,
       refreshIntervalSeconds: input.refreshIntervalSeconds || 60,
@@ -170,7 +297,7 @@ export function addEnvProvider(input: {
   const providerName = input.providerName.trim();
   const baseUrl = input.baseUrl.trim().replace(/\/+$/, "");
   const envVar = input.envVar.trim();
-  const model = input.model?.trim() || "default";
+  const model = input.model?.trim();
   const id = `${sanitizeProviderId(providerName)}_${accountIdHash(`${baseUrl}:${envVar}`)}`;
   return addProvider({
     id,
@@ -179,7 +306,7 @@ export function addEnvProvider(input: {
     baseUrl,
     authRef: `env:${envVar}`,
     directAuthRef: `env:${envVar}`,
-    modelMap: { [model]: model },
+    modelMap: model ? { [model]: model } : {},
     priority: 100,
     enabled: true,
     refreshIntervalSeconds: input.refreshIntervalSeconds || 60,
@@ -587,6 +714,7 @@ export function launchGroup(id: string, codexDir?: string) {
   if (!isTauri()) {
     const group = mockStatus.config.groups[id];
     if (!group) return Promise.reject(new Error(`unknown group: ${id}`));
+    const restartRequired = mockRelayRestartRequired();
     mockStatus = {
       ...mockStatus,
       config: {
@@ -600,11 +728,12 @@ export function launchGroup(id: string, codexDir?: string) {
         ...mockStatus.codex,
         installed: true,
         modelProvider: "codex-companion",
-        message: "Codex 已配置为使用 Codex Companion",
+        message: "Codex 已配置为使用本地代理",
       },
     };
     mockStatus = syncMockDerived(mockStatus);
-    return Promise.resolve(mockLaunchOutcome("group_relay", id, "codex-companion", codexDir));
+    recordMockCodexLaunch("group_relay", "codex-companion");
+    return Promise.resolve(mockLaunchOutcome("group_relay", id, "codex-companion", codexDir, restartRequired));
   }
   return invoke<CodexLaunchOutcome>("launch_group", { id, codexDir: emptyToNull(codexDir) });
 }
@@ -613,10 +742,11 @@ export function launchProvider(id: string, mode: ProviderLaunchMode = "auto", co
   if (!isTauri()) {
     const provider = mockStatus.config.providers[id];
     if (!provider) return Promise.reject(new Error(`unknown provider: ${id}`));
+    const shouldDirect = mode === "direct" || (mode === "auto" && providerCanDirectConnect(provider));
     if (mode === "direct" && !providerCanDirectConnect(provider)) {
-      return Promise.reject(new Error(`${provider.name} 缺少直连中转站所需的 API Key`));
+      return Promise.reject(new Error(`${provider.name} 缺少直连所需的账号材料、API Key 文件或环境变量`));
     }
-    if (mode === "direct" || (mode === "auto" && providerCanDirectConnect(provider))) {
+    if (shouldDirect) {
       mockStatus = {
         ...mockStatus,
         codex: {
@@ -627,8 +757,10 @@ export function launchProvider(id: string, mode: ProviderLaunchMode = "auto", co
           message: `Codex 已配置为直连: ${provider.name}`,
         },
       };
-      return Promise.resolve(mockLaunchOutcome("provider_direct", id, provider.id, codexDir));
+      recordMockCodexLaunch("provider_direct", provider.id);
+      return Promise.resolve(mockLaunchOutcome("provider_direct", id, provider.id, codexDir, true));
     }
+    const restartRequired = mockRelayRestartRequired();
     const groupId = `single-${provider.id}`;
     const group: ProviderGroup = {
       id: groupId,
@@ -654,17 +786,21 @@ export function launchProvider(id: string, mode: ProviderLaunchMode = "auto", co
         ...mockStatus.codex,
         installed: true,
         modelProvider: "codex-companion",
-        message: "Codex 已配置为使用 Codex Companion",
+        message: "Codex 已配置为使用本地代理",
       },
     };
     mockStatus = syncMockDerived(mockStatus);
-    return Promise.resolve(mockLaunchOutcome("provider_relay", id, "codex-companion", codexDir));
+    recordMockCodexLaunch("provider_relay", "codex-companion");
+    return Promise.resolve(mockLaunchOutcome("provider_relay", id, "codex-companion", codexDir, restartRequired));
   }
   return invoke<CodexLaunchOutcome>("launch_provider", { id, codexDir: emptyToNull(codexDir), mode });
 }
 
 export function setProviderLaunchMode(providerId: string, mode: ProviderLaunchMode) {
   if (!isTauri()) {
+    const previousMode =
+      mockStatus.config.app.providerLaunchModes[providerId] ?? "direct";
+    const needsRelayRestart = previousMode === "direct" && mode === "relay";
     const providerLaunchModes = {
       ...mockStatus.config.app.providerLaunchModes,
       [providerId]: mode,
@@ -679,6 +815,8 @@ export function setProviderLaunchMode(providerId: string, mode: ProviderLaunchMo
         app: {
           ...mockStatus.config.app,
           providerLaunchModes,
+          codexRestartRequiredOnNextRelay:
+            mockStatus.config.app.codexRestartRequiredOnNextRelay || needsRelayRestart,
         },
       },
     };
@@ -792,14 +930,15 @@ function importApiKeyJsonMock(value: unknown, providerId?: string, providerName?
     emptyToNull(providerId) ||
     findString(value, ["api_provider_id", "apiProviderId"]) ||
     `${sanitizeProviderId(name)}_${accountIdHash(baseUrl)}`;
+  const model = findString(value, ["model", "defaultModel", "default_model"]);
   const provider: ProviderConfig = {
     id,
     name,
-    kind: "openai_compatible",
+    kind: baseUrl.startsWith("https://api.openai.com/") ? "openai_compatible" : "relay_provider",
     baseUrl,
     authRef: `file:${mockStatus.dataDir}/auth/api-keys/${id}.json`,
     directAuthRef: null,
-    modelMap: { default: "default" },
+    modelMap: model ? { [model]: model } : {},
     priority: 100,
     enabled: true,
     refreshIntervalSeconds: 60,
@@ -866,7 +1005,6 @@ function isTauri() {
 }
 
 function providerCanDirectConnect(provider: ProviderConfig) {
-  if (provider.kind === "official_codex") return false;
   const authRef = provider.directAuthRef?.trim() || provider.authRef?.trim();
   return !authRef || authRef.startsWith("env:") || authRef.startsWith("file:");
 }
@@ -876,7 +1014,9 @@ function mockLaunchOutcome(
   targetId: string,
   targetProviderId: string,
   codexDir?: string,
+  restartRequired = mode === "provider_direct",
 ): CodexLaunchOutcome {
+  const codexStarted = restartRequired;
   return {
     mode,
     targetId,
@@ -900,11 +1040,38 @@ function mockLaunchOutcome(
       migratedStateRows: 3,
       skippedReason: null,
     },
-    codexStarted: true,
+    restartRequired,
+    codexStarted,
     message:
       mode === "provider_direct"
-        ? `已直连启动 ${targetId}`
-        : `已通过 relay 启动 ${targetId}`,
+        ? `已直连启动 ${targetId}，并已重启 Codex 以载入账号/API Key`
+        : restartRequired
+          ? `已通过本地代理启动 ${targetId}，并已重启 Codex`
+          : `已切换本地代理到 ${targetId}，Codex 已在本地代理模式运行，无需重启`,
+  };
+}
+
+function mockRelayRestartRequired() {
+  const app = mockStatus.config.app;
+  return (
+    !mockStatus.codex.installed ||
+    app.codexRestartRequiredOnNextRelay === true ||
+    app.lastCodexLaunchMode === "provider_direct"
+  );
+}
+
+function recordMockCodexLaunch(mode: CodexLaunchOutcome["mode"], targetProviderId: string) {
+  mockStatus = {
+    ...mockStatus,
+    config: {
+      ...mockStatus.config,
+      app: {
+        ...mockStatus.config.app,
+        lastCodexLaunchMode: mode,
+        lastCodexTargetProviderId: targetProviderId,
+        codexRestartRequiredOnNextRelay: false,
+      },
+    },
   };
 }
 
@@ -952,6 +1119,9 @@ function defaultAppSettings(): AppSettings {
     theme: "light",
     providerViewMode: "compact",
     providerLaunchModes: {},
+    lastCodexLaunchMode: null,
+    lastCodexTargetProviderId: null,
+    codexRestartRequiredOnNextRelay: false,
   };
 }
 
@@ -966,6 +1136,11 @@ function readStoredAppSettings(): AppSettings {
       theme: parsed.theme === "dark" || parsed.theme === "system" || parsed.theme === "light" ? parsed.theme : fallback.theme,
       providerViewMode: parsed.providerViewMode === "cards" || parsed.providerViewMode === "compact" ? parsed.providerViewMode : fallback.providerViewMode,
       providerLaunchModes: parsed.providerLaunchModes && typeof parsed.providerLaunchModes === "object" ? parsed.providerLaunchModes : fallback.providerLaunchModes,
+      lastCodexLaunchMode: isCodexLaunchMode(parsed.lastCodexLaunchMode) ? parsed.lastCodexLaunchMode : fallback.lastCodexLaunchMode,
+      lastCodexTargetProviderId:
+        typeof parsed.lastCodexTargetProviderId === "string" ? parsed.lastCodexTargetProviderId : fallback.lastCodexTargetProviderId,
+      codexRestartRequiredOnNextRelay:
+        typeof parsed.codexRestartRequiredOnNextRelay === "boolean" ? parsed.codexRestartRequiredOnNextRelay : fallback.codexRestartRequiredOnNextRelay,
     };
   } catch {
     return fallback;
@@ -975,6 +1150,10 @@ function readStoredAppSettings(): AppSettings {
 function writeStoredAppSettings(settings: AppSettings) {
   if (typeof localStorage === "undefined") return;
   localStorage.setItem(APP_PREFS_STORAGE_KEY, JSON.stringify(settings));
+}
+
+function isCodexLaunchMode(value: unknown): value is CodexLaunchOutcome["mode"] {
+  return value === "group_relay" || value === "provider_direct" || value === "provider_relay";
 }
 
 function syncMockDerived(status: CompanionStatus): CompanionStatus {
@@ -987,7 +1166,6 @@ function syncMockDerived(status: CompanionStatus): CompanionStatus {
   return {
     ...status,
     activeGroup,
-    activeProviders:
-      activeProviders.length > 0 ? activeProviders : Object.values(status.config.providers),
+    activeProviders,
   };
 }

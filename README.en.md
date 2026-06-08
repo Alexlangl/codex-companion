@@ -2,7 +2,7 @@
 
 [中文](./README.md) | English
 
-`codex-companion` is a local account and relay tool for Codex Desktop / CLI.
+`codex-companion` is a local account and proxy tool for Codex Desktop / CLI.
 
 It lets Codex connect to one Companion runtime while you manage official Codex accounts, API-key gateways, and third-party OpenAI-compatible providers locally. It supports provider groups, fallback, health refresh, history repair, plugin state repair, and token usage stats.
 
@@ -16,10 +16,10 @@ It provides:
 
 ## What It Does
 
-- Import official Codex account JSON, including CPA, sub2api, and cockpit exports.
+- Import official Codex account JSON, including Codex Companion, CPA, and sub2api formats.
 - Import API Key account JSON or manually add OpenAI-compatible providers.
 - Compose multiple accounts into a Provider Group and fallback by priority.
-- Start a single API Key account in direct mode or local relay mode.
+- Single accounts default to direct mode, and you can switch them to local proxy mode from the account card.
 - Let Companion handle token refresh and request headers for official Codex accounts.
 - Refresh account health, subscription state, and recognizable quota information.
 - Repair Codex history and plugin state before launching Codex, reducing provider-switch continuity issues.
@@ -29,7 +29,7 @@ It provides:
 
 ### Dashboard
 
-View the current group, local relay address, available accounts, and Codex integration status.
+View the current group, local proxy address, available accounts, and Codex integration status.
 
 <img src="assets/readme/dashboard.jpg" alt="Codex Companion dashboard" width="720">
 
@@ -51,9 +51,9 @@ Put multiple accounts into one group and fallback in order.
 
 <img src="assets/readme/groups.jpg" alt="Provider groups" width="720">
 
-### Local Relay
+### Local Proxy
 
-Inspect Companion relay status, request logs, upstream errors, and fallback events.
+Inspect Companion local proxy status, request logs, upstream errors, and fallback events.
 
 <img src="assets/readme/relay.jpg" alt="Relay page" width="720">
 
@@ -75,7 +75,7 @@ After opening the desktop app:
 
 - Use `Providers` to add or import accounts.
 - Use `Groups` to arrange fallback order.
-- Use `Relay` to inspect local relay status and request logs.
+- Use `Relay` to inspect local proxy status and request logs.
 - Use `Repair` to preview or repair Codex history and plugin state.
 - Use `Usage` to view local token stats.
 - Use `Settings` to install or restore Codex configuration.
@@ -112,7 +112,7 @@ Preview repair:
 codex-companion repair --history --plugins --dry-run
 ```
 
-Start local relay:
+Start local proxy:
 
 ```bash
 codex-companion relay start
@@ -130,7 +130,7 @@ Press `?` inside the TUI to view shortcuts.
 
 - Official Codex account JSON.
 - sub2api `accounts[]` OpenAI OAuth accounts.
-- cockpit / CPA style Codex OAuth accounts.
+- Codex Companion / CPA style Codex OAuth accounts.
 - API Key account JSON.
 - Manually added OpenAI-compatible providers.
 - Existing local Codex accounts.

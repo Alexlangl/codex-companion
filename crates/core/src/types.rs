@@ -226,6 +226,12 @@ pub struct AppSettings {
     pub provider_view_mode: ProviderViewMode,
     #[serde(default)]
     pub provider_launch_modes: BTreeMap<String, ProviderLaunchMode>,
+    #[serde(default)]
+    pub last_codex_launch_mode: Option<CodexLaunchMode>,
+    #[serde(default)]
+    pub last_codex_target_provider_id: Option<String>,
+    #[serde(default)]
+    pub codex_restart_required_on_next_relay: bool,
 }
 
 impl Default for AppSettings {
@@ -234,6 +240,9 @@ impl Default for AppSettings {
             theme: ThemeMode::Light,
             provider_view_mode: ProviderViewMode::Compact,
             provider_launch_modes: BTreeMap::new(),
+            last_codex_launch_mode: None,
+            last_codex_target_provider_id: None,
+            codex_restart_required_on_next_relay: false,
         }
     }
 }
@@ -302,6 +311,7 @@ pub struct CodexLaunchOutcome {
     pub target_provider_id: String,
     pub codex: CodexInstallStatus,
     pub repair: RepairOutcome,
+    pub restart_required: bool,
     pub codex_started: bool,
     pub message: String,
 }

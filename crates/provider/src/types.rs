@@ -30,6 +30,38 @@ pub struct ProviderUpsert {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ApiKeyProviderUpdate {
+    pub id: String,
+    #[serde(default)]
+    pub provider_display_name: Option<String>,
+    pub provider_name: String,
+    pub kind: ProviderKind,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub env_var: Option<String>,
+    #[serde(default = "default_refresh_interval_seconds")]
+    pub refresh_interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderExportFormat {
+    CodexCompanion,
+    Sub2api,
+    Cpa,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderExportOutput {
+    pub file_name_base: String,
+    pub json_content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GroupUpsert {
     pub id: String,
     pub name: String,

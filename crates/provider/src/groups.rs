@@ -86,20 +86,6 @@ pub fn selected_providers_for_group(
         }
     }
 
-    if group.provider_order.is_empty() {
-        ordered = config
-            .providers
-            .values()
-            .filter(|provider| provider.enabled)
-            .cloned()
-            .collect();
-        ordered.sort_by(|left, right| {
-            left.priority
-                .cmp(&right.priority)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-    }
-
     if matches!(group.policy, GroupPolicy::Manual) {
         ordered.truncate(1);
     }
@@ -170,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_orders_when_group_is_empty() {
+    fn empty_group_has_no_selected_providers() {
         let mut config = CompanionConfig::default();
         config.providers.insert("a".to_string(), provider("a", 20));
         config.providers.insert("b".to_string(), provider("b", 10));
@@ -179,7 +165,7 @@ mod tests {
             .into_iter()
             .map(|provider| provider.id)
             .collect();
-        assert_eq!(ids, vec!["b", "a"]);
+        assert!(ids.is_empty());
     }
 
     #[test]

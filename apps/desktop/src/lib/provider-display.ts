@@ -2,10 +2,9 @@ import type { BadgeTone } from "../components/ui";
 import type {
   ProviderAccountInfo,
   ProviderConfig,
-  ProviderHealth,
   ProviderQuotaWindow,
 } from "../types/domain";
-import { daysUntil, formatPercent, formatTime, providerKindLabel } from "./format";
+import { daysUntil, formatPercent, formatTime } from "./format";
 
 export function providerAccountTitle(provider: ProviderConfig) {
   const account = provider.account;
@@ -53,16 +52,17 @@ export function providerSecondaryLine(provider: ProviderConfig) {
 }
 
 export function providerRunMode(provider: ProviderConfig) {
-  if (provider.kind === "official_codex") return "需本地代理";
+  if (provider.kind === "official_codex") return "可直连";
   const directAuthRef = provider.directAuthRef?.trim();
   const authRef = provider.authRef?.trim();
-  if (!authRef || authRef.startsWith("env:") || directAuthRef?.startsWith("env:")) return "可直连";
+  const directRef = directAuthRef || authRef;
+  if (!directRef || directRef.startsWith("env:") || directRef.startsWith("file:")) return "可直连";
   return "可本地代理";
 }
 
 export function providerTypeLabel(provider: ProviderConfig) {
   if (provider.kind === "official_codex") return "Codex 官方账号";
-  return providerKindLabel(provider.kind);
+  return "API Key";
 }
 
 export function providerHealthLabel(status?: string) {
@@ -117,15 +117,19 @@ export function quotaInfo(account?: ProviderAccountInfo | null): {
 } {
   const window = primaryQuotaWindow(account?.quotaWindows);
   const percent = window?.remainingPercent ?? account?.quotaPercent ?? null;
-  const usage = formatApiUsage(account?.usageAvailable, account?.usageTotal, account?.usageUsed);
+  const usage = formatApiUsage(account?.usageAvailable, account?.usageTotal, account?.usageUsed, account?.quotaLabel);
   const label = window ? `${window.label} 剩余额度` : account?.quotaLabel || usage || "额度待刷新";
   return {
     label,
     percent,
-    percentLabel: formatPercent(percent) || (account?.quotaLabel ? "已记录" : "待刷新"),
+    percentLabel: formatPercent(percent) || usage || (account?.quotaLabel ? "已记录" : "待刷新"),
     resetAt: window?.resetAt ?? account?.quotaResetAt ?? null,
     tone: quotaTone(percent),
   };
+}
+
+export function hasQuotaInfo(quota: { label: string; percentLabel: string }) {
+  return quota.label !== "额度待刷新" || quota.percentLabel !== "待刷新";
 }
 
 export function validityLabel(value?: string | null) {
@@ -143,17 +147,10 @@ export function validityTone(value?: string | null): BadgeTone {
 }
 
 export function subscriptionLabel(provider: ProviderConfig) {
-  return (
-    [provider.account?.subscriptionType, provider.account?.subscriptionStatus].filter(Boolean).join(" / ") ||
-    (provider.kind === "official_codex" ? "待刷新订阅" : "API Key")
-  );
-}
-
-export function healthSummary(health?: ProviderHealth) {
-  if (!health) return "未刷新";
-  return health.lastChecked
-    ? `${providerHealthLabel(health.status)} · ${formatTime(health.lastChecked)}`
-    : providerHealthLabel(health.status);
+  if (provider.kind === "official_codex") {
+    return [provider.account?.subscriptionType, provider.account?.subscriptionStatus].filter(Boolean).join(" / ") || "待刷新订阅";
+  }
+  return ["API Key", provider.account?.subscriptionStatus].filter(Boolean).join(" / ");
 }
 
 export function quotaTone(value?: number | null): BadgeTone {
@@ -172,8 +169,9 @@ function primaryQuotaWindow(windows?: ProviderQuotaWindow[] | null) {
   return windows.reduce((lowest, window) => (window.remainingPercent < lowest.remainingPercent ? window : lowest), windows[0]);
 }
 
-function formatApiUsage(available?: number | null, total?: number | null, used?: number | null) {
+function formatApiUsage(available?: number | null, total?: number | null, used?: number | null, label?: string | null) {
   if (available === undefined || available === null) return null;
+  if (label?.includes("余额")) return `$${compactNumber(available)}`;
   if (total !== undefined && total !== null && total > 0) {
     const usedText = used !== undefined && used !== null ? ` · 已用 ${compactNumber(used)}` : "";
     return `${compactNumber(available)} / ${compactNumber(total)}${usedText}`;

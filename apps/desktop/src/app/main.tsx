@@ -54,7 +54,7 @@ function App() {
                 <header className="topbar">
                   <div>
                     <h1>Codex Companion</h1>
-                    <p>本地转发、账号分组、失败切换与 Codex 状态修复。</p>
+                    <p>本地代理、账号分组、失败切换与 Codex 状态修复。</p>
                   </div>
                   <div className="topbar-actions">
                     <IconButton
@@ -77,7 +77,7 @@ function App() {
                 {error ? <div className="error-banner">{error}</div> : null}
 
                 <Tabs.Content className="tabs-content" value="dashboard">
-                  <Dashboard busy={busy} status={status} onLaunchGroup={actions.launchGroup} />
+                  <Dashboard busy={busy} status={status} onLaunchGroup={actions.launchGroup} onLaunchProvider={actions.launchProvider} />
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="providers">
                   <Providers
@@ -87,12 +87,14 @@ function App() {
                     launchModes={status.config.app.providerLaunchModes}
                     onLaunchModeChange={actions.changeProviderLaunchMode}
                     onViewModeChange={actions.changeProviderViewMode}
+                    onExport={actions.exportProvider}
                     onImportApiKey={actions.importApiKey}
                     onImportJsonBatch={actions.importJsonBatch}
                     onImportLocal={actions.importLocal}
                     onRemove={actions.removeProvider}
                     onRefresh={actions.refreshProvider}
                     onRefreshAll={actions.refreshAllProviders}
+                    onUpdateApiKey={actions.updateApiKeyProvider}
                     onLaunch={actions.launchProvider}
                   />
                 </Tabs.Content>

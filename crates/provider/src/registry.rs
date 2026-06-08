@@ -1,8 +1,10 @@
-use crate::types::ProviderUpsert;
+use crate::types::{ApiKeyProviderUpdate, ProviderUpsert};
 use crate::validate::{validate_base_url, validate_id};
 use codex_companion_core::{
-    ConfigStore, ProviderConfig, ProviderGroup, ProviderHealth, Result, DEFAULT_GROUP_ID,
+    CompanionError, ConfigStore, ProviderAccountInfo, ProviderConfig, ProviderGroup,
+    ProviderHealth, ProviderKind, Result, DEFAULT_GROUP_ID,
 };
+use std::fs;
 
 pub fn add_provider(store: &ConfigStore, input: ProviderUpsert) -> Result<ProviderConfig> {
     validate_id(&input.id)?;
@@ -30,15 +32,109 @@ pub fn add_provider(store: &ConfigStore, input: ProviderUpsert) -> Result<Provid
         config
             .providers
             .insert(provider.id.clone(), provider.clone());
-        let group = config
+        config
             .groups
             .entry(DEFAULT_GROUP_ID.to_string())
             .or_insert_with(ProviderGroup::default_group);
-        if !group.provider_order.contains(&provider.id) {
-            group.provider_order.push(provider.id.clone());
-        }
         Ok(provider)
     })
+}
+
+pub fn update_api_key_provider(
+    store: &ConfigStore,
+    input: ApiKeyProviderUpdate,
+) -> Result<ProviderConfig> {
+    validate_id(&input.id)?;
+    validate_base_url(&input.base_url)?;
+    if matches!(input.kind, ProviderKind::OfficialCodex) {
+        return Err(CompanionError::InvalidConfig(
+            "官方 Codex 账号不能按 API Key provider 编辑".to_string(),
+        ));
+    }
+    let provider_name = normalize_non_empty(&input.provider_name)
+        .ok_or_else(|| CompanionError::InvalidConfig("供应商名称不能为空".to_string()))?;
+    let provider_display_name = input
+        .provider_display_name
+        .as_deref()
+        .and_then(normalize_non_empty);
+    let base_url = input.base_url.trim().trim_end_matches('/').to_string();
+    let new_api_key = input.api_key.as_deref().and_then(normalize_non_empty);
+    let new_env_var = input.env_var.as_deref().and_then(normalize_non_empty);
+
+    let existing = store
+        .load()?
+        .providers
+        .get(&input.id)
+        .cloned()
+        .ok_or_else(|| CompanionError::InvalidConfig(format!("unknown provider: {}", input.id)))?;
+    if matches!(existing.kind, ProviderKind::OfficialCodex) {
+        return Err(CompanionError::InvalidConfig(
+            "官方 Codex 账号不能按 API Key provider 编辑".to_string(),
+        ));
+    }
+
+    let mut auth_ref = existing.auth_ref.clone();
+    let mut direct_auth_ref = existing.direct_auth_ref.clone();
+    if let Some(api_key) = new_api_key {
+        let auth_path = store
+            .data_dir()
+            .join("auth")
+            .join("api-keys")
+            .join(format!("{}.json", input.id));
+        if let Some(parent) = auth_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
+        }
+        let auth = serde_json::json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": api_key,
+            "email": provider_display_name.clone().unwrap_or_else(|| provider_name.clone()),
+            "api_base_url": base_url.clone(),
+            "api_provider_id": input.id.clone(),
+            "api_provider_name": provider_name.clone(),
+        });
+        let text = serde_json::to_string_pretty(&auth).map_err(|source| {
+            CompanionError::InvalidConfig(format!("provider API key serialize failed: {source}"))
+        })?;
+        fs::write(&auth_path, format!("{text}\n"))
+            .map_err(|source| CompanionError::io(&auth_path, source))?;
+        auth_ref = Some(format!("file:{}", auth_path.display()));
+        direct_auth_ref = None;
+    } else if let Some(env_var) = new_env_var {
+        auth_ref = Some(format!("env:{env_var}"));
+        direct_auth_ref = Some(format!("env:{env_var}"));
+    }
+
+    if auth_ref.as_deref().and_then(normalize_non_empty).is_none() {
+        return Err(CompanionError::InvalidConfig(
+            "API Key provider 缺少 API Key 文件或环境变量".to_string(),
+        ));
+    }
+
+    let mut account = existing
+        .account
+        .unwrap_or_else(ProviderAccountInfo::default);
+    if let Some(provider_display_name) = provider_display_name {
+        account.email = Some(provider_display_name);
+    }
+    account.display_name = Some(provider_name.clone());
+    account.subscription_type = Some("API Key".to_string());
+
+    add_provider(
+        store,
+        ProviderUpsert {
+            id: input.id,
+            name: provider_name,
+            kind: input.kind,
+            base_url,
+            auth_ref,
+            direct_auth_ref,
+            model_map: existing.model_map,
+            priority: existing.priority,
+            enabled: existing.enabled,
+            refresh_interval_seconds: input.refresh_interval_seconds,
+            account: Some(account),
+        },
+    )
 }
 
 pub fn remove_provider(store: &ConfigStore, id: &str) -> Result<bool> {
@@ -57,9 +153,19 @@ pub fn list_providers(store: &ConfigStore) -> Result<Vec<ProviderConfig>> {
     Ok(config.providers.into_values().collect())
 }
 
+fn normalize_non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ApiKeyProviderUpdate;
     use codex_companion_core::{default_refresh_interval_seconds, GroupPolicy, ProviderKind};
     use std::collections::BTreeMap;
 
@@ -77,6 +183,17 @@ mod tests {
             refresh_interval_seconds: default_refresh_interval_seconds(),
             account: None,
         }
+    }
+
+    #[test]
+    fn add_provider_does_not_auto_join_default_group() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+
+        add_provider(&store, provider("a")).expect("add");
+
+        let config = store.load().expect("load");
+        assert!(config.groups[DEFAULT_GROUP_ID].provider_order.is_empty());
     }
 
     #[test]
@@ -104,9 +221,47 @@ mod tests {
         assert!(remove_provider(&store, "a").expect("remove"));
         let config = store.load().expect("load");
         assert_eq!(config.groups["work"].provider_order, vec!["b".to_string()]);
+        assert!(config.groups[DEFAULT_GROUP_ID].provider_order.is_empty());
+    }
+
+    #[test]
+    fn update_api_key_provider_writes_codex_companion_auth_json() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        add_provider(&store, provider("api-key-provider")).expect("add");
+
+        let updated = update_api_key_provider(
+            &store,
+            ApiKeyProviderUpdate {
+                id: "api-key-provider".to_string(),
+                provider_display_name: Some("api-key-demo".to_string()),
+                provider_name: "PPTOKEN".to_string(),
+                kind: ProviderKind::RelayProvider,
+                base_url: "https://cn.pptoken.cc/v1".to_string(),
+                api_key: Some("sk-secret".to_string()),
+                env_var: None,
+                refresh_interval_seconds: 30,
+            },
+        )
+        .expect("update");
+
+        assert_eq!(updated.name, "PPTOKEN");
+        assert_eq!(updated.kind, ProviderKind::RelayProvider);
+        let auth_ref = updated.auth_ref.as_deref().expect("auth ref");
+        let path = auth_ref.strip_prefix("file:").expect("file ref");
+        let auth = std::fs::read_to_string(path).expect("auth file");
+        let value = serde_json::from_str::<serde_json::Value>(&auth).expect("json");
+        assert_eq!(value["auth_mode"], "apikey");
+        assert_eq!(value["OPENAI_API_KEY"], "sk-secret");
+        assert_eq!(value["email"], "api-key-demo");
+        assert_eq!(value["api_base_url"], "https://cn.pptoken.cc/v1");
+        assert_eq!(value["api_provider_name"], "PPTOKEN");
         assert_eq!(
-            config.groups[DEFAULT_GROUP_ID].provider_order,
-            vec!["b".to_string()]
+            updated
+                .account
+                .as_ref()
+                .and_then(|account| account.email.as_deref()),
+            Some("api-key-demo")
         );
     }
 }

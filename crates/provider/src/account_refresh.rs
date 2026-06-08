@@ -139,14 +139,24 @@ pub async fn refresh_api_key_usage(provider: &ProviderConfig) -> Result<Provider
             Err(error) => last_error = Some(error),
         }
     }
-    account.quota_label = account.quota_label.or_else(|| {
-        Some(match last_error {
-            Some(error) => format!("余量接口不可用：{error}"),
-            None => "该 provider 未声明余量接口".to_string(),
-        })
-    });
-    account.last_refresh_at = Some(Utc::now().to_rfc3339());
-    Ok(account)
+    Err(CompanionError::InvalidConfig(match last_error {
+        Some(error) => format!("余量接口不可用：{error}"),
+        None => "该 provider 未声明余量接口".to_string(),
+    }))
+}
+
+pub fn provider_supports_api_key_usage(provider: &ProviderConfig) -> bool {
+    if provider.kind == ProviderKind::RelayProvider {
+        return true;
+    }
+    let Ok(url) = Url::parse(provider.base_url.trim()) else {
+        return false;
+    };
+    let host = url
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    host.contains("openrouter.ai") || host.contains("newapi") || host.contains("new-api")
 }
 
 async fn fetch_api_usage(
@@ -169,8 +179,24 @@ async fn fetch_api_usage(
     if !status.is_success() {
         return Err(format!("{status} [body_len:{}]", body.len()));
     }
-    serde_json::from_str::<serde_json::Value>(&body)
-        .map_err(|source| format!("解析 JSON 失败: {source}"))
+    let value = serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|source| format!("解析 JSON 失败: {source}"))?;
+    if value
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .is_some_and(|success| !success)
+        || value
+            .get("code")
+            .and_then(serde_json::Value::as_bool)
+            .is_some_and(|success| !success)
+    {
+        let message = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("余量接口返回失败");
+        return Err(message.to_string());
+    }
+    Ok(value)
 }
 
 async fn fetch_account_profile(
@@ -407,6 +433,10 @@ fn apply_usage_to_account(account: &mut ProviderAccountInfo, usage: UsageRespons
 }
 
 fn apply_api_key_usage_to_account(account: &mut ProviderAccountInfo, value: &serde_json::Value) {
+    if apply_public_key_usage_to_account(account, value) {
+        return;
+    }
+
     let usage = usage_record(value);
     let total = pick_first_number(
         usage,
@@ -518,6 +548,245 @@ fn apply_api_key_usage_to_account(account: &mut ProviderAccountInfo, value: &ser
     });
 }
 
+fn apply_public_key_usage_to_account(
+    account: &mut ProviderAccountInfo,
+    value: &serde_json::Value,
+) -> bool {
+    let has_public_usage_shape = value.get("mode").is_some()
+        || value.get("balance").is_some()
+        || value.get("remaining").is_some()
+        || value.get("quota").is_some()
+        || value.get("rate_limits").is_some()
+        || value.get("daily_usage").is_some()
+        || value
+            .get("usage")
+            .and_then(|usage| usage.get("today"))
+            .is_some();
+    if !has_public_usage_shape {
+        return false;
+    }
+
+    let mode = pick_first_string(&[value], &[&["mode"]]);
+    let plan_name = pick_first_string(
+        &[value],
+        &[
+            &["planName"],
+            &["plan_name"],
+            &["subscription", "planName"],
+            &["subscription", "plan_name"],
+            &["subscription", "name"],
+        ],
+    );
+    let status = pick_first_string(&[value], &[&["status"]]);
+    let balance = pick_first_number(
+        value,
+        &[&["balance"], &["wallet_balance"], &["walletBalance"]],
+    );
+    let remaining = pick_first_number(
+        value,
+        &[
+            &["remaining"],
+            &["quota", "remaining"],
+            &["quota_remaining"],
+            &["quotaRemaining"],
+        ],
+    );
+    let quota_total = pick_first_number(
+        value,
+        &[
+            &["quota", "limit"],
+            &["quota", "total"],
+            &["quota", "total_granted"],
+            &["limit"],
+        ],
+    );
+    let quota_used = pick_first_number(
+        value,
+        &[&["quota", "used"], &["quota", "total_used"], &["used"]],
+    );
+    let quota_remaining = pick_first_number(
+        value,
+        &[
+            &["quota", "remaining"],
+            &["remaining"],
+            &["quota_remaining"],
+            &["quotaRemaining"],
+        ],
+    );
+    let expires_at = pick_first_timestamp(
+        value,
+        &[
+            &["expires_at"],
+            &["expiresAt"],
+            &["subscription", "expires_at"],
+            &["subscription", "expiresAt"],
+        ],
+    );
+
+    let usage_available = quota_remaining.or(remaining).or(balance);
+    account.usage_available = usage_available;
+    account.usage_total = quota_total;
+    account.usage_used = quota_used;
+    account.valid_until = expires_at.clone().or_else(|| account.valid_until.clone());
+    account.quota_reset_at = expires_at
+        .clone()
+        .or_else(|| account.quota_reset_at.clone());
+
+    if let Some(plan_name) = plan_name {
+        account.subscription_type = Some(plan_name);
+    } else if mode.as_deref() == Some("quota_limited") {
+        account.subscription_type = Some("Quota".to_string());
+    } else {
+        account.subscription_type = account
+            .subscription_type
+            .clone()
+            .or_else(|| Some("API Key".to_string()));
+    }
+
+    let remaining_percent = quota_remaining
+        .zip(quota_total)
+        .and_then(|(remaining, total)| {
+            if total > 0.0 {
+                Some((remaining / total * 100.0).clamp(0.0, 100.0))
+            } else {
+                None
+            }
+        });
+    if let Some(percent) = remaining_percent {
+        account.quota_percent = Some(percent);
+        account.quota_windows = vec![ProviderQuotaWindow {
+            label: "API".to_string(),
+            remaining_percent: percent,
+            reset_at: expires_at.clone(),
+            window_minutes: None,
+        }];
+    } else {
+        let windows = public_usage_windows(value);
+        if !windows.is_empty() {
+            if let Some(lowest) = windows.iter().min_by(|left, right| {
+                left.remaining_percent
+                    .partial_cmp(&right.remaining_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                account.quota_percent = Some(lowest.remaining_percent);
+                account.quota_reset_at = lowest.reset_at.clone();
+            }
+            account.quota_windows = windows;
+        } else {
+            account.quota_percent = None;
+            account.quota_windows.clear();
+        }
+    }
+
+    account.quota_label = if balance.is_some() && remaining_percent.is_none() {
+        Some("账户余额".to_string())
+    } else if quota_total.is_some() || remaining.is_some() || quota_remaining.is_some() {
+        Some("剩余额度".to_string())
+    } else {
+        account.quota_label.clone()
+    };
+    account.subscription_status = Some(
+        if status.as_deref() == Some("quota_exhausted")
+            || usage_available.is_some_and(|available| available <= 0.0)
+        {
+            "额度耗尽".to_string()
+        } else {
+            "可用".to_string()
+        },
+    );
+    true
+}
+
+fn public_usage_windows(value: &serde_json::Value) -> Vec<ProviderQuotaWindow> {
+    let mut windows = Vec::new();
+    if let Some(rate_limits) = value
+        .get("rate_limits")
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in rate_limits {
+            let label =
+                pick_first_string(&[item], &[&["window"]]).unwrap_or_else(|| "Window".to_string());
+            let Some(limit) = pick_first_number(item, &[&["limit"]]) else {
+                continue;
+            };
+            if limit <= 0.0 {
+                continue;
+            }
+            let used = pick_first_number(item, &[&["used"]]).unwrap_or(0.0);
+            windows.push(ProviderQuotaWindow {
+                label: public_window_label(&label),
+                remaining_percent: ((limit - used).max(0.0) / limit * 100.0).clamp(0.0, 100.0),
+                reset_at: pick_first_timestamp(item, &[&["reset_at"], &["resetAt"]]),
+                window_minutes: public_window_minutes(&label),
+            });
+        }
+    }
+
+    if let Some(subscription) = value
+        .get("subscription")
+        .filter(|subscription| subscription.is_object())
+    {
+        for (label, usage_key, limit_key, reset_key) in [
+            (
+                "Day",
+                "daily_usage_usd",
+                "daily_limit_usd",
+                "daily_window_resets_at",
+            ),
+            (
+                "Week",
+                "weekly_usage_usd",
+                "weekly_limit_usd",
+                "weekly_window_resets_at",
+            ),
+            (
+                "Month",
+                "monthly_usage_usd",
+                "monthly_limit_usd",
+                "monthly_window_resets_at",
+            ),
+        ] {
+            let Some(limit) = pick_first_number(subscription, &[&[limit_key]]) else {
+                continue;
+            };
+            if limit <= 0.0 {
+                continue;
+            }
+            let used = pick_first_number(subscription, &[&[usage_key]]).unwrap_or(0.0);
+            windows.push(ProviderQuotaWindow {
+                label: label.to_string(),
+                remaining_percent: ((limit - used).max(0.0) / limit * 100.0).clamp(0.0, 100.0),
+                reset_at: pick_first_timestamp(subscription, &[&[reset_key]]),
+                window_minutes: match label {
+                    "Day" => Some(1_440),
+                    "Week" => Some(10_080),
+                    "Month" => Some(43_200),
+                    _ => None,
+                },
+            });
+        }
+    }
+    windows
+}
+
+fn public_window_label(value: &str) -> String {
+    match value {
+        "5h" => "5h".to_string(),
+        "1d" => "Day".to_string(),
+        "7d" => "Week".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn public_window_minutes(value: &str) -> Option<i64> {
+    match value {
+        "5h" => Some(300),
+        "1d" => Some(1_440),
+        "7d" => Some(10_080),
+        _ => None,
+    }
+}
+
 fn usage_windows(usage: &UsageResponse) -> Vec<ProviderQuotaWindow> {
     let Some(rate_limit) = usage.rate_limit.as_ref() else {
         return Vec::new();
@@ -601,10 +870,17 @@ fn api_usage_endpoints(base_url: &str) -> Vec<String> {
     if host.contains("openrouter.ai") {
         endpoints.push("https://openrouter.ai/api/v1/auth/key".to_string());
     }
+    endpoints.push(public_key_usage_url(trimmed));
+    endpoints.push(api_root_url(trimmed, "/v1/usage?days=30"));
+    endpoints.push(api_root_url(trimmed, "/api/usage/token/"));
     endpoints.push(new_api_usage_url(trimmed));
     endpoints.push(api_root_url(trimmed, "/api/v1/user/token"));
     endpoints.push(api_root_url(trimmed, "/api/user/self"));
     dedupe_strings(endpoints)
+}
+
+fn public_key_usage_url(base_url: &str) -> String {
+    format!("{}/usage?days=30", base_url.trim().trim_end_matches('/'))
 }
 
 fn new_api_usage_url(base_url: &str) -> String {
@@ -758,7 +1034,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_usage_windows_like_cockpit() {
+    fn parses_usage_windows_with_rate_limits() {
         let usage = serde_json::from_value::<UsageResponse>(serde_json::json!({
             "plan_type": "team",
             "rate_limit": {
@@ -851,6 +1127,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_public_key_usage_with_wallet_balance() {
+        let value = serde_json::json!({
+            "mode": "wallet",
+            "planName": "标准",
+            "balance": 6.42,
+            "remaining": 6.42,
+            "usage": {
+                "today": {
+                    "requests": 234,
+                    "total_tokens": 20910000,
+                    "actual_cost": 1.23
+                }
+            }
+        });
+        let mut account = ProviderAccountInfo::default();
+        apply_api_key_usage_to_account(&mut account, &value);
+        assert_eq!(account.subscription_type.as_deref(), Some("标准"));
+        assert_eq!(account.subscription_status.as_deref(), Some("可用"));
+        assert_eq!(account.usage_available, Some(6.42));
+        assert_eq!(account.quota_label.as_deref(), Some("账户余额"));
+        assert_eq!(account.quota_percent, None);
+        assert!(account.quota_windows.is_empty());
+    }
+
+    #[test]
+    fn parses_public_key_quota_windows() {
+        let value = serde_json::json!({
+            "mode": "quota_limited",
+            "status": "active",
+            "quota": {
+                "limit": 100.0,
+                "used": 25.0,
+                "remaining": 75.0
+            },
+            "rate_limits": [
+                { "window": "5h", "limit": 50.0, "used": 10.0, "reset_at": 1780800000 },
+                { "window": "7d", "limit": 100.0, "used": 30.0 }
+            ]
+        });
+        let mut account = ProviderAccountInfo::default();
+        apply_api_key_usage_to_account(&mut account, &value);
+        assert_eq!(account.subscription_status.as_deref(), Some("可用"));
+        assert_eq!(account.usage_total, Some(100.0));
+        assert_eq!(account.usage_used, Some(25.0));
+        assert_eq!(account.usage_available, Some(75.0));
+        assert_eq!(account.quota_percent, Some(75.0));
+        assert_eq!(account.quota_label.as_deref(), Some("剩余额度"));
+    }
+
+    #[test]
     fn generates_provider_specific_usage_endpoints() {
         let endpoints = api_usage_endpoints("https://openrouter.ai/api/v1");
         assert_eq!(
@@ -862,7 +1188,45 @@ mod tests {
         let endpoints = api_usage_endpoints("https://new-api.example.com/v1");
         assert_eq!(
             endpoints.first().map(String::as_str),
-            Some("https://new-api.example.com/api/usage/token")
+            Some("https://new-api.example.com/v1/usage?days=30")
         );
+        assert!(endpoints.contains(&"https://new-api.example.com/api/usage/token".to_string()));
+
+        let endpoints = api_usage_endpoints("https://cn.pptoken.cc/v1");
+        assert_eq!(
+            endpoints.first().map(String::as_str),
+            Some("https://cn.pptoken.cc/v1/usage?days=30")
+        );
+        assert!(endpoints.contains(&"https://cn.pptoken.cc/api/usage/token/".to_string()));
+    }
+
+    #[test]
+    fn only_known_api_key_providers_probe_usage() {
+        let mut provider =
+            provider_config("https://api.openai.com/v1", ProviderKind::OpenAiCompatible);
+        assert!(!provider_supports_api_key_usage(&provider));
+
+        provider.base_url = "https://openrouter.ai/api/v1".to_string();
+        assert!(provider_supports_api_key_usage(&provider));
+
+        provider.base_url = "https://relay.example.com/v1".to_string();
+        provider.kind = ProviderKind::RelayProvider;
+        assert!(provider_supports_api_key_usage(&provider));
+    }
+
+    fn provider_config(base_url: &str, kind: ProviderKind) -> ProviderConfig {
+        ProviderConfig {
+            id: "p".to_string(),
+            name: "Provider".to_string(),
+            kind,
+            base_url: base_url.to_string(),
+            auth_ref: None,
+            direct_auth_ref: None,
+            model_map: std::collections::BTreeMap::new(),
+            priority: 0,
+            enabled: true,
+            refresh_interval_seconds: 60,
+            account: None,
+        }
     }
 }

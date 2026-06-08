@@ -2,6 +2,11 @@ import * as Dialog from "@radix-ui/react-dialog";
 import * as Select from "@radix-ui/react-select";
 import * as Tabs from "@radix-ui/react-tabs";
 import {
+  Check,
+  Copy,
+  Download,
+  Eye,
+  EyeOff,
   FileJson,
   FolderInput,
   KeyRound,
@@ -12,10 +17,20 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { useRef, useState, type FormEvent, type RefObject } from "react";
+import { useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import { Button, Field, Panel } from "../../components/ui";
 import { providerKindLabel } from "../../lib/format";
-import type { BusyState, CompanionStatus, ProviderLaunchMode, ProviderViewMode } from "../../types/domain";
+import { providerAccountTitle } from "../../lib/provider-display";
+import type {
+  ApiKeyProviderUpdate,
+  BusyState,
+  CompanionStatus,
+  ProviderConfig,
+  ProviderExportFormat,
+  ProviderExportOutput,
+  ProviderLaunchMode,
+  ProviderViewMode,
+} from "../../types/domain";
 import { ProviderCard, ProviderCompactItem } from "./ProviderCards";
 import { emptyApiKeyForm, type ApiKeyForm, type ApiKeyKind, type JsonImportFile } from "./provider-types";
 
@@ -25,11 +40,13 @@ export function Providers({
   onImportApiKey,
   onImportJsonBatch,
   onImportLocal,
+  onExport,
   onLaunch,
   onLaunchModeChange,
   onRemove,
   onRefresh,
   onRefreshAll,
+  onUpdateApiKey,
   onViewModeChange,
   launchModes,
   viewMode,
@@ -40,22 +57,38 @@ export function Providers({
   onImportApiKey: (input: ApiKeyForm) => Promise<void>;
   onImportJsonBatch: (jsonFiles: JsonImportFile[]) => Promise<void>;
   onImportLocal: () => Promise<void>;
+  onExport: (id: string, format?: ProviderExportFormat | null) => Promise<ProviderExportOutput>;
   onLaunch: (id: string, mode?: ProviderLaunchMode) => Promise<void>;
   onLaunchModeChange: (providerId: string, mode: ProviderLaunchMode) => Promise<void>;
   onRemove: (id: string) => Promise<void>;
   onRefresh: (id: string) => Promise<void>;
   onRefreshAll: () => Promise<void>;
+  onUpdateApiKey: (input: ApiKeyProviderUpdate) => Promise<void>;
   onViewModeChange: (mode: ProviderViewMode) => Promise<void>;
   viewMode: ProviderViewMode;
 }) {
   const [apiKeyForm, setApiKeyForm] = useState<ApiKeyForm>(emptyApiKeyForm);
+  const [editProvider, setEditProvider] = useState<ProviderConfig | null>(null);
+  const [editForm, setEditForm] = useState<ApiKeyForm>(emptyApiKeyForm);
+  const [editError, setEditError] = useState("");
+  const [exportProvider, setExportProvider] = useState<ProviderConfig | null>(null);
+  const [exportFormat, setExportFormat] = useState<ProviderExportFormat>("codex_companion");
+  const [exportOutput, setExportOutput] = useState<ProviderExportOutput | null>(null);
+  const [exportLoading, setExportLoading] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [exportHidden, setExportHidden] = useState(true);
+  const [exportCopied, setExportCopied] = useState(false);
   const [jsonFiles, setJsonFiles] = useState<JsonImportFile[]>([]);
   const [pastedJson, setPastedJson] = useState("");
   const [addOpen, setAddOpen] = useState(false);
   const [apiKeyError, setApiKeyError] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const exportRequestRef = useRef(0);
   const disabled = busy !== "idle";
   const providers = Object.values(status.config.providers);
+  const exportFormats = exportProvider ? exportFormatOptionsForProvider(exportProvider) : [];
+  const maskedExportJson = useMemo(() => (exportOutput ? maskJsonPreviewContent(exportOutput.jsonContent) : ""), [exportOutput]);
+  const exportPreviewText = exportOutput ? (exportHidden ? maskedExportJson : exportOutput.jsonContent) : "";
   const jsonImportSources = [
     ...jsonFiles,
     ...(pastedJson.trim() ? [{ name: "粘贴的 JSON", text: pastedJson.trim() }] : []),
@@ -72,7 +105,7 @@ export function Providers({
       refreshIntervalSeconds: Number(apiKeyForm.refreshIntervalSeconds) || 60,
     };
     if (!input.apiKey && !input.envVar) {
-      setApiKeyError("至少填写 API Key 或 API Key 环境变量名。直连中转站需要环境变量名；本地代理可以使用 API Key。");
+      setApiKeyError("至少填写 API Key 或 API Key 环境变量名。直连会写入 Codex auth.json 或使用环境变量；本地代理由 Companion 注入密钥。");
       return;
     }
     await onImportApiKey(input);
@@ -95,6 +128,106 @@ export function Providers({
   async function importLocalAccount() {
     await onImportLocal();
     setAddOpen(false);
+  }
+
+  function openEdit(provider: ProviderConfig) {
+    setEditProvider(provider);
+    setEditForm(apiKeyFormFromProvider(provider));
+    setEditError("");
+  }
+
+  async function submitEdit(event: FormEvent) {
+    event.preventDefault();
+    if (!editProvider || !isApiKeyProvider(editProvider)) return;
+    const input = {
+      ...editForm,
+      providerDisplayName: editForm.providerDisplayName.trim(),
+      providerName: editForm.providerName.trim(),
+      baseUrl: editForm.baseUrl.trim(),
+      apiKey: editForm.apiKey.trim(),
+      envVar: editForm.envVar.trim(),
+      refreshIntervalSeconds: Number(editForm.refreshIntervalSeconds) || 60,
+    };
+    if (!input.providerDisplayName || !input.providerName || !input.baseUrl) {
+      setEditError("Provider Name、供应商名称和 Base URL 不能为空。");
+      return;
+    }
+    await onUpdateApiKey({
+      id: editProvider.id,
+      providerDisplayName: input.providerDisplayName,
+      providerName: input.providerName,
+      kind: input.kind,
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey || null,
+      envVar: input.envVar || null,
+      refreshIntervalSeconds: input.refreshIntervalSeconds,
+    });
+    setEditProvider(null);
+    setEditError("");
+  }
+
+  async function loadExportPreview(provider: ProviderConfig, format: ProviderExportFormat) {
+    const requestId = exportRequestRef.current + 1;
+    exportRequestRef.current = requestId;
+    setExportLoading(true);
+    setExportError("");
+    setExportOutput(null);
+    try {
+      const output = await onExport(provider.id, format);
+      if (exportRequestRef.current === requestId) {
+        setExportOutput(output);
+      }
+    } catch (unknownError) {
+      if (exportRequestRef.current === requestId) {
+        setExportError(String(unknownError));
+      }
+    } finally {
+      if (exportRequestRef.current === requestId) {
+        setExportLoading(false);
+      }
+    }
+  }
+
+  function startExport(provider: ProviderConfig) {
+    const nextFormat: ProviderExportFormat = "codex_companion";
+    setExportProvider(provider);
+    setExportFormat(nextFormat);
+    setExportOutput(null);
+    setExportError("");
+    setExportHidden(true);
+    setExportCopied(false);
+    void loadExportPreview(provider, nextFormat);
+  }
+
+  function closeExportDialog() {
+    exportRequestRef.current += 1;
+    setExportProvider(null);
+    setExportFormat("codex_companion");
+    setExportOutput(null);
+    setExportLoading(false);
+    setExportError("");
+    setExportHidden(true);
+    setExportCopied(false);
+  }
+
+  function selectExportFormat(format: ProviderExportFormat) {
+    if (!exportProvider || format === exportFormat) return;
+    setExportFormat(format);
+    setExportHidden(true);
+    setExportCopied(false);
+    void loadExportPreview(exportProvider, format);
+  }
+
+  async function copyExportJson() {
+    if (!exportOutput) return;
+    await copyText(exportOutput.jsonContent);
+    setExportCopied(true);
+    window.setTimeout(() => setExportCopied(false), 1200);
+  }
+
+  function downloadExportJson() {
+    if (!exportOutput) return;
+    downloadJson(`${exportOutput.fileNameBase}.json`, exportOutput.jsonContent);
   }
 
   async function loadJsonFiles(fileList: FileList | null) {
@@ -143,6 +276,8 @@ export function Providers({
                 launchMode={launchModes[provider.id]}
                 onLaunch={onLaunch}
                 onLaunchModeChange={onLaunchModeChange}
+                onEdit={openEdit}
+                onExport={startExport}
                 onRemove={onRemove}
                 onRefresh={onRefresh}
               />
@@ -159,6 +294,8 @@ export function Providers({
                 launchMode={launchModes[provider.id]}
                 onLaunch={onLaunch}
                 onLaunchModeChange={onLaunchModeChange}
+                onEdit={openEdit}
+                onExport={startExport}
                 onRefresh={onRefresh}
                 onRemove={onRemove}
               />
@@ -200,8 +337,231 @@ export function Providers({
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
+
+      <Dialog.Root open={Boolean(editProvider)} onOpenChange={(open) => !open && setEditProvider(null)}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="dialog-content api-key-edit-dialog">
+            <div className="dialog-header">
+              <div>
+                <Dialog.Title className="dialog-title">编辑 API Key Provider</Dialog.Title>
+                <Dialog.Description className="dialog-description">
+                  API Key 留空会保留原密钥；只改名称或 Base URL 时不需要重新填写密钥。
+                </Dialog.Description>
+              </div>
+              <Dialog.Close className="icon-button" aria-label="关闭">
+                <X size={16} />
+              </Dialog.Close>
+            </div>
+            <ApiKeyEditForm
+              disabled={disabled}
+              editError={editError}
+              form={editForm}
+              setEditError={setEditError}
+              setForm={setEditForm}
+              submit={submitEdit}
+            />
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root open={Boolean(exportProvider)} onOpenChange={(open) => !open && closeExportDialog()}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="dialog-content provider-export-dialog">
+            <div className="dialog-header">
+              <div>
+                <Dialog.Title className="dialog-title">导出 JSON</Dialog.Title>
+                <Dialog.Description className="dialog-description">
+                  {exportProvider ? providerAccountTitle(exportProvider) : "Provider"} · 默认隐藏关键信息，复制和下载使用完整 JSON。
+                </Dialog.Description>
+              </div>
+              <Dialog.Close className="icon-button" aria-label="关闭">
+                <X size={16} />
+              </Dialog.Close>
+            </div>
+            <div className="export-preview-toolbar">
+              <div className="export-format-options" aria-label="导出格式">
+                <span className="export-format-label">导出格式</span>
+                {exportFormats.map((format) => (
+                  <button
+                    aria-pressed={exportFormat === format}
+                    className="export-format-option"
+                    disabled={disabled || exportLoading}
+                    key={format}
+                    onClick={() => selectExportFormat(format)}
+                    type="button"
+                  >
+                    {EXPORT_FORMAT_LABELS[format]}
+                  </button>
+                ))}
+              </div>
+              <div className="export-preview-actions">
+                <Button disabled={!exportOutput || exportLoading} onClick={() => setExportHidden((current) => !current)} type="button" variant="secondary">
+                  {exportHidden ? <Eye size={15} /> : <EyeOff size={15} />}
+                  {exportHidden ? "显示" : "隐藏"}
+                </Button>
+                <Button disabled={!exportOutput || exportLoading} onClick={() => void copyExportJson()} type="button" variant="secondary">
+                  {exportCopied ? <Check size={15} /> : <Copy size={15} />}
+                  {exportCopied ? "已复制" : "复制"}
+                </Button>
+                <Button disabled={!exportOutput || exportLoading} onClick={downloadExportJson} type="button">
+                  <Download size={15} /> 下载
+                </Button>
+              </div>
+            </div>
+            {exportError ? <p className="field-error">{exportError}</p> : null}
+            <textarea
+              className="export-json-textarea"
+              readOnly
+              value={exportLoading ? "正在生成 JSON..." : exportOutput ? exportPreviewText : "暂无 JSON"}
+            />
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   );
+}
+
+function ApiKeyEditForm({
+  disabled,
+  editError,
+  form,
+  setEditError,
+  setForm,
+  submit,
+}: {
+  disabled: boolean;
+  editError: string;
+  form: ApiKeyForm;
+  setEditError: (value: string) => void;
+  setForm: (form: ApiKeyForm) => void;
+  submit: (event: FormEvent) => Promise<void>;
+}) {
+  function update(form: ApiKeyForm) {
+    setEditError("");
+    setForm(form);
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <Field label="Provider Name">
+        <input value={form.providerDisplayName} onChange={(event) => update({ ...form, providerDisplayName: event.target.value })} required />
+      </Field>
+      <Field label="供应商名称">
+        <input value={form.providerName} onChange={(event) => update({ ...form, providerName: event.target.value })} required />
+      </Field>
+      <Field label="Base URL">
+        <input value={form.baseUrl} onChange={(event) => update({ ...form, baseUrl: event.target.value })} required />
+      </Field>
+      <Field label="API Key（留空保留）">
+        <input value={form.apiKey} onChange={(event) => update({ ...form, apiKey: event.target.value })} placeholder="sk-..." type="password" />
+      </Field>
+      <details className="advanced-details" open={Boolean(form.envVar)}>
+        <summary>高级选项</summary>
+        <Field label="环境变量名">
+          <input value={form.envVar} onChange={(event) => update({ ...form, envVar: event.target.value })} placeholder="例如 OPENROUTER_API_KEY" />
+        </Field>
+        <p className="field-hint">
+          只有你已经把 API Key 放进系统环境变量时才填写。普通导入的 provider 保持为空即可。
+        </p>
+      </details>
+      <Field label="状态刷新间隔（秒）">
+        <input min={15} type="number" value={form.refreshIntervalSeconds} onChange={(event) => update({ ...form, refreshIntervalSeconds: Number(event.target.value) })} />
+      </Field>
+      {editError ? <p className="field-error">{editError}</p> : null}
+      <div className="actions">
+        <Button disabled={disabled} type="submit">
+          <KeyRound size={15} /> 保存
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function isApiKeyProvider(provider: ProviderConfig): provider is ProviderConfig & { kind: ApiKeyKind } {
+  return provider.kind === "openai_compatible" || provider.kind === "relay_provider";
+}
+
+const EXPORT_FORMAT_LABELS: Record<ProviderExportFormat, string> = {
+  codex_companion: "Codex Companion",
+  sub2api: "Sub2API",
+  cpa: "CPA",
+};
+
+function exportFormatOptionsForProvider(provider: ProviderConfig): ProviderExportFormat[] {
+  if (isApiKeyProvider(provider)) return ["codex_companion"];
+  return ["codex_companion", "sub2api", "cpa"];
+}
+
+function apiKeyFormFromProvider(provider: ProviderConfig): ApiKeyForm {
+  const authRef = provider.directAuthRef?.trim() || provider.authRef?.trim() || "";
+  return {
+    providerDisplayName: provider.account?.email || providerAccountTitle(provider),
+    providerName: provider.name,
+    kind: isApiKeyProvider(provider) ? provider.kind : "openai_compatible",
+    baseUrl: provider.baseUrl,
+    apiKey: "",
+    envVar: authRef.startsWith("env:") ? authRef.slice("env:".length) : "",
+    refreshIntervalSeconds: provider.refreshIntervalSeconds || 60,
+  };
+}
+
+function downloadJson(fileName: string, jsonContent: string) {
+  const blob = new Blob([`${jsonContent.trimEnd()}\n`], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = sanitizeDownloadName(fileName);
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+function sanitizeDownloadName(fileName: string) {
+  return fileName.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").replace(/_+/g, "_") || "provider.json";
+}
+
+async function copyText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
+}
+
+function maskJsonPreviewContent(jsonContent: string) {
+  const trimmed = jsonContent.trim();
+  if (!trimmed) return "";
+  try {
+    return JSON.stringify(maskJsonValue(JSON.parse(trimmed)), null, 2);
+  } catch {
+    return maskSecretString(trimmed);
+  }
+}
+
+function maskJsonValue(value: unknown): unknown {
+  if (typeof value === "string") return maskSecretString(value);
+  if (Array.isArray(value)) return value.map(maskJsonValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, maskJsonValue(item)]));
+  }
+  return value;
+}
+
+function maskSecretString(value: string) {
+  if (!value) return value;
+  if (value.length <= 4) return "*".repeat(value.length);
+  if (value.length <= 8) return `${value.slice(0, 1)}***${value.slice(-1)}`;
+  return `${value.slice(0, 2)}***${value.slice(-2)}`;
 }
 
 function ProviderAddTabs({
@@ -252,7 +612,7 @@ function ProviderAddTabs({
       <Tabs.Content className="add-tabs-content" value="api-key">
         <form onSubmit={submitApiKey}>
           <div className="form-grid">
-            <Field label="显示名称">
+            <Field label="供应商名称">
               <input value={apiKeyForm.providerName} onChange={(event) => updateApiKeyForm({ ...apiKeyForm, providerName: event.target.value })} placeholder="OpenRouter" required />
             </Field>
             <Field label="类型">
@@ -286,7 +646,7 @@ function ProviderAddTabs({
           </Field>
           {apiKeyError ? <p className="field-error">{apiKeyError}</p> : null}
           <p className="field-hint">
-            创建时只保存账号材料；启动时在账号卡片上选择直连中转站或本地代理。直连由 Codex 读取环境变量，本地代理由 Companion 注入 API Key。
+            创建时只保存账号材料，不会自动加入分组；单账号默认直连，也可以在账号卡片上切换为本地代理。直连需要重启 Codex 以读取账号/API Key，本地代理切换账号无需重启。
           </p>
           <div className="actions">
             <Button disabled={disabled} type="submit">

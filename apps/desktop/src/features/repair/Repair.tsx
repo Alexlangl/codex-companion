@@ -28,7 +28,7 @@ export function Repair({
   const currentProviderId = status.codex.modelProvider || "codex-companion";
   const currentProviderName =
     currentProviderId === "codex-companion"
-      ? "Codex Companion（分组 / 本地代理）"
+      ? "本地代理（分组 / 账号代理）"
       : (status.config.providers[currentProviderId]?.name ?? currentProviderId);
   const resultPrefix = outcome?.plan.dryRun ? "预计" : "已修复";
   const historyFiles = outcome?.plan.dryRun ? outcome.plan.historyFiles : outcome?.migratedHistoryFiles;

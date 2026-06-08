@@ -3,6 +3,7 @@ import type { ProviderKind } from "../../types/domain";
 export type ApiKeyKind = Extract<ProviderKind, "openai_compatible" | "relay_provider">;
 
 export interface ApiKeyForm {
+  providerDisplayName: string;
   providerName: string;
   kind: ApiKeyKind;
   baseUrl: string;
@@ -17,6 +18,7 @@ export interface JsonImportFile {
 }
 
 export const emptyApiKeyForm: ApiKeyForm = {
+  providerDisplayName: "",
   providerName: "",
   kind: "openai_compatible",
   baseUrl: "",

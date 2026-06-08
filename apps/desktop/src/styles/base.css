@@ -2,9 +2,15 @@
   box-sizing: border-box;
 }
 
+html,
+body,
+#app {
+  height: 100%;
+  overflow: hidden;
+}
+
 body {
   min-width: 900px;
-  min-height: 100vh;
   margin: 0;
   color: var(--foreground);
   background: var(--background);

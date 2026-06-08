@@ -54,7 +54,7 @@ macOS 下默认启动：
 /Applications/Codex.app/Contents/MacOS/Codex
 ```
 
-沙盒 Codex app 默认不传语言参数，让 Codex app 自己跟随系统语言。
+沙盒 Codex app 默认会从本机 locale 推断语言，并通过 `--lang` 传给 Codex。
 
 如果需要临时强制语言，可以显式设置：
 
@@ -68,7 +68,7 @@ DEVCODEX_LANG=zh-CN
 DEVCODEX_LANG=en-US pnpm dev
 ```
 
-显式保持系统语言：
+显式不传语言参数，让 Codex 自己决定：
 
 ```bash
 DEVCODEX_LANG=system pnpm dev
@@ -111,13 +111,13 @@ $env:CODEX_COMPANION_START_DEVCODEX="1"
 pnpm dev
 ```
 
-立刻启动时，脚本会默认设置：
+立刻启动后，UI 按钮仍然会按当前启动模式启动/重启沙盒 Codex。脚本会用 `DEV_CODEX_APP_DATA` 标记沙盒进程，避免误判真实本机 Codex。
+
+如果你只想让 UI 写配置、不自动停止或启动 Codex，可以手动设置：
 
 ```bash
-CODEX_COMPANION_SKIP_CODEX_RESTART=1
+CODEX_COMPANION_SKIP_CODEX_RESTART=1 pnpm dev
 ```
-
-这样 UI 按钮只写配置，不会再启动第二个 devcodex。
 
 ### 3. 本机 Codex 模式
 
@@ -163,14 +163,15 @@ DEVCODEX_KIND=cli ./scripts/devcodex.sh
 
 - `CODEX_COMPANION_DEV_TARGET`：`sandbox` 或 `local`。默认 `sandbox`。
 - `CODEX_COMPANION_START_DEVCODEX`：设为 `1` 时，`pnpm dev` 期间立刻启动沙盒 Codex。
-- `CODEX_COMPANION_SKIP_CODEX_RESTART`：设为 `1` 时，companion 写配置但不停止/启动 Codex。
+- `CODEX_COMPANION_SKIP_CODEX_RESTART`：设为 `1` 时，companion 写配置但不停止/启动 Codex；默认不设置。
+- `CODEX_COMPANION_CODEX_PROCESS_MATCH`：自定义 Codex 启动命令时可设置进程命令行匹配片段，供 UI 判断是否已运行以及停止目标进程；沙盒模式自动设置。
 - `DEV_CODEX_HOME`：沙盒 Codex 状态目录。
 - `DEV_CODEX_WORKSPACE`：沙盒 Codex 工作目录。
 - `DEV_CODEX_APP_DATA`：沙盒 Codex app data 目录。
 - `DEV_COMPANION_HOME`：dev companion 状态目录。
 - `DEVCODEX_KIND`：`app` 或 `cli`。能找到 app 时默认 `app`。
 - `DEVCODEX_APP_PATH`：沙盒 Codex app 路径。macOS 可传 `.app`，Windows 可传 `.exe`。
-- `DEVCODEX_LANG`：沙盒 Codex app 语言。默认不传，让 app 跟随系统；可显式设为 `zh-CN`、`en-US` 等。
+- `DEVCODEX_LANG`：沙盒 Codex app 语言。默认从本机 locale 推断；可显式设为 `zh-CN`、`en-US` 等，或设为 `system` 表示不传 `--lang`。
 - `DEVCODEX_BIN`：CLI 模式下的 Codex binary。
 - `DEVCODEX_COMMAND`：完整自定义启动命令。设置后会在 `pnpm dev` 时立刻启动。
 
@@ -230,7 +231,7 @@ On macOS, the default app executable is:
 /Applications/Codex.app/Contents/MacOS/Codex
 ```
 
-The sandbox Codex app passes no language flag by default, so the app can follow the system language itself.
+The sandbox Codex app infers the host locale by default and passes it to Codex with `--lang`.
 
 To temporarily force a language, set:
 
@@ -244,7 +245,7 @@ To force English:
 DEVCODEX_LANG=en-US pnpm dev
 ```
 
-To explicitly keep system language behavior:
+To explicitly pass no language flag and let Codex decide:
 
 ```bash
 DEVCODEX_LANG=system pnpm dev
@@ -287,13 +288,13 @@ $env:CODEX_COMPANION_START_DEVCODEX="1"
 pnpm dev
 ```
 
-Immediate startup defaults to:
+After immediate startup, UI launch buttons still start or restart the sandbox Codex according to the selected launch mode. The script marks the sandbox process with `DEV_CODEX_APP_DATA` so Companion does not confuse it with the real local Codex.
+
+If you only want UI launch buttons to write config without stopping or starting Codex, set it manually:
 
 ```bash
-CODEX_COMPANION_SKIP_CODEX_RESTART=1
+CODEX_COMPANION_SKIP_CODEX_RESTART=1 pnpm dev
 ```
-
-This prevents UI launch buttons from starting a duplicate devcodex process.
 
 ### 3. Local Codex mode
 
@@ -339,14 +340,15 @@ DEVCODEX_KIND=cli ./scripts/devcodex.sh
 
 - `CODEX_COMPANION_DEV_TARGET`: `sandbox` or `local`. Defaults to `sandbox`.
 - `CODEX_COMPANION_START_DEVCODEX`: set to `1` to start sandbox Codex immediately during `pnpm dev`.
-- `CODEX_COMPANION_SKIP_CODEX_RESTART`: set to `1` to let companion write config without stopping or starting Codex.
+- `CODEX_COMPANION_SKIP_CODEX_RESTART`: set to `1` to let companion write config without stopping or starting Codex; unset by default.
+- `CODEX_COMPANION_CODEX_PROCESS_MATCH`: optional process command-line substring for custom Codex launch commands; UI launch buttons use it to detect and stop the target process. Sandbox mode sets it automatically.
 - `DEV_CODEX_HOME`: sandbox Codex state directory.
 - `DEV_CODEX_WORKSPACE`: sandbox Codex workspace directory.
 - `DEV_CODEX_APP_DATA`: sandbox Codex app data directory.
 - `DEV_COMPANION_HOME`: dev companion state directory.
 - `DEVCODEX_KIND`: `app` or `cli`. Defaults to `app` when an app is found.
 - `DEVCODEX_APP_PATH`: sandbox Codex app path. Use `.app` on macOS or `.exe` on Windows.
-- `DEVCODEX_LANG`: sandbox Codex app language. Defaults to no language flag so the app follows the system; can be set explicitly to `zh-CN`, `en-US`, etc.
+- `DEVCODEX_LANG`: sandbox Codex app language. Defaults to the inferred host locale; set it explicitly to `zh-CN`, `en-US`, etc., or set `system` to pass no `--lang`.
 - `DEVCODEX_BIN`: Codex binary for CLI mode.
 - `DEVCODEX_COMMAND`: full custom launch command. When set, it starts immediately during `pnpm dev`.
 

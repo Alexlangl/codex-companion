@@ -2,7 +2,8 @@ import * as Dialog from "@radix-ui/react-dialog";
 import * as Select from "@radix-ui/react-select";
 import { ArrowDown, ArrowUp, Play, Plus, Save, Settings2, X } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
-import { Badge, Button, Field, Panel } from "../../components/ui";
+import { Badge, Button, Field, IconButton, Panel } from "../../components/ui";
+import { currentApplication, userVisibleGroups } from "../../lib/current-application";
 import { providerAccountTitle, providerHealthLabel, providerHealthTone, quotaInfo } from "../../lib/provider-display";
 import type { BusyState, CompanionStatus, GroupPolicy, GroupUpsert, ProviderConfig } from "../../types/domain";
 
@@ -20,12 +21,14 @@ export function Groups({
   onUse: (id: string) => Promise<void>;
 }) {
   const providers = useMemo(() => Object.values(status.config.providers), [status]);
-  const [form, setForm] = useState<GroupUpsert>(newGroupDraft(providers));
+  const groups = userVisibleGroups(status);
+  const application = currentApplication(status);
+  const [form, setForm] = useState<GroupUpsert>(newGroupDraft());
   const [open, setOpen] = useState(false);
   const disabled = busy !== "idle";
 
   function openNewGroup() {
-    setForm(newGroupDraft(providers));
+    setForm(newGroupDraft());
     setOpen(true);
   }
 
@@ -70,9 +73,9 @@ export function Groups({
           </Button>
         </div>
         <div className="group-card-grid">
-          {Object.values(status.config.groups).map((group) => {
+          {groups.map((group) => {
             const providerIds = existingProviderIds(group.providerOrder, providers);
-            const active = status.config.relay.activeGroupId === group.id;
+            const active = application.kind === "group" && application.id === group.id;
             return (
               <div className="group-card" key={group.id}>
                 <div className="group-card-head">
@@ -113,9 +116,9 @@ export function Groups({
                   <Button disabled={disabled} onClick={() => openEditor(group)} variant="secondary">
                     <Settings2 size={15} /> 编排分组
                   </Button>
-                  <Button disabled={disabled} onClick={() => void onLaunch(group.id)} variant="secondary">
-                    <Play size={15} /> 启动
-                  </Button>
+                  <IconButton disabled={disabled} label={`启动分组：${group.name}`} onClick={() => void onLaunch(group.id)}>
+                    <Play size={16} />
+                  </IconButton>
                   <Button disabled={disabled || active} onClick={() => void onUse(group.id)} variant="secondary">
                     设为当前
                   </Button>
@@ -123,6 +126,7 @@ export function Groups({
               </div>
             );
           })}
+          {groups.length === 0 ? <p className="empty">还没有用户分组。单账号启动会作为当前应用显示，不会占用这里的分组列表。</p> : null}
         </div>
       </Panel>
 
@@ -248,12 +252,12 @@ export function Groups({
   );
 }
 
-function newGroupDraft(providers: ProviderConfig[]): GroupUpsert {
+function newGroupDraft(): GroupUpsert {
   return {
     id: "",
     name: "",
     policy: "priority_fallback",
-    providerOrder: providers.map((provider) => provider.id),
+    providerOrder: [],
     fallbackEnabled: true,
   };
 }

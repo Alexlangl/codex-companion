@@ -8,7 +8,7 @@ import type { CompanionStatus, RelayEvent } from "../../types/domain";
 export function Relay({ status }: { status: CompanionStatus }) {
   return (
     <div className="content-grid">
-      <Panel eyebrow="本地转发" title="Companion 转发服务">
+      <Panel eyebrow="本地代理" title="Companion 代理服务">
         <div className="relay-summary">
           <div className="relay-url-card">
             <RadioTower size={20} />
@@ -37,18 +37,18 @@ export function Relay({ status }: { status: CompanionStatus }) {
         <div className="relay-mode-list">
           <RelayMode icon={<GitBranch size={16} />} title="启动账号分组" text="Codex 固定指向 Companion，分组内按优先级失败切换。" />
           <RelayMode icon={<ShieldCheck size={16} />} title="启动官方 Codex 账号" text="Companion 负责 OAuth token、账号 ID 和请求头注入。" />
-          <RelayMode icon={<Route size={16} />} title="账号选择本地代理启动" text="API Key 账号也可以走这里，由 Companion 注入密钥、记录请求并参与分组路由。" />
+          <RelayMode icon={<Route size={16} />} title="账号选择本地代理启动" text="API Key 账号也可以走这里，由 Companion 注入密钥、记录请求并参与分组代理。" />
         </div>
       </Panel>
 
-      <Panel eyebrow="请求日志" title="本地转发记录">
+      <Panel eyebrow="请求日志" title="本地代理记录">
         <p className="relay-help">
-          这里记录 Codex 发到 Companion 本地转发服务的请求、上游错误和自动切换。直连账号不会经过这里。
+          这里记录 Codex 发到 Companion 本地代理服务的请求、上游错误和自动切换。直连账号不会经过这里。
         </p>
         {status.recentEvents.length === 0 ? (
           <div className="empty-state">
             <RadioTower size={28} />
-            <p>启动账号分组、官方账号或本地转发 API Key 后，这里会显示请求记录。</p>
+            <p>启动账号分组、官方账号或本地代理 API Key 后，这里会显示请求记录。</p>
           </div>
         ) : (
           <div className="relay-event-list">
@@ -108,7 +108,7 @@ function relayEventProviderHint(status: CompanionStatus, event: RelayEvent) {
 function relayEventMessage(providerId: string | null | undefined, message: string) {
   const rawMessage = message || "";
   const companionMessage = explainRelayEventMessage(rawMessage);
-  if (!providerId) return companionMessage || rawMessage || "Companion 本地转发事件";
+  if (!providerId) return companionMessage || rawMessage || "Companion 本地代理事件";
   const returnedPrefix = `${providerId} returned `;
   if (message.startsWith(returnedPrefix)) {
     const detail = message.slice(returnedPrefix.length) || "错误响应";
@@ -128,7 +128,7 @@ function explainRelayEventMessage(message: string) {
   const lower = normalized.toLowerCase();
   if (!normalized) return null;
   if (normalized === "GET /v1") {
-    return "Codex 正在探测 Companion 本地转发根地址。";
+    return "Codex 正在探测 Companion 本地代理根地址。";
   }
   if (lower.includes("client_version") && lower.includes("field required")) {
     return "官方 Codex 请求缺少 client_version。当前版本已自动补齐；这是旧转发请求留下的日志，不是账号或额度问题。";

@@ -31,6 +31,17 @@ impl CompanionDaemon {
         mode: ProviderLaunchMode,
     ) -> Result<ProviderLaunchMode> {
         self.store.update(|config| {
+            let previous_mode = config
+                .app
+                .provider_launch_modes
+                .get(&provider_id)
+                .cloned()
+                .unwrap_or(ProviderLaunchMode::Direct);
+            if matches!(previous_mode, ProviderLaunchMode::Direct)
+                && matches!(mode, ProviderLaunchMode::Relay)
+            {
+                config.app.codex_restart_required_on_next_relay = true;
+            }
             if matches!(mode, ProviderLaunchMode::Auto) {
                 config.app.provider_launch_modes.remove(&provider_id);
             } else {

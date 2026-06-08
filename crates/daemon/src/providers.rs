@@ -1,15 +1,28 @@
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{ProviderConfig, ProviderHealth, ProviderKind, Result};
 use codex_companion_provider::{
-    add_provider, import_api_key_provider, import_local_codex_provider, import_provider_json,
-    import_provider_json_many, list_providers, refresh_provider_status, remove_provider,
-    test_provider, ProviderImportOutcome, ProviderUpsert,
+    add_provider, export_provider_json, import_api_key_provider, import_local_codex_provider,
+    import_provider_json, import_provider_json_many, list_providers, refresh_provider_status,
+    remove_provider, test_provider, ApiKeyProviderUpdate, ProviderExportFormat,
+    ProviderExportOutput, ProviderImportOutcome, ProviderUpsert,
 };
 use std::path::PathBuf;
 
 impl CompanionDaemon {
     pub fn add_provider(&self, input: ProviderUpsert) -> Result<ProviderConfig> {
         add_provider(&self.store, input)
+    }
+
+    pub fn update_api_key_provider(&self, input: ApiKeyProviderUpdate) -> Result<ProviderConfig> {
+        codex_companion_provider::update_api_key_provider(&self.store, input)
+    }
+
+    pub fn export_provider_json(
+        &self,
+        id: &str,
+        format: Option<ProviderExportFormat>,
+    ) -> Result<ProviderExportOutput> {
+        export_provider_json(&self.store, id, format)
     }
 
     pub fn import_provider_json(

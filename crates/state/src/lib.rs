@@ -2,8 +2,9 @@ mod token_usage;
 
 use chrono::Local;
 use codex_companion_core::{
-    default_codex_dir, CodexInstallStatus, CompanionError, ProviderConfig, RelayConfig,
-    RepairOptions, RepairOutcome, RepairPlan, Result, COMPANION_PROVIDER_ID,
+    default_codex_dir, CodexInstallStatus, CompanionError, ProviderConfig, ProviderKind,
+    RelayConfig, RepairOptions, RepairOutcome, RepairPlan, Result, COMPANION_PROVIDER_ID,
+    COMPANION_PROVIDER_NAME,
 };
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -42,7 +43,7 @@ pub fn install_companion_provider(
     })?;
 
     doc["model_provider"] = value(COMPANION_PROVIDER_ID);
-    doc["model_providers"][COMPANION_PROVIDER_ID]["name"] = value("Codex Companion");
+    doc["model_providers"][COMPANION_PROVIDER_ID]["name"] = value(COMPANION_PROVIDER_NAME);
     doc["model_providers"][COMPANION_PROVIDER_ID]["base_url"] = value(relay.base_url());
     doc["model_providers"][COMPANION_PROVIDER_ID]["wire_api"] = value("responses");
 
@@ -83,6 +84,10 @@ pub fn install_direct_provider(
             doc["model_providers"][&provider.id]["env_key"] = Item::None;
             write_codex_openai_api_key(&codex_dir, &api_key)?;
         }
+        DirectAuthMaterial::CodexAuth(auth) => {
+            doc["model_providers"][&provider.id]["env_key"] = Item::None;
+            write_codex_auth_json(&codex_dir, &auth)?;
+        }
         DirectAuthMaterial::None => {
             doc["model_providers"][&provider.id]["env_key"] = Item::None;
         }
@@ -103,6 +108,7 @@ pub fn install_direct_provider(
 enum DirectAuthMaterial {
     EnvKey(String),
     ApiKey(String),
+    CodexAuth(Value),
     None,
 }
 
@@ -128,10 +134,15 @@ fn resolve_direct_auth(provider: &ProviderConfig) -> Result<DirectAuthMaterial> 
         let text = fs::read_to_string(&path).map_err(|source| CompanionError::io(&path, source))?;
         let value = serde_json::from_str::<Value>(&text).map_err(|source| {
             CompanionError::InvalidConfig(format!(
-                "解析 API Key auth 文件失败 {}: {source}",
+                "解析 provider auth 文件失败 {}: {source}",
                 path.display()
             ))
         })?;
+        if matches!(provider.kind, ProviderKind::OfficialCodex) {
+            if let Some(auth) = normalize_codex_oauth_auth(&value) {
+                return Ok(DirectAuthMaterial::CodexAuth(auth));
+            }
+        }
         let api_key = pick_json_string(
             &value,
             &[
@@ -153,7 +164,178 @@ fn resolve_direct_auth(provider: &ProviderConfig) -> Result<DirectAuthMaterial> 
     Ok(DirectAuthMaterial::None)
 }
 
-fn write_codex_openai_api_key(codex_dir: &Path, api_key: &str) -> Result<()> {
+fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
+    let null = Value::Null;
+    let candidate = oauth_account_candidate(value);
+    let tokens_source = candidate
+        .get("tokens")
+        .or_else(|| value.get("tokens"))
+        .unwrap_or(&null);
+    let credentials_source = candidate
+        .get("credentials")
+        .or_else(|| value.get("credentials"))
+        .unwrap_or(&null);
+    let extra_source = candidate
+        .get("extra")
+        .or_else(|| value.get("extra"))
+        .unwrap_or(&null);
+    let auth_source = value.get("auth").unwrap_or(&null);
+    let sources = [
+        tokens_source,
+        credentials_source,
+        extra_source,
+        auth_source,
+        candidate,
+        value,
+    ];
+
+    let access_token = pick_first_json_string(
+        &sources,
+        &[
+            &["access_token"],
+            &["accessToken"],
+            &["token"],
+            &["credentials", "access_token"],
+            &["tokens", "access_token"],
+        ],
+    );
+    let id_token = pick_first_json_string(
+        &sources,
+        &[
+            &["id_token"],
+            &["idToken"],
+            &["credentials", "id_token"],
+            &["tokens", "id_token"],
+        ],
+    );
+    let session_token = pick_first_json_string(
+        &sources,
+        &[
+            &["session_token"],
+            &["sessionToken"],
+            &["credentials", "session_token"],
+            &["tokens", "session_token"],
+        ],
+    );
+    let refresh_token = pick_first_json_string(
+        &sources,
+        &[
+            &["refresh_token"],
+            &["refreshToken"],
+            &["credentials", "refresh_token"],
+            &["tokens", "refresh_token"],
+        ],
+    );
+    if access_token.is_none()
+        && id_token.is_none()
+        && session_token.is_none()
+        && refresh_token.is_none()
+    {
+        return None;
+    }
+
+    let mut tokens = tokens_source
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    insert_optional_json_string(&mut tokens, "access_token", access_token);
+    insert_optional_json_string(&mut tokens, "id_token", id_token);
+    insert_optional_json_string(&mut tokens, "session_token", session_token);
+    insert_optional_json_string(&mut tokens, "refresh_token", refresh_token);
+
+    let account_id = pick_first_json_string(
+        &sources,
+        &[
+            &["chatgpt_account_id"],
+            &["account_id"],
+            &["accountId"],
+            &["workspace_id"],
+            &["credentials", "chatgpt_account_id"],
+            &["tokens", "chatgpt_account_id"],
+        ],
+    );
+    insert_optional_json_string(&mut tokens, "account_id", account_id.clone());
+    insert_optional_json_string(&mut tokens, "chatgpt_account_id", account_id);
+    insert_optional_json_string(
+        &mut tokens,
+        "email",
+        pick_first_json_string(
+            &sources,
+            &[
+                &["email"],
+                &["name"],
+                &["credentials", "email"],
+                &["tokens", "email"],
+            ],
+        ),
+    );
+    insert_optional_json_string(
+        &mut tokens,
+        "name",
+        pick_first_json_string(
+            &sources,
+            &[
+                &["name"],
+                &["display_name"],
+                &["displayName"],
+                &["tokens", "name"],
+            ],
+        ),
+    );
+    insert_optional_json_string(
+        &mut tokens,
+        "plan_type",
+        pick_first_json_string(
+            &sources,
+            &[
+                &["plan_type"],
+                &["planType"],
+                &["chatgpt_plan_type"],
+                &["credentials", "plan_type"],
+                &["tokens", "plan_type"],
+            ],
+        ),
+    );
+
+    let mut auth = serde_json::Map::new();
+    auth.insert("OPENAI_API_KEY".to_string(), Value::Null);
+    auth.insert("tokens".to_string(), Value::Object(tokens));
+    insert_optional_json_string(
+        &mut auth,
+        "expired",
+        pick_first_json_string(&sources, &[&["expired"], &["expires_at"], &["expiresAt"]]),
+    );
+    insert_optional_json_string(
+        &mut auth,
+        "last_refresh",
+        pick_first_json_string(&sources, &[&["last_refresh"], &["lastRefresh"]]),
+    );
+    Some(Value::Object(auth))
+}
+
+fn oauth_account_candidate(value: &Value) -> &Value {
+    value
+        .get("accounts")
+        .and_then(Value::as_array)
+        .and_then(|accounts| {
+            accounts
+                .iter()
+                .find(|account| {
+                    account
+                        .get("platform")
+                        .and_then(Value::as_str)
+                        .is_none_or(|platform| platform.eq_ignore_ascii_case("openai"))
+                        && account
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_none_or(|kind| kind.eq_ignore_ascii_case("oauth"))
+                })
+                .or_else(|| accounts.first())
+        })
+        .unwrap_or(value)
+}
+
+fn write_codex_auth_json(codex_dir: &Path, material: &Value) -> Result<()> {
     let auth_path = codex_dir.join("auth.json");
     let mut auth = if auth_path.exists() {
         let text = fs::read_to_string(&auth_path)
@@ -165,20 +347,70 @@ fn write_codex_openai_api_key(codex_dir: &Path, api_key: &str) -> Result<()> {
     if !auth.is_object() {
         auth = Value::Object(Default::default());
     }
-    let Some(object) = auth.as_object_mut() else {
-        return Err(CompanionError::InvalidConfig(
-            "Codex auth.json 不是 JSON object".to_string(),
-        ));
-    };
-    object.insert(
-        "OPENAI_API_KEY".to_string(),
-        Value::String(api_key.to_string()),
-    );
+    merge_codex_auth(&mut auth, material)?;
     let text = serde_json::to_string_pretty(&auth).map_err(|source| {
         CompanionError::InvalidConfig(format!("序列化 Codex auth.json 失败: {source}"))
     })?;
     fs::write(&auth_path, format!("{text}\n"))
         .map_err(|source| CompanionError::io(&auth_path, source))
+}
+
+fn merge_codex_auth(target: &mut Value, source: &Value) -> Result<()> {
+    let Some(target_object) = target.as_object_mut() else {
+        return Err(CompanionError::InvalidConfig(
+            "Codex auth.json 不是 JSON object".to_string(),
+        ));
+    };
+    let Some(source_object) = source.as_object() else {
+        return Err(CompanionError::InvalidConfig(
+            "provider auth 不是 JSON object".to_string(),
+        ));
+    };
+    for (key, value) in source_object {
+        if key == "tokens" && value.is_object() {
+            let target_tokens = target_object
+                .entry("tokens".to_string())
+                .or_insert_with(|| Value::Object(Default::default()));
+            if !target_tokens.is_object() {
+                *target_tokens = Value::Object(Default::default());
+            }
+            if let (Some(target_tokens), Some(source_tokens)) =
+                (target_tokens.as_object_mut(), value.as_object())
+            {
+                for (token_key, token_value) in source_tokens {
+                    target_tokens.insert(token_key.clone(), token_value.clone());
+                }
+            }
+        } else {
+            target_object.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
+}
+
+fn write_codex_openai_api_key(codex_dir: &Path, api_key: &str) -> Result<()> {
+    let mut auth = serde_json::Map::new();
+    auth.insert(
+        "OPENAI_API_KEY".to_string(),
+        Value::String(api_key.to_string()),
+    );
+    write_codex_auth_json(codex_dir, &Value::Object(auth))
+}
+
+fn pick_first_json_string(sources: &[&Value], paths: &[&[&str]]) -> Option<String> {
+    sources
+        .iter()
+        .find_map(|source| pick_json_string(source, paths))
+}
+
+fn insert_optional_json_string(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<String>,
+) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), Value::String(value));
+    }
 }
 
 fn pick_json_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
@@ -252,13 +484,13 @@ pub fn doctor(codex_dir: PathBuf, relay: &RelayConfig) -> Result<CodexInstallSta
         }
     }
     let message = if installed {
-        "Codex 已配置为使用 Codex Companion".to_string()
+        "Codex 已配置为使用本地代理".to_string()
     } else if let Some(provider) = model_provider.as_deref() {
         format!("Codex 当前配置 provider: {provider}")
     } else if config_path.exists() {
         "Codex 配置存在，但尚未设置 model_provider".to_string()
     } else {
-        "Codex 配置尚未创建，可在设置里写入 Companion 配置".to_string()
+        "Codex 配置尚未创建，可在设置里写入本地代理配置".to_string()
     };
     Ok(CodexInstallStatus {
         codex_dir,
@@ -918,6 +1150,7 @@ mod tests {
         assert!(status.installed);
         let text = fs::read_to_string(temp.path().join("config.toml")).expect("config");
         assert!(text.contains("model_provider = \"codex-companion\""));
+        assert!(text.contains("name = \"本地代理\""));
         assert!(text.contains("base_url = \"http://127.0.0.1:17687/v1\""));
     }
 
@@ -1230,5 +1463,53 @@ mod tests {
         assert!(!config.contains("api_key_env_var"));
         let auth = fs::read_to_string(temp.path().join("auth.json")).expect("codex auth");
         assert!(auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
+    }
+
+    #[test]
+    fn install_direct_official_provider_writes_codex_oauth_tokens() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("official-auth.json");
+        fs::write(
+            &auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "access-token",
+                    "id_token": "id-token",
+                    "refresh_token": "refresh-token",
+                    "chatgpt_account_id": "account-id",
+                    "email": "mark@example.com",
+                    "plan_type": "team"
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth");
+        let provider = ProviderConfig {
+            id: "official-mark".to_string(),
+            name: "mark@example.com".to_string(),
+            kind: codex_companion_core::ProviderKind::OfficialCodex,
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            auth_ref: Some(format!("file:{}", auth_path.display())),
+            direct_auth_ref: None,
+            model_map: Default::default(),
+            priority: 50,
+            enabled: true,
+            refresh_interval_seconds: codex_companion_core::default_refresh_interval_seconds(),
+            account: None,
+        };
+
+        let status = install_direct_provider(Some(temp.path().to_path_buf()), &provider)
+            .expect("install direct");
+
+        assert!(status.installed);
+        assert_eq!(status.model_provider.as_deref(), Some("official-mark"));
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains("model_provider = \"official-mark\""));
+        assert!(config.contains("requires_openai_auth = true"));
+        let auth = fs::read_to_string(temp.path().join("auth.json")).expect("codex auth");
+        assert!(auth.contains("\"OPENAI_API_KEY\": null"));
+        assert!(auth.contains("\"access_token\": \"access-token\""));
+        assert!(auth.contains("\"refresh_token\": \"refresh-token\""));
+        assert!(auth.contains("\"chatgpt_account_id\": \"account-id\""));
     }
 }

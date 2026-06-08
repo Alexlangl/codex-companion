@@ -1,4 +1,6 @@
-use crate::account_refresh::{refresh_api_key_usage, refresh_official_codex_account};
+use crate::account_refresh::{
+    provider_supports_api_key_usage, refresh_api_key_usage, refresh_official_codex_account,
+};
 use crate::auth::resolve_auth_token;
 use chrono::Utc;
 use codex_companion_core::{
@@ -40,20 +42,26 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
         .get(id)
         .cloned()
         .ok_or_else(|| CompanionError::InvalidConfig(format!("unknown provider: {id}")))?;
-    let account_result = if provider.kind == ProviderKind::OfficialCodex {
-        Some(refresh_official_codex_account(&provider).await)
+    let mut account_result = None;
+    let mut api_usage_error = None;
+    let result = if provider.kind == ProviderKind::OfficialCodex {
+        let result = refresh_official_codex_account(&provider).await;
+        let health_result = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+        account_result = Some(result);
+        health_result
+    } else if provider_supports_api_key_usage(&provider) {
+        match refresh_api_key_usage(&provider).await {
+            Ok(account) => {
+                account_result = Some(Ok(account));
+                Ok(())
+            }
+            Err(error) => {
+                api_usage_error = Some(error.to_string());
+                test_provider(&provider).await
+            }
+        }
     } else {
-        None
-    };
-    let result = match account_result.as_ref() {
-        Some(Ok(_)) => Ok(()),
-        Some(Err(error)) => Err(error.to_string()),
-        None => test_provider(&provider).await,
-    };
-    let api_usage_result = if result.is_ok() && provider.kind != ProviderKind::OfficialCodex {
-        refresh_api_key_usage(&provider).await.ok()
-    } else {
-        None
+        test_provider(&provider).await
     };
     store.update(|config| {
         let now = Utc::now();
@@ -64,9 +72,23 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
                 if let Some(provider) = config.providers.get_mut(id) {
                     if let Some(Ok(account)) = account_result {
                         provider.account = Some(account);
-                    } else if let Some(account) = api_usage_result {
+                    } else if let Some(error) = api_usage_error {
+                        let mut account = provider.account.clone().unwrap_or_default();
+                        account.display_name =
+                            account.display_name.or_else(|| Some(provider.name.clone()));
+                        account.subscription_type = account
+                            .subscription_type
+                            .or_else(|| Some("API Key".to_string()));
+                        account.subscription_status = Some("连接正常".to_string());
+                        clear_api_key_usage(&mut account);
+                        account.quota_label = Some(error);
+                        account.last_refresh_at = Some(now.to_rfc3339());
                         provider.account = Some(account);
                     } else if let Some(account) = provider.account.as_mut() {
+                        if provider.kind != ProviderKind::OfficialCodex {
+                            clear_api_key_usage(account);
+                            account.subscription_status = Some("连接正常".to_string());
+                        }
                         account.last_refresh_at = Some(now.to_rfc3339());
                     }
                 }
@@ -78,4 +100,14 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
         }
         Ok(health.clone())
     })
+}
+
+fn clear_api_key_usage(account: &mut codex_companion_core::ProviderAccountInfo) {
+    account.quota_label = None;
+    account.quota_percent = None;
+    account.quota_reset_at = None;
+    account.quota_windows.clear();
+    account.usage_total = None;
+    account.usage_used = None;
+    account.usage_available = None;
 }

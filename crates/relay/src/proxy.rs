@@ -48,31 +48,32 @@ async fn proxy_inner(
         .get(&config.relay.active_group_id)
         .cloned()
         .ok_or_else(|| format!("active group not found: {}", config.relay.active_group_id))?;
-    let mut candidates = selected_providers_for_group(&config, &group)
+    let selected = selected_providers_for_group(&config, &group)
         .into_iter()
         .filter(|provider| provider.enabled)
-        .filter(|provider| {
-            config
-                .health
-                .get(&provider.id)
-                .is_none_or(|health| !cooldown_active(health))
-        })
         .collect::<Vec<_>>();
+    let should_skip_cooldown = group.fallback_enabled && selected.len() > 1;
+    let mut candidates = if should_skip_cooldown {
+        selected
+            .into_iter()
+            .filter(|provider| {
+                config
+                    .health
+                    .get(&provider.id)
+                    .is_none_or(|health| !cooldown_active(health))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        selected
+    };
 
     if !group.fallback_enabled {
         candidates.truncate(1);
     }
     if candidates.is_empty() {
-        append_event(
-            &state.store,
-            "error",
-            None,
-            "no available provider in active group".to_string(),
-        );
-        return Ok(text_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no available provider in active group",
-        ));
+        let message = "当前本地代理分组没有可用账号".to_string();
+        append_event(&state.store, "error", None, message.clone());
+        return Ok(text_response(StatusCode::SERVICE_UNAVAILABLE, message));
     }
 
     let mut last_error = None;
@@ -98,7 +99,7 @@ async fn proxy_inner(
                     Some(provider.id.clone()),
                     format!("{} {} -> {}", method, uri, status),
                 );
-                return Ok(stream_response(provider.id, response));
+                return Ok(stream_response(provider.id, response).await);
             }
             Ok(response) => {
                 let status = response.status();
@@ -184,7 +185,7 @@ mod tests {
     use super::*;
     use axum::{body::to_bytes, routing::any, Router};
     use codex_companion_core::{
-        ConfigStore, GroupPolicy, ProviderConfig, ProviderGroup, ProviderKind,
+        ConfigStore, GroupPolicy, ProviderConfig, ProviderGroup, ProviderHealth, ProviderKind,
     };
     use std::collections::BTreeMap;
     use std::sync::{
@@ -281,6 +282,48 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024).await.expect("body");
         assert_eq!(&body[..], b"stream from a");
         assert_eq!(provider_b_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn single_provider_route_ignores_its_own_cooldown() {
+        let provider_hits = Arc::new(AtomicUsize::new(0));
+        let provider_url = spawn_mock_server(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporary unavailable",
+            Some(provider_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![provider("a", &provider_url)]);
+        store
+            .update(|config| {
+                let failure = classify_failure(Some(503), "temporary unavailable");
+                let health = config
+                    .health
+                    .entry("a".to_string())
+                    .or_insert_with(ProviderHealth::default);
+                mark_failure(health, &failure, "temporary unavailable".to_string());
+                Ok(())
+            })
+            .expect("seed cooldown");
+        let state = RelayState {
+            store,
+            client: reqwest::Client::new(),
+        };
+
+        let response = proxy_inner(
+            state,
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(provider_hits.load(Ordering::SeqCst), 1);
+        let body = to_bytes(response.into_body(), 1024).await.expect("body");
+        assert_eq!(&body[..], b"temporary unavailable");
     }
 
     async fn spawn_mock_server(
