@@ -750,6 +750,81 @@ dd {
   min-height: 16px;
 }
 
+.repair-status {
+  display: grid;
+  gap: 9px;
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--muted-bg);
+}
+
+.repair-status-head {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.repair-status-head strong {
+  min-width: 0;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repair-status-head span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.repair-status p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.repair-status-bar {
+  position: relative;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-solid);
+}
+
+.repair-status-bar::after {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 38%;
+  border-radius: inherit;
+  background: var(--primary);
+  animation: repair-status-slide 1.2s ease-in-out infinite;
+  content: "";
+}
+
+.spin-icon {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes repair-status-slide {
+  0% {
+    transform: translateX(-105%);
+  }
+  100% {
+    transform: translateX(270%);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .provider-picker {
   display: grid;
   gap: 8px;

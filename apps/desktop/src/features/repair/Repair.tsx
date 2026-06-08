@@ -1,16 +1,14 @@
-import { Hammer, Search } from "lucide-react";
-import { useState } from "react";
+import { Hammer, LoaderCircle, Search } from "lucide-react";
+import { useEffect, useState } from "react";
 import { Button, Field, Panel } from "../../components/ui";
 import { compactPath } from "../../lib/format";
-import type { BusyState, CompanionStatus, RepairOutcome } from "../../types/domain";
+import type { CompanionStatus, RepairOutcome } from "../../types/domain";
 
 export function Repair({
-  busy,
   status,
   outcome,
   onRepair,
 }: {
-  busy: BusyState;
   status: CompanionStatus;
   outcome: RepairOutcome | null;
   onRepair: (
@@ -23,7 +21,10 @@ export function Repair({
   const [codexDir, setCodexDir] = useState(status.codex.codexDir);
   const [history, setHistory] = useState(true);
   const [plugins, setPlugins] = useState(true);
-  const disabled = busy !== "idle";
+  const [pendingMode, setPendingMode] = useState<"dry-run" | "repair" | null>(null);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const repairing = pendingMode !== null;
   const currentProviderId = status.codex.modelProvider || "codex-companion";
   const currentProviderName =
     currentProviderId === "codex-companion"
@@ -34,6 +35,29 @@ export function Repair({
   const historyLines = outcome?.plan.dryRun ? outcome.plan.historyLines : outcome?.migratedHistoryLines;
   const pluginFiles = outcome?.plan.dryRun ? outcome.plan.pluginFiles : outcome?.migratedPluginFiles;
   const stateRows = outcome?.plan.dryRun ? outcome.plan.stateRows : outcome?.migratedStateRows;
+  const pendingLabel = pendingMode === "dry-run" ? "Dry-run" : "修复";
+
+  useEffect(() => {
+    if (!repairing || !startedAt) {
+      setElapsedSeconds(0);
+      return undefined;
+    }
+    const updateElapsed = () => setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(timer);
+  }, [repairing, startedAt]);
+
+  async function runRepair(dryRun: boolean) {
+    setPendingMode(dryRun ? "dry-run" : "repair");
+    setStartedAt(Date.now());
+    try {
+      await onRepair(history, plugins, dryRun, codexDir);
+    } finally {
+      setPendingMode(null);
+      setStartedAt(null);
+    }
+  }
 
   return (
     <div className="content-grid">
@@ -56,13 +80,26 @@ export function Repair({
           <span>插件状态</span>
         </label>
         <div className="actions">
-          <Button disabled={disabled} onClick={() => void onRepair(history, plugins, true, codexDir)} variant="secondary">
-            <Search size={15} /> Dry-run
+          <Button disabled={repairing} onClick={() => void runRepair(true)} variant="secondary">
+            {repairing && pendingMode === "dry-run" ? <LoaderCircle className="spin-icon" size={15} /> : <Search size={15} />}
+            {repairing && pendingMode === "dry-run" ? "扫描中" : "Dry-run"}
           </Button>
-          <Button disabled={disabled} onClick={() => void onRepair(history, plugins, false, codexDir)}>
-            <Hammer size={15} /> 执行修复
+          <Button disabled={repairing} onClick={() => void runRepair(false)}>
+            {repairing && pendingMode === "repair" ? <LoaderCircle className="spin-icon" size={15} /> : <Hammer size={15} />}
+            {repairing && pendingMode === "repair" ? "修复中" : "执行修复"}
           </Button>
         </div>
+        {repairing ? (
+          <div className="repair-status" aria-live="polite">
+            <div className="repair-status-head">
+              <LoaderCircle className="spin-icon" size={16} />
+              <strong>{pendingLabel} 进行中</strong>
+              <span>{elapsedSeconds}s</span>
+            </div>
+            <div className="repair-status-bar" />
+            <p>正在扫描 Codex 历史、插件状态和 SQLite，完成后会自动刷新结果。</p>
+          </div>
+        ) : null}
       </Panel>
 
       <Panel eyebrow="结果" title="修复结果">

@@ -112,7 +112,7 @@ function App() {
                   <TokenStats active={activeTab === "token"} status={status} onLoad={actions.loadTokenUsage} />
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="repair">
-                  <Repair busy={busy} outcome={repairOutcome} status={status} onRepair={actions.repair} />
+                  <Repair outcome={repairOutcome} status={status} onRepair={actions.repair} />
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="settings">
                   <Settings

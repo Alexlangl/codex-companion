@@ -213,16 +213,22 @@ export function useCompanionController() {
         run("Provider 已删除", "saving", async () => {
           await removeProvider(id);
         }),
-      repair: (
+      repair: async (
         history: boolean,
         plugins: boolean,
         dryRun: boolean,
         codexDir?: string,
-      ) =>
-        run(dryRun ? "Dry-run 已完成" : "修复已完成", "repairing", async () => {
+      ) => {
+        setError(null);
+        try {
           const outcome = await repair(history, plugins, dryRun, codexDir);
           setRepairOutcome(outcome);
-        }),
+          setToast(dryRun ? "Dry-run 已完成" : "修复已完成");
+          void refresh({ silent: true });
+        } catch (unknownError) {
+          setError(String(unknownError));
+        }
+      },
       resetPreferences,
       saveGroup: (group: GroupUpsert) =>
         run("分组已保存", "saving", async () => {

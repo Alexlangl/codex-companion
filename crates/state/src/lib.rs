@@ -370,7 +370,7 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
     }
 
     let mut migrated_state_rows = 0;
-    if options.history && db_path.exists() {
+    if options.history && db_path.exists() && state_rows > 0 {
         backup_file(&db_path, &backup_root, &options.codex_dir)?;
         migrated_state_rows =
             rewrite_sqlite_provider_ids(&db_path, &source_provider_ids, &target_provider_id)?;
@@ -427,11 +427,22 @@ fn resolve_repair_target_provider_id(codex_dir: &Path, requested: Option<&str>) 
 fn collect_files(root: &Path, extension: &str) -> Vec<PathBuf> {
     WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| !is_repair_backup_path(entry.path()))
         .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
         .filter(|path| path.extension().is_some_and(|value| value == extension))
         .collect()
+}
+
+fn is_repair_backup_path(path: &Path) -> bool {
+    let parts = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>();
+    parts
+        .windows(2)
+        .any(|window| window[0] == "backups" && window[1] == "codex-companion")
 }
 
 fn collect_plugin_json_files(root: &Path) -> Vec<PathBuf> {
@@ -779,6 +790,40 @@ mod tests {
     }
 
     #[test]
+    fn repair_ignores_its_own_backups() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let backup_sessions = temp
+            .path()
+            .join("backups")
+            .join("codex-companion")
+            .join("old")
+            .join("sessions");
+        fs::create_dir_all(&backup_sessions).expect("backup sessions");
+        let backup_file = backup_sessions.join("session.jsonl");
+        fs::write(
+            &backup_file,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"openai\"}}\n",
+        )
+        .expect("write");
+
+        let outcome = repair_state(RepairOptions {
+            codex_dir: temp.path().to_path_buf(),
+            history: true,
+            plugins: false,
+            dry_run: false,
+            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
+        })
+        .expect("repair");
+
+        assert!(outcome.backup_root.is_none());
+        assert!(outcome.skipped_reason.is_some());
+        assert_eq!(outcome.plan.history_files, 0);
+        assert_eq!(outcome.plan.history_lines, 0);
+        let text = fs::read_to_string(&backup_file).expect("read");
+        assert!(text.contains("\"openai\""));
+    }
+
+    #[test]
     fn repair_rewrites_history_and_sqlite() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions = temp.path().join("sessions");
@@ -821,6 +866,42 @@ mod tests {
             )
             .expect("provider");
         assert_eq!(provider, COMPANION_PROVIDER_ID);
+    }
+
+    #[test]
+    fn repair_does_not_backup_sqlite_when_no_rows_change() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        let file = sessions.join("session.jsonl");
+        fs::write(
+            &file,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"openai\"}}\n",
+        )
+        .expect("write");
+
+        let db = temp.path().join(CODEX_STATE_DB_FILENAME);
+        let conn = Connection::open(&db).expect("db");
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL);
+             INSERT INTO threads (id, model_provider) VALUES ('s1', 'codex-companion');",
+        )
+        .expect("schema");
+        drop(conn);
+
+        let outcome = repair_state(RepairOptions {
+            codex_dir: temp.path().to_path_buf(),
+            history: true,
+            plugins: false,
+            dry_run: false,
+            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
+        })
+        .expect("repair");
+
+        let backup_root = outcome.backup_root.expect("backup root");
+        assert_eq!(outcome.migrated_history_lines, 1);
+        assert_eq!(outcome.migrated_state_rows, 0);
+        assert!(!backup_root.join(CODEX_STATE_DB_FILENAME).exists());
     }
 
     #[test]

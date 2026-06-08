@@ -157,7 +157,7 @@ fn launch_provider(
 }
 
 #[tauri::command]
-fn repair(
+async fn repair(
     history: bool,
     plugins: bool,
     dry_run: bool,
@@ -168,15 +168,19 @@ fn repair(
         Some(value) => PathBuf::from(value),
         None => default_codex_dir().map_err(|error| error.to_string())?,
     };
-    daemon()?
-        .repair(RepairOptions {
+    let target_provider_id = target_provider_id.filter(|value| !value.trim().is_empty());
+    tauri::async_runtime::spawn_blocking(move || {
+        daemon()?.repair(RepairOptions {
             codex_dir,
             history,
             plugins,
             dry_run,
-            target_provider_id: target_provider_id.filter(|value| !value.trim().is_empty()),
+            target_provider_id,
         })
         .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
