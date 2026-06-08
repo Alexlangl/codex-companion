@@ -6,6 +6,7 @@ use codex_companion_core::{
 };
 use codex_companion_provider::use_group;
 use codex_companion_state::{install_companion_provider, install_direct_provider, repair_state};
+use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -183,52 +184,129 @@ pub fn single_provider_group_id(provider: &ProviderConfig) -> String {
 }
 
 fn restart_codex() -> bool {
-    stop_codex();
+    let target = CodexLaunchTarget::from_env();
+    if target.skip_restart {
+        return false;
+    }
+    stop_codex(&target);
     thread::sleep(Duration::from_millis(650));
-    start_codex()
+    start_codex(&target)
+}
+
+#[derive(Debug, Clone)]
+struct CodexLaunchTarget {
+    app_name: Option<String>,
+    command: Option<String>,
+    skip_restart: bool,
+}
+
+impl CodexLaunchTarget {
+    fn from_env() -> Self {
+        let command = env_text("CODEX_COMPANION_CODEX_COMMAND");
+        Self {
+            app_name: env_text("CODEX_COMPANION_CODEX_APP_NAME")
+                .or_else(|| command.is_none().then(|| "Codex".to_string())),
+            command,
+            skip_restart: env_flag("CODEX_COMPANION_SKIP_CODEX_RESTART"),
+        }
+    }
+}
+
+fn env_text(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_flag(name: &str) -> bool {
+    env_text(name).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn stop_codex() {
+fn stop_codex(target: &CodexLaunchTarget) {
+    let Some(app_name) = target.app_name.as_deref() else {
+        return;
+    };
     let _ = Command::new("osascript")
         .arg("-e")
-        .arg(r#"tell application "Codex" to quit"#)
+        .arg(format!(r#"tell application "{app_name}" to quit"#))
         .status();
-    let _ = Command::new("pkill").args(["-x", "Codex"]).status();
+    let _ = Command::new("pkill").args(["-x", app_name]).status();
 }
 
 #[cfg(target_os = "windows")]
-fn stop_codex() {
+fn stop_codex(target: &CodexLaunchTarget) {
+    let Some(app_name) = target.app_name.as_deref() else {
+        return;
+    };
+    let image_name = if app_name.ends_with(".exe") {
+        app_name.to_string()
+    } else {
+        format!("{app_name}.exe")
+    };
     let _ = Command::new("taskkill")
-        .args(["/IM", "Codex.exe", "/F"])
+        .args(["/IM", image_name.as_str(), "/F"])
         .status();
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-fn stop_codex() {
-    let _ = Command::new("pkill").arg("codex").status();
+fn stop_codex(target: &CodexLaunchTarget) {
+    let Some(app_name) = target.app_name.as_deref() else {
+        return;
+    };
+    let _ = Command::new("pkill").arg(app_name).status();
 }
 
 #[cfg(target_os = "macos")]
-fn start_codex() -> bool {
+fn start_codex(target: &CodexLaunchTarget) -> bool {
+    if let Some(command) = target.command.as_deref() {
+        return Command::new("/bin/sh")
+            .args(["-lc", command])
+            .spawn()
+            .is_ok();
+    }
+    let app_name = target.app_name.as_deref().unwrap_or("Codex");
     Command::new("open")
-        .args(["-a", "Codex"])
+        .args(["-a", app_name])
         .status()
         .is_ok_and(|status| status.success())
         || Command::new("codex").spawn().is_ok()
 }
 
 #[cfg(target_os = "windows")]
-fn start_codex() -> bool {
+fn start_codex(target: &CodexLaunchTarget) -> bool {
+    if let Some(command) = target.command.as_deref() {
+        return Command::new("cmd")
+            .args(["/C", "start", "", "cmd", "/C", command])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+    let command = target.command.clone().unwrap_or_else(|| {
+        target
+            .app_name
+            .clone()
+            .unwrap_or_else(|| "codex".to_string())
+    });
     Command::new("cmd")
-        .args(["/C", "start", "codex"])
+        .args(["/C", "start", "", command.as_str()])
         .status()
         .is_ok_and(|status| status.success())
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-fn start_codex() -> bool {
-    Command::new("codex").spawn().is_ok()
+fn start_codex(target: &CodexLaunchTarget) -> bool {
+    if let Some(command) = target.command.as_deref() {
+        return Command::new("sh").args(["-lc", command]).spawn().is_ok();
+    }
+    Command::new(target.app_name.as_deref().unwrap_or("codex"))
+        .spawn()
+        .is_ok()
 }
 
 #[cfg(test)]

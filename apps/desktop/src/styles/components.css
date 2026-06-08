@@ -999,7 +999,7 @@ dd {
 }
 
 .provider-compact-list {
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: 1fr;
   gap: 8px;
 }
 

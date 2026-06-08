@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "pnpm --filter @codex-companion/desktop dev",
+    "dev": "node scripts/companion-devcodex.mjs",
+    "dev:app": "pnpm --filter @codex-companion/desktop dev",
     "build": "pnpm --filter @codex-companion/desktop build",
     "build:tauri": "pnpm --filter @codex-companion/desktop build:tauri",
     "check": "pnpm --filter @codex-companion/desktop check",
@@ -16,4 +17,3 @@
     "node": ">=22"
   }
 }
-
