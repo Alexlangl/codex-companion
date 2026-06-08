@@ -143,8 +143,8 @@ struct RepairArgs {
     dry_run: bool,
     #[arg(long)]
     codex_dir: Option<PathBuf>,
-    #[arg(long, default_value = "codex-companion")]
-    target_provider_id: String,
+    #[arg(long)]
+    target_provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, ValueEnum)]

@@ -578,7 +578,7 @@ fn repair(daemon: &CompanionDaemon, app: &mut TuiState, dry_run: bool) {
         history: true,
         plugins: true,
         dry_run,
-        target_provider_id: "codex-companion".to_string(),
+        target_provider_id: None,
     }) {
         Ok(outcome) => {
             app.message = format!(

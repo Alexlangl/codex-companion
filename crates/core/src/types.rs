@@ -363,12 +363,8 @@ pub struct RepairOptions {
     pub history: bool,
     pub plugins: bool,
     pub dry_run: bool,
-    #[serde(default = "default_repair_target_provider_id")]
-    pub target_provider_id: String,
-}
-
-pub fn default_repair_target_provider_id() -> String {
-    crate::constants::COMPANION_PROVIDER_ID.to_string()
+    #[serde(default)]
+    pub target_provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +373,7 @@ pub struct RepairPlan {
     pub codex_dir: PathBuf,
     pub target_provider_id: String,
     pub history_files: usize,
+    pub history_lines: usize,
     pub plugin_files: usize,
     pub state_rows: usize,
     pub source_provider_ids: Vec<String>,

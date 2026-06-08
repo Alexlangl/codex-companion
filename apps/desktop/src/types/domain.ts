@@ -192,6 +192,7 @@ export interface RepairOutcome {
     codexDir: string;
     targetProviderId: string;
     historyFiles: number;
+    historyLines: number;
     pluginFiles: number;
     stateRows: number;
     sourceProviderIds: string[];

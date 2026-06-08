@@ -693,14 +693,16 @@ export function repair(
   plugins: boolean,
   dryRun: boolean,
   codexDir?: string,
-  targetProviderId = "codex-companion",
+  targetProviderId?: string,
 ) {
+  const resolvedTargetProviderId = targetProviderId || mockStatus.codex.modelProvider || "codex-companion";
   if (!isTauri()) {
     return Promise.resolve({
       plan: {
         codexDir: codexDir || mockStatus.codex.codexDir,
-        targetProviderId,
+        targetProviderId: resolvedTargetProviderId,
         historyFiles: history ? 2 : 0,
+        historyLines: history ? 2 : 0,
         pluginFiles: plugins ? 1 : 0,
         stateRows: history ? 3 : 0,
         sourceProviderIds: ["openai", "custom"],
@@ -885,6 +887,7 @@ function mockLaunchOutcome(
         codexDir: codexDir || mockStatus.codex.codexDir,
         targetProviderId,
         historyFiles: 2,
+        historyLines: 2,
         pluginFiles: 1,
         stateRows: 3,
         sourceProviderIds: ["openai", "custom"],

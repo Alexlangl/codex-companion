@@ -174,9 +174,7 @@ fn repair(
             history,
             plugins,
             dry_run,
-            target_provider_id: target_provider_id
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(codex_companion_core::default_repair_target_provider_id),
+            target_provider_id: target_provider_id.filter(|value| !value.trim().is_empty()),
         })
         .map_err(|error| error.to_string())
 }

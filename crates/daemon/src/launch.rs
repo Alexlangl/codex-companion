@@ -28,7 +28,7 @@ impl CompanionDaemon {
             history: true,
             plugins: true,
             dry_run: false,
-            target_provider_id: COMPANION_PROVIDER_ID.to_string(),
+            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
         })?;
         let codex_started = restart_codex();
 
@@ -92,7 +92,7 @@ impl CompanionDaemon {
                 history: true,
                 plugins: true,
                 dry_run: false,
-                target_provider_id: provider.id.clone(),
+                target_provider_id: Some(provider.id.clone()),
             })?;
             let codex_started = restart_codex();
             return Ok(CodexLaunchOutcome {
@@ -114,7 +114,7 @@ impl CompanionDaemon {
             history: true,
             plugins: true,
             dry_run: false,
-            target_provider_id: COMPANION_PROVIDER_ID.to_string(),
+            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
         })?;
         let codex_started = restart_codex();
 

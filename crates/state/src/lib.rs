@@ -276,12 +276,10 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
             options.codex_dir.display()
         )));
     }
-    let target_provider_id = options.target_provider_id.trim();
-    if target_provider_id.is_empty() {
-        return Err(CompanionError::InvalidConfig(
-            "修复目标 provider id 不能为空".to_string(),
-        ));
-    }
+    let target_provider_id = resolve_repair_target_provider_id(
+        &options.codex_dir,
+        options.target_provider_id.as_deref(),
+    )?;
 
     let jsonl_files = if options.history {
         collect_files(&options.codex_dir, "jsonl")
@@ -302,18 +300,24 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
     if options.plugins {
         source_provider_ids.extend(collect_plugin_provider_ids(&plugin_files)?);
     }
-    source_provider_ids.remove(target_provider_id);
+    source_provider_ids.remove(target_provider_id.as_str());
 
     let state_rows = if options.history && db_path.exists() {
         count_sqlite_rows_to_migrate(&db_path, &source_provider_ids)?
     } else {
         0
     };
+    let history_lines = if options.history {
+        count_jsonl_lines_to_migrate(&jsonl_files, &source_provider_ids)?
+    } else {
+        0
+    };
 
     let plan = RepairPlan {
         codex_dir: options.codex_dir.clone(),
-        target_provider_id: target_provider_id.to_string(),
+        target_provider_id: target_provider_id.clone(),
         history_files: jsonl_files.len(),
+        history_lines,
         plugin_files: plugin_files.len(),
         state_rows,
         source_provider_ids: source_provider_ids.iter().cloned().collect(),
@@ -355,7 +359,7 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
         let (changed, lines) = rewrite_jsonl_file(
             path,
             &source_provider_ids,
-            target_provider_id,
+            &target_provider_id,
             &backup_root,
             &options.codex_dir,
         )?;
@@ -369,14 +373,14 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
     if options.history && db_path.exists() {
         backup_file(&db_path, &backup_root, &options.codex_dir)?;
         migrated_state_rows =
-            rewrite_sqlite_provider_ids(&db_path, &source_provider_ids, target_provider_id)?;
+            rewrite_sqlite_provider_ids(&db_path, &source_provider_ids, &target_provider_id)?;
     }
 
     for path in &plugin_files {
         if rewrite_plugin_file(
             path,
             &source_provider_ids,
-            target_provider_id,
+            &target_provider_id,
             &backup_root,
             &options.codex_dir,
         )? {
@@ -393,6 +397,31 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
         migrated_state_rows,
         skipped_reason: None,
     })
+}
+
+fn resolve_repair_target_provider_id(codex_dir: &Path, requested: Option<&str>) -> Result<String> {
+    if let Some(provider_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(provider_id.to_string());
+    }
+
+    let config_path = codex_dir.join("config.toml");
+    if config_path.exists() {
+        let current = fs::read_to_string(&config_path)
+            .map_err(|source| CompanionError::io(&config_path, source))?;
+        let doc = current.parse::<DocumentMut>().map_err(|source| {
+            CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
+        })?;
+        if let Some(provider_id) = doc
+            .get("model_provider")
+            .and_then(Item::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(provider_id.to_string());
+        }
+    }
+
+    Ok(COMPANION_PROVIDER_ID.to_string())
 }
 
 fn collect_files(root: &Path, extension: &str) -> Vec<PathBuf> {
@@ -479,6 +508,23 @@ fn session_meta_provider(line: &str) -> Option<String> {
         .as_str()
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn count_jsonl_lines_to_migrate(files: &[PathBuf], source_ids: &BTreeSet<String>) -> Result<usize> {
+    if source_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for path in files {
+        let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|source| CompanionError::io(path, source))?;
+            if session_meta_provider(&line).is_some_and(|provider| source_ids.contains(&provider)) {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 fn collect_sqlite_provider_ids(path: &Path) -> Result<BTreeSet<String>> {
@@ -721,11 +767,13 @@ mod tests {
             history: true,
             plugins: false,
             dry_run: true,
-            target_provider_id: COMPANION_PROVIDER_ID.to_string(),
+            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
         })
         .expect("repair");
 
         assert_eq!(outcome.plan.source_provider_ids, vec!["openai".to_string()]);
+        assert_eq!(outcome.plan.history_files, 1);
+        assert_eq!(outcome.plan.history_lines, 1);
         let text = fs::read_to_string(&file).expect("read");
         assert!(text.contains("\"openai\""));
     }
@@ -756,7 +804,7 @@ mod tests {
             history: true,
             plugins: false,
             dry_run: false,
-            target_provider_id: COMPANION_PROVIDER_ID.to_string(),
+            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
         })
         .expect("repair");
 
@@ -792,7 +840,38 @@ mod tests {
             history: true,
             plugins: false,
             dry_run: false,
-            target_provider_id: "openrouter".to_string(),
+            target_provider_id: Some("openrouter".to_string()),
+        })
+        .expect("repair");
+
+        assert_eq!(outcome.plan.target_provider_id, "openrouter");
+        let text = fs::read_to_string(&file).expect("read");
+        assert!(text.contains("\"openrouter\""));
+    }
+
+    #[test]
+    fn repair_defaults_to_current_codex_model_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openrouter\"\n",
+        )
+        .expect("config");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        let file = sessions.join("session.jsonl");
+        fs::write(
+            &file,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"openai\"}}\n",
+        )
+        .expect("write");
+
+        let outcome = repair_state(RepairOptions {
+            codex_dir: temp.path().to_path_buf(),
+            history: true,
+            plugins: false,
+            dry_run: false,
+            target_provider_id: None,
         })
         .expect("repair");
 
@@ -818,7 +897,7 @@ mod tests {
             history: false,
             plugins: true,
             dry_run: false,
-            target_provider_id: "codex-companion".to_string(),
+            target_provider_id: Some("codex-companion".to_string()),
         })
         .expect("repair");
 

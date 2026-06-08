@@ -218,10 +218,9 @@ export function useCompanionController() {
         plugins: boolean,
         dryRun: boolean,
         codexDir?: string,
-        targetProviderId?: string,
       ) =>
         run(dryRun ? "Dry-run 已完成" : "修复已完成", "repairing", async () => {
-          const outcome = await repair(history, plugins, dryRun, codexDir, targetProviderId);
+          const outcome = await repair(history, plugins, dryRun, codexDir);
           setRepairOutcome(outcome);
         }),
       resetPreferences,
