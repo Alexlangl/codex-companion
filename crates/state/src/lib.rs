@@ -7,7 +7,7 @@ use codex_companion_core::{
 };
 use rusqlite::{params, Connection};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,12 @@ use walkdir::WalkDir;
 const CODEX_STATE_DB_FILENAME: &str = "state_5.sqlite";
 
 pub use token_usage::{collect_token_usage, collect_token_usage_cached};
+
+#[derive(Debug, Clone, Default)]
+struct SessionMetadata {
+    cwd: Option<String>,
+    rollout_path: Option<String>,
+}
 
 pub fn install_companion_provider(
     codex_dir: Option<PathBuf>,
@@ -302,8 +308,18 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
     }
     source_provider_ids.remove(target_provider_id.as_str());
 
+    let session_metadata = if options.history {
+        collect_session_metadata(&jsonl_files)?
+    } else {
+        Default::default()
+    };
     let state_rows = if options.history && db_path.exists() {
-        count_sqlite_rows_to_migrate(&db_path, &source_provider_ids)?
+        count_sqlite_rows_to_repair(
+            &db_path,
+            &source_provider_ids,
+            &target_provider_id,
+            &session_metadata,
+        )?
     } else {
         0
     };
@@ -324,7 +340,7 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
         dry_run: options.dry_run,
     };
 
-    if source_provider_ids.is_empty() {
+    if source_provider_ids.is_empty() && state_rows == 0 {
         return Ok(RepairOutcome {
             plan,
             backup_root: None,
@@ -350,30 +366,21 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
         });
     }
 
-    let backup_root = create_backup_root(&options.codex_dir)?;
-    let mut migrated_history_files = 0;
-    let mut migrated_history_lines = 0;
+    let migrated_history_files = 0;
+    let migrated_history_lines = 0;
     let mut migrated_plugin_files = 0;
+    let mut migrated_state_rows = 0;
+    let mut backup_root = None;
 
-    for path in &jsonl_files {
-        let (changed, lines) = rewrite_jsonl_file(
-            path,
+    if options.history && db_path.exists() && state_rows > 0 {
+        let backup_root = ensure_backup_root(&mut backup_root, &options.codex_dir)?;
+        backup_file(&db_path, backup_root, &options.codex_dir)?;
+        migrated_state_rows = repair_sqlite_threads(
+            &db_path,
             &source_provider_ids,
             &target_provider_id,
-            &backup_root,
-            &options.codex_dir,
+            &session_metadata,
         )?;
-        if changed {
-            migrated_history_files += 1;
-            migrated_history_lines += lines;
-        }
-    }
-
-    let mut migrated_state_rows = 0;
-    if options.history && db_path.exists() && state_rows > 0 {
-        backup_file(&db_path, &backup_root, &options.codex_dir)?;
-        migrated_state_rows =
-            rewrite_sqlite_provider_ids(&db_path, &source_provider_ids, &target_provider_id)?;
     }
 
     for path in &plugin_files {
@@ -381,21 +388,31 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
             path,
             &source_provider_ids,
             &target_provider_id,
-            &backup_root,
+            &mut backup_root,
             &options.codex_dir,
         )? {
             migrated_plugin_files += 1;
         }
     }
 
+    let skipped_reason = if history_lines > 0 {
+        Some("已保留历史会话文件不改写；仅合并 Codex SQLite 索引和插件状态".to_string())
+    } else if migrated_plugin_files == 0 && migrated_state_rows == 0 {
+        Some(format!(
+            "未发现需要迁移到 {target_provider_id} 的可合并状态"
+        ))
+    } else {
+        None
+    };
+
     Ok(RepairOutcome {
         plan,
-        backup_root: Some(backup_root),
+        backup_root,
         migrated_history_files,
         migrated_history_lines,
         migrated_plugin_files,
         migrated_state_rows,
-        skipped_reason: None,
+        skipped_reason,
     })
 }
 
@@ -508,6 +525,38 @@ fn collect_jsonl_provider_ids(files: &[PathBuf]) -> Result<BTreeSet<String>> {
     Ok(ids)
 }
 
+fn collect_session_metadata(files: &[PathBuf]) -> Result<BTreeMap<String, SessionMetadata>> {
+    let mut metadata = BTreeMap::new();
+    for path in files {
+        let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|source| CompanionError::io(path, source))?;
+            let Some((id, mut entry)) = session_meta_metadata(&line) else {
+                continue;
+            };
+            entry
+                .rollout_path
+                .get_or_insert_with(|| path.display().to_string());
+            metadata
+                .entry(id)
+                .and_modify(|current: &mut SessionMetadata| current.merge_missing(&entry))
+                .or_insert(entry);
+        }
+    }
+    Ok(metadata)
+}
+
+impl SessionMetadata {
+    fn merge_missing(&mut self, other: &SessionMetadata) {
+        if self.cwd.as_deref().is_none_or(str::is_empty) {
+            self.cwd = other.cwd.clone();
+        }
+        if self.rollout_path.as_deref().is_none_or(str::is_empty) {
+            self.rollout_path = other.rollout_path.clone();
+        }
+    }
+}
+
 fn session_meta_provider(line: &str) -> Option<String> {
     if !line.contains("session_meta") || !line.contains("model_provider") {
         return None;
@@ -519,6 +568,35 @@ fn session_meta_provider(line: &str) -> Option<String> {
         .as_str()
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn session_meta_metadata(line: &str) -> Option<(String, SessionMetadata)> {
+    if !line.contains("session_meta") {
+        return None;
+    }
+    let value: Value = serde_json::from_str(line).ok()?;
+    let payload = value.get("payload")?;
+    let id = payload
+        .get("id")?
+        .as_str()
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    Some((
+        id,
+        SessionMetadata {
+            cwd: payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            rollout_path: payload
+                .get("rollout_path")
+                .or_else(|| payload.get("rolloutPath"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        },
+    ))
 }
 
 fn count_jsonl_lines_to_migrate(files: &[PathBuf], source_ids: &BTreeSet<String>) -> Result<usize> {
@@ -562,43 +640,172 @@ fn collect_sqlite_provider_ids(path: &Path) -> Result<BTreeSet<String>> {
     Ok(ids)
 }
 
-fn count_sqlite_rows_to_migrate(path: &Path, source_ids: &BTreeSet<String>) -> Result<usize> {
+fn count_sqlite_rows_to_repair(
+    path: &Path,
+    source_ids: &BTreeSet<String>,
+    target_provider_id: &str,
+    metadata: &BTreeMap<String, SessionMetadata>,
+) -> Result<usize> {
     let conn = open_sqlite(path)?;
+    if !sqlite_threads_have_repair_columns(&conn)? {
+        return Ok(0);
+    }
+    let mut stmt = conn
+        .prepare("SELECT id, model_provider, cwd, rollout_path FROM threads")
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("SQLite query failed: {source}"))
+        })?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SqliteThreadRow {
+                id: row.get(0)?,
+                model_provider: row.get(1)?,
+                cwd: row.get(2)?,
+                rollout_path: row.get(3)?,
+            })
+        })
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("SQLite query failed: {source}"))
+        })?;
     let mut total = 0;
-    for id in source_ids {
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM threads WHERE model_provider = ?",
-                [id],
-                |row| row.get(0),
-            )
-            .map_err(|source| {
-                CompanionError::InvalidConfig(format!("SQLite count failed: {source}"))
-            })?;
-        total += count as usize;
+    for row in rows {
+        let row = row.map_err(|source| {
+            CompanionError::InvalidConfig(format!("SQLite row failed: {source}"))
+        })?;
+        if sqlite_thread_needs_repair(&row, source_ids, target_provider_id, metadata.get(&row.id)) {
+            total += 1;
+        }
     }
     Ok(total)
 }
 
-fn rewrite_sqlite_provider_ids(
+fn repair_sqlite_threads(
     path: &Path,
     source_ids: &BTreeSet<String>,
     target_provider_id: &str,
+    metadata: &BTreeMap<String, SessionMetadata>,
 ) -> Result<usize> {
     let conn = open_sqlite(path)?;
+    if !sqlite_threads_have_repair_columns(&conn)? {
+        return Ok(0);
+    }
     let mut total = 0;
-    for id in source_ids {
-        let changed = conn
+    let mut stmt = conn
+        .prepare("SELECT id, model_provider, cwd, rollout_path FROM threads")
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("SQLite query failed: {source}"))
+        })?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SqliteThreadRow {
+                id: row.get(0)?,
+                model_provider: row.get(1)?,
+                cwd: row.get(2)?,
+                rollout_path: row.get(3)?,
+            })
+        })
+        .map_err(|source| CompanionError::InvalidConfig(format!("SQLite query failed: {source}")))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| CompanionError::InvalidConfig(format!("SQLite row failed: {source}")))?;
+    drop(stmt);
+
+    for row in rows {
+        let row_metadata = metadata.get(&row.id);
+        if !sqlite_thread_needs_repair(&row, source_ids, target_provider_id, row_metadata) {
+            continue;
+        }
+        let next_provider = if source_ids.contains(&row.model_provider) {
+            target_provider_id.to_string()
+        } else {
+            row.model_provider.clone()
+        };
+        let next_cwd = merge_string_field(
+            &row.cwd,
+            row_metadata.and_then(|value| value.cwd.as_deref()),
+        );
+        let next_rollout_path = merge_string_field(
+            &row.rollout_path,
+            row_metadata.and_then(|value| value.rollout_path.as_deref()),
+        );
+        total += conn
             .execute(
-                "UPDATE threads SET model_provider = ? WHERE model_provider = ?",
-                params![target_provider_id, id],
+                "UPDATE threads SET model_provider = ?, cwd = ?, rollout_path = ? WHERE id = ?",
+                params![next_provider, next_cwd, next_rollout_path, row.id],
             )
             .map_err(|source| {
                 CompanionError::InvalidConfig(format!("SQLite update failed: {source}"))
             })?;
-        total += changed;
     }
     Ok(total)
+}
+
+#[derive(Debug)]
+struct SqliteThreadRow {
+    id: String,
+    model_provider: String,
+    cwd: String,
+    rollout_path: String,
+}
+
+fn sqlite_thread_needs_repair(
+    row: &SqliteThreadRow,
+    source_ids: &BTreeSet<String>,
+    target_provider_id: &str,
+    metadata: Option<&SessionMetadata>,
+) -> bool {
+    if source_ids.contains(&row.model_provider) {
+        return true;
+    }
+    if row.model_provider != target_provider_id {
+        return false;
+    }
+    metadata.is_some_and(|metadata| {
+        string_field_needs_merge(&row.cwd, metadata.cwd.as_deref())
+            || string_field_needs_merge(&row.rollout_path, metadata.rollout_path.as_deref())
+    })
+}
+
+fn string_field_needs_merge(current: &str, incoming: Option<&str>) -> bool {
+    current.trim().is_empty() && incoming.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn merge_string_field(current: &str, incoming: Option<&str>) -> String {
+    if string_field_needs_merge(current, incoming) {
+        incoming.unwrap_or_default().to_string()
+    } else {
+        current.to_string()
+    }
+}
+
+fn sqlite_table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("SQLite schema failed: {source}"))
+        })?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("SQLite schema failed: {source}"))
+        })?;
+    for value in columns {
+        if value.map_err(|source| {
+            CompanionError::InvalidConfig(format!("SQLite schema failed: {source}"))
+        })? == column
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sqlite_threads_have_repair_columns(conn: &Connection) -> Result<bool> {
+    for column in ["id", "model_provider", "cwd", "rollout_path"] {
+        if !sqlite_table_has_column(conn, "threads", column)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn open_sqlite(path: &Path) -> Result<Connection> {
@@ -610,69 +817,11 @@ fn open_sqlite(path: &Path) -> Result<Connection> {
     })
 }
 
-fn rewrite_jsonl_file(
-    path: &Path,
-    source_ids: &BTreeSet<String>,
-    target_provider_id: &str,
-    backup_root: &Path,
-    codex_dir: &Path,
-) -> Result<(bool, usize)> {
-    let text = fs::read_to_string(path).map_err(|source| CompanionError::io(path, source))?;
-    let mut changed_lines = 0;
-    let mut output = Vec::new();
-
-    for line in text.lines() {
-        if let Ok(mut value) = serde_json::from_str::<Value>(line) {
-            let changed = rewrite_session_meta_value(&mut value, source_ids, target_provider_id);
-            if changed {
-                changed_lines += 1;
-                output.push(
-                    serde_json::to_string(&value)
-                        .map_err(|source| CompanionError::json(path, source))?,
-                );
-                continue;
-            }
-        }
-        output.push(line.to_string());
-    }
-
-    if changed_lines > 0 {
-        backup_file(path, backup_root, codex_dir)?;
-        let mut next = output.join("\n");
-        next.push('\n');
-        fs::write(path, next).map_err(|source| CompanionError::io(path, source))?;
-        Ok((true, changed_lines))
-    } else {
-        Ok((false, 0))
-    }
-}
-
-fn rewrite_session_meta_value(
-    value: &mut Value,
-    source_ids: &BTreeSet<String>,
-    target_provider_id: &str,
-) -> bool {
-    let Some(provider) = value
-        .get_mut("payload")
-        .and_then(|payload| payload.get_mut("model_provider"))
-    else {
-        return false;
-    };
-    let Some(current) = provider.as_str() else {
-        return false;
-    };
-    if source_ids.contains(current) {
-        *provider = Value::String(target_provider_id.to_string());
-        return true;
-    }
-    false
-}
-
 fn rewrite_plugin_file(
     path: &Path,
     source_ids: &BTreeSet<String>,
     target_provider_id: &str,
-    backup_root: &Path,
+    backup_root: &mut Option<PathBuf>,
     codex_dir: &Path,
 ) -> Result<bool> {
     let text = fs::read_to_string(path).map_err(|source| CompanionError::io(path, source))?;
@@ -680,6 +829,7 @@ fn rewrite_plugin_file(
         return Ok(false);
     };
     if rewrite_provider_fields(&mut value, source_ids, target_provider_id) {
+        let backup_root = ensure_backup_root(backup_root, codex_dir)?;
         backup_file(path, backup_root, codex_dir)?;
         let next = serde_json::to_string_pretty(&value)
             .map_err(|source| CompanionError::json(path, source))?;
@@ -733,6 +883,16 @@ fn create_backup_root(codex_dir: &Path) -> Result<PathBuf> {
         .join(timestamp);
     fs::create_dir_all(&root).map_err(|source| CompanionError::io(&root, source))?;
     Ok(root)
+}
+
+fn ensure_backup_root<'a>(
+    backup_root: &'a mut Option<PathBuf>,
+    codex_dir: &Path,
+) -> Result<&'a Path> {
+    if backup_root.is_none() {
+        *backup_root = Some(create_backup_root(codex_dir)?);
+    }
+    Ok(backup_root.as_deref().expect("backup root"))
 }
 
 fn backup_file(path: &Path, backup_root: &Path, codex_dir: &Path) -> Result<()> {
@@ -824,22 +984,22 @@ mod tests {
     }
 
     #[test]
-    fn repair_rewrites_history_and_sqlite() {
+    fn repair_merges_sqlite_index_without_rewriting_history() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions = temp.path().join("sessions");
         fs::create_dir_all(&sessions).expect("sessions");
         let file = sessions.join("session.jsonl");
         fs::write(
             &file,
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"openai\"}}\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"openai\",\"cwd\":\"/work/project\"}}\n",
         )
         .expect("write");
 
         let db = temp.path().join(CODEX_STATE_DB_FILENAME);
         let conn = Connection::open(&db).expect("db");
         conn.execute_batch(
-            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL);
-             INSERT INTO threads (id, model_provider) VALUES ('s1', 'openai');",
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, rollout_path TEXT NOT NULL);
+             INSERT INTO threads (id, model_provider, cwd, rollout_path) VALUES ('s1', 'openai', '', '');",
         )
         .expect("schema");
         drop(conn);
@@ -853,59 +1013,73 @@ mod tests {
         })
         .expect("repair");
 
-        assert_eq!(outcome.migrated_history_lines, 1);
+        assert_eq!(outcome.plan.history_lines, 1);
+        assert_eq!(outcome.plan.state_rows, 1);
+        assert_eq!(outcome.migrated_history_lines, 0);
+        assert_eq!(outcome.migrated_state_rows, 1);
+        assert!(outcome.backup_root.is_some());
+        assert!(outcome.skipped_reason.is_some());
+        let text = fs::read_to_string(&file).expect("read");
+        assert!(text.contains("\"openai\""));
+        let conn = Connection::open(&db).expect("db");
+        let (provider, cwd): (String, String) = conn
+            .query_row(
+                "SELECT model_provider, cwd FROM threads WHERE id = 's1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("provider");
+        assert_eq!(provider, COMPANION_PROVIDER_ID);
+        assert_eq!(cwd, "/work/project");
+    }
+
+    #[test]
+    fn repair_merges_missing_project_for_target_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        let file = sessions.join("session.jsonl");
+        fs::write(
+            &file,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"codex-companion\",\"cwd\":\"/work/project\"}}\n",
+        )
+        .expect("write");
+
+        let db = temp.path().join(CODEX_STATE_DB_FILENAME);
+        let conn = Connection::open(&db).expect("db");
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, rollout_path TEXT NOT NULL);
+             INSERT INTO threads (id, model_provider, cwd, rollout_path) VALUES ('s1', 'codex-companion', '', '');",
+        )
+        .expect("schema");
+        drop(conn);
+
+        let outcome = repair_state(RepairOptions {
+            codex_dir: temp.path().to_path_buf(),
+            history: true,
+            plugins: false,
+            dry_run: false,
+            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
+        })
+        .expect("repair");
+
+        assert!(outcome.backup_root.is_some());
+        assert_eq!(outcome.plan.state_rows, 1);
+        assert_eq!(outcome.migrated_history_lines, 0);
         assert_eq!(outcome.migrated_state_rows, 1);
         let text = fs::read_to_string(&file).expect("read");
         assert!(text.contains("\"codex-companion\""));
         let conn = Connection::open(&db).expect("db");
-        let provider: String = conn
-            .query_row(
-                "SELECT model_provider FROM threads WHERE id = 's1'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("provider");
-        assert_eq!(provider, COMPANION_PROVIDER_ID);
+        let cwd: String = conn
+            .query_row("SELECT cwd FROM threads WHERE id = 's1'", [], |row| {
+                row.get(0)
+            })
+            .expect("cwd");
+        assert_eq!(cwd, "/work/project");
     }
 
     #[test]
-    fn repair_does_not_backup_sqlite_when_no_rows_change() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let sessions = temp.path().join("sessions");
-        fs::create_dir_all(&sessions).expect("sessions");
-        let file = sessions.join("session.jsonl");
-        fs::write(
-            &file,
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"openai\"}}\n",
-        )
-        .expect("write");
-
-        let db = temp.path().join(CODEX_STATE_DB_FILENAME);
-        let conn = Connection::open(&db).expect("db");
-        conn.execute_batch(
-            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL);
-             INSERT INTO threads (id, model_provider) VALUES ('s1', 'codex-companion');",
-        )
-        .expect("schema");
-        drop(conn);
-
-        let outcome = repair_state(RepairOptions {
-            codex_dir: temp.path().to_path_buf(),
-            history: true,
-            plugins: false,
-            dry_run: false,
-            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
-        })
-        .expect("repair");
-
-        let backup_root = outcome.backup_root.expect("backup root");
-        assert_eq!(outcome.migrated_history_lines, 1);
-        assert_eq!(outcome.migrated_state_rows, 0);
-        assert!(!backup_root.join(CODEX_STATE_DB_FILENAME).exists());
-    }
-
-    #[test]
-    fn repair_rewrites_to_custom_target_provider() {
+    fn repair_plans_custom_target_without_rewriting_history() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions = temp.path().join("sessions");
         fs::create_dir_all(&sessions).expect("sessions");
@@ -926,12 +1100,14 @@ mod tests {
         .expect("repair");
 
         assert_eq!(outcome.plan.target_provider_id, "openrouter");
+        assert_eq!(outcome.migrated_history_lines, 0);
+        assert!(outcome.backup_root.is_none());
         let text = fs::read_to_string(&file).expect("read");
-        assert!(text.contains("\"openrouter\""));
+        assert!(text.contains("\"openai\""));
     }
 
     #[test]
-    fn repair_defaults_to_current_codex_model_provider() {
+    fn repair_defaults_to_current_codex_model_provider_without_rewriting_history() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("config.toml"),
@@ -957,8 +1133,10 @@ mod tests {
         .expect("repair");
 
         assert_eq!(outcome.plan.target_provider_id, "openrouter");
+        assert_eq!(outcome.migrated_history_lines, 0);
+        assert!(outcome.backup_root.is_none());
         let text = fs::read_to_string(&file).expect("read");
-        assert!(text.contains("\"openrouter\""));
+        assert!(text.contains("\"openai\""));
     }
 
     #[test]
