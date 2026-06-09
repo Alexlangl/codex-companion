@@ -11,6 +11,11 @@ export function canDirectLaunch(provider: ProviderConfig) {
   return !authRef || authRef.startsWith("env:") || authRef.startsWith("file:");
 }
 
+export function directLaunchWritesAuthJson(provider: ProviderConfig) {
+  const authRef = provider.directAuthRef?.trim() || provider.authRef?.trim() || "";
+  return authRef.startsWith("file:");
+}
+
 export function launchModeLabel(mode: ProviderLaunchMode) {
   return mode === "direct" ? "直连" : "本地代理";
 }

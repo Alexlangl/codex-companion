@@ -6,4 +6,5 @@ mod repair;
 mod runtime;
 mod status;
 
+pub use launch::provider_can_direct_connect;
 pub use runtime::CompanionDaemon;

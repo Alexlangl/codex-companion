@@ -1,5 +1,5 @@
 import * as Select from "@radix-ui/react-select";
-import { Cable, RotateCcw } from "lucide-react";
+import { Cable, RotateCcw, ShieldCheck } from "lucide-react";
 import { Button, Field, Panel } from "../../components/ui";
 import { compactPath } from "../../lib/format";
 import type { BusyState, CompanionStatus, ThemeMode } from "../../types/domain";
@@ -9,6 +9,7 @@ export function Settings({
   status,
   onInstall,
   onResetPreferences,
+  onPreserveOfficialCodexAuth,
   onUninstall,
   onTheme,
 }: {
@@ -16,6 +17,7 @@ export function Settings({
   status: CompanionStatus;
   onInstall: () => Promise<void>;
   onUninstall: () => Promise<void>;
+  onPreserveOfficialCodexAuth: (preserve: boolean) => Promise<void>;
   onTheme: (theme: ThemeMode) => Promise<void>;
   onResetPreferences: () => Promise<void>;
 }) {
@@ -34,6 +36,20 @@ export function Settings({
           <dt>状态</dt>
           <dd>{status.codex.message}</dd>
         </dl>
+        <label className="toggle-row">
+          <input
+            checked={Boolean(status.config.app.preserveOfficialCodexAuth)}
+            disabled={disabled}
+            onChange={(event) => void onPreserveOfficialCodexAuth(event.currentTarget.checked)}
+            type="checkbox"
+          />
+          <span>
+            <ShieldCheck size={15} /> 保留官方 Codex 登录
+          </span>
+        </label>
+        <p className="field-hint">
+          开启后，第三方 API key 直连如果会写入 auth.json 并影响官方 OAuth，会被拦截；本地代理仍由 Companion 注入密钥。
+        </p>
         <div className="actions">
           <Button disabled={disabled} onClick={() => void onInstall()}>
             <Cable size={15} /> 写入 Codex 配置

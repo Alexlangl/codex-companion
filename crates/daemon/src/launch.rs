@@ -4,9 +4,10 @@ use codex_companion_core::{
     ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode, RepairOptions, Result,
     COMPANION_PROVIDER_ID,
 };
-use codex_companion_provider::use_group;
+use codex_companion_provider::{selected_providers_for_group, use_group};
 use codex_companion_state::{
-    doctor, install_companion_provider, install_direct_provider, repair_state,
+    doctor, install_companion_provider_with_token_source, install_direct_provider_with_options,
+    repair_state, DirectInstallOptions,
 };
 use std::env;
 use std::path::PathBuf;
@@ -34,7 +35,13 @@ impl CompanionDaemon {
             previous_launch_mode.as_ref(),
             pending_relay_restart,
         );
-        let codex = install_companion_provider(Some(codex_dir.clone()), &config.relay)?;
+        let selected = selected_providers_for_group(&config, &group);
+        let token_source = group_relay_token_source(&group, &selected);
+        let codex = install_companion_provider_with_token_source(
+            Some(codex_dir.clone()),
+            &config.relay,
+            Some(&token_source),
+        )?;
         let repair = repair_state(RepairOptions {
             codex_dir,
             history: true,
@@ -52,11 +59,14 @@ impl CompanionDaemon {
             mode: CodexLaunchMode::GroupRelay,
             target_id: group.id.clone(),
             target_provider_id: COMPANION_PROVIDER_ID.to_string(),
-            codex,
+            message: with_codex_status(
+                relay_launch_message("分组", &group.name, restart_required, codex_launch),
+                &codex.message,
+            ),
             repair,
             restart_required,
             codex_started: codex_launch.codex_started(),
-            message: relay_launch_message("分组", &group.name, restart_required, codex_launch),
+            codex,
         })
     }
 
@@ -101,7 +111,13 @@ impl CompanionDaemon {
         };
 
         if should_direct {
-            let codex = install_direct_provider(Some(codex_dir.clone()), &provider)?;
+            let codex = install_direct_provider_with_options(
+                Some(codex_dir.clone()),
+                &provider,
+                DirectInstallOptions {
+                    preserve_official_codex_auth: config_snapshot.app.preserve_official_codex_auth,
+                },
+            )?;
             let repair = repair_state(RepairOptions {
                 codex_dir,
                 history: true,
@@ -116,11 +132,14 @@ impl CompanionDaemon {
                 mode: CodexLaunchMode::ProviderDirect,
                 target_id: provider.id.clone(),
                 target_provider_id: provider.id.clone(),
-                codex,
+                message: with_codex_status(
+                    direct_launch_message(&provider.name, codex_launch),
+                    &codex.message,
+                ),
                 repair,
                 restart_required,
                 codex_started: codex_launch.codex_started(),
-                message: direct_launch_message(&provider.name, codex_launch),
+                codex,
             });
         }
 
@@ -132,7 +151,12 @@ impl CompanionDaemon {
             previous_launch_mode.as_ref(),
             pending_relay_restart,
         );
-        let codex = install_companion_provider(Some(codex_dir.clone()), &config.relay)?;
+        let token_source = provider_relay_token_source(&provider);
+        let codex = install_companion_provider_with_token_source(
+            Some(codex_dir.clone()),
+            &config.relay,
+            Some(&token_source),
+        )?;
         let repair = repair_state(RepairOptions {
             codex_dir,
             history: true,
@@ -150,15 +174,23 @@ impl CompanionDaemon {
             mode: CodexLaunchMode::ProviderRelay,
             target_id: provider.id.clone(),
             target_provider_id: COMPANION_PROVIDER_ID.to_string(),
-            codex,
+            message: with_codex_status(
+                format!(
+                    "{}，原因：{}",
+                    relay_launch_message(
+                        "provider",
+                        &provider.name,
+                        restart_required,
+                        codex_launch
+                    ),
+                    provider_relay_reason(&provider)
+                ),
+                &codex.message,
+            ),
             repair,
             restart_required,
             codex_started: codex_launch.codex_started(),
-            message: format!(
-                "{}，原因：{}",
-                relay_launch_message("provider", &provider.name, restart_required, codex_launch),
-                provider_relay_reason(&provider)
-            ),
+            codex,
         })
     }
 
@@ -211,6 +243,59 @@ pub fn provider_relay_reason(provider: &ProviderConfig) -> &'static str {
         "密钥保存在 Companion auth 文件中，需要 relay 注入 Authorization"
     } else {
         "该 provider 需要 Companion relay 能力"
+    }
+}
+
+fn provider_relay_token_source(provider: &ProviderConfig) -> String {
+    let source = provider
+        .auth_ref
+        .as_deref()
+        .or(provider.direct_auth_ref.as_deref())
+        .map(str::trim)
+        .filter(|auth_ref| !auth_ref.is_empty());
+    if matches!(provider.kind, ProviderKind::OfficialCodex) {
+        return format!(
+            "Companion relay injection from official Codex provider {}",
+            provider.name
+        );
+    }
+    if let Some(env_var) = source.and_then(|auth_ref| auth_ref.strip_prefix("env:")) {
+        return format!(
+            "Companion relay injection from environment variable {} for provider {}",
+            env_var.trim(),
+            provider.name
+        );
+    }
+    if source.is_some_and(|auth_ref| auth_ref.starts_with("file:")) {
+        return format!(
+            "Companion relay injection from Companion auth file for provider {}",
+            provider.name
+        );
+    }
+    format!(
+        "Companion relay injection from selected provider {}",
+        provider.name
+    )
+}
+
+fn group_relay_token_source(group: &ProviderGroup, providers: &[ProviderConfig]) -> String {
+    match providers {
+        [] => format!(
+            "Companion relay injection from active group {} with no enabled providers",
+            group.name
+        ),
+        [provider] => provider_relay_token_source(provider),
+        providers => {
+            let names = providers
+                .iter()
+                .map(|provider| provider.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Companion relay injection from active group {} providers: {}",
+                group.name, names
+            )
+        }
     }
 }
 
@@ -316,6 +401,14 @@ fn direct_launch_message(provider_name: &str, codex_launch: CodexProcessLaunch) 
         );
     }
     format!("已写入直连 provider {provider_name}；直连模式需要启动/重启 Codex 后才会生效")
+}
+
+fn with_codex_status(message: String, codex_status: &str) -> String {
+    if codex_status.trim().is_empty() || message.contains(codex_status) {
+        message
+    } else {
+        format!("{message}；{codex_status}")
+    }
 }
 
 fn relay_launch_message(
@@ -701,5 +794,27 @@ mod tests {
             },
         );
         assert!(message.contains("并已启动 Codex"));
+    }
+
+    #[test]
+    fn launch_message_includes_codex_token_source_status() {
+        let message = with_codex_status(
+            "已写入直连 provider Provider".to_string(),
+            "Codex 已直连 provider: Provider；Token source: API key file copied into Codex auth.json；warning: direct API key mode",
+        );
+        assert!(message.contains("Token source: API key file"));
+        assert!(message.contains("warning: direct API key mode"));
+    }
+
+    #[test]
+    fn relay_token_source_uses_selected_provider_auth_ref() {
+        let provider = provider(
+            ProviderKind::OpenAiCompatible,
+            Some("env:OPENROUTER_API_KEY"),
+        );
+        let source = provider_relay_token_source(&provider);
+
+        assert!(source.contains("environment variable OPENROUTER_API_KEY"));
+        assert!(source.contains("Provider"));
     }
 }

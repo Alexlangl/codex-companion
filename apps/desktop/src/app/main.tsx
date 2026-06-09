@@ -1,24 +1,28 @@
+import * as Dialog from "@radix-ui/react-dialog";
 import * as Progress from "@radix-ui/react-progress";
 import * as Tabs from "@radix-ui/react-tabs";
 import * as Toast from "@radix-ui/react-toast";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { Boxes, Gauge, GitBranch, Hammer, LayoutDashboard, Moon, RadioTower, Settings as SettingsIcon, Sun } from "lucide-react";
+import { Boxes, Gauge, GitBranch, Hammer, LayoutDashboard, Moon, RadioTower, Settings as SettingsIcon, Sun, X } from "lucide-react";
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { Badge, IconButton } from "../components/ui";
+import { Badge, Button, IconButton } from "../components/ui";
 import { Dashboard } from "../features/dashboard/Dashboard";
 import { Groups } from "../features/groups/Groups";
 import { Providers } from "../features/providers/Providers";
+import { canDirectLaunch, directLaunchWritesAuthJson } from "../features/providers/provider-launch";
 import { Relay } from "../features/relay/Relay";
 import { Repair } from "../features/repair/Repair";
 import { Settings } from "../features/settings/Settings";
 import { TokenStats } from "../features/token/TokenStats";
 import { useCompanionController } from "../hooks/useCompanionController";
+import { providerAccountTitle } from "../lib/provider-display";
 import "../styles/tokens.css";
 import "../styles/base.css";
 import "../styles/layout.css";
 import "../styles/components.css";
 import "../styles/radix.css";
+import type { ProviderConfig, ProviderLaunchMode } from "../types/domain";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 
@@ -28,6 +32,36 @@ if (!root) {
 
 function App() {
   const { activeTab, actions, busy, error, progress, repairOutcome, status, toast } = useCompanionController();
+  const [pendingProviderLaunch, setPendingProviderLaunch] = React.useState<{
+    mode: ProviderLaunchMode;
+    provider: ProviderConfig;
+  } | null>(null);
+
+  async function requestLaunchProvider(id: string, mode?: ProviderLaunchMode) {
+    if (!status) {
+      await actions.launchProvider(id, mode);
+      return;
+    }
+    const provider = status.config.providers[id];
+    if (!provider) {
+      await actions.launchProvider(id, mode);
+      return;
+    }
+    const resolvedMode = mode ?? status.config.app.providerLaunchModes[id] ?? "auto";
+    const willDirect = resolvedMode === "direct" || (resolvedMode === "auto" && canDirectLaunch(provider));
+    if (willDirect && directLaunchWritesAuthJson(provider)) {
+      setPendingProviderLaunch({ mode: resolvedMode, provider });
+      return;
+    }
+    await actions.launchProvider(id, mode);
+  }
+
+  function confirmPendingProviderLaunch() {
+    if (!pendingProviderLaunch) return;
+    const { mode, provider } = pendingProviderLaunch;
+    setPendingProviderLaunch(null);
+    void actions.launchProvider(provider.id, mode);
+  }
 
   return (
     <Toast.Provider swipeDirection="right">
@@ -77,7 +111,7 @@ function App() {
                 {error ? <div className="error-banner">{error}</div> : null}
 
                 <Tabs.Content className="tabs-content" value="dashboard">
-                  <Dashboard busy={busy} status={status} onLaunchGroup={actions.launchGroup} onLaunchProvider={actions.launchProvider} />
+                  <Dashboard busy={busy} status={status} onLaunchGroup={actions.launchGroup} onLaunchProvider={requestLaunchProvider} />
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="providers">
                   <Providers
@@ -95,7 +129,7 @@ function App() {
                     onRefresh={actions.refreshProvider}
                     onRefreshAll={actions.refreshAllProviders}
                     onUpdateApiKey={actions.updateApiKeyProvider}
-                    onLaunch={actions.launchProvider}
+                    onLaunch={requestLaunchProvider}
                   />
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="groups">
@@ -122,6 +156,7 @@ function App() {
                     status={status}
                     onInstall={actions.install}
                     onUninstall={actions.uninstall}
+                    onPreserveOfficialCodexAuth={actions.changePreserveOfficialCodexAuth}
                     onTheme={actions.changeTheme}
                     onResetPreferences={actions.resetPreferences}
                   />
@@ -141,6 +176,42 @@ function App() {
             </section>
           </main>
         )}
+        <Dialog.Root open={Boolean(pendingProviderLaunch)} onOpenChange={(open) => !open && setPendingProviderLaunch(null)}>
+          <Dialog.Portal>
+            <Dialog.Overlay className="dialog-overlay" />
+            <Dialog.Content className="dialog-content direct-launch-confirm-dialog">
+              <div className="dialog-header">
+                <div>
+                  <Dialog.Title className="dialog-title">确认直连写入</Dialog.Title>
+                  <Dialog.Description className="dialog-description">
+                    {pendingProviderLaunch
+                      ? `${providerAccountTitle(pendingProviderLaunch.provider)} 将把账号材料合并写入 Codex auth.json。`
+                      : "直连会更新 Codex auth.json。"}
+                  </Dialog.Description>
+                </div>
+                <Dialog.Close className="icon-button" aria-label="关闭">
+                  <X size={16} />
+                </Dialog.Close>
+              </div>
+              <div className="warning-box">
+                <strong>这会修改本机 Codex 登录材料</strong>
+                <p>
+                  Companion 会先备份并记录 ownership marker；如果已开启官方登录保护，后端会阻止可能覆盖官方 OAuth 的第三方 API key 直连。
+                </p>
+              </div>
+              <div className="actions">
+                <Button disabled={busy !== "idle"} onClick={confirmPendingProviderLaunch} variant="danger">
+                  确认直连
+                </Button>
+                <Dialog.Close asChild>
+                  <Button disabled={busy !== "idle"} variant="secondary">
+                    取消
+                  </Button>
+                </Dialog.Close>
+              </div>
+            </Dialog.Content>
+          </Dialog.Portal>
+        </Dialog.Root>
       </Tooltip.Provider>
       <Toast.Root className="toast-root" onOpenChange={() => actions.setToast("")} open={Boolean(toast)}>
         <Toast.Title className="toast-title">{toast}</Toast.Title>
