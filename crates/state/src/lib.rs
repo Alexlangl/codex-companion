@@ -1016,12 +1016,12 @@ pub fn uninstall_companion_provider(codex_dir: Option<PathBuf>) -> Result<CodexI
     let doc = current.parse::<DocumentMut>().map_err(|source| {
         CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
     })?;
-    let marker = CompanionConfigMarker::from_doc(&doc).ok_or_else(|| {
-        CompanionError::InvalidConfig(
-            "Codex config.toml 没有 Companion ownership marker；为避免覆盖用户配置，已停止卸载"
-                .to_string(),
-        )
-    })?;
+    let marker = match CompanionConfigMarker::from_doc(&doc) {
+        Some(marker) => marker,
+        None => {
+            return uninstall_legacy_companion_provider(codex_dir, config_path, doc);
+        }
+    };
     ensure_marker_hash_matches(&doc, &marker)?;
     if !matches!(marker.install_kind.as_deref(), Some("relay" | "direct")) {
         return Err(CompanionError::InvalidConfig(
@@ -1040,6 +1040,36 @@ pub fn uninstall_companion_provider(codex_dir: Option<PathBuf>) -> Result<CodexI
     validate_restore_inputs(&codex_dir, &marker)?;
     restore_auth_from_marker(&codex_dir, &marker)?;
     restore_config_from_marker(&codex_dir, &config_path, &marker)?;
+    doctor(codex_dir, &RelayConfig::default())
+}
+
+fn uninstall_legacy_companion_provider(
+    codex_dir: PathBuf,
+    config_path: PathBuf,
+    mut doc: DocumentMut,
+) -> Result<CodexInstallStatus> {
+    let live_provider = doc.get("model_provider").and_then(Item::as_str);
+    if live_provider != Some(COMPANION_PROVIDER_ID) {
+        return Err(CompanionError::InvalidConfig(
+            "Codex config.toml 没有 Companion ownership marker；为避免覆盖用户配置，已停止卸载"
+                .to_string(),
+        ));
+    }
+    let has_companion_provider = doc
+        .get("model_providers")
+        .and_then(|item| item.get(COMPANION_PROVIDER_ID))
+        .is_some();
+    if !has_companion_provider {
+        return Err(CompanionError::InvalidConfig(
+            "Codex config.toml 当前 provider 是 Companion，但缺少 Companion provider 配置；为避免覆盖用户配置，已停止卸载"
+                .to_string(),
+        ));
+    }
+
+    doc["model_provider"] = value("openai");
+    doc["model_providers"][COMPANION_PROVIDER_ID] = Item::None;
+    fs::write(&config_path, doc.to_string())
+        .map_err(|source| CompanionError::io(&config_path, source))?;
     doctor(codex_dir, &RelayConfig::default())
 }
 
@@ -1946,6 +1976,46 @@ mod tests {
         assert!(restored.contains("model_provider = \"openai\""));
         assert!(!restored.contains("codex_companion ="));
         assert!(!restored.contains("codex-companion"));
+    }
+
+    #[test]
+    fn uninstall_allows_legacy_companion_config_without_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"codex-companion\"\n\n[model_providers.openai]\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\n\n[model_providers.codex-companion]\nname = \"本地代理\"\nbase_url = \"http://127.0.0.1:17687/v1\"\nwire_api = \"responses\"\n",
+        )
+        .expect("config");
+
+        let status = uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect("legacy uninstall should clean companion provider");
+
+        assert!(!status.installed);
+        assert_eq!(status.model_provider.as_deref(), Some("openai"));
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains("model_provider = \"openai\""));
+        assert!(!config.contains("[model_providers.codex-companion]"));
+        assert!(!config.contains("codex_companion ="));
+    }
+
+    #[test]
+    fn uninstall_without_marker_still_blocks_when_live_provider_is_not_companion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\n\n[model_providers.openai]\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\n\n[model_providers.codex-companion]\nname = \"本地代理\"\nbase_url = \"http://127.0.0.1:17687/v1\"\nwire_api = \"responses\"\n",
+        )
+        .expect("config");
+
+        let error = uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect_err("non-live legacy companion table should not be removed");
+
+        assert!(error
+            .to_string()
+            .contains("没有 Companion ownership marker"));
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains("[model_providers.codex-companion]"));
+        assert!(config.contains("model_provider = \"openai\""));
     }
 
     #[test]
