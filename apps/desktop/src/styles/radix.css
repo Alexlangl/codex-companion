@@ -127,6 +127,10 @@
   width: min(760px, calc(100vw - 32px));
 }
 
+.direct-launch-confirm-dialog {
+  width: min(520px, calc(100vw - 32px));
+}
+
 .dialog-header {
   display: flex;
   justify-content: space-between;

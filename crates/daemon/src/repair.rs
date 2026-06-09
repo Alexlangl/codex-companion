@@ -25,6 +25,13 @@ impl CompanionDaemon {
         })
     }
 
+    pub fn set_preserve_official_codex_auth(&self, preserve: bool) -> Result<bool> {
+        self.store.update(|config| {
+            config.app.preserve_official_codex_auth = preserve;
+            Ok(preserve)
+        })
+    }
+
     pub fn set_provider_launch_mode(
         &self,
         provider_id: String,
@@ -56,12 +63,53 @@ impl CompanionDaemon {
 
     pub fn reset_app_settings(&self) -> Result<AppSettings> {
         self.store.update(|config| {
-            config.app = AppSettings::default();
+            let preserve_official_codex_auth = config.app.preserve_official_codex_auth;
+            config.app = AppSettings {
+                preserve_official_codex_auth,
+                ..AppSettings::default()
+            };
             Ok(config.app.clone())
         })
     }
 
     pub fn token_usage(&self, codex_dir: PathBuf) -> Result<TokenUsageSummary> {
         collect_token_usage_cached(codex_dir, self.store.data_dir().join("cache"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_companion_core::{ConfigStore, ThemeMode};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn reset_app_settings_preserves_official_auth_protection() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!("codex-companion-daemon-reset-test-{suffix}"));
+        std::fs::create_dir_all(&temp).expect("tempdir");
+        let daemon = CompanionDaemon::new(ConfigStore::new(temp.join("config.json")));
+
+        daemon
+            .set_preserve_official_codex_auth(true)
+            .expect("set preserve");
+        daemon.set_theme(ThemeMode::Dark).expect("set theme");
+
+        let settings = daemon.reset_app_settings().expect("reset settings");
+
+        assert!(settings.preserve_official_codex_auth);
+        assert_eq!(settings.theme, ThemeMode::Light);
+        assert!(
+            daemon
+                .store()
+                .load()
+                .expect("stored config")
+                .app
+                .preserve_official_codex_auth
+        );
+        let _ = std::fs::remove_dir_all(temp);
     }
 }

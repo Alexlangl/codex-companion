@@ -232,6 +232,8 @@ pub struct AppSettings {
     pub last_codex_target_provider_id: Option<String>,
     #[serde(default)]
     pub codex_restart_required_on_next_relay: bool,
+    #[serde(default)]
+    pub preserve_official_codex_auth: bool,
 }
 
 impl Default for AppSettings {
@@ -243,6 +245,7 @@ impl Default for AppSettings {
             last_codex_launch_mode: None,
             last_codex_target_provider_id: None,
             codex_restart_required_on_next_relay: false,
+            preserve_official_codex_auth: false,
         }
     }
 }

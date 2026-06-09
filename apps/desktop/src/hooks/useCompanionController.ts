@@ -14,6 +14,7 @@ import {
   refreshAllProviders,
   refreshProvider,
   resetAppSettings,
+  setPreserveOfficialCodexAuth,
   setProviderLaunchMode,
   setProviderViewMode,
   setTheme,
@@ -153,6 +154,29 @@ export function useCompanionController() {
     }
   }
 
+  async function changePreserveOfficialCodexAuth(preserve: boolean) {
+    setStatus((current) =>
+      current
+        ? {
+            ...current,
+            config: {
+              ...current.config,
+              app: {
+                ...current.config.app,
+                preserveOfficialCodexAuth: preserve,
+              },
+            },
+          }
+        : current,
+    );
+    try {
+      await setPreserveOfficialCodexAuth(preserve);
+    } catch (unknownError) {
+      setError(String(unknownError));
+      await refresh();
+    }
+  }
+
   async function resetPreferences() {
     await run("界面偏好已恢复默认", "saving", async () => {
       const appSettings = await resetAppSettings();
@@ -191,6 +215,7 @@ export function useCompanionController() {
     actions: {
       changeProviderLaunchMode,
       changeProviderViewMode,
+      changePreserveOfficialCodexAuth,
       changeTheme,
       importApiKey: (input: ApiKeyForm) =>
         run("API Key Provider 已添加", "saving", async () => {
