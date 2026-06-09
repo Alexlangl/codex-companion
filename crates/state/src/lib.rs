@@ -589,6 +589,32 @@ impl AuthRollback {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ConfigRollback {
+    bytes: Option<Vec<u8>>,
+}
+
+impl ConfigRollback {
+    fn capture(config_path: &Path) -> Result<Self> {
+        let bytes = if config_path.exists() {
+            Some(fs::read(config_path).map_err(|source| CompanionError::io(config_path, source))?)
+        } else {
+            None
+        };
+        Ok(Self { bytes })
+    }
+
+    fn restore(&self, config_path: &Path) -> Result<()> {
+        match self.bytes.as_deref() {
+            Some(bytes) => fs::write(config_path, bytes)
+                .map_err(|source| CompanionError::io(config_path, source)),
+            None if config_path.exists() => fs::remove_file(config_path)
+                .map_err(|source| CompanionError::io(config_path, source)),
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ManagedConfigBackup {
     backup_root: String,
@@ -1038,8 +1064,7 @@ pub fn uninstall_companion_provider(codex_dir: Option<PathBuf>) -> Result<CodexI
         )));
     }
     validate_restore_inputs(&codex_dir, &marker)?;
-    restore_auth_from_marker(&codex_dir, &marker)?;
-    restore_config_from_marker(&codex_dir, &config_path, &marker)?;
+    restore_managed_install(&codex_dir, &config_path, &marker)?;
     doctor(codex_dir, &RelayConfig::default())
 }
 
@@ -1120,6 +1145,27 @@ fn validate_restore_inputs(codex_dir: &Path, marker: &CompanionConfigMarker) -> 
                 backup_path.display()
             )));
         }
+    }
+    Ok(())
+}
+
+fn restore_managed_install(
+    codex_dir: &Path,
+    config_path: &Path,
+    marker: &CompanionConfigMarker,
+) -> Result<()> {
+    let config_rollback = ConfigRollback::capture(config_path)?;
+    let auth_rollback = AuthRollback::capture(codex_dir)?;
+    restore_config_from_marker(codex_dir, config_path, marker)?;
+    if let Err(auth_error) = restore_auth_from_marker(codex_dir, marker) {
+        let config_restore = config_rollback.restore(config_path);
+        let auth_restore = auth_rollback.restore(codex_dir);
+        if let Err(rollback_error) = config_restore.and(auth_restore) {
+            return Err(CompanionError::InvalidConfig(format!(
+                "卸载已恢复 config.toml 但恢复 auth.json 失败: {auth_error}；尝试回滚卸载状态也失败: {rollback_error}"
+            )));
+        }
+        return Err(auth_error);
     }
     Ok(())
 }
@@ -2262,6 +2308,52 @@ mod tests {
         assert!(error.to_string().contains("config backup 不存在"));
         let auth = fs::read_to_string(temp.path().join("auth.json")).expect("auth");
         assert!(auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
+    }
+
+    #[test]
+    fn uninstall_rolls_back_config_when_auth_restore_fails_after_config_restore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original_auth = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {"refresh_token": "refresh-token"}
+        })
+        .to_string();
+        fs::write(temp.path().join("auth.json"), &original_auth).expect("auth");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("config");
+        let auth_path = temp.path().join("provider-auth.json");
+        fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
+        let provider = api_key_provider(Some(format!("file:{}", auth_path.display())), None);
+        install_direct_provider(Some(temp.path().to_path_buf()), &provider)
+            .expect("install direct");
+        let managed_config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        let managed_auth = fs::read_to_string(temp.path().join("auth.json")).expect("auth");
+        let auth_backup = CompanionConfigMarker::from_doc(
+            &managed_config
+                .parse::<DocumentMut>()
+                .expect("managed config doc"),
+        )
+        .and_then(|marker| marker.auth_backup)
+        .expect("auth backup");
+        let auth_backup_path = temp.path().join(auth_backup);
+        fs::remove_file(&auth_backup_path).expect("remove auth backup file");
+        fs::create_dir_all(&auth_backup_path).expect("replace auth backup with directory");
+
+        let error = uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect_err("auth restore failure should roll back restored config");
+
+        assert!(!error.to_string().is_empty());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("config.toml")).expect("config"),
+            managed_config
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).expect("auth"),
+            managed_auth
+        );
     }
 
     #[cfg(unix)]
