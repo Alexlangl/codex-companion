@@ -750,18 +750,19 @@ export function launchProvider(id: string, mode: ProviderLaunchMode = "auto", co
       return Promise.reject(new Error(`${provider.name} 缺少直连所需的账号材料、API Key 文件或环境变量`));
     }
     if (shouldDirect) {
+      const targetProviderId = provider.kind === "official_codex" ? "openai" : provider.id;
       mockStatus = {
         ...mockStatus,
         codex: {
           ...mockStatus.codex,
           installed: true,
-          modelProvider: provider.id,
+          modelProvider: targetProviderId,
           companionBaseUrl: provider.baseUrl,
           message: `Codex 已配置为直连: ${provider.name}`,
         },
       };
       recordMockCodexLaunch("provider_direct", provider.id);
-      return Promise.resolve(mockLaunchOutcome("provider_direct", id, provider.id, codexDir, true));
+      return Promise.resolve(mockLaunchOutcome("provider_direct", id, targetProviderId, codexDir, true));
     }
     const restartRequired = mockRelayRestartRequired();
     const groupId = `single-${provider.id}`;

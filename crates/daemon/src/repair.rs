@@ -1,13 +1,27 @@
+use crate::launch::direct_repair_target_provider_id;
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
-    AppSettings, ProviderLaunchMode, ProviderViewMode, RepairOptions, RepairOutcome, Result,
-    ThemeMode, TokenUsageSummary,
+    AppSettings, CodexLaunchMode, CompanionConfig, ProviderLaunchMode, ProviderViewMode,
+    RepairOptions, RepairOutcome, Result, ThemeMode, TokenUsageSummary, COMPANION_PROVIDER_ID,
 };
 use codex_companion_state::{collect_token_usage_cached, repair_state};
 use std::path::PathBuf;
 
 impl CompanionDaemon {
-    pub fn repair(&self, options: RepairOptions) -> Result<RepairOutcome> {
+    pub fn repair(&self, mut options: RepairOptions) -> Result<RepairOutcome> {
+        if options
+            .target_provider_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            options.target_provider_id = self.repair_target_provider_id_from_state()?;
+        }
+        if options.target_provider_id.is_some() {
+            let config = self.store.load()?;
+            options.target_provider_id = options
+                .target_provider_id
+                .map(|provider_id| repair_target_provider_id(&config, provider_id));
+        }
         repair_state(options)
     }
 
@@ -75,14 +89,81 @@ impl CompanionDaemon {
     pub fn token_usage(&self, codex_dir: PathBuf) -> Result<TokenUsageSummary> {
         collect_token_usage_cached(codex_dir, self.store.data_dir().join("cache"))
     }
+
+    fn repair_target_provider_id_from_state(&self) -> Result<Option<String>> {
+        let config = self.store.load()?;
+        let target = match config.app.last_codex_launch_mode {
+            Some(CodexLaunchMode::ProviderDirect) => config
+                .app
+                .last_codex_target_provider_id
+                .clone()
+                .map(|provider_id| repair_target_provider_id(&config, provider_id)),
+            Some(CodexLaunchMode::GroupRelay) | Some(CodexLaunchMode::ProviderRelay) => {
+                Some(COMPANION_PROVIDER_ID.to_string())
+            }
+            None => None,
+        };
+        Ok(target)
+    }
+}
+
+fn repair_target_provider_id(config: &CompanionConfig, provider_id: String) -> String {
+    let provider_id = provider_id.trim().to_string();
+    config
+        .providers
+        .get(&provider_id)
+        .map(direct_repair_target_provider_id)
+        .unwrap_or(provider_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_companion_core::{ConfigStore, ThemeMode};
+    use codex_companion_core::{
+        default_refresh_interval_seconds, ConfigStore, ProviderConfig, ProviderKind,
+    };
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn provider(kind: ProviderKind) -> ProviderConfig {
+        ProviderConfig {
+            id: "official-account".to_string(),
+            name: "Official".to_string(),
+            kind,
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            auth_ref: None,
+            direct_auth_ref: None,
+            model_map: BTreeMap::new(),
+            priority: 50,
+            enabled: true,
+            refresh_interval_seconds: default_refresh_interval_seconds(),
+            account: None,
+        }
+    }
+
+    #[test]
+    fn repair_target_normalizes_official_provider_to_codex_namespace() {
+        let mut config = CompanionConfig::default();
+        config.providers.insert(
+            "official-account".to_string(),
+            provider(ProviderKind::OfficialCodex),
+        );
+
+        assert_eq!(
+            repair_target_provider_id(&config, "official-account".to_string()),
+            "openai"
+        );
+    }
+
+    #[test]
+    fn repair_target_keeps_unknown_bucket_names() {
+        let config = CompanionConfig::default();
+
+        assert_eq!(
+            repair_target_provider_id(&config, "cc-switch-bucket".to_string()),
+            "cc-switch-bucket"
+        );
+    }
     #[test]
     fn reset_app_settings_preserves_official_auth_protection() {
         let suffix = SystemTime::now()

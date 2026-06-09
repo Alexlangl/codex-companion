@@ -1,6 +1,7 @@
 import { Hammer, LoaderCircle, Search } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Button, Field, Panel } from "../../components/ui";
+import { currentApplication } from "../../lib/current-application";
 import { compactPath } from "../../lib/format";
 import type { CompanionStatus, RepairOutcome } from "../../types/domain";
 
@@ -16,6 +17,7 @@ export function Repair({
     plugins: boolean,
     dryRun: boolean,
     codexDir?: string,
+    targetProviderId?: string,
   ) => Promise<void>;
 }) {
   const [codexDir, setCodexDir] = useState(status.codex.codexDir);
@@ -25,11 +27,22 @@ export function Repair({
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const repairing = pendingMode !== null;
-  const currentProviderId = status.codex.modelProvider || "codex-companion";
+  const application = currentApplication(status);
+  const modelProvider = status.codex.modelProvider?.trim();
+  const currentProviderId =
+    application.kind === "provider"
+      ? application.provider.kind === "official_codex" && application.launchMode === "direct"
+        ? "openai"
+        : application.provider.id
+      : modelProvider && modelProvider !== "codex-companion"
+        ? modelProvider
+      : "codex-companion";
   const currentProviderName =
-    currentProviderId === "codex-companion"
-      ? "本地代理（分组 / 账号代理）"
-      : (status.config.providers[currentProviderId]?.name ?? currentProviderId);
+    application.kind === "provider"
+      ? application.name
+      : modelProvider && modelProvider !== "codex-companion"
+        ? `Codex 当前 provider（${modelProvider}）`
+      : "本地代理（分组 / 账号代理）";
   const resultPrefix = outcome?.plan.dryRun ? "预计" : "已修复";
   const historyFiles = outcome?.plan.dryRun ? outcome.plan.historyFiles : outcome?.migratedHistoryFiles;
   const historyLines = outcome?.plan.dryRun ? outcome.plan.historyLines : outcome?.migratedHistoryLines;
@@ -52,7 +65,7 @@ export function Repair({
     setPendingMode(dryRun ? "dry-run" : "repair");
     setStartedAt(Date.now());
     try {
-      await onRepair(history, plugins, dryRun, codexDir);
+      await onRepair(history, plugins, dryRun, codexDir, currentProviderId);
     } finally {
       setPendingMode(null);
       setStartedAt(null);

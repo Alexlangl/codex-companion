@@ -4,7 +4,10 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use codex_companion_core::{ProviderConfig, ProviderKind};
+use codex_companion_core::{
+    provider_base_url_is_endpoint, provider_endpoint_is_chat_completions, ProviderConfig,
+    ProviderKind,
+};
 use codex_companion_provider::{ensure_codex_auth_snapshot, resolve_auth_token};
 use futures_util::{stream, Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
@@ -37,13 +40,14 @@ pub(crate) async fn send_upstream(
     client: &reqwest::Client,
     provider: &ProviderConfig,
     method: &Method,
+    uri: &Uri,
     headers: &HeaderMap,
     body: Bytes,
     upstream: &str,
 ) -> std::result::Result<UpstreamResponse, String> {
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|error| format!("invalid method: {error}"))?;
-    let transform = response_transform(provider, method, upstream);
+    let transform = response_transform(provider, method, uri);
     let upstream = if transform == ResponseTransform::ChatCompletionsToResponses {
         chat_completions_url(provider, upstream)
     } else {
@@ -109,16 +113,7 @@ fn rewrite_model(provider: &ProviderConfig, body: Bytes) -> Bytes {
     else {
         return body;
     };
-    let Some(mapped) = provider.model_map.get(&model).cloned().or_else(|| {
-        provider
-            .model_map
-            .get("default")
-            .filter(|mapped| {
-                let mapped = mapped.trim();
-                !mapped.is_empty() && mapped != "default"
-            })
-            .cloned()
-    }) else {
+    let Some(mapped) = provider.model_map.get(&model).cloned() else {
         return body;
     };
     if mapped == model {
@@ -223,14 +218,12 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
 }
 
-fn response_transform(
-    provider: &ProviderConfig,
-    method: &Method,
-    upstream: &str,
-) -> ResponseTransform {
-    if provider.kind == ProviderKind::RelayProvider
-        && method == Method::POST
-        && is_responses_url(upstream)
+fn response_transform(provider: &ProviderConfig, method: &Method, uri: &Uri) -> ResponseTransform {
+    if method == Method::POST
+        && uri
+            .path_and_query()
+            .is_some_and(|value| is_responses_url(value.as_str()))
+        && provider_endpoint_is_chat_completions(&provider.base_url)
     {
         ResponseTransform::ChatCompletionsToResponses
     } else {
@@ -245,6 +238,9 @@ fn is_responses_url(url: &str) -> bool {
 }
 
 fn chat_completions_url(provider: &ProviderConfig, upstream: &str) -> String {
+    if provider_base_url_is_endpoint(&provider.base_url) {
+        return upstream.to_string();
+    }
     let query = upstream
         .split_once('?')
         .map(|(_, query)| query)
@@ -804,6 +800,10 @@ pub(crate) fn text_response(status: StatusCode, text: impl Into<String>) -> Resp
 }
 
 pub(crate) fn upstream_url(provider: &ProviderConfig, uri: &Uri) -> String {
+    if provider_base_url_is_endpoint(&provider.base_url) {
+        return provider.base_url.trim().to_string();
+    }
+
     let path_and_query = uri
         .path_and_query()
         .map(|value| value.as_str())
@@ -928,7 +928,32 @@ mod tests {
     }
 
     #[test]
-    fn relay_provider_responses_requests_use_chat_completions() {
+    fn default_model_map_does_not_override_user_selected_model() {
+        let mut model_map = BTreeMap::new();
+        model_map.insert("default".to_string(), "gpt-5.5".to_string());
+        let provider = ProviderConfig {
+            id: "p".to_string(),
+            name: "Provider".to_string(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.example.com/v1".to_string(),
+            auth_ref: None,
+            direct_auth_ref: None,
+            model_map,
+            priority: 0,
+            enabled: true,
+            refresh_interval_seconds: default_refresh_interval_seconds(),
+            account: None,
+        };
+        let body = rewrite_model(
+            &provider,
+            Bytes::from_static(br#"{"model":"gpt-5.4","input":"hello"}"#),
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["model"], "gpt-5.4");
+    }
+
+    #[test]
+    fn relay_provider_v1_base_keeps_responses_requests() {
         let provider = ProviderConfig {
             id: "p".to_string(),
             name: "Provider".to_string(),
@@ -942,15 +967,72 @@ mod tests {
             refresh_interval_seconds: default_refresh_interval_seconds(),
             account: None,
         };
-        let upstream = "https://api.example.com/v1/responses?foo=bar";
+        let uri: Uri = "/v1/responses?foo=bar".parse().expect("uri");
 
         assert_eq!(
-            response_transform(&provider, &Method::POST, upstream),
+            upstream_url(&provider, &uri),
+            "https://api.example.com/v1/responses?foo=bar"
+        );
+        assert_eq!(
+            response_transform(&provider, &Method::POST, &uri),
+            ResponseTransform::None
+        );
+    }
+
+    #[test]
+    fn explicit_chat_endpoint_uses_chat_completions_transform() {
+        let provider = ProviderConfig {
+            id: "p".to_string(),
+            name: "Provider".to_string(),
+            kind: ProviderKind::RelayProvider,
+            base_url: "https://api.example.com/v1/chat/completions".to_string(),
+            auth_ref: None,
+            direct_auth_ref: None,
+            model_map: BTreeMap::new(),
+            priority: 0,
+            enabled: true,
+            refresh_interval_seconds: default_refresh_interval_seconds(),
+            account: None,
+        };
+        let uri: Uri = "/v1/responses?foo=bar".parse().expect("uri");
+        let upstream = upstream_url(&provider, &uri);
+
+        assert_eq!(upstream, "https://api.example.com/v1/chat/completions");
+        assert_eq!(
+            response_transform(&provider, &Method::POST, &uri),
             ResponseTransform::ChatCompletionsToResponses
         );
         assert_eq!(
-            chat_completions_url(&provider, upstream),
-            "https://api.example.com/v1/chat/completions?foo=bar"
+            chat_completions_url(&provider, &upstream),
+            "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn explicit_responses_endpoint_preserves_query_and_skips_transform() {
+        let provider = ProviderConfig {
+            id: "p".to_string(),
+            name: "Provider".to_string(),
+            kind: ProviderKind::RelayProvider,
+            base_url: "https://api.example.com/v1/responses?api-version=2026-06-09".to_string(),
+            auth_ref: None,
+            direct_auth_ref: None,
+            model_map: BTreeMap::new(),
+            priority: 0,
+            enabled: true,
+            refresh_interval_seconds: default_refresh_interval_seconds(),
+            account: None,
+        };
+        let uri: Uri = "/v1/responses?foo=bar".parse().expect("uri");
+        let upstream = upstream_url(&provider, &uri);
+
+        assert_eq!(
+            upstream,
+            "https://api.example.com/v1/responses?api-version=2026-06-09"
+        );
+        assert_eq!(
+            response_transform(&provider, &Method::POST, &uri),
+            ResponseTransform::None
         );
     }
 

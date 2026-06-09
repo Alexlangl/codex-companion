@@ -16,6 +16,10 @@ use toml_edit::{value, DocumentMut, Item};
 use walkdir::WalkDir;
 
 const CODEX_STATE_DB_FILENAME: &str = "state_5.sqlite";
+const CODEX_OPENAI_PROVIDER_ID: &str = "openai";
+const CODEX_API_KEY_AUTH_MODE: &str = "apikey";
+#[cfg(all(target_os = "macos", not(test)))]
+const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const COMPANION_MARKER_TABLE: &str = "codex_companion";
 const COMPANION_MARKER_VERSION: i64 = 1;
 
@@ -121,38 +125,64 @@ pub fn install_direct_provider_with_options(
         ));
     }
 
-    doc["model_provider"] = value(&provider.id);
-    doc["model_providers"][&provider.id]["name"] = value(&provider.name);
-    doc["model_providers"][&provider.id]["base_url"] = value(&provider.base_url);
-    doc["model_providers"][&provider.id]["wire_api"] = value("responses");
-    doc["model_providers"][&provider.id]["requires_openai_auth"] = value(true);
-    doc["model_providers"][&provider.id]["api_key_env_var"] = Item::None;
+    let mut effective_model_provider = provider.id.clone();
+    let mut keychain_warning = None;
+    if matches!(provider.kind, ProviderKind::OfficialCodex) {
+        let DirectAuthMaterial::CodexAuth(auth) = direct_auth else {
+            return Err(CompanionError::InvalidConfig(format!(
+                "官方 Codex 账号 {} 缺少可直连的 OAuth access_token",
+                provider.name
+            )));
+        };
+        write_official_codex_config(&mut doc, &provider.id);
+        ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
+        ensure_auth_backup(&mut backup, &codex_dir)?;
+        write_codex_auth_json(&codex_dir, &auth)?;
+        record_auth_write(&mut backup, &codex_dir)?;
+        if let Err(error) = write_codex_keychain_to_dir(&codex_dir, &auth) {
+            keychain_warning = Some(format!(
+                "；Keychain 写入失败，若 Codex Desktop 仍要求登录，请检查 macOS 钥匙串权限: {error}"
+            ));
+        }
+        effective_model_provider = CODEX_OPENAI_PROVIDER_ID.to_string();
+    } else {
+        doc["model_provider"] = value(&provider.id);
+        doc["model_providers"][&provider.id]["name"] = value(&provider.name);
+        doc["model_providers"][&provider.id]["base_url"] = value(&provider.base_url);
+        doc["model_providers"][&provider.id]["wire_api"] = value("responses");
+        doc["model_providers"][&provider.id]["requires_openai_auth"] = value(true);
+        doc["model_providers"][&provider.id]["api_key_env_var"] = Item::None;
 
-    match direct_auth {
-        DirectAuthMaterial::EnvKey(env_var) => {
-            restored_prior_auth_write =
-                restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
-            token_source = format!("environment variable {env_var}");
-            doc["model_providers"][&provider.id]["env_key"] = value(env_var);
-        }
-        DirectAuthMaterial::ApiKey(api_key) => {
-            doc["model_providers"][&provider.id]["env_key"] = Item::None;
-            ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
-            ensure_auth_backup(&mut backup, &codex_dir)?;
-            write_codex_openai_api_key(&codex_dir, &api_key)?;
-            record_auth_write(&mut backup, &codex_dir)?;
-        }
-        DirectAuthMaterial::CodexAuth(auth) => {
-            doc["model_providers"][&provider.id]["env_key"] = Item::None;
-            ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
-            ensure_auth_backup(&mut backup, &codex_dir)?;
-            write_codex_auth_json(&codex_dir, &auth)?;
-            record_auth_write(&mut backup, &codex_dir)?;
-        }
-        DirectAuthMaterial::None => {
-            restored_prior_auth_write =
-                restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
-            doc["model_providers"][&provider.id]["env_key"] = Item::None;
+        match direct_auth {
+            DirectAuthMaterial::EnvKey(env_var) => {
+                restored_prior_auth_write =
+                    restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
+                token_source = format!("environment variable {env_var}");
+                doc["model_providers"][&provider.id]["env_key"] = value(env_var);
+                doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
+            }
+            DirectAuthMaterial::ApiKey(api_key) => {
+                doc["model_providers"][&provider.id]["env_key"] = Item::None;
+                doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
+                ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
+                ensure_auth_backup(&mut backup, &codex_dir)?;
+                write_codex_openai_api_key(&codex_dir, &api_key)?;
+                record_auth_write(&mut backup, &codex_dir)?;
+            }
+            DirectAuthMaterial::CodexAuth(auth) => {
+                doc["model_providers"][&provider.id]["env_key"] = Item::None;
+                doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
+                ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
+                ensure_auth_backup(&mut backup, &codex_dir)?;
+                write_codex_auth_json(&codex_dir, &auth)?;
+                record_auth_write(&mut backup, &codex_dir)?;
+            }
+            DirectAuthMaterial::None => {
+                restored_prior_auth_write =
+                    restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
+                doc["model_providers"][&provider.id]["env_key"] = Item::None;
+                doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
+            }
         }
     }
     if !direct_writes_auth && restored_prior_auth_write {
@@ -162,23 +192,27 @@ pub fn install_direct_provider_with_options(
         &mut doc,
         &backup,
         CompanionInstallKind::Direct,
-        &provider.id,
+        &effective_model_provider,
         &token_source,
     );
 
     write_config_with_auth_rollback(&config_path, &doc, &auth_rollback, &codex_dir)?;
     let auth_shape_after = detect_codex_auth_shape(&codex_dir)?;
     let auth_warning = direct_auth_warning(&auth_shape_before, &auth_shape_after, &token_source);
+    let mut message = format!(
+        "Codex 已直连 provider: {}；Token source: {}{}",
+        provider.name, token_source, auth_warning
+    );
+    if let Some(warning) = keychain_warning {
+        message.push_str(&warning);
+    }
     Ok(CodexInstallStatus {
         codex_dir,
         config_path,
         installed: true,
-        model_provider: Some(provider.id.clone()),
+        model_provider: Some(effective_model_provider),
         companion_base_url: provider.base_url.clone(),
-        message: format!(
-            "Codex 已直连 provider: {}；Token source: {}{}",
-            provider.name, token_source, auth_warning
-        ),
+        message,
     })
 }
 
@@ -238,9 +272,13 @@ fn resolve_direct_auth(provider: &ProviderConfig) -> Result<DirectAuthMaterial> 
             ))
         })?;
         if matches!(provider.kind, ProviderKind::OfficialCodex) {
-            if let Some(auth) = normalize_codex_oauth_auth(&value) {
-                return Ok(DirectAuthMaterial::CodexAuth(auth));
-            }
+            let auth = normalize_codex_oauth_auth(&value).ok_or_else(|| {
+                CompanionError::InvalidConfig(format!(
+                    "官方 Codex 账号 auth 文件缺少 access_token: {}",
+                    path.display()
+                ))
+            })?;
+            return Ok(DirectAuthMaterial::CodexAuth(auth));
         }
         let api_key = pick_json_string(
             &value,
@@ -325,11 +363,7 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
             &["tokens", "refresh_token"],
         ],
     );
-    if access_token.is_none()
-        && id_token.is_none()
-        && session_token.is_none()
-        && refresh_token.is_none()
-    {
+    if access_token.is_none() {
         return None;
     }
 
@@ -410,6 +444,30 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
         pick_first_json_string(&sources, &[&["last_refresh"], &["lastRefresh"]]),
     );
     Some(Value::Object(auth))
+}
+
+fn write_official_codex_config(doc: &mut DocumentMut, provider_id: &str) {
+    let previous_provider = doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(ToOwned::to_owned);
+    doc["openai_base_url"] = Item::None;
+    doc["model_provider"] = value(CODEX_OPENAI_PROVIDER_ID);
+    remove_model_provider_table(doc, provider_id);
+    if let Some(previous_provider) = previous_provider.as_deref() {
+        remove_model_provider_table(doc, previous_provider);
+    }
+}
+
+fn remove_model_provider_table(doc: &mut DocumentMut, provider_id: &str) {
+    let Some(model_providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) else {
+        return;
+    };
+    model_providers.remove(provider_id);
+    model_providers.remove(CODEX_OPENAI_PROVIDER_ID);
+    if model_providers.is_empty() {
+        doc["model_providers"] = Item::None;
+    }
 }
 
 fn oauth_account_candidate(value: &Value) -> &Value {
@@ -497,10 +555,55 @@ fn merge_codex_auth(target: &mut Value, source: &Value) -> Result<()> {
 fn write_codex_openai_api_key(codex_dir: &Path, api_key: &str) -> Result<()> {
     let mut auth = serde_json::Map::new();
     auth.insert(
+        "auth_mode".to_string(),
+        Value::String(CODEX_API_KEY_AUTH_MODE.to_string()),
+    );
+    auth.insert(
         "OPENAI_API_KEY".to_string(),
         Value::String(api_key.to_string()),
     );
     write_codex_auth_json(codex_dir, &Value::Object(auth))
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn write_codex_keychain_to_dir(codex_dir: &Path, material: &Value) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let resolved_home = fs::canonicalize(codex_dir).unwrap_or_else(|_| codex_dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(resolved_home.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let digest_hex = format!("{digest:x}");
+    let account = format!("cli|{}", &digest_hex[..16]);
+    let secret = serde_json::to_string(material).map_err(|source| {
+        CompanionError::InvalidConfig(format!("序列化 Codex Keychain 数据失败: {source}"))
+    })?;
+    let output = std::process::Command::new("security")
+        .arg("add-generic-password")
+        .arg("-U")
+        .arg("-s")
+        .arg(CODEX_KEYCHAIN_SERVICE)
+        .arg("-a")
+        .arg(account)
+        .arg("-w")
+        .arg(secret)
+        .output()
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("执行 security 写入 Keychain 失败: {source}"))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(CompanionError::InvalidConfig(format!(
+        "写入 Codex Keychain 失败: {}",
+        stderr.trim()
+    )))
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn write_codex_keychain_to_dir(_codex_dir: &Path, _material: &Value) -> Result<()> {
+    Ok(())
 }
 
 fn pick_first_json_string(sources: &[&Value], paths: &[&[&str]]) -> Option<String> {
@@ -1297,7 +1400,7 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
     )?;
 
     let jsonl_files = if options.history {
-        collect_files(&options.codex_dir, "jsonl")
+        collect_history_jsonl_files(&options.codex_dir)
     } else {
         Vec::new()
     };
@@ -1375,11 +1478,24 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
         });
     }
 
-    let migrated_history_files = 0;
-    let migrated_history_lines = 0;
+    let mut migrated_history_files = 0;
+    let mut migrated_history_lines = 0;
     let mut migrated_plugin_files = 0;
     let mut migrated_state_rows = 0;
     let mut backup_root = None;
+
+    if options.history && history_lines > 0 {
+        let backup_root = ensure_backup_root(&mut backup_root, &options.codex_dir)?;
+        let history_migration = rewrite_history_files(
+            &jsonl_files,
+            &source_provider_ids,
+            &target_provider_id,
+            backup_root,
+            &options.codex_dir,
+        )?;
+        migrated_history_files = history_migration.files;
+        migrated_history_lines = history_migration.lines;
+    }
 
     if options.history && db_path.exists() && state_rows > 0 {
         let backup_root = ensure_backup_root(&mut backup_root, &options.codex_dir)?;
@@ -1404,15 +1520,14 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
         }
     }
 
-    let skipped_reason = if history_lines > 0 {
-        Some("已保留历史会话文件不改写；仅合并 Codex SQLite 索引和插件状态".to_string())
-    } else if migrated_plugin_files == 0 && migrated_state_rows == 0 {
-        Some(format!(
-            "未发现需要迁移到 {target_provider_id} 的可合并状态"
-        ))
-    } else {
-        None
-    };
+    let skipped_reason =
+        if migrated_history_files == 0 && migrated_plugin_files == 0 && migrated_state_rows == 0 {
+            Some(format!(
+                "未发现需要迁移到 {target_provider_id} 的可合并状态"
+            ))
+        } else {
+            None
+        };
 
     Ok(RepairOutcome {
         plan,
@@ -1447,7 +1562,20 @@ fn resolve_repair_target_provider_id(codex_dir: &Path, requested: Option<&str>) 
         }
     }
 
+    if codex_auth_json_looks_like_official_account(codex_dir) {
+        return Ok(CODEX_OPENAI_PROVIDER_ID.to_string());
+    }
+
     Ok(COMPANION_PROVIDER_ID.to_string())
+}
+
+fn collect_history_jsonl_files(root: &Path) -> Vec<PathBuf> {
+    ["sessions", "archived_sessions"]
+        .iter()
+        .map(|dir| root.join(dir))
+        .filter(|dir| dir.exists())
+        .flat_map(|dir| collect_files(&dir, "jsonl"))
+        .collect()
 }
 
 fn collect_files(root: &Path, extension: &str) -> Vec<PathBuf> {
@@ -1459,6 +1587,33 @@ fn collect_files(root: &Path, extension: &str) -> Vec<PathBuf> {
         .map(|entry| entry.into_path())
         .filter(|path| path.extension().is_some_and(|value| value == extension))
         .collect()
+}
+
+fn codex_auth_json_looks_like_official_account(codex_dir: &Path) -> bool {
+    let auth_path = codex_dir.join("auth.json");
+    let Ok(text) = fs::read_to_string(&auth_path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    let auth_mode = pick_json_string(&value, &[&["auth_mode"], &["authMode"]]);
+    if auth_mode
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case(CODEX_API_KEY_AUTH_MODE))
+    {
+        return false;
+    }
+    pick_json_string(
+        &value,
+        &[
+            &["tokens", "access_token"],
+            &["credentials", "access_token"],
+            &["access_token"],
+            &["token"],
+        ],
+    )
+    .is_some()
 }
 
 fn is_repair_backup_path(path: &Path) -> bool {
@@ -1623,6 +1778,88 @@ fn count_jsonl_lines_to_migrate(files: &[PathBuf], source_ids: &BTreeSet<String>
         }
     }
     Ok(count)
+}
+
+#[derive(Debug, Default)]
+struct HistoryMigration {
+    files: usize,
+    lines: usize,
+}
+
+fn rewrite_history_files(
+    files: &[PathBuf],
+    source_ids: &BTreeSet<String>,
+    target_provider_id: &str,
+    backup_root: &Path,
+    codex_dir: &Path,
+) -> Result<HistoryMigration> {
+    if source_ids.is_empty() {
+        return Ok(HistoryMigration::default());
+    }
+    let mut total = HistoryMigration::default();
+    for path in files {
+        let text = fs::read_to_string(path).map_err(|source| CompanionError::io(path, source))?;
+        let trailing_newline = text.ends_with('\n');
+        let mut changed_lines = 0;
+        let mut next_lines = Vec::new();
+        for line in text.lines() {
+            if let Some(next_line) =
+                rewrite_session_meta_provider_line(line, source_ids, target_provider_id)?
+            {
+                changed_lines += 1;
+                next_lines.push(next_line);
+            } else {
+                next_lines.push(line.to_string());
+            }
+        }
+        if changed_lines == 0 {
+            continue;
+        }
+
+        backup_file(path, backup_root, codex_dir)?;
+        let mut next = next_lines.join("\n");
+        if trailing_newline {
+            next.push('\n');
+        }
+        fs::write(path, next).map_err(|source| CompanionError::io(path, source))?;
+        total.files += 1;
+        total.lines += changed_lines;
+    }
+    Ok(total)
+}
+
+fn rewrite_session_meta_provider_line(
+    line: &str,
+    source_ids: &BTreeSet<String>,
+    target_provider_id: &str,
+) -> Result<Option<String>> {
+    if !line.contains("session_meta") || !line.contains("model_provider") {
+        return Ok(None);
+    }
+    let mut value: Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let Some(provider) = value
+        .get("payload")
+        .and_then(|payload| payload.get("model_provider"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    if !source_ids.contains(provider) {
+        return Ok(None);
+    }
+    if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+        payload.insert(
+            "model_provider".to_string(),
+            Value::String(target_provider_id.to_string()),
+        );
+    }
+    let next = serde_json::to_string(&value).map_err(|source| {
+        CompanionError::InvalidConfig(format!("JSONL rewrite failed: {source}"))
+    })?;
+    Ok(Some(next))
 }
 
 fn collect_sqlite_provider_ids(path: &Path) -> Result<BTreeSet<String>> {
@@ -2540,7 +2777,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_merges_sqlite_index_without_rewriting_history() {
+    fn repair_rewrites_history_and_merges_sqlite_index() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions = temp.path().join("sessions");
         fs::create_dir_all(&sessions).expect("sessions");
@@ -2571,12 +2808,12 @@ mod tests {
 
         assert_eq!(outcome.plan.history_lines, 1);
         assert_eq!(outcome.plan.state_rows, 1);
-        assert_eq!(outcome.migrated_history_lines, 0);
+        assert_eq!(outcome.migrated_history_lines, 1);
         assert_eq!(outcome.migrated_state_rows, 1);
         assert!(outcome.backup_root.is_some());
-        assert!(outcome.skipped_reason.is_some());
+        assert!(outcome.skipped_reason.is_none());
         let text = fs::read_to_string(&file).expect("read");
-        assert!(text.contains("\"openai\""));
+        assert!(text.contains("\"codex-companion\""));
         let conn = Connection::open(&db).expect("db");
         let (provider, cwd): (String, String) = conn
             .query_row(
@@ -2635,7 +2872,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_plans_custom_target_without_rewriting_history() {
+    fn repair_rewrites_history_for_custom_target() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions = temp.path().join("sessions");
         fs::create_dir_all(&sessions).expect("sessions");
@@ -2656,14 +2893,14 @@ mod tests {
         .expect("repair");
 
         assert_eq!(outcome.plan.target_provider_id, "openrouter");
-        assert_eq!(outcome.migrated_history_lines, 0);
-        assert!(outcome.backup_root.is_none());
+        assert_eq!(outcome.migrated_history_lines, 1);
+        assert!(outcome.backup_root.is_some());
         let text = fs::read_to_string(&file).expect("read");
-        assert!(text.contains("\"openai\""));
+        assert!(text.contains("\"openrouter\""));
     }
 
     #[test]
-    fn repair_defaults_to_current_codex_model_provider_without_rewriting_history() {
+    fn repair_defaults_to_current_codex_model_provider_and_rewrites_history() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("config.toml"),
@@ -2689,10 +2926,98 @@ mod tests {
         .expect("repair");
 
         assert_eq!(outcome.plan.target_provider_id, "openrouter");
-        assert_eq!(outcome.migrated_history_lines, 0);
-        assert!(outcome.backup_root.is_none());
+        assert_eq!(outcome.migrated_history_lines, 1);
+        assert!(outcome.backup_root.is_some());
         let text = fs::read_to_string(&file).expect("read");
+        assert!(text.contains("\"openrouter\""));
+    }
+
+    #[test]
+    fn repair_defaults_official_auth_without_model_provider_to_openai() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("config.toml"), "").expect("config");
+        fs::write(
+            temp.path().join("auth.json"),
+            r#"{"OPENAI_API_KEY":null,"tokens":{"access_token":"access-token"}}"#,
+        )
+        .expect("auth");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        fs::write(
+            sessions.join("session.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"cc-switch-bucket\",\"cwd\":\"/work/project\"}}\n",
+        )
+        .expect("write");
+        let db = temp.path().join(CODEX_STATE_DB_FILENAME);
+        let conn = Connection::open(&db).expect("db");
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, rollout_path TEXT NOT NULL);
+             INSERT INTO threads (id, model_provider, cwd, rollout_path) VALUES ('s1', 'cc-switch-bucket', '', '');",
+        )
+        .expect("schema");
+        drop(conn);
+
+        let outcome = repair_state(RepairOptions {
+            codex_dir: temp.path().to_path_buf(),
+            history: true,
+            plugins: false,
+            dry_run: false,
+            target_provider_id: None,
+        })
+        .expect("repair");
+
+        assert_eq!(outcome.plan.target_provider_id, "openai");
+        assert_eq!(
+            outcome.plan.source_provider_ids,
+            vec!["cc-switch-bucket".to_string()]
+        );
+        assert_eq!(outcome.migrated_state_rows, 1);
+        assert_eq!(outcome.migrated_history_lines, 1);
+        let text = fs::read_to_string(sessions.join("session.jsonl")).expect("session");
         assert!(text.contains("\"openai\""));
+        let conn = Connection::open(&db).expect("db");
+        let provider: String = conn
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("provider");
+        assert_eq!(provider, "openai");
+    }
+
+    #[test]
+    fn repair_history_scan_ignores_non_session_jsonl_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        let random = temp.path().join("logs");
+        fs::create_dir_all(&sessions).expect("sessions");
+        fs::create_dir_all(&random).expect("logs");
+        fs::write(
+            sessions.join("session.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"old-bucket\"}}\n",
+        )
+        .expect("session");
+        fs::write(
+            random.join("not-a-session.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s2\",\"model_provider\":\"backup-bucket\"}}\n",
+        )
+        .expect("random");
+
+        let outcome = repair_state(RepairOptions {
+            codex_dir: temp.path().to_path_buf(),
+            history: true,
+            plugins: false,
+            dry_run: true,
+            target_provider_id: Some("openai".to_string()),
+        })
+        .expect("repair");
+
+        assert_eq!(outcome.plan.history_files, 1);
+        assert_eq!(
+            outcome.plan.source_provider_ids,
+            vec!["old-bucket".to_string()]
+        );
     }
 
     #[test]
@@ -2791,6 +3116,21 @@ mod tests {
     #[test]
     fn install_direct_official_provider_writes_codex_oauth_tokens() {
         let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            r#"
+model_provider = "old-direct"
+
+[model_providers.old-direct]
+name = "Old Direct"
+base_url = "https://old.example/v1"
+
+[model_providers.keep-me]
+name = "Keep Me"
+base_url = "https://keep.example/v1"
+"#,
+        )
+        .expect("config");
         let auth_path = temp.path().join("official-auth.json");
         fs::write(
             &auth_path,
@@ -2825,10 +3165,13 @@ mod tests {
             .expect("install direct");
 
         assert!(status.installed);
-        assert_eq!(status.model_provider.as_deref(), Some("official-mark"));
+        assert_eq!(status.model_provider.as_deref(), Some("openai"));
         let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
-        assert!(config.contains("model_provider = \"official-mark\""));
-        assert!(config.contains("requires_openai_auth = true"));
+        assert!(config.contains("model_provider = \"openai\""));
+        assert!(!config.contains("[model_providers.old-direct]"));
+        assert!(!config.contains("[model_providers.official-mark]"));
+        assert!(config.contains("[model_providers.keep-me]"));
+        assert!(!config.contains("openai_base_url"));
         let auth = fs::read_to_string(temp.path().join("auth.json")).expect("codex auth");
         assert!(auth.contains("\"OPENAI_API_KEY\": null"));
         assert!(auth.contains("\"access_token\": \"access-token\""));

@@ -41,7 +41,16 @@ export function userVisibleGroups(status: CompanionStatus) {
 }
 
 export function currentApplication(status: CompanionStatus): CurrentApplication {
-  const codexProviderId = status.codex.modelProvider?.trim();
+  const modelProvider = status.codex.modelProvider?.trim() || "";
+  const lastDirectProviderId =
+    status.config.app.lastCodexLaunchMode === "provider_direct"
+      ? status.config.app.lastCodexTargetProviderId?.trim()
+      : "";
+  const lastDirectProvider = lastDirectProviderId ? status.config.providers[lastDirectProviderId] : undefined;
+  const codexProviderId =
+    modelProvider === "openai" && lastDirectProvider?.kind === "official_codex"
+      ? lastDirectProviderId
+      : modelProvider || lastDirectProviderId;
   if (codexProviderId && codexProviderId !== "codex-companion") {
     const provider = status.config.providers[codexProviderId];
     if (provider) {

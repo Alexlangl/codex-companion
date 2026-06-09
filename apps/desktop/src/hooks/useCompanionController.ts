@@ -268,10 +268,11 @@ export function useCompanionController() {
         plugins: boolean,
         dryRun: boolean,
         codexDir?: string,
+        targetProviderId?: string,
       ) => {
         setError(null);
         try {
-          const outcome = await repair(history, plugins, dryRun, codexDir);
+          const outcome = await repair(history, plugins, dryRun, codexDir, targetProviderId);
           setRepairOutcome(outcome);
           setToast(dryRun ? "Dry-run 已完成" : "修复已完成");
           void refresh({ silent: true });
