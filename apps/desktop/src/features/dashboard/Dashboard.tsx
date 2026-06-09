@@ -1,7 +1,7 @@
 import { CheckCircle2, Play, RadioTower, Router } from "lucide-react";
 import type { ReactNode } from "react";
 import { Badge, Button, Panel } from "../../components/ui";
-import { currentApplication } from "../../lib/current-application";
+import { currentApplication, currentProviderId } from "../../lib/current-application";
 import { compactPath, formatTime } from "../../lib/format";
 import {
   hasQuotaInfo,
@@ -166,6 +166,8 @@ function launchModeLabel(status: CompanionStatus, applicationKind: string) {
 }
 
 function currentProviderLabel(status: CompanionStatus, applicationKind: string) {
+  const providerId = currentProviderId(currentApplication(status));
+  if (providerId) return providerId;
   if (status.codex.modelProvider) return status.codex.modelProvider;
   if (
     applicationKind === "provider" &&

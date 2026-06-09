@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 const SINGLE_PROVIDER_GROUP_PREFIX: &str = "single-";
-const CODEX_OPENAI_PROVIDER_ID: &str = "openai";
+pub(crate) const CODEX_OPENAI_PROVIDER_ID: &str = "openai";
 
 impl CompanionDaemon {
     pub fn launch_group(
@@ -97,14 +97,15 @@ impl CompanionDaemon {
 
         if should_direct {
             let codex = install_direct_provider(Some(codex_dir.clone()), &provider)?;
-            let repair = repair_for_launch(&codex_dir, direct_repair_target_provider_id(&provider));
+            let target_provider_id = direct_repair_target_provider_id(&provider);
+            let repair = repair_for_launch(&codex_dir, target_provider_id.clone());
             let restart_required = true;
             let codex_launch = restart_codex();
             self.record_codex_launch(CodexLaunchMode::ProviderDirect, provider.id.clone())?;
             return Ok(CodexLaunchOutcome {
                 mode: CodexLaunchMode::ProviderDirect,
                 target_id: provider.id.clone(),
-                target_provider_id: provider.id.clone(),
+                target_provider_id,
                 codex,
                 repair,
                 restart_required,
@@ -201,7 +202,7 @@ pub fn single_provider_group_id(provider: &ProviderConfig) -> String {
     format!("{SINGLE_PROVIDER_GROUP_PREFIX}{}", provider.id)
 }
 
-fn direct_repair_target_provider_id(provider: &ProviderConfig) -> String {
+pub(crate) fn direct_repair_target_provider_id(provider: &ProviderConfig) -> String {
     if matches!(provider.kind, ProviderKind::OfficialCodex) {
         CODEX_OPENAI_PROVIDER_ID.to_string()
     } else {
@@ -530,7 +531,7 @@ fn stop_codex(target: &CodexLaunchTarget) {
 ))]
 fn process_match_running(pattern: &str) -> bool {
     Command::new("pgrep")
-        .args(["-f", pattern])
+        .args(["-f", "--", pattern])
         .status()
         .is_ok_and(|status| status.success())
 }
@@ -551,7 +552,7 @@ fn process_name_running(name: &str) -> bool {
     all(not(target_os = "windows"), not(target_os = "macos"))
 ))]
 fn kill_process_match(pattern: &str) {
-    let _ = Command::new("pkill").args(["-f", pattern]).status();
+    let _ = Command::new("pkill").args(["-f", "--", pattern]).status();
 }
 
 #[cfg(target_os = "windows")]

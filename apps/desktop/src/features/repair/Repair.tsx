@@ -17,6 +17,7 @@ export function Repair({
     plugins: boolean,
     dryRun: boolean,
     codexDir?: string,
+    targetProviderId?: string,
   ) => Promise<void>;
 }) {
   const [codexDir, setCodexDir] = useState(status.codex.codexDir);
@@ -27,13 +28,21 @@ export function Repair({
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const repairing = pendingMode !== null;
   const application = currentApplication(status);
+  const modelProvider = status.codex.modelProvider?.trim();
   const currentProviderId =
     application.kind === "provider"
       ? application.provider.kind === "official_codex" && application.launchMode === "direct"
         ? "openai"
         : application.provider.id
+      : modelProvider && modelProvider !== "codex-companion"
+        ? modelProvider
       : "codex-companion";
-  const currentProviderName = application.kind === "provider" ? application.name : "本地代理（分组 / 账号代理）";
+  const currentProviderName =
+    application.kind === "provider"
+      ? application.name
+      : modelProvider && modelProvider !== "codex-companion"
+        ? `Codex 当前 provider（${modelProvider}）`
+      : "本地代理（分组 / 账号代理）";
   const resultPrefix = outcome?.plan.dryRun ? "预计" : "已修复";
   const historyFiles = outcome?.plan.dryRun ? outcome.plan.historyFiles : outcome?.migratedHistoryFiles;
   const historyLines = outcome?.plan.dryRun ? outcome.plan.historyLines : outcome?.migratedHistoryLines;
@@ -56,7 +65,7 @@ export function Repair({
     setPendingMode(dryRun ? "dry-run" : "repair");
     setStartedAt(Date.now());
     try {
-      await onRepair(history, plugins, dryRun, codexDir);
+      await onRepair(history, plugins, dryRun, codexDir, currentProviderId);
     } finally {
       setPendingMode(null);
       setStartedAt(null);
