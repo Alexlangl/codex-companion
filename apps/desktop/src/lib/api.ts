@@ -23,6 +23,9 @@ import { extractQuotaWindows, findNumber, findString, isApiKeyJson, lowestQuotaP
 import { getTokenUsage as getTokenUsageFromRuntime } from "./token-usage-api";
 
 const APP_PREFS_STORAGE_KEY = "codex-companion:app-settings";
+const MOCK_HOME_DIR = "/mock-home";
+const MOCK_DATA_DIR = `${MOCK_HOME_DIR}/.codex-companion`;
+const MOCK_CODEX_DIR = `${MOCK_HOME_DIR}/.codex`;
 
 let mockStatus = createMockStatus();
 
@@ -469,8 +472,8 @@ export function importLocalCodexProvider(codexDir?: string) {
           plan_type: "team",
         },
         extra: {
-          team_name: "035611",
-          user_id: "0870da3c-a509-4340-b33a-30",
+          team_name: "mock-team",
+          user_id: "mock-user-id",
           hourly_percentage: 82,
           hourly_reset_time: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
           weekly_percentage: 77,
@@ -894,9 +897,27 @@ export function setProviderViewMode(mode: ProviderViewMode) {
   return invoke<ProviderViewMode>("set_provider_view_mode", { mode });
 }
 
+export function setPreserveOfficialCodexAuth(preserve: boolean) {
+  if (!isTauri()) {
+    writeStoredAppSettings({ ...mockStatus.config.app, preserveOfficialCodexAuth: preserve });
+    mockStatus = {
+      ...mockStatus,
+      config: {
+        ...mockStatus.config,
+        app: { ...mockStatus.config.app, preserveOfficialCodexAuth: preserve },
+      },
+    };
+    return Promise.resolve(preserve);
+  }
+  return invoke<boolean>("set_preserve_official_codex_auth", { preserve });
+}
+
 export function resetAppSettings() {
   if (!isTauri()) {
-    const app = defaultAppSettings();
+    const app = {
+      ...defaultAppSettings(),
+      preserveOfficialCodexAuth: mockStatus.config.app.preserveOfficialCodexAuth,
+    };
     writeStoredAppSettings(app);
     mockStatus = {
       ...mockStatus,
@@ -1098,14 +1119,14 @@ function createMockStatus(): CompanionStatus {
       health: {},
       app,
     },
-    dataDir: "/Users/zhuxichen/.codex-companion",
-    configPath: "/Users/zhuxichen/.codex-companion/config.json",
+    dataDir: MOCK_DATA_DIR,
+    configPath: `${MOCK_DATA_DIR}/config.json`,
     relayBaseUrl: "http://127.0.0.1:17687/v1",
     activeGroup: null,
     activeProviders: [],
     codex: {
-      codexDir: "/Users/zhuxichen/.codex",
-      configPath: "/Users/zhuxichen/.codex/config.toml",
+      codexDir: MOCK_CODEX_DIR,
+      configPath: `${MOCK_CODEX_DIR}/config.toml`,
       installed: false,
       modelProvider: null,
       companionBaseUrl: "http://127.0.0.1:17687/v1",
@@ -1123,6 +1144,7 @@ function defaultAppSettings(): AppSettings {
     lastCodexLaunchMode: null,
     lastCodexTargetProviderId: null,
     codexRestartRequiredOnNextRelay: false,
+    preserveOfficialCodexAuth: false,
   };
 }
 
@@ -1142,6 +1164,8 @@ function readStoredAppSettings(): AppSettings {
         typeof parsed.lastCodexTargetProviderId === "string" ? parsed.lastCodexTargetProviderId : fallback.lastCodexTargetProviderId,
       codexRestartRequiredOnNextRelay:
         typeof parsed.codexRestartRequiredOnNextRelay === "boolean" ? parsed.codexRestartRequiredOnNextRelay : fallback.codexRestartRequiredOnNextRelay,
+      preserveOfficialCodexAuth:
+        typeof parsed.preserveOfficialCodexAuth === "boolean" ? parsed.preserveOfficialCodexAuth : fallback.preserveOfficialCodexAuth,
     };
   } catch {
     return fallback;

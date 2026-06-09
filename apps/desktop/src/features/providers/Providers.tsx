@@ -105,7 +105,7 @@ export function Providers({
       refreshIntervalSeconds: Number(apiKeyForm.refreshIntervalSeconds) || 60,
     };
     if (!input.apiKey && !input.envVar) {
-      setApiKeyError("至少填写 API Key 或 API Key 环境变量名。直连会写入 Codex auth.json 或使用环境变量；本地代理由 Companion 注入密钥。");
+      setApiKeyError("至少填写 API Key 或 API Key 环境变量名。直连使用 API key 文件时会合并写入 Codex auth.json；本地代理由 Companion 注入密钥且不写 auth.json。");
       return;
     }
     await onImportApiKey(input);

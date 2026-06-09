@@ -1,8 +1,8 @@
 use codex_companion_core::{
     default_codex_dir, CompanionStatus, GroupPolicy, ProviderConfig, ProviderGroup, ProviderKind,
-    RepairOptions, TokenUsageSummary,
+    ProviderLaunchMode, RepairOptions, TokenUsageSummary,
 };
-use codex_companion_daemon::CompanionDaemon;
+use codex_companion_daemon::{provider_can_direct_connect, CompanionDaemon};
 use codex_companion_provider::GroupUpsert;
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -485,10 +485,49 @@ fn launch_selected_provider(
     let Some(provider) = selected_provider(app, status) else {
         return;
     };
-    match daemon.launch_provider(&provider.id, None) {
+    let mode = status
+        .config
+        .app
+        .provider_launch_modes
+        .get(&provider.id)
+        .cloned()
+        .unwrap_or_default();
+    if provider_launch_will_direct(provider, &mode)
+        && provider_direct_launch_writes_auth_json(provider)
+        && !confirm_direct_auth_write(provider)
+    {
+        app.message = format!("已取消启动账号：{}", provider.name);
+        return;
+    }
+    match daemon.launch_provider_with_mode(&provider.id, None, mode) {
         Ok(outcome) => app.message = outcome.message,
         Err(error) => app.message = format!("启动失败：{error}"),
     }
+}
+
+fn provider_launch_will_direct(provider: &ProviderConfig, mode: &ProviderLaunchMode) -> bool {
+    match mode {
+        ProviderLaunchMode::Direct => true,
+        ProviderLaunchMode::Relay => false,
+        ProviderLaunchMode::Auto => provider_can_direct_connect(provider),
+    }
+}
+
+fn provider_direct_launch_writes_auth_json(provider: &ProviderConfig) -> bool {
+    provider
+        .direct_auth_ref
+        .as_deref()
+        .or(provider.auth_ref.as_deref())
+        .map(str::trim)
+        .is_some_and(|auth_ref| auth_ref.starts_with("file:"))
+}
+
+fn confirm_direct_auth_write(provider: &ProviderConfig) -> bool {
+    let answer = prompt(&format!(
+        "{} 直连会合并写入 Codex auth.json。输入 YES 确认",
+        provider_label(provider)
+    ));
+    matches!(answer.as_deref(), Some("YES"))
 }
 
 fn create_group(daemon: &CompanionDaemon, app: &mut TuiState) {
@@ -649,4 +688,50 @@ fn prompt(label: &str) -> Option<String> {
     result
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(auth_ref: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://example.com/v1".to_string(),
+            auth_ref: auth_ref.map(ToOwned::to_owned),
+            direct_auth_ref: None,
+            model_map: Default::default(),
+            priority: 100,
+            enabled: true,
+            refresh_interval_seconds: codex_companion_core::default_refresh_interval_seconds(),
+            account: None,
+        }
+    }
+
+    #[test]
+    fn tui_launch_respects_relay_mode_when_direct_is_possible() {
+        let provider = provider(Some("file:/tmp/provider-auth.json"));
+
+        assert!(provider_launch_will_direct(
+            &provider,
+            &ProviderLaunchMode::Auto
+        ));
+        assert!(!provider_launch_will_direct(
+            &provider,
+            &ProviderLaunchMode::Relay
+        ));
+    }
+
+    #[test]
+    fn tui_requires_confirmation_for_file_auth_direct_writes() {
+        assert!(provider_direct_launch_writes_auth_json(&provider(Some(
+            "file:/tmp/provider-auth.json"
+        ))));
+        assert!(!provider_direct_launch_writes_auth_json(&provider(Some(
+            "env:OPENAI_API_KEY"
+        ))));
+        assert!(!provider_direct_launch_writes_auth_json(&provider(None)));
+    }
 }

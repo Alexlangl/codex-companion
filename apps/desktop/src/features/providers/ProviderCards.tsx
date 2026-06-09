@@ -205,14 +205,14 @@ function LaunchModeControl({
   const canDirect = canDirectLaunch(provider);
   const directTitle =
     provider.kind === "official_codex"
-      ? "直连会把官方账号 auth/token 写入 Codex，启动后需要重启 Codex"
+      ? "直连会把官方账号 OAuth token 合并写入 Codex auth.json，启动后需要重启 Codex"
       : canDirect
-        ? "直连会写入 Codex 配置和账号材料，启动后需要重启 Codex"
+        ? "直连会写入 Codex 配置；API key 文件会合并进 auth.json，并可能影响官方登录态"
         : "直连需要 API Key 文件、官方账号 auth 文件或环境变量";
   const relayTitle =
     provider.kind === "official_codex"
-      ? "本地代理由 Companion 续期并注入官方账号 headers，代理内切换不需要重启 Codex"
-      : "本地代理由 Companion 注入账号材料，代理内切换不需要重启 Codex";
+      ? "本地代理由 Companion 续期并注入官方账号 headers，不写入 Codex auth.json"
+      : "本地代理由 Companion 注入账号材料，不写入 Codex auth.json";
   return (
     <div className={`launch-mode-toggle ${compact ? "launch-mode-compact" : ""}`} role="radiogroup" aria-label="启动方式">
       <div className="launch-mode-options">

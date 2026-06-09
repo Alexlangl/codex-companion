@@ -20,6 +20,8 @@ const CODEX_OPENAI_PROVIDER_ID: &str = "openai";
 const CODEX_API_KEY_AUTH_MODE: &str = "apikey";
 #[cfg(all(target_os = "macos", not(test)))]
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
+const COMPANION_MARKER_TABLE: &str = "codex_companion";
+const COMPANION_MARKER_VERSION: i64 = 1;
 
 pub use token_usage::{collect_token_usage, collect_token_usage_cached};
 
@@ -33,32 +35,13 @@ pub fn install_companion_provider(
     codex_dir: Option<PathBuf>,
     relay: &RelayConfig,
 ) -> Result<CodexInstallStatus> {
-    let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
-    fs::create_dir_all(&codex_dir).map_err(|source| CompanionError::io(&codex_dir, source))?;
-    let config_path = codex_dir.join("config.toml");
-    let current = if config_path.exists() {
-        fs::read_to_string(&config_path)
-            .map_err(|source| CompanionError::io(&config_path, source))?
-    } else {
-        String::new()
-    };
-    let mut doc = current.parse::<DocumentMut>().map_err(|source| {
-        CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
-    })?;
-
-    doc["model_provider"] = value(COMPANION_PROVIDER_ID);
-    doc["model_providers"][COMPANION_PROVIDER_ID]["name"] = value(COMPANION_PROVIDER_NAME);
-    doc["model_providers"][COMPANION_PROVIDER_ID]["base_url"] = value(relay.base_url());
-    doc["model_providers"][COMPANION_PROVIDER_ID]["wire_api"] = value("responses");
-
-    fs::write(&config_path, doc.to_string())
-        .map_err(|source| CompanionError::io(&config_path, source))?;
-    doctor(codex_dir, relay)
+    install_companion_provider_with_token_source(codex_dir, relay, None)
 }
 
-pub fn install_direct_provider(
+pub fn install_companion_provider_with_token_source(
     codex_dir: Option<PathBuf>,
-    provider: &ProviderConfig,
+    relay: &RelayConfig,
+    token_source_override: Option<&str>,
 ) -> Result<CodexInstallStatus> {
     let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
     fs::create_dir_all(&codex_dir).map_err(|source| CompanionError::io(&codex_dir, source))?;
@@ -72,24 +55,94 @@ pub fn install_direct_provider(
     let mut doc = current.parse::<DocumentMut>().map_err(|source| {
         CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
     })?;
+    let auth_rollback = AuthRollback::capture(&codex_dir)?;
+    let mut backup = prepare_config_write(&codex_dir, &config_path, &doc)?;
+    restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
+    let auth_shape = detect_codex_auth_shape(&codex_dir)?;
 
-    let auth = resolve_direct_auth(provider)?;
+    doc["model_provider"] = value(COMPANION_PROVIDER_ID);
+    doc["model_providers"][COMPANION_PROVIDER_ID]["name"] = value(COMPANION_PROVIDER_NAME);
+    doc["model_providers"][COMPANION_PROVIDER_ID]["base_url"] = value(relay.base_url());
+    doc["model_providers"][COMPANION_PROVIDER_ID]["wire_api"] = value("responses");
+    apply_companion_marker(
+        &mut doc,
+        &backup,
+        CompanionInstallKind::Relay,
+        COMPANION_PROVIDER_ID,
+        token_source_override.unwrap_or_else(|| auth_shape.relay_token_source()),
+    );
+
+    write_config_with_auth_rollback(&config_path, &doc, &auth_rollback, &codex_dir)?;
+    let mut status = doctor(codex_dir, relay)?;
+    status.message = format!("{}，auth.json 未被本地代理写入", status.message);
+    Ok(status)
+}
+
+pub fn install_direct_provider(
+    codex_dir: Option<PathBuf>,
+    provider: &ProviderConfig,
+) -> Result<CodexInstallStatus> {
+    install_direct_provider_with_options(codex_dir, provider, DirectInstallOptions::default())
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirectInstallOptions {
+    pub preserve_official_codex_auth: bool,
+}
+
+pub fn install_direct_provider_with_options(
+    codex_dir: Option<PathBuf>,
+    provider: &ProviderConfig,
+    options: DirectInstallOptions,
+) -> Result<CodexInstallStatus> {
+    let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
+    fs::create_dir_all(&codex_dir).map_err(|source| CompanionError::io(&codex_dir, source))?;
+    let config_path = codex_dir.join("config.toml");
+    let current = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .map_err(|source| CompanionError::io(&config_path, source))?
+    } else {
+        String::new()
+    };
+    let mut doc = current.parse::<DocumentMut>().map_err(|source| {
+        CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
+    })?;
+    let auth_rollback = AuthRollback::capture(&codex_dir)?;
+    let mut backup = prepare_config_write(&codex_dir, &config_path, &doc)?;
+    let auth_shape_before = detect_codex_auth_shape(&codex_dir)?;
+    let direct_auth = resolve_direct_auth(provider)?;
+    let mut token_source = direct_auth.token_source();
+    let direct_writes_auth = direct_auth.writes_auth_json();
+    let mut restored_prior_auth_write = false;
+    if options.preserve_official_codex_auth
+        && !matches!(provider.kind, ProviderKind::OfficialCodex)
+        && matches!(&direct_auth, DirectAuthMaterial::ApiKey(_))
+        && auth_shape_before.has_official_oauth()
+    {
+        return Err(CompanionError::InvalidConfig(
+            "已开启官方 Codex 登录保护：直连第三方 API key 会写入 auth.json 并影响官方登录态，请改用本地代理或环境变量直连"
+                .to_string(),
+        ));
+    }
+
     let mut effective_model_provider = provider.id.clone();
-    let mut message = format!("Codex 已直连 provider: {}", provider.name);
-
+    let mut keychain_warning = None;
     if matches!(provider.kind, ProviderKind::OfficialCodex) {
-        let DirectAuthMaterial::CodexAuth(auth) = auth else {
+        let DirectAuthMaterial::CodexAuth(auth) = direct_auth else {
             return Err(CompanionError::InvalidConfig(format!(
                 "官方 Codex 账号 {} 缺少可直连的 OAuth access_token",
                 provider.name
             )));
         };
         write_official_codex_config(&mut doc, &provider.id);
+        ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
+        ensure_auth_backup(&mut backup, &codex_dir)?;
         write_codex_auth_json(&codex_dir, &auth)?;
+        record_auth_write(&mut backup, &codex_dir)?;
         if let Err(error) = write_codex_keychain_to_dir(&codex_dir, &auth) {
-            message = format!(
-                "{message}；Keychain 写入失败，若 Codex Desktop 仍要求登录，请检查 macOS 钥匙串权限: {error}"
-            );
+            keychain_warning = Some(format!(
+                "；Keychain 写入失败，若 Codex Desktop 仍要求登录，请检查 macOS 钥匙串权限: {error}"
+            ));
         }
         effective_model_provider = CODEX_OPENAI_PROVIDER_ID.to_string();
     } else {
@@ -100,30 +153,59 @@ pub fn install_direct_provider(
         doc["model_providers"][&provider.id]["requires_openai_auth"] = value(true);
         doc["model_providers"][&provider.id]["api_key_env_var"] = Item::None;
 
-        match auth {
+        match direct_auth {
             DirectAuthMaterial::EnvKey(env_var) => {
+                restored_prior_auth_write =
+                    restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
+                token_source = format!("environment variable {env_var}");
                 doc["model_providers"][&provider.id]["env_key"] = value(env_var);
                 doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
             }
             DirectAuthMaterial::ApiKey(api_key) => {
                 doc["model_providers"][&provider.id]["env_key"] = Item::None;
-                doc["model_providers"][&provider.id]["experimental_bearer_token"] = value(&api_key);
+                doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
+                ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
+                ensure_auth_backup(&mut backup, &codex_dir)?;
                 write_codex_openai_api_key(&codex_dir, &api_key)?;
+                record_auth_write(&mut backup, &codex_dir)?;
             }
             DirectAuthMaterial::CodexAuth(auth) => {
                 doc["model_providers"][&provider.id]["env_key"] = Item::None;
                 doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
+                ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
+                ensure_auth_backup(&mut backup, &codex_dir)?;
                 write_codex_auth_json(&codex_dir, &auth)?;
+                record_auth_write(&mut backup, &codex_dir)?;
             }
             DirectAuthMaterial::None => {
+                restored_prior_auth_write =
+                    restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
                 doc["model_providers"][&provider.id]["env_key"] = Item::None;
                 doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
             }
         }
     }
+    if !direct_writes_auth && restored_prior_auth_write {
+        token_source.push_str("; any prior Companion auth.json write was restored first");
+    }
+    apply_companion_marker(
+        &mut doc,
+        &backup,
+        CompanionInstallKind::Direct,
+        &effective_model_provider,
+        &token_source,
+    );
 
-    fs::write(&config_path, doc.to_string())
-        .map_err(|source| CompanionError::io(&config_path, source))?;
+    write_config_with_auth_rollback(&config_path, &doc, &auth_rollback, &codex_dir)?;
+    let auth_shape_after = detect_codex_auth_shape(&codex_dir)?;
+    let auth_warning = direct_auth_warning(&auth_shape_before, &auth_shape_after, &token_source);
+    let mut message = format!(
+        "Codex 已直连 provider: {}；Token source: {}{}",
+        provider.name, token_source, auth_warning
+    );
+    if let Some(warning) = keychain_warning {
+        message.push_str(&warning);
+    }
     Ok(CodexInstallStatus {
         codex_dir,
         config_path,
@@ -139,6 +221,28 @@ enum DirectAuthMaterial {
     ApiKey(String),
     CodexAuth(Value),
     None,
+}
+
+impl DirectAuthMaterial {
+    fn token_source(&self) -> String {
+        match self {
+            DirectAuthMaterial::EnvKey(env_var) => format!("environment variable {env_var}"),
+            DirectAuthMaterial::ApiKey(_) => "API key file copied into Codex auth.json".to_string(),
+            DirectAuthMaterial::CodexAuth(_) => {
+                "official Codex OAuth auth file merged into Codex auth.json".to_string()
+            }
+            DirectAuthMaterial::None => {
+                "existing Codex auth.json or Codex default auth resolution".to_string()
+            }
+        }
+    }
+
+    fn writes_auth_json(&self) -> bool {
+        matches!(
+            self,
+            DirectAuthMaterial::ApiKey(_) | DirectAuthMaterial::CodexAuth(_)
+        )
+    }
 }
 
 fn resolve_direct_auth(provider: &ProviderConfig) -> Result<DirectAuthMaterial> {
@@ -390,16 +494,62 @@ fn oauth_account_candidate(value: &Value) -> &Value {
 
 fn write_codex_auth_json(codex_dir: &Path, material: &Value) -> Result<()> {
     let auth_path = codex_dir.join("auth.json");
-    if !material.is_object() {
-        return Err(CompanionError::InvalidConfig(
-            "provider auth 不是 JSON object".to_string(),
-        ));
-    }
-    let text = serde_json::to_string_pretty(material).map_err(|source| {
+    let mut auth = if auth_path.exists() {
+        let text = fs::read_to_string(&auth_path)
+            .map_err(|source| CompanionError::io(&auth_path, source))?;
+        let auth = serde_json::from_str::<Value>(&text).map_err(|source| {
+            CompanionError::InvalidConfig(format!(
+                "无法安全更新 Codex auth.json：现有文件不是有效 JSON: {source}"
+            ))
+        })?;
+        if !auth.is_object() {
+            return Err(CompanionError::InvalidConfig(
+                "无法安全更新 Codex auth.json：现有文件不是 JSON object".to_string(),
+            ));
+        }
+        auth
+    } else {
+        Value::Object(Default::default())
+    };
+    merge_codex_auth(&mut auth, material)?;
+    let text = serde_json::to_string_pretty(&auth).map_err(|source| {
         CompanionError::InvalidConfig(format!("序列化 Codex auth.json 失败: {source}"))
     })?;
     fs::write(&auth_path, format!("{text}\n"))
         .map_err(|source| CompanionError::io(&auth_path, source))
+}
+
+fn merge_codex_auth(target: &mut Value, source: &Value) -> Result<()> {
+    let Some(target_object) = target.as_object_mut() else {
+        return Err(CompanionError::InvalidConfig(
+            "Codex auth.json 不是 JSON object".to_string(),
+        ));
+    };
+    let Some(source_object) = source.as_object() else {
+        return Err(CompanionError::InvalidConfig(
+            "provider auth 不是 JSON object".to_string(),
+        ));
+    };
+    for (key, value) in source_object {
+        if key == "tokens" && value.is_object() {
+            let target_tokens = target_object
+                .entry("tokens".to_string())
+                .or_insert_with(|| Value::Object(Default::default()));
+            if !target_tokens.is_object() {
+                *target_tokens = Value::Object(Default::default());
+            }
+            if let (Some(target_tokens), Some(source_tokens)) =
+                (target_tokens.as_object_mut(), value.as_object())
+            {
+                for (token_key, token_value) in source_tokens {
+                    target_tokens.insert(token_key.clone(), token_value.clone());
+                }
+            }
+        } else {
+            target_object.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 fn write_codex_openai_api_key(codex_dir: &Path, api_key: &str) -> Result<()> {
@@ -498,37 +648,703 @@ fn pick_json_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompanionInstallKind {
+    Relay,
+    Direct,
+}
+
+impl CompanionInstallKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            CompanionInstallKind::Relay => "relay",
+            CompanionInstallKind::Direct => "direct",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthRollback {
+    bytes: Option<Vec<u8>>,
+}
+
+impl AuthRollback {
+    fn capture(codex_dir: &Path) -> Result<Self> {
+        let auth_path = codex_dir.join("auth.json");
+        let bytes = if auth_path.exists() {
+            Some(fs::read(&auth_path).map_err(|source| CompanionError::io(&auth_path, source))?)
+        } else {
+            None
+        };
+        Ok(Self { bytes })
+    }
+
+    fn restore(&self, codex_dir: &Path) -> Result<()> {
+        let auth_path = codex_dir.join("auth.json");
+        match self.bytes.as_deref() {
+            Some(bytes) => fs::write(&auth_path, bytes)
+                .map_err(|source| CompanionError::io(&auth_path, source)),
+            None if auth_path.exists() => {
+                fs::remove_file(&auth_path).map_err(|source| CompanionError::io(&auth_path, source))
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConfigRollback {
+    bytes: Option<Vec<u8>>,
+}
+
+impl ConfigRollback {
+    fn capture(config_path: &Path) -> Result<Self> {
+        let bytes = if config_path.exists() {
+            Some(fs::read(config_path).map_err(|source| CompanionError::io(config_path, source))?)
+        } else {
+            None
+        };
+        Ok(Self { bytes })
+    }
+
+    fn restore(&self, config_path: &Path) -> Result<()> {
+        match self.bytes.as_deref() {
+            Some(bytes) => fs::write(config_path, bytes)
+                .map_err(|source| CompanionError::io(config_path, source)),
+            None if config_path.exists() => fs::remove_file(config_path)
+                .map_err(|source| CompanionError::io(config_path, source)),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ManagedConfigBackup {
+    backup_root: String,
+    config_backup: Option<String>,
+    auth_backup: Option<String>,
+    previous_config_exists: bool,
+    previous_auth_exists: bool,
+    previous_model_provider: Option<String>,
+    auth_write_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CompanionConfigMarker {
+    backup_root: Option<String>,
+    config_backup: Option<String>,
+    auth_backup: Option<String>,
+    previous_config_exists: bool,
+    previous_auth_exists: bool,
+    previous_model_provider: Option<String>,
+    target_provider: Option<String>,
+    install_kind: Option<String>,
+    token_source: Option<String>,
+    config_hash: Option<String>,
+    auth_write_hash: Option<String>,
+}
+
+impl CompanionConfigMarker {
+    fn from_doc(doc: &DocumentMut) -> Option<Self> {
+        let marker = doc.get(COMPANION_MARKER_TABLE)?;
+        if !marker
+            .get("managed")
+            .and_then(Item::as_bool)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        Some(Self {
+            backup_root: marker
+                .get("backup_root")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            config_backup: marker
+                .get("config_backup")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            auth_backup: marker
+                .get("auth_backup")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            previous_config_exists: marker
+                .get("previous_config_exists")
+                .and_then(Item::as_bool)
+                .unwrap_or(true),
+            previous_auth_exists: marker
+                .get("previous_auth_exists")
+                .and_then(Item::as_bool)
+                .unwrap_or(true),
+            previous_model_provider: marker
+                .get("previous_model_provider")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            target_provider: marker
+                .get("target_provider")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            install_kind: marker
+                .get("install_kind")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            token_source: marker
+                .get("token_source")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            config_hash: marker
+                .get("config_hash")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            auth_write_hash: marker
+                .get("auth_write_hash")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+        })
+    }
+}
+
+fn prepare_config_write(
+    codex_dir: &Path,
+    config_path: &Path,
+    doc: &DocumentMut,
+) -> Result<ManagedConfigBackup> {
+    if let Some(marker) = CompanionConfigMarker::from_doc(doc) {
+        ensure_marker_hash_matches(doc, &marker)?;
+        if let Some(backup_root) = marker.backup_root {
+            return Ok(ManagedConfigBackup {
+                backup_root,
+                config_backup: marker.config_backup,
+                auth_backup: marker.auth_backup,
+                previous_config_exists: marker.previous_config_exists,
+                previous_auth_exists: marker.previous_auth_exists,
+                previous_model_provider: marker.previous_model_provider,
+                auth_write_hash: marker.auth_write_hash,
+            });
+        }
+    }
+
+    let backup_root = create_backup_root(codex_dir)?;
+    let config_backup = if config_path.exists() {
+        backup_file_to_root(config_path, &backup_root, codex_dir)?
+    } else {
+        None
+    };
+    Ok(ManagedConfigBackup {
+        backup_root: path_relative_to_codex_dir(&backup_root, codex_dir),
+        config_backup,
+        auth_backup: None,
+        previous_config_exists: config_path.exists(),
+        previous_auth_exists: false,
+        previous_model_provider: doc
+            .get("model_provider")
+            .and_then(Item::as_str)
+            .map(ToOwned::to_owned),
+        auth_write_hash: None,
+    })
+}
+
+fn ensure_auth_backup(backup: &mut ManagedConfigBackup, codex_dir: &Path) -> Result<()> {
+    if backup.auth_backup.is_some() {
+        return Ok(());
+    }
+    if backup.auth_write_hash.is_some() {
+        ensure_managed_auth_write_unchanged(backup, codex_dir)?;
+        return Ok(());
+    }
+    let auth_path = codex_dir.join("auth.json");
+    if !auth_path.exists() {
+        backup.previous_auth_exists = false;
+        return Ok(());
+    }
+    backup.previous_auth_exists = true;
+    let backup_root = codex_dir.join(&backup.backup_root);
+    backup.auth_backup = backup_file_to_root(&auth_path, &backup_root, codex_dir)?;
+    Ok(())
+}
+
+fn record_auth_write(backup: &mut ManagedConfigBackup, codex_dir: &Path) -> Result<()> {
+    let auth_path = codex_dir.join("auth.json");
+    backup.auth_write_hash = Some(hash_file(&auth_path)?);
+    Ok(())
+}
+
+fn ensure_managed_auth_write_unchanged(
+    backup: &ManagedConfigBackup,
+    codex_dir: &Path,
+) -> Result<()> {
+    let Some(expected_hash) = backup.auth_write_hash.as_deref() else {
+        return Ok(());
+    };
+    let auth_path = codex_dir.join("auth.json");
+    if !auth_path.exists() {
+        return Err(CompanionError::InvalidConfig(
+            "Codex auth.json 在 Companion 写入后已不存在；为避免误覆盖账号材料，已停止写入"
+                .to_string(),
+        ));
+    }
+    let current_hash = hash_file(&auth_path)?;
+    if current_hash != expected_hash {
+        return Err(CompanionError::InvalidConfig(
+            "Codex auth.json 在 Companion 写入后发生过修改；为避免覆盖官方登录或用户 API key，已停止写入"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn restore_prior_auth_write_if_managed(
+    backup: &mut ManagedConfigBackup,
+    codex_dir: &Path,
+) -> Result<bool> {
+    if backup.auth_write_hash.is_none() {
+        return Ok(false);
+    }
+    ensure_managed_auth_write_unchanged(backup, codex_dir)?;
+    let auth_path = codex_dir.join("auth.json");
+    if backup.previous_auth_exists {
+        let backup_path = backup.auth_backup.as_deref().ok_or_else(|| {
+            CompanionError::InvalidConfig(
+                "Companion marker 表示原 auth.json 存在，但缺少 auth_backup；已停止写入"
+                    .to_string(),
+            )
+        })?;
+        let backup_path = resolve_codex_relative(codex_dir, backup_path);
+        fs::copy(&backup_path, &auth_path)
+            .map_err(|source| CompanionError::io(&backup_path, source))?;
+    } else if auth_path.exists() {
+        fs::remove_file(&auth_path).map_err(|source| CompanionError::io(&auth_path, source))?;
+    }
+    backup.auth_backup = None;
+    backup.previous_auth_exists = auth_path.exists();
+    backup.auth_write_hash = None;
+    Ok(true)
+}
+
+fn apply_companion_marker(
+    doc: &mut DocumentMut,
+    backup: &ManagedConfigBackup,
+    install_kind: CompanionInstallKind,
+    target_provider: &str,
+    token_source: &str,
+) {
+    doc[COMPANION_MARKER_TABLE]["managed"] = value(true);
+    doc[COMPANION_MARKER_TABLE]["version"] = value(COMPANION_MARKER_VERSION);
+    doc[COMPANION_MARKER_TABLE]["install_kind"] = value(install_kind.as_str());
+    doc[COMPANION_MARKER_TABLE]["target_provider"] = value(target_provider);
+    doc[COMPANION_MARKER_TABLE]["backup_root"] = value(&backup.backup_root);
+    doc[COMPANION_MARKER_TABLE]["previous_config_exists"] = value(backup.previous_config_exists);
+    doc[COMPANION_MARKER_TABLE]["previous_auth_exists"] = value(backup.previous_auth_exists);
+    if let Some(provider) = backup.previous_model_provider.as_deref() {
+        doc[COMPANION_MARKER_TABLE]["previous_model_provider"] = value(provider);
+    } else {
+        doc[COMPANION_MARKER_TABLE]["previous_model_provider"] = Item::None;
+    }
+    if let Some(config_backup) = backup.config_backup.as_deref() {
+        doc[COMPANION_MARKER_TABLE]["config_backup"] = value(config_backup);
+    } else {
+        doc[COMPANION_MARKER_TABLE]["config_backup"] = Item::None;
+    }
+    if let Some(auth_backup) = backup.auth_backup.as_deref() {
+        doc[COMPANION_MARKER_TABLE]["auth_backup"] = value(auth_backup);
+    } else {
+        doc[COMPANION_MARKER_TABLE]["auth_backup"] = Item::None;
+    }
+    if let Some(auth_hash) = backup.auth_write_hash.as_deref() {
+        doc[COMPANION_MARKER_TABLE]["auth_write_hash"] = value(auth_hash);
+    } else {
+        doc[COMPANION_MARKER_TABLE]["auth_write_hash"] = Item::None;
+    }
+    doc[COMPANION_MARKER_TABLE]["token_source"] = value(token_source);
+    doc[COMPANION_MARKER_TABLE]["written_at"] = value(Local::now().to_rfc3339());
+    doc[COMPANION_MARKER_TABLE]["config_hash"] = value("");
+    let hash = config_doc_hash(doc);
+    doc[COMPANION_MARKER_TABLE]["config_hash"] = value(hash);
+}
+
+fn ensure_marker_hash_matches(doc: &DocumentMut, marker: &CompanionConfigMarker) -> Result<()> {
+    let Some(expected) = marker
+        .config_hash
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(CompanionError::InvalidConfig(
+            "Codex config.toml 已带 Companion marker，但缺少 config_hash；为避免覆盖用户修改，已停止写入"
+                .to_string(),
+        ));
+    };
+    let actual = config_doc_hash(doc);
+    if actual != expected {
+        return Err(CompanionError::InvalidConfig(
+            "Codex config.toml 在 Companion 接管后发生过手动修改；为避免覆盖用户配置，已停止写入。请先备份并手动处理 [codex_companion] marker"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn config_doc_hash(doc: &DocumentMut) -> String {
+    let mut clone = doc.clone();
+    if clone.get(COMPANION_MARKER_TABLE).is_some() {
+        clone[COMPANION_MARKER_TABLE]["config_hash"] = value("");
+    }
+    stable_hash_hex(&clone.to_string())
+}
+
+fn stable_hash_hex(text: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).map_err(|source| CompanionError::io(path, source))?;
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in &bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("{hash:016x}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexAuthShape {
+    Missing,
+    Empty,
+    OfficialOAuth,
+    ApiKey,
+    ApiKeyAndOAuth,
+}
+
+impl CodexAuthShape {
+    fn label(self) -> &'static str {
+        match self {
+            CodexAuthShape::Missing => "missing auth.json",
+            CodexAuthShape::Empty => "empty auth.json",
+            CodexAuthShape::OfficialOAuth => "official OAuth tokens",
+            CodexAuthShape::ApiKey => "OPENAI_API_KEY",
+            CodexAuthShape::ApiKeyAndOAuth => "OPENAI_API_KEY plus official OAuth tokens",
+        }
+    }
+
+    fn relay_token_source(self) -> &'static str {
+        match self {
+            CodexAuthShape::OfficialOAuth | CodexAuthShape::ApiKeyAndOAuth => {
+                "Companion relay injection from official OAuth/auth material"
+            }
+            CodexAuthShape::ApiKey => "Companion relay injection from API key auth material",
+            CodexAuthShape::Missing | CodexAuthShape::Empty => {
+                "Companion relay injection from selected provider"
+            }
+        }
+    }
+
+    fn has_official_oauth(self) -> bool {
+        matches!(
+            self,
+            CodexAuthShape::OfficialOAuth | CodexAuthShape::ApiKeyAndOAuth
+        )
+    }
+}
+
+fn detect_codex_auth_shape(codex_dir: &Path) -> Result<CodexAuthShape> {
+    let auth_path = codex_dir.join("auth.json");
+    if !auth_path.exists() {
+        return Ok(CodexAuthShape::Missing);
+    }
+    let text =
+        fs::read_to_string(&auth_path).map_err(|source| CompanionError::io(&auth_path, source))?;
+    let auth = serde_json::from_str::<Value>(&text).map_err(|source| {
+        CompanionError::InvalidConfig(format!(
+            "无法识别 Codex auth.json 风险：现有文件不是有效 JSON: {source}"
+        ))
+    })?;
+    if !auth.is_object() {
+        return Err(CompanionError::InvalidConfig(
+            "无法识别 Codex auth.json 风险：现有文件不是 JSON object".to_string(),
+        ));
+    }
+    Ok(classify_codex_auth_shape(&auth))
+}
+
+fn classify_codex_auth_shape(auth: &Value) -> CodexAuthShape {
+    let has_api_key = auth
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let null = Value::Null;
+    let candidate = oauth_account_candidate(auth);
+    let tokens = candidate
+        .get("tokens")
+        .or_else(|| auth.get("tokens"))
+        .unwrap_or(&null);
+    let credentials = candidate
+        .get("credentials")
+        .or_else(|| auth.get("credentials"))
+        .unwrap_or(&null);
+    let auth_source = auth.get("auth").unwrap_or(&null);
+    let sources = [tokens, credentials, auth_source, candidate, auth];
+    let has_oauth = pick_first_json_string(
+        &sources,
+        &[
+            &["refresh_token"],
+            &["refreshToken"],
+            &["access_token"],
+            &["accessToken"],
+            &["id_token"],
+            &["idToken"],
+            &["session_token"],
+            &["sessionToken"],
+            &["chatgpt_account_id"],
+            &["account_id"],
+            &["accountId"],
+            &["credentials", "refresh_token"],
+            &["credentials", "access_token"],
+            &["tokens", "refresh_token"],
+            &["tokens", "access_token"],
+        ],
+    )
+    .is_some();
+    match (has_api_key, has_oauth) {
+        (true, true) => CodexAuthShape::ApiKeyAndOAuth,
+        (true, false) => CodexAuthShape::ApiKey,
+        (false, true) => CodexAuthShape::OfficialOAuth,
+        (false, false) => CodexAuthShape::Empty,
+    }
+}
+
+fn direct_auth_warning(
+    before: &CodexAuthShape,
+    after: &CodexAuthShape,
+    token_source: &str,
+) -> String {
+    let mut parts = vec![format!(
+        "；auth.json: {} -> {}",
+        before.label(),
+        after.label()
+    )];
+    if before.has_official_oauth() && token_source.contains("API key") {
+        parts.push(
+            "；warning: direct API key mode updates OPENAI_API_KEY while preserving existing OAuth refresh data"
+                .to_string(),
+        );
+    }
+    parts.concat()
+}
+
 pub fn uninstall_companion_provider(codex_dir: Option<PathBuf>) -> Result<CodexInstallStatus> {
     let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
     let config_path = codex_dir.join("config.toml");
-    if config_path.exists() {
-        let current = fs::read_to_string(&config_path)
-            .map_err(|source| CompanionError::io(&config_path, source))?;
-        let mut doc = current.parse::<DocumentMut>().map_err(|source| {
-            CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
-        })?;
-        if doc
-            .get("model_provider")
-            .and_then(Item::as_str)
-            .is_some_and(|provider| provider == COMPANION_PROVIDER_ID)
-        {
-            doc["model_provider"] = value("openai");
-        }
-        doc["model_providers"][COMPANION_PROVIDER_ID] = Item::None;
-        fs::write(&config_path, doc.to_string())
-            .map_err(|source| CompanionError::io(&config_path, source))?;
+    if !config_path.exists() {
+        return doctor(codex_dir, &RelayConfig::default());
     }
+    let current = fs::read_to_string(&config_path)
+        .map_err(|source| CompanionError::io(&config_path, source))?;
+    let doc = current.parse::<DocumentMut>().map_err(|source| {
+        CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
+    })?;
+    let marker = match CompanionConfigMarker::from_doc(&doc) {
+        Some(marker) => marker,
+        None => {
+            return uninstall_legacy_companion_provider(codex_dir, config_path, doc);
+        }
+    };
+    ensure_marker_hash_matches(&doc, &marker)?;
+    if !matches!(marker.install_kind.as_deref(), Some("relay" | "direct")) {
+        return Err(CompanionError::InvalidConfig(
+            "Codex config.toml 的 Companion marker 缺少有效 install_kind；为避免覆盖用户配置，已停止卸载"
+                .to_string(),
+        ));
+    }
+    let live_provider = doc.get("model_provider").and_then(Item::as_str);
+    if marker.target_provider.as_deref() != live_provider {
+        return Err(CompanionError::InvalidConfig(format!(
+            "Codex config.toml 当前 provider ({}) 与 Companion marker 目标 ({}) 不一致；为避免覆盖用户配置，已停止卸载",
+            live_provider.unwrap_or("<none>"),
+            marker.target_provider.as_deref().unwrap_or("<none>")
+        )));
+    }
+    validate_restore_inputs(&codex_dir, &marker)?;
+    restore_managed_install(&codex_dir, &config_path, &marker)?;
     doctor(codex_dir, &RelayConfig::default())
+}
+
+fn uninstall_legacy_companion_provider(
+    codex_dir: PathBuf,
+    config_path: PathBuf,
+    mut doc: DocumentMut,
+) -> Result<CodexInstallStatus> {
+    let live_provider = doc.get("model_provider").and_then(Item::as_str);
+    if live_provider != Some(COMPANION_PROVIDER_ID) {
+        return Err(CompanionError::InvalidConfig(
+            "Codex config.toml 没有 Companion ownership marker；为避免覆盖用户配置，已停止卸载"
+                .to_string(),
+        ));
+    }
+    let has_companion_provider = doc
+        .get("model_providers")
+        .and_then(|item| item.get(COMPANION_PROVIDER_ID))
+        .is_some();
+    if !has_companion_provider {
+        return Err(CompanionError::InvalidConfig(
+            "Codex config.toml 当前 provider 是 Companion，但缺少 Companion provider 配置；为避免覆盖用户配置，已停止卸载"
+                .to_string(),
+        ));
+    }
+
+    doc["model_provider"] = value("openai");
+    doc["model_providers"][COMPANION_PROVIDER_ID] = Item::None;
+    fs::write(&config_path, doc.to_string())
+        .map_err(|source| CompanionError::io(&config_path, source))?;
+    doctor(codex_dir, &RelayConfig::default())
+}
+
+fn validate_restore_inputs(codex_dir: &Path, marker: &CompanionConfigMarker) -> Result<()> {
+    if marker.previous_config_exists {
+        let backup = marker.config_backup.as_deref().ok_or_else(|| {
+            CompanionError::InvalidConfig(
+                "Companion marker 表示原 config.toml 存在，但缺少 config_backup；已停止卸载"
+                    .to_string(),
+            )
+        })?;
+        let backup_path = resolve_codex_relative(codex_dir, backup);
+        if !backup_path.exists() {
+            return Err(CompanionError::InvalidConfig(format!(
+                "Companion config backup 不存在：{}；已停止卸载且未恢复 auth.json",
+                backup_path.display()
+            )));
+        }
+    }
+    let Some(expected_hash) = marker.auth_write_hash.as_deref() else {
+        return Ok(());
+    };
+    let auth_path = codex_dir.join("auth.json");
+    if !auth_path.exists() {
+        return Err(CompanionError::InvalidConfig(
+            "Codex auth.json 在 Companion 写入后已不存在；为避免误恢复账号材料，已停止卸载"
+                .to_string(),
+        ));
+    }
+    let current_hash = hash_file(&auth_path)?;
+    if current_hash != expected_hash {
+        return Err(CompanionError::InvalidConfig(
+            "Codex auth.json 在 Companion 写入后发生过修改；为避免覆盖官方登录或用户 API key，已停止卸载"
+                .to_string(),
+        ));
+    }
+    if marker.previous_auth_exists {
+        let backup = marker.auth_backup.as_deref().ok_or_else(|| {
+            CompanionError::InvalidConfig(
+                "Companion marker 表示原 auth.json 存在，但缺少 auth_backup；已停止卸载"
+                    .to_string(),
+            )
+        })?;
+        let backup_path = resolve_codex_relative(codex_dir, backup);
+        if !backup_path.exists() {
+            return Err(CompanionError::InvalidConfig(format!(
+                "Companion auth backup 不存在：{}；已停止卸载且未恢复 config.toml",
+                backup_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn restore_managed_install(
+    codex_dir: &Path,
+    config_path: &Path,
+    marker: &CompanionConfigMarker,
+) -> Result<()> {
+    let config_rollback = ConfigRollback::capture(config_path)?;
+    let auth_rollback = AuthRollback::capture(codex_dir)?;
+    restore_config_from_marker(codex_dir, config_path, marker)?;
+    if let Err(auth_error) = restore_auth_from_marker(codex_dir, marker) {
+        let config_restore = config_rollback.restore(config_path);
+        let auth_restore = auth_rollback.restore(codex_dir);
+        if let Err(rollback_error) = config_restore.and(auth_restore) {
+            return Err(CompanionError::InvalidConfig(format!(
+                "卸载已恢复 config.toml 但恢复 auth.json 失败: {auth_error}；尝试回滚卸载状态也失败: {rollback_error}"
+            )));
+        }
+        return Err(auth_error);
+    }
+    Ok(())
+}
+
+fn restore_config_from_marker(
+    codex_dir: &Path,
+    config_path: &Path,
+    marker: &CompanionConfigMarker,
+) -> Result<()> {
+    if marker.previous_config_exists {
+        let backup = marker.config_backup.as_deref().ok_or_else(|| {
+            CompanionError::InvalidConfig(
+                "Companion marker 表示原 config.toml 存在，但缺少 config_backup；已停止卸载"
+                    .to_string(),
+            )
+        })?;
+        let backup_path = resolve_codex_relative(codex_dir, backup);
+        fs::copy(&backup_path, config_path)
+            .map_err(|source| CompanionError::io(&backup_path, source))?;
+    } else if config_path.exists() {
+        fs::remove_file(config_path).map_err(|source| CompanionError::io(config_path, source))?;
+    }
+    Ok(())
+}
+
+fn restore_auth_from_marker(codex_dir: &Path, marker: &CompanionConfigMarker) -> Result<()> {
+    let Some(expected_hash) = marker.auth_write_hash.as_deref() else {
+        return Ok(());
+    };
+    let auth_path = codex_dir.join("auth.json");
+    if !auth_path.exists() {
+        return Err(CompanionError::InvalidConfig(
+            "Codex auth.json 在 Companion 写入后已不存在；为避免误恢复账号材料，已停止卸载"
+                .to_string(),
+        ));
+    }
+    let current_hash = hash_file(&auth_path)?;
+    if current_hash != expected_hash {
+        return Err(CompanionError::InvalidConfig(
+            "Codex auth.json 在 Companion 写入后发生过修改；为避免覆盖官方登录或用户 API key，已停止卸载"
+                .to_string(),
+        ));
+    }
+    if marker.previous_auth_exists {
+        let backup = marker.auth_backup.as_deref().ok_or_else(|| {
+            CompanionError::InvalidConfig(
+                "Companion marker 表示原 auth.json 存在，但缺少 auth_backup；已停止卸载"
+                    .to_string(),
+            )
+        })?;
+        let backup_path = resolve_codex_relative(codex_dir, backup);
+        fs::copy(&backup_path, &auth_path)
+            .map_err(|source| CompanionError::io(&backup_path, source))?;
+    } else {
+        fs::remove_file(&auth_path).map_err(|source| CompanionError::io(&auth_path, source))?;
+    }
+    Ok(())
 }
 
 pub fn doctor(codex_dir: PathBuf, relay: &RelayConfig) -> Result<CodexInstallStatus> {
     let config_path = codex_dir.join("config.toml");
     let mut model_provider = None;
     let mut installed = false;
+    let mut token_source = None;
     if config_path.exists() {
         let current = fs::read_to_string(&config_path)
             .map_err(|source| CompanionError::io(&config_path, source))?;
         if let Ok(doc) = current.parse::<DocumentMut>() {
+            token_source = CompanionConfigMarker::from_doc(&doc).and_then(|marker| {
+                let live_provider = doc.get("model_provider").and_then(Item::as_str);
+                if marker.target_provider.as_deref() == live_provider {
+                    marker.token_source
+                } else {
+                    None
+                }
+            });
             model_provider = doc
                 .get("model_provider")
                 .and_then(Item::as_str)
@@ -550,6 +1366,11 @@ pub fn doctor(codex_dir: PathBuf, relay: &RelayConfig) -> Result<CodexInstallSta
         "Codex 配置存在，但尚未设置 model_provider".to_string()
     } else {
         "Codex 配置尚未创建，可在设置里写入本地代理配置".to_string()
+    };
+    let message = if let Some(token_source) = token_source.as_deref() {
+        format!("{message}；Token source: {token_source}")
+    } else {
+        message
     };
     Ok(CodexInstallStatus {
         codex_dir,
@@ -1321,18 +2142,83 @@ fn ensure_backup_root<'a>(
 }
 
 fn backup_file(path: &Path, backup_root: &Path, codex_dir: &Path) -> Result<()> {
+    backup_file_to_root(path, backup_root, codex_dir)?;
+    Ok(())
+}
+
+fn backup_file_to_root(
+    path: &Path,
+    backup_root: &Path,
+    codex_dir: &Path,
+) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
     let relative = path.strip_prefix(codex_dir).unwrap_or(path);
     let target = backup_root.join(relative);
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
     }
     fs::copy(path, &target).map_err(|source| CompanionError::io(path, source))?;
+    Ok(Some(path_relative_to_codex_dir(&target, codex_dir)))
+}
+
+fn path_relative_to_codex_dir(path: &Path, codex_dir: &Path) -> String {
+    path.strip_prefix(codex_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn resolve_codex_relative(codex_dir: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        codex_dir.join(path)
+    }
+}
+
+fn write_config_with_auth_rollback(
+    config_path: &Path,
+    doc: &DocumentMut,
+    auth_rollback: &AuthRollback,
+    codex_dir: &Path,
+) -> Result<()> {
+    if let Err(source) = fs::write(config_path, doc.to_string()) {
+        let write_error = CompanionError::io(config_path, source);
+        if let Err(rollback_error) = auth_rollback.restore(codex_dir) {
+            return Err(CompanionError::InvalidConfig(format!(
+                "写入 Codex config.toml 失败: {write_error}；尝试恢复 auth.json 也失败: {rollback_error}"
+            )));
+        }
+        return Err(write_error);
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn api_key_provider(
+        auth_ref: Option<String>,
+        direct_auth_ref: Option<String>,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            id: "openrouter".to_string(),
+            name: "OpenRouter".to_string(),
+            kind: codex_companion_core::ProviderKind::OpenAiCompatible,
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            auth_ref,
+            direct_auth_ref,
+            model_map: Default::default(),
+            priority: 100,
+            enabled: true,
+            refresh_interval_seconds: codex_companion_core::default_refresh_interval_seconds(),
+            account: None,
+        }
+    }
 
     #[test]
     fn install_writes_companion_provider() {
@@ -1345,6 +2231,487 @@ mod tests {
         assert!(text.contains("model_provider = \"codex-companion\""));
         assert!(text.contains("name = \"本地代理\""));
         assert!(text.contains("base_url = \"http://127.0.0.1:17687/v1\""));
+    }
+
+    #[test]
+    fn relay_install_backs_up_and_uninstall_restores_previous_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\n\n[model_providers.openai]\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\n",
+        )
+        .expect("config");
+        let relay = RelayConfig::default();
+
+        install_companion_provider(Some(temp.path().to_path_buf()), &relay).expect("install");
+
+        let installed = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(installed.contains("codex_companion = {"));
+        assert!(installed.contains("previous_model_provider = \"openai\""));
+        assert!(installed.contains("config_backup = \"backups/codex-companion/"));
+
+        let status = uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect("uninstall restores");
+
+        assert!(!status.installed);
+        assert_eq!(status.model_provider.as_deref(), Some("openai"));
+        let restored = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(restored.contains("model_provider = \"openai\""));
+        assert!(!restored.contains("codex_companion ="));
+        assert!(!restored.contains("codex-companion"));
+    }
+
+    #[test]
+    fn uninstall_allows_legacy_companion_config_without_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"codex-companion\"\n\n[model_providers.openai]\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\n\n[model_providers.codex-companion]\nname = \"本地代理\"\nbase_url = \"http://127.0.0.1:17687/v1\"\nwire_api = \"responses\"\n",
+        )
+        .expect("config");
+
+        let status = uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect("legacy uninstall should clean companion provider");
+
+        assert!(!status.installed);
+        assert_eq!(status.model_provider.as_deref(), Some("openai"));
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains("model_provider = \"openai\""));
+        assert!(!config.contains("[model_providers.codex-companion]"));
+        assert!(!config.contains("codex_companion ="));
+    }
+
+    #[test]
+    fn uninstall_without_marker_still_blocks_when_live_provider_is_not_companion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\n\n[model_providers.openai]\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\n\n[model_providers.codex-companion]\nname = \"本地代理\"\nbase_url = \"http://127.0.0.1:17687/v1\"\nwire_api = \"responses\"\n",
+        )
+        .expect("config");
+
+        let error = uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect_err("non-live legacy companion table should not be removed");
+
+        assert!(error
+            .to_string()
+            .contains("没有 Companion ownership marker"));
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains("[model_providers.codex-companion]"));
+        assert!(config.contains("model_provider = \"openai\""));
+    }
+
+    #[test]
+    fn uninstall_stops_when_managed_config_changed_after_install() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("config");
+        let relay = RelayConfig::default();
+        install_companion_provider(Some(temp.path().to_path_buf()), &relay).expect("install");
+        let mut config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        config.push_str("\nmodel = \"manual-change\"\n");
+        fs::write(temp.path().join("config.toml"), config).expect("config");
+
+        let error = uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect_err("manual drift should block uninstall");
+
+        assert!(error.to_string().contains("发生过手动修改"));
+        let current = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(current.contains("model = \"manual-change\""));
+        assert!(current.contains("codex_companion ="));
+    }
+
+    #[test]
+    fn relay_install_preserves_existing_auth_json() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original_auth = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "refresh_token": "refresh-token",
+                "chatgpt_account_id": "account-id"
+            }
+        })
+        .to_string();
+        fs::write(temp.path().join("auth.json"), &original_auth).expect("auth");
+
+        let status =
+            install_companion_provider(Some(temp.path().to_path_buf()), &RelayConfig::default())
+                .expect("install");
+
+        assert!(status.message.contains("Token source"));
+        let auth = fs::read_to_string(temp.path().join("auth.json")).expect("auth");
+        assert_eq!(auth, original_auth);
+    }
+
+    #[test]
+    fn relay_install_records_selected_token_source_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let status = install_companion_provider_with_token_source(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            Some("Companion relay injection from provider OpenRouter"),
+        )
+        .expect("install");
+
+        assert!(status
+            .message
+            .contains("Companion relay injection from provider OpenRouter"));
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config
+            .contains("token_source = \"Companion relay injection from provider OpenRouter\""));
+    }
+
+    #[test]
+    fn direct_api_key_preserves_oauth_tokens_and_warns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("auth.json"),
+            serde_json::json!({
+                "OPENAI_API_KEY": null,
+                "tokens": {
+                    "refresh_token": "refresh-token",
+                    "chatgpt_account_id": "account-id"
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth");
+        let auth_path = temp.path().join("provider-auth.json");
+        fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
+        let provider = ProviderConfig {
+            id: "openrouter".to_string(),
+            name: "OpenRouter".to_string(),
+            kind: codex_companion_core::ProviderKind::OpenAiCompatible,
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            auth_ref: Some(format!("file:{}", auth_path.display())),
+            direct_auth_ref: None,
+            model_map: Default::default(),
+            priority: 100,
+            enabled: true,
+            refresh_interval_seconds: codex_companion_core::default_refresh_interval_seconds(),
+            account: None,
+        };
+
+        let status = install_direct_provider(Some(temp.path().to_path_buf()), &provider)
+            .expect("install direct");
+
+        assert!(status.message.contains("warning: direct API key mode"));
+        let auth = fs::read_to_string(temp.path().join("auth.json")).expect("auth");
+        assert!(auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
+        assert!(auth.contains("\"refresh_token\": \"refresh-token\""));
+        assert!(auth.contains("\"chatgpt_account_id\": \"account-id\""));
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains("auth_backup = \"backups/codex-companion/"));
+        assert!(config.contains("auth_write_hash = "));
+    }
+
+    #[test]
+    fn preserve_official_auth_blocks_third_party_api_key_auth_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original_auth = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {"refresh_token": "refresh-token"}
+        })
+        .to_string();
+        fs::write(temp.path().join("auth.json"), &original_auth).expect("auth");
+        let auth_path = temp.path().join("provider-auth.json");
+        fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
+        let provider = api_key_provider(Some(format!("file:{}", auth_path.display())), None);
+
+        let error = install_direct_provider_with_options(
+            Some(temp.path().to_path_buf()),
+            &provider,
+            DirectInstallOptions {
+                preserve_official_codex_auth: true,
+            },
+        )
+        .expect_err("preserve setting should block direct auth write");
+
+        assert!(error.to_string().contains("官方 Codex 登录保护"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).expect("auth"),
+            original_auth
+        );
+        assert!(!temp.path().join("config.toml").exists());
+    }
+
+    #[test]
+    fn relay_install_restores_previous_direct_auth_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original_auth = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "refresh_token": "refresh-token",
+                "chatgpt_account_id": "account-id"
+            }
+        })
+        .to_string();
+        fs::write(temp.path().join("auth.json"), &original_auth).expect("auth");
+        let auth_path = temp.path().join("provider-auth.json");
+        fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
+        let provider = api_key_provider(Some(format!("file:{}", auth_path.display())), None);
+
+        install_direct_provider(Some(temp.path().to_path_buf()), &provider)
+            .expect("install direct");
+        assert!(fs::read_to_string(temp.path().join("auth.json"))
+            .expect("auth")
+            .contains("\"OPENAI_API_KEY\": \"sk-test\""));
+
+        let status =
+            install_companion_provider(Some(temp.path().to_path_buf()), &RelayConfig::default())
+                .expect("install relay");
+
+        assert!(status.message.contains("auth.json 未被本地代理写入"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).expect("auth"),
+            original_auth
+        );
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(!config.contains("auth_write_hash ="));
+    }
+
+    #[test]
+    fn direct_after_relay_restore_backs_up_current_auth_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original_auth = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {"refresh_token": "old-refresh"}
+        })
+        .to_string();
+        fs::write(temp.path().join("auth.json"), &original_auth).expect("auth");
+        let first_auth_path = temp.path().join("first-provider-auth.json");
+        fs::write(&first_auth_path, r#"{"api_key":"sk-first"}"#).expect("provider auth");
+        let first_provider =
+            api_key_provider(Some(format!("file:{}", first_auth_path.display())), None);
+
+        install_direct_provider(Some(temp.path().to_path_buf()), &first_provider)
+            .expect("install direct");
+        install_companion_provider(Some(temp.path().to_path_buf()), &RelayConfig::default())
+            .expect("install relay");
+
+        let current_auth = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {"refresh_token": "new-refresh"}
+        })
+        .to_string();
+        fs::write(temp.path().join("auth.json"), &current_auth).expect("auth");
+        let second_auth_path = temp.path().join("second-provider-auth.json");
+        fs::write(&second_auth_path, r#"{"api_key":"sk-second"}"#).expect("provider auth");
+        let second_provider =
+            api_key_provider(Some(format!("file:{}", second_auth_path.display())), None);
+
+        install_direct_provider(Some(temp.path().to_path_buf()), &second_provider)
+            .expect("install direct again");
+        uninstall_companion_provider(Some(temp.path().to_path_buf())).expect("uninstall");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).expect("auth"),
+            current_auth
+        );
+    }
+
+    #[test]
+    fn uninstall_validates_config_backup_before_restoring_auth() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original_auth = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {"refresh_token": "refresh-token"}
+        })
+        .to_string();
+        fs::write(temp.path().join("auth.json"), &original_auth).expect("auth");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("config");
+        let auth_path = temp.path().join("provider-auth.json");
+        fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
+        let provider = api_key_provider(Some(format!("file:{}", auth_path.display())), None);
+        install_direct_provider(Some(temp.path().to_path_buf()), &provider)
+            .expect("install direct");
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        let doc = config.parse::<DocumentMut>().expect("config doc");
+        let config_backup = CompanionConfigMarker::from_doc(&doc)
+            .and_then(|marker| marker.config_backup)
+            .expect("config backup");
+        fs::remove_file(temp.path().join(config_backup)).expect("remove backup");
+
+        let error = uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect_err("missing config backup should block before auth restore");
+
+        assert!(error.to_string().contains("config backup 不存在"));
+        let auth = fs::read_to_string(temp.path().join("auth.json")).expect("auth");
+        assert!(auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
+    }
+
+    #[test]
+    fn uninstall_rolls_back_config_when_auth_restore_fails_after_config_restore() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original_auth = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {"refresh_token": "refresh-token"}
+        })
+        .to_string();
+        fs::write(temp.path().join("auth.json"), &original_auth).expect("auth");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("config");
+        let auth_path = temp.path().join("provider-auth.json");
+        fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
+        let provider = api_key_provider(Some(format!("file:{}", auth_path.display())), None);
+        install_direct_provider(Some(temp.path().to_path_buf()), &provider)
+            .expect("install direct");
+        let managed_config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        let managed_auth = fs::read_to_string(temp.path().join("auth.json")).expect("auth");
+        let auth_backup = CompanionConfigMarker::from_doc(
+            &managed_config
+                .parse::<DocumentMut>()
+                .expect("managed config doc"),
+        )
+        .and_then(|marker| marker.auth_backup)
+        .expect("auth backup");
+        let auth_backup_path = temp.path().join(auth_backup);
+        fs::remove_file(&auth_backup_path).expect("remove auth backup file");
+        fs::create_dir_all(&auth_backup_path).expect("replace auth backup with directory");
+
+        let error = uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect_err("auth restore failure should roll back restored config");
+
+        assert!(!error.to_string().is_empty());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("config.toml")).expect("config"),
+            managed_config
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).expect("auth"),
+            managed_auth
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_install_rolls_back_auth_when_config_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, "model_provider = \"openai\"\n").expect("config");
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o444))
+            .expect("readonly config");
+        let original_auth = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {"refresh_token": "refresh-token"}
+        })
+        .to_string();
+        fs::write(temp.path().join("auth.json"), &original_auth).expect("auth");
+        let auth_path = temp.path().join("provider-auth.json");
+        fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
+        let provider = api_key_provider(Some(format!("file:{}", auth_path.display())), None);
+
+        install_direct_provider(Some(temp.path().to_path_buf()), &provider)
+            .expect_err("readonly config should fail");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).expect("auth"),
+            original_auth
+        );
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o644))
+            .expect("restore config permissions");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_install_rolls_back_auth_restore_when_config_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original_auth = serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {"refresh_token": "refresh-token"}
+        })
+        .to_string();
+        fs::write(temp.path().join("auth.json"), &original_auth).expect("auth");
+        let auth_path = temp.path().join("provider-auth.json");
+        fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
+        let provider = api_key_provider(Some(format!("file:{}", auth_path.display())), None);
+        install_direct_provider(Some(temp.path().to_path_buf()), &provider)
+            .expect("install direct");
+        let managed_auth = fs::read_to_string(temp.path().join("auth.json")).expect("auth");
+        assert!(managed_auth.contains("\"OPENAI_API_KEY\": \"sk-test\""));
+        let config_path = temp.path().join("config.toml");
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o444))
+            .expect("readonly config");
+
+        install_companion_provider(Some(temp.path().to_path_buf()), &RelayConfig::default())
+            .expect_err("readonly config should fail");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).expect("auth"),
+            managed_auth
+        );
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o644))
+            .expect("restore config permissions");
+    }
+
+    #[test]
+    fn direct_env_install_restores_previous_direct_auth_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("provider-auth.json");
+        fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
+        let file_provider = api_key_provider(Some(format!("file:{}", auth_path.display())), None);
+        install_direct_provider(Some(temp.path().to_path_buf()), &file_provider)
+            .expect("install direct file");
+        assert!(temp.path().join("auth.json").exists());
+
+        let env_provider = api_key_provider(
+            Some("env:OPENROUTER_API_KEY".to_string()),
+            Some("env:OPENROUTER_API_KEY".to_string()),
+        );
+        let status = install_direct_provider(Some(temp.path().to_path_buf()), &env_provider)
+            .expect("install direct env");
+
+        assert!(status
+            .message
+            .contains("prior Companion auth.json write was restored"));
+        assert!(!temp.path().join("auth.json").exists());
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains("env_key = \"OPENROUTER_API_KEY\""));
+        assert!(!config.contains("auth_write_hash ="));
+    }
+
+    #[test]
+    fn direct_api_key_warns_for_supported_oauth_auth_shapes() {
+        for auth in [
+            serde_json::json!({"refresh_token": "top-level-refresh"}),
+            serde_json::json!({"credentials": {"refresh_token": "credential-refresh"}}),
+            serde_json::json!({
+                "accounts": [{
+                    "platform": "openai",
+                    "type": "oauth",
+                    "tokens": {"refresh_token": "account-refresh"}
+                }]
+            }),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            fs::write(temp.path().join("auth.json"), auth.to_string()).expect("auth");
+            let auth_path = temp.path().join("provider-auth.json");
+            fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
+            let provider = api_key_provider(Some(format!("file:{}", auth_path.display())), None);
+
+            let status = install_direct_provider(Some(temp.path().to_path_buf()), &provider)
+                .expect("install direct");
+
+            assert!(
+                status.message.contains("warning: direct API key mode"),
+                "missing warning for auth shape: {}",
+                auth
+            );
+        }
     }
 
     #[test]

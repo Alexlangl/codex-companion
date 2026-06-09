@@ -83,6 +83,7 @@ export interface AppSettings {
   lastCodexLaunchMode?: CodexLaunchMode | null;
   lastCodexTargetProviderId?: string | null;
   codexRestartRequiredOnNextRelay?: boolean;
+  preserveOfficialCodexAuth?: boolean;
 }
 
 export interface CodexInstallStatus {

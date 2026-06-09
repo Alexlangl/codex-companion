@@ -220,6 +220,13 @@ fn set_provider_view_mode(mode: ProviderViewMode) -> Result<ProviderViewMode, St
 }
 
 #[tauri::command]
+fn set_preserve_official_codex_auth(preserve: bool) -> Result<bool, String> {
+    daemon()?
+        .set_preserve_official_codex_auth(preserve)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn set_provider_launch_mode(
     provider_id: String,
     mode: ProviderLaunchMode,
@@ -293,6 +300,7 @@ pub fn run() {
             repair,
             set_theme,
             set_provider_view_mode,
+            set_preserve_official_codex_auth,
             set_provider_launch_mode,
             reset_app_settings,
             get_token_usage
