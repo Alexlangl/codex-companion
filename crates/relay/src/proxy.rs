@@ -84,6 +84,7 @@ async fn proxy_inner(
             &state.client,
             &provider,
             &method,
+            &uri,
             &headers,
             body.clone(),
             &upstream,

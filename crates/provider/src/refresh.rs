@@ -4,7 +4,8 @@ use crate::account_refresh::{
 use crate::auth::resolve_auth_token;
 use chrono::Utc;
 use codex_companion_core::{
-    CompanionError, ConfigStore, ProviderConfig, ProviderHealth, ProviderKind, Result,
+    provider_api_base_url, CompanionError, ConfigStore, ProviderConfig, ProviderHealth,
+    ProviderKind, Result,
 };
 use codex_companion_health::{classify_failure, mark_failure, mark_success};
 
@@ -17,7 +18,10 @@ pub async fn test_provider(provider: &ProviderConfig) -> std::result::Result<(),
     }
 
     let client = reqwest::Client::new();
-    let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/models",
+        provider_api_base_url(&provider.base_url).trim_end_matches('/')
+    );
     let mut request = client.get(url);
     if let Some(token) = resolve_auth_token(provider) {
         request = request.bearer_auth(token);

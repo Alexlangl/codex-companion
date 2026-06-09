@@ -149,7 +149,7 @@ export function Providers({
       refreshIntervalSeconds: Number(editForm.refreshIntervalSeconds) || 60,
     };
     if (!input.providerDisplayName || !input.providerName || !input.baseUrl) {
-      setEditError("Provider Name、供应商名称和 Base URL 不能为空。");
+      setEditError("Provider Name、供应商名称和请求地址不能为空。");
       return;
     }
     await onUpdateApiKey({
@@ -346,7 +346,7 @@ export function Providers({
               <div>
                 <Dialog.Title className="dialog-title">编辑 API Key Provider</Dialog.Title>
                 <Dialog.Description className="dialog-description">
-                  API Key 留空会保留原密钥；只改名称或 Base URL 时不需要重新填写密钥。
+                  API Key 留空会保留原密钥；只改名称或请求地址时不需要重新填写密钥。
                 </Dialog.Description>
               </div>
               <Dialog.Close className="icon-button" aria-label="关闭">
@@ -451,9 +451,17 @@ function ApiKeyEditForm({
       <Field label="供应商名称">
         <input value={form.providerName} onChange={(event) => update({ ...form, providerName: event.target.value })} required />
       </Field>
-      <Field label="Base URL">
-        <input value={form.baseUrl} onChange={(event) => update({ ...form, baseUrl: event.target.value })} required />
+      <Field label="请求地址">
+        <input
+          value={form.baseUrl}
+          onChange={(event) => update({ ...form, baseUrl: event.target.value })}
+          placeholder="https://api.example.com/v1 或完整 endpoint"
+          required
+        />
       </Field>
+      <p className="field-hint">
+        这里不决定直连或代理；启动方式以账号卡片上的选择为准。本地代理下填 /v1 会按 Codex 请求路径拼接，填完整 endpoint 则按原地址发送。
+      </p>
       <Field label="API Key（留空保留）">
         <input value={form.apiKey} onChange={(event) => update({ ...form, apiKey: event.target.value })} placeholder="sk-..." type="password" />
       </Field>
@@ -632,8 +640,13 @@ function ProviderAddTabs({
               </Select.Root>
             </Field>
           </div>
-          <Field label="Base URL">
-            <input value={apiKeyForm.baseUrl} onChange={(event) => updateApiKeyForm({ ...apiKeyForm, baseUrl: event.target.value })} placeholder="https://api.example.com/v1" required />
+          <Field label="请求地址">
+            <input
+              value={apiKeyForm.baseUrl}
+              onChange={(event) => updateApiKeyForm({ ...apiKeyForm, baseUrl: event.target.value })}
+              placeholder="https://api.example.com/v1 或 https://api.example.com/v1/responses"
+              required
+            />
           </Field>
           <Field label="API Key（可选）">
             <input value={apiKeyForm.apiKey} onChange={(event) => updateApiKeyForm({ ...apiKeyForm, apiKey: event.target.value })} placeholder="sk-..." type="password" />
@@ -646,7 +659,7 @@ function ProviderAddTabs({
           </Field>
           {apiKeyError ? <p className="field-error">{apiKeyError}</p> : null}
           <p className="field-hint">
-            创建时只保存账号材料，不会自动加入分组；单账号默认直连，也可以在账号卡片上切换为本地代理。直连需要重启 Codex 以读取账号/API Key，本地代理切换账号无需重启。
+            创建时只保存账号材料，不会自动加入分组；请求地址不决定直连或代理，启动方式以账号卡片上的选择为准。直连需要重启 Codex 以读取账号/API Key，本地代理切换账号无需重启。
           </p>
           <div className="actions">
             <Button disabled={disabled} type="submit">
