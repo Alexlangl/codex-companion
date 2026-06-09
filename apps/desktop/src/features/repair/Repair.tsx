@@ -1,6 +1,7 @@
 import { Hammer, LoaderCircle, Search } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Button, Field, Panel } from "../../components/ui";
+import { currentApplication } from "../../lib/current-application";
 import { compactPath } from "../../lib/format";
 import type { CompanionStatus, RepairOutcome } from "../../types/domain";
 
@@ -25,11 +26,14 @@ export function Repair({
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const repairing = pendingMode !== null;
-  const currentProviderId = status.codex.modelProvider || "codex-companion";
-  const currentProviderName =
-    currentProviderId === "codex-companion"
-      ? "本地代理（分组 / 账号代理）"
-      : (status.config.providers[currentProviderId]?.name ?? currentProviderId);
+  const application = currentApplication(status);
+  const currentProviderId =
+    application.kind === "provider"
+      ? application.provider.kind === "official_codex" && application.launchMode === "direct"
+        ? "openai"
+        : application.provider.id
+      : "codex-companion";
+  const currentProviderName = application.kind === "provider" ? application.name : "本地代理（分组 / 账号代理）";
   const resultPrefix = outcome?.plan.dryRun ? "预计" : "已修复";
   const historyFiles = outcome?.plan.dryRun ? outcome.plan.historyFiles : outcome?.migratedHistoryFiles;
   const historyLines = outcome?.plan.dryRun ? outcome.plan.historyLines : outcome?.migratedHistoryLines;

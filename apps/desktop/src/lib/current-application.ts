@@ -41,7 +41,11 @@ export function userVisibleGroups(status: CompanionStatus) {
 }
 
 export function currentApplication(status: CompanionStatus): CurrentApplication {
-  const codexProviderId = status.codex.modelProvider?.trim();
+  const codexProviderId =
+    status.codex.modelProvider?.trim() ||
+    (status.config.app.lastCodexLaunchMode === "provider_direct"
+      ? status.config.app.lastCodexTargetProviderId?.trim()
+      : "");
   if (codexProviderId && codexProviderId !== "codex-companion") {
     const provider = status.config.providers[codexProviderId];
     if (provider) {

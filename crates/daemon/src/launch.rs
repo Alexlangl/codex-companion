@@ -1,8 +1,8 @@
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
     default_codex_dir, CodexLaunchMode, CodexLaunchOutcome, CompanionError, GroupPolicy,
-    ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode, RepairOptions, Result,
-    COMPANION_PROVIDER_ID,
+    ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode, RepairOptions, RepairOutcome,
+    RepairPlan, Result, COMPANION_PROVIDER_ID,
 };
 use codex_companion_provider::use_group;
 use codex_companion_state::{
@@ -15,6 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 const SINGLE_PROVIDER_GROUP_PREFIX: &str = "single-";
+const CODEX_OPENAI_PROVIDER_ID: &str = "openai";
 
 impl CompanionDaemon {
     pub fn launch_group(
@@ -35,13 +36,7 @@ impl CompanionDaemon {
             pending_relay_restart,
         );
         let codex = install_companion_provider(Some(codex_dir.clone()), &config.relay)?;
-        let repair = repair_state(RepairOptions {
-            codex_dir,
-            history: true,
-            plugins: true,
-            dry_run: false,
-            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
-        })?;
+        let repair = repair_for_launch(&codex_dir, COMPANION_PROVIDER_ID.to_string());
         let codex_launch = ensure_codex_started(restart_required);
         self.record_codex_launch(
             CodexLaunchMode::GroupRelay,
@@ -102,13 +97,7 @@ impl CompanionDaemon {
 
         if should_direct {
             let codex = install_direct_provider(Some(codex_dir.clone()), &provider)?;
-            let repair = repair_state(RepairOptions {
-                codex_dir,
-                history: true,
-                plugins: true,
-                dry_run: false,
-                target_provider_id: Some(provider.id.clone()),
-            })?;
+            let repair = repair_for_launch(&codex_dir, direct_repair_target_provider_id(&provider));
             let restart_required = true;
             let codex_launch = restart_codex();
             self.record_codex_launch(CodexLaunchMode::ProviderDirect, provider.id.clone())?;
@@ -133,13 +122,7 @@ impl CompanionDaemon {
             pending_relay_restart,
         );
         let codex = install_companion_provider(Some(codex_dir.clone()), &config.relay)?;
-        let repair = repair_state(RepairOptions {
-            codex_dir,
-            history: true,
-            plugins: true,
-            dry_run: false,
-            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
-        })?;
+        let repair = repair_for_launch(&codex_dir, COMPANION_PROVIDER_ID.to_string());
         let codex_launch = ensure_codex_started(restart_required);
         self.record_codex_launch(
             CodexLaunchMode::ProviderRelay,
@@ -216,6 +199,56 @@ pub fn provider_relay_reason(provider: &ProviderConfig) -> &'static str {
 
 pub fn single_provider_group_id(provider: &ProviderConfig) -> String {
     format!("{SINGLE_PROVIDER_GROUP_PREFIX}{}", provider.id)
+}
+
+fn direct_repair_target_provider_id(provider: &ProviderConfig) -> String {
+    if matches!(provider.kind, ProviderKind::OfficialCodex) {
+        CODEX_OPENAI_PROVIDER_ID.to_string()
+    } else {
+        provider.id.clone()
+    }
+}
+
+fn repair_for_launch(codex_dir: &std::path::Path, target_provider_id: String) -> RepairOutcome {
+    repair_state(RepairOptions {
+        codex_dir: codex_dir.to_path_buf(),
+        history: true,
+        plugins: true,
+        dry_run: false,
+        target_provider_id: Some(target_provider_id.clone()),
+    })
+    .unwrap_or_else(|error| {
+        skipped_launch_repair(
+            codex_dir,
+            target_provider_id,
+            format!("启动前修复未完成，已跳过且不阻塞 Codex 启动: {error}"),
+        )
+    })
+}
+
+fn skipped_launch_repair(
+    codex_dir: &std::path::Path,
+    target_provider_id: String,
+    reason: String,
+) -> RepairOutcome {
+    RepairOutcome {
+        plan: RepairPlan {
+            codex_dir: codex_dir.to_path_buf(),
+            target_provider_id,
+            history_files: 0,
+            history_lines: 0,
+            plugin_files: 0,
+            state_rows: 0,
+            source_provider_ids: Vec::new(),
+            dry_run: false,
+        },
+        backup_root: None,
+        migrated_history_files: 0,
+        migrated_history_lines: 0,
+        migrated_plugin_files: 0,
+        migrated_state_rows: 0,
+        skipped_reason: Some(reason),
+    }
 }
 
 fn relay_restart_required(

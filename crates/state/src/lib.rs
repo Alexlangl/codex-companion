@@ -16,6 +16,10 @@ use toml_edit::{value, DocumentMut, Item};
 use walkdir::WalkDir;
 
 const CODEX_STATE_DB_FILENAME: &str = "state_5.sqlite";
+const CODEX_OPENAI_PROVIDER_ID: &str = "openai";
+const CODEX_API_KEY_AUTH_MODE: &str = "apikey";
+#[cfg(all(target_os = "macos", not(test)))]
+const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 
 pub use token_usage::{collect_token_usage, collect_token_usage_cached};
 
@@ -69,27 +73,52 @@ pub fn install_direct_provider(
         CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
     })?;
 
-    doc["model_provider"] = value(&provider.id);
-    doc["model_providers"][&provider.id]["name"] = value(&provider.name);
-    doc["model_providers"][&provider.id]["base_url"] = value(&provider.base_url);
-    doc["model_providers"][&provider.id]["wire_api"] = value("responses");
-    doc["model_providers"][&provider.id]["requires_openai_auth"] = value(true);
-    doc["model_providers"][&provider.id]["api_key_env_var"] = Item::None;
+    let auth = resolve_direct_auth(provider)?;
+    let mut effective_model_provider = provider.id.clone();
+    let mut message = format!("Codex 已直连 provider: {}", provider.name);
 
-    match resolve_direct_auth(provider)? {
-        DirectAuthMaterial::EnvKey(env_var) => {
-            doc["model_providers"][&provider.id]["env_key"] = value(env_var);
+    if matches!(provider.kind, ProviderKind::OfficialCodex) {
+        let DirectAuthMaterial::CodexAuth(auth) = auth else {
+            return Err(CompanionError::InvalidConfig(format!(
+                "官方 Codex 账号 {} 缺少可直连的 OAuth access_token",
+                provider.name
+            )));
+        };
+        write_official_codex_config(&mut doc, &provider.id);
+        write_codex_auth_json(&codex_dir, &auth)?;
+        if let Err(error) = write_codex_keychain_to_dir(&codex_dir, &auth) {
+            message = format!(
+                "{message}；Keychain 写入失败，若 Codex Desktop 仍要求登录，请检查 macOS 钥匙串权限: {error}"
+            );
         }
-        DirectAuthMaterial::ApiKey(api_key) => {
-            doc["model_providers"][&provider.id]["env_key"] = Item::None;
-            write_codex_openai_api_key(&codex_dir, &api_key)?;
-        }
-        DirectAuthMaterial::CodexAuth(auth) => {
-            doc["model_providers"][&provider.id]["env_key"] = Item::None;
-            write_codex_auth_json(&codex_dir, &auth)?;
-        }
-        DirectAuthMaterial::None => {
-            doc["model_providers"][&provider.id]["env_key"] = Item::None;
+        effective_model_provider = provider.id.clone();
+    } else {
+        doc["model_provider"] = value(&provider.id);
+        doc["model_providers"][&provider.id]["name"] = value(&provider.name);
+        doc["model_providers"][&provider.id]["base_url"] = value(&provider.base_url);
+        doc["model_providers"][&provider.id]["wire_api"] = value("responses");
+        doc["model_providers"][&provider.id]["requires_openai_auth"] = value(true);
+        doc["model_providers"][&provider.id]["api_key_env_var"] = Item::None;
+
+        match auth {
+            DirectAuthMaterial::EnvKey(env_var) => {
+                doc["model_providers"][&provider.id]["env_key"] = value(env_var);
+                doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
+            }
+            DirectAuthMaterial::ApiKey(api_key) => {
+                doc["model_providers"][&provider.id]["env_key"] = Item::None;
+                doc["model_providers"][&provider.id]["experimental_bearer_token"] = value(&api_key);
+                write_codex_openai_api_key(&codex_dir, &api_key)?;
+            }
+            DirectAuthMaterial::CodexAuth(auth) => {
+                doc["model_providers"][&provider.id]["env_key"] = Item::None;
+                doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
+                write_codex_auth_json(&codex_dir, &auth)?;
+            }
+            DirectAuthMaterial::None => {
+                doc["model_providers"][&provider.id]["env_key"] = Item::None;
+                doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
+            }
         }
     }
 
@@ -99,9 +128,9 @@ pub fn install_direct_provider(
         codex_dir,
         config_path,
         installed: true,
-        model_provider: Some(provider.id.clone()),
+        model_provider: Some(effective_model_provider),
         companion_base_url: provider.base_url.clone(),
-        message: format!("Codex 已直连 provider: {}", provider.name),
+        message,
     })
 }
 
@@ -139,9 +168,13 @@ fn resolve_direct_auth(provider: &ProviderConfig) -> Result<DirectAuthMaterial> 
             ))
         })?;
         if matches!(provider.kind, ProviderKind::OfficialCodex) {
-            if let Some(auth) = normalize_codex_oauth_auth(&value) {
-                return Ok(DirectAuthMaterial::CodexAuth(auth));
-            }
+            let auth = normalize_codex_oauth_auth(&value).ok_or_else(|| {
+                CompanionError::InvalidConfig(format!(
+                    "官方 Codex 账号 auth 文件缺少 access_token: {}",
+                    path.display()
+                ))
+            })?;
+            return Ok(DirectAuthMaterial::CodexAuth(auth));
         }
         let api_key = pick_json_string(
             &value,
@@ -226,11 +259,7 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
             &["tokens", "refresh_token"],
         ],
     );
-    if access_token.is_none()
-        && id_token.is_none()
-        && session_token.is_none()
-        && refresh_token.is_none()
-    {
+    if access_token.is_none() {
         return None;
     }
 
@@ -313,6 +342,30 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
     Some(Value::Object(auth))
 }
 
+fn write_official_codex_config(doc: &mut DocumentMut, provider_id: &str) {
+    doc["openai_base_url"] = Item::None;
+    #[cfg(target_os = "windows")]
+    {
+        doc["model_provider"] = value(CODEX_OPENAI_PROVIDER_ID);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        doc["model_provider"] = Item::None;
+    }
+    remove_model_provider_table(doc, provider_id);
+}
+
+fn remove_model_provider_table(doc: &mut DocumentMut, provider_id: &str) {
+    let Some(model_providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) else {
+        return;
+    };
+    model_providers.remove(provider_id);
+    model_providers.remove(CODEX_OPENAI_PROVIDER_ID);
+    if model_providers.is_empty() {
+        doc["model_providers"] = Item::None;
+    }
+}
+
 fn oauth_account_candidate(value: &Value) -> &Value {
     value
         .get("accounts")
@@ -337,64 +390,70 @@ fn oauth_account_candidate(value: &Value) -> &Value {
 
 fn write_codex_auth_json(codex_dir: &Path, material: &Value) -> Result<()> {
     let auth_path = codex_dir.join("auth.json");
-    let mut auth = if auth_path.exists() {
-        let text = fs::read_to_string(&auth_path)
-            .map_err(|source| CompanionError::io(&auth_path, source))?;
-        serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::Object(Default::default()))
-    } else {
-        Value::Object(Default::default())
-    };
-    if !auth.is_object() {
-        auth = Value::Object(Default::default());
+    if !material.is_object() {
+        return Err(CompanionError::InvalidConfig(
+            "provider auth 不是 JSON object".to_string(),
+        ));
     }
-    merge_codex_auth(&mut auth, material)?;
-    let text = serde_json::to_string_pretty(&auth).map_err(|source| {
+    let text = serde_json::to_string_pretty(material).map_err(|source| {
         CompanionError::InvalidConfig(format!("序列化 Codex auth.json 失败: {source}"))
     })?;
     fs::write(&auth_path, format!("{text}\n"))
         .map_err(|source| CompanionError::io(&auth_path, source))
 }
 
-fn merge_codex_auth(target: &mut Value, source: &Value) -> Result<()> {
-    let Some(target_object) = target.as_object_mut() else {
-        return Err(CompanionError::InvalidConfig(
-            "Codex auth.json 不是 JSON object".to_string(),
-        ));
-    };
-    let Some(source_object) = source.as_object() else {
-        return Err(CompanionError::InvalidConfig(
-            "provider auth 不是 JSON object".to_string(),
-        ));
-    };
-    for (key, value) in source_object {
-        if key == "tokens" && value.is_object() {
-            let target_tokens = target_object
-                .entry("tokens".to_string())
-                .or_insert_with(|| Value::Object(Default::default()));
-            if !target_tokens.is_object() {
-                *target_tokens = Value::Object(Default::default());
-            }
-            if let (Some(target_tokens), Some(source_tokens)) =
-                (target_tokens.as_object_mut(), value.as_object())
-            {
-                for (token_key, token_value) in source_tokens {
-                    target_tokens.insert(token_key.clone(), token_value.clone());
-                }
-            }
-        } else {
-            target_object.insert(key.clone(), value.clone());
-        }
-    }
-    Ok(())
-}
-
 fn write_codex_openai_api_key(codex_dir: &Path, api_key: &str) -> Result<()> {
     let mut auth = serde_json::Map::new();
+    auth.insert(
+        "auth_mode".to_string(),
+        Value::String(CODEX_API_KEY_AUTH_MODE.to_string()),
+    );
     auth.insert(
         "OPENAI_API_KEY".to_string(),
         Value::String(api_key.to_string()),
     );
     write_codex_auth_json(codex_dir, &Value::Object(auth))
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn write_codex_keychain_to_dir(codex_dir: &Path, material: &Value) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let resolved_home = fs::canonicalize(codex_dir).unwrap_or_else(|_| codex_dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(resolved_home.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let digest_hex = format!("{digest:x}");
+    let account = format!("cli|{}", &digest_hex[..16]);
+    let secret = serde_json::to_string(material).map_err(|source| {
+        CompanionError::InvalidConfig(format!("序列化 Codex Keychain 数据失败: {source}"))
+    })?;
+    let output = std::process::Command::new("security")
+        .arg("add-generic-password")
+        .arg("-U")
+        .arg("-s")
+        .arg(CODEX_KEYCHAIN_SERVICE)
+        .arg("-a")
+        .arg(account)
+        .arg("-w")
+        .arg(secret)
+        .output()
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("执行 security 写入 Keychain 失败: {source}"))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(CompanionError::InvalidConfig(format!(
+        "写入 Codex Keychain 失败: {}",
+        stderr.trim()
+    )))
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn write_codex_keychain_to_dir(_codex_dir: &Path, _material: &Value) -> Result<()> {
+    Ok(())
 }
 
 fn pick_first_json_string(sources: &[&Value], paths: &[&[&str]]) -> Option<String> {
@@ -1504,8 +1563,12 @@ mod tests {
         assert!(status.installed);
         assert_eq!(status.model_provider.as_deref(), Some("official-mark"));
         let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
-        assert!(config.contains("model_provider = \"official-mark\""));
-        assert!(config.contains("requires_openai_auth = true"));
+        #[cfg(target_os = "windows")]
+        assert!(config.contains("model_provider = \"openai\""));
+        #[cfg(not(target_os = "windows"))]
+        assert!(!config.contains("model_provider ="));
+        assert!(!config.contains("[model_providers.official-mark]"));
+        assert!(!config.contains("openai_base_url"));
         let auth = fs::read_to_string(temp.path().join("auth.json")).expect("codex auth");
         assert!(auth.contains("\"OPENAI_API_KEY\": null"));
         assert!(auth.contains("\"access_token\": \"access-token\""));

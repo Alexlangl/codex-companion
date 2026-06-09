@@ -88,7 +88,7 @@ export function Dashboard({
           <dt>配置文件</dt>
           <dd>{compactPath(status.codex.configPath)}</dd>
           <dt>当前 Provider</dt>
-          <dd>{status.codex.modelProvider ?? "未设置"}</dd>
+          <dd>{currentProviderLabel(status, application.kind)}</dd>
           <dt>启动方式</dt>
           <dd>{launchModeLabel(status, application.kind)}</dd>
           <dt>状态</dt>
@@ -160,6 +160,19 @@ function StatusChip({ icon, label, value }: { icon: ReactNode; label: string; va
 
 function launchModeLabel(status: CompanionStatus, applicationKind: string) {
   if (status.codex.installed) return applicationKind === "provider" ? "单账号 / 本地代理" : "分组 / 本地代理";
+  if (applicationKind === "provider") return "单 Provider 直连";
   if (status.codex.modelProvider) return "单 Provider 直连";
   return "未配置";
+}
+
+function currentProviderLabel(status: CompanionStatus, applicationKind: string) {
+  if (status.codex.modelProvider) return status.codex.modelProvider;
+  if (
+    applicationKind === "provider" &&
+    status.config.app.lastCodexLaunchMode === "provider_direct" &&
+    status.config.app.lastCodexTargetProviderId
+  ) {
+    return status.config.app.lastCodexTargetProviderId;
+  }
+  return "未设置";
 }
