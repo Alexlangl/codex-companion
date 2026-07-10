@@ -493,7 +493,10 @@ fn launch_selected_provider(
         .cloned()
         .unwrap_or_default();
     if provider_launch_will_direct(provider, &mode)
-        && provider_direct_launch_writes_auth_json(provider)
+        && provider_direct_launch_writes_auth_json(
+            provider,
+            status.config.app.preserve_official_codex_auth,
+        )
         && !confirm_direct_auth_write(provider)
     {
         app.message = format!("已取消启动账号：{}", provider.name);
@@ -513,13 +516,18 @@ fn provider_launch_will_direct(provider: &ProviderConfig, mode: &ProviderLaunchM
     }
 }
 
-fn provider_direct_launch_writes_auth_json(provider: &ProviderConfig) -> bool {
-    provider
+fn provider_direct_launch_writes_auth_json(
+    provider: &ProviderConfig,
+    preserve_official_codex_auth: bool,
+) -> bool {
+    let has_file_auth = provider
         .direct_auth_ref
         .as_deref()
         .or(provider.auth_ref.as_deref())
         .map(str::trim)
-        .is_some_and(|auth_ref| auth_ref.starts_with("file:"))
+        .is_some_and(|auth_ref| auth_ref.starts_with("file:"));
+    has_file_auth
+        && (matches!(provider.kind, ProviderKind::OfficialCodex) || !preserve_official_codex_auth)
 }
 
 fn confirm_direct_auth_write(provider: &ProviderConfig) -> bool {
@@ -726,12 +734,27 @@ mod tests {
 
     #[test]
     fn tui_requires_confirmation_for_file_auth_direct_writes() {
-        assert!(provider_direct_launch_writes_auth_json(&provider(Some(
-            "file:/tmp/provider-auth.json"
-        ))));
-        assert!(!provider_direct_launch_writes_auth_json(&provider(Some(
-            "env:OPENAI_API_KEY"
-        ))));
-        assert!(!provider_direct_launch_writes_auth_json(&provider(None)));
+        assert!(provider_direct_launch_writes_auth_json(
+            &provider(Some("file:/tmp/provider-auth.json")),
+            false,
+        ));
+        assert!(!provider_direct_launch_writes_auth_json(
+            &provider(Some("file:/tmp/provider-auth.json")),
+            true,
+        ));
+        assert!(!provider_direct_launch_writes_auth_json(
+            &provider(Some("env:OPENAI_API_KEY")),
+            false,
+        ));
+        assert!(!provider_direct_launch_writes_auth_json(
+            &provider(None),
+            false,
+        ));
+        let mut official_provider = provider(Some("file:/tmp/official-auth.json"));
+        official_provider.kind = ProviderKind::OfficialCodex;
+        assert!(provider_direct_launch_writes_auth_json(
+            &official_provider,
+            true,
+        ));
     }
 }

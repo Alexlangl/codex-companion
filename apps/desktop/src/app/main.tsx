@@ -36,6 +36,11 @@ function App() {
     mode: ProviderLaunchMode;
     provider: ProviderConfig;
   } | null>(null);
+  const directLaunchDialogTitleRef = React.useRef<HTMLHeadingElement>(null);
+  let directLaunchDescription = "直连会更新 Codex auth.json。";
+  if (pendingProviderLaunch) {
+    directLaunchDescription = `${providerAccountTitle(pendingProviderLaunch.provider)} 将把账号材料合并写入 Codex auth.json，并由 ChatGPT / Codex 重新载入。`;
+  }
 
   async function requestLaunchProvider(id: string, mode?: ProviderLaunchMode) {
     if (!status) {
@@ -49,7 +54,7 @@ function App() {
     }
     const resolvedMode = mode ?? status.config.app.providerLaunchModes[id] ?? "auto";
     const willDirect = resolvedMode === "direct" || (resolvedMode === "auto" && canDirectLaunch(provider));
-    if (willDirect && directLaunchWritesAuthJson(provider)) {
+    if (willDirect && directLaunchWritesAuthJson(provider, status.config.app.preserveOfficialCodexAuth)) {
       setPendingProviderLaunch({ mode: resolvedMode, provider });
       return;
     }
@@ -179,14 +184,20 @@ function App() {
         <Dialog.Root open={Boolean(pendingProviderLaunch)} onOpenChange={(open) => !open && setPendingProviderLaunch(null)}>
           <Dialog.Portal>
             <Dialog.Overlay className="dialog-overlay" />
-            <Dialog.Content className="dialog-content direct-launch-confirm-dialog">
+            <Dialog.Content
+              className="dialog-content direct-launch-confirm-dialog"
+              onOpenAutoFocus={(event) => {
+                event.preventDefault();
+                directLaunchDialogTitleRef.current?.focus();
+              }}
+            >
               <div className="dialog-header">
                 <div>
-                  <Dialog.Title className="dialog-title">确认直连写入</Dialog.Title>
+                  <Dialog.Title className="dialog-title" ref={directLaunchDialogTitleRef} tabIndex={-1}>
+                    确认直连写入
+                  </Dialog.Title>
                   <Dialog.Description className="dialog-description">
-                    {pendingProviderLaunch
-                      ? `${providerAccountTitle(pendingProviderLaunch.provider)} 将把账号材料合并写入 Codex auth.json。`
-                      : "直连会更新 Codex auth.json。"}
+                    {directLaunchDescription}
                   </Dialog.Description>
                 </div>
                 <Dialog.Close className="icon-button" aria-label="关闭">
@@ -196,7 +207,7 @@ function App() {
               <div className="warning-box">
                 <strong>这会修改本机 Codex 登录材料</strong>
                 <p>
-                  Companion 会先备份并记录 ownership marker；如果已开启官方登录保护，后端会阻止可能覆盖官方 OAuth 的第三方 API key 直连。
+                  Companion 会先备份并记录 ownership marker。开启“保留官方 Codex 登录”后，第三方 API key 会改写到 provider-scoped config.toml，不再修改官方 OAuth auth.json。
                 </p>
               </div>
               <div className="actions">

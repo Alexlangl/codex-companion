@@ -1,7 +1,6 @@
 use crate::registry::add_provider;
 use crate::types::{
-    ProviderImportDraft, ProviderImportOutcome, ProviderUpsert, DEFAULT_CODEX_MODEL,
-    OFFICIAL_CODEX_BASE_URL,
+    ProviderImportDraft, ProviderImportOutcome, ProviderUpsert, OFFICIAL_CODEX_BASE_URL,
 };
 use codex_companion_core::{
     default_codex_dir, default_refresh_interval_seconds, CompanionError, ConfigStore,
@@ -46,7 +45,9 @@ pub fn import_provider_json(
         .map_err(|source| CompanionError::io(&auth_path, source))?;
 
     let mut model_map = BTreeMap::new();
-    model_map.insert(draft.model.clone(), draft.model.clone());
+    if let Some(model) = draft.model.as_ref() {
+        model_map.insert(model.clone(), model.clone());
+    }
     let existed = store.load()?.providers.contains_key(&draft.provider_id);
     let provider = add_provider(
         store,
@@ -417,7 +418,7 @@ pub fn parse_provider_import_draft(
     let provider_id = explicit_provider_id
         .and_then(sanitize_provider_id)
         .unwrap_or_else(|| derive_oauth_provider_id(&provider_name, &account_id));
-    let model = extract_model(value).unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string());
+    let model = extract_model(value);
 
     Ok(ProviderImportDraft {
         provider_id: provider_id.clone(),
@@ -1224,6 +1225,20 @@ mod tests {
         assert_eq!(draft.provider_name, "mark@example.com");
         assert_eq!(draft.account_id, "00000000-0000-4000-9000-000000000000");
         assert_eq!(draft.base_url, OFFICIAL_CODEX_BASE_URL);
+        assert_eq!(draft.model, None);
+    }
+
+    #[test]
+    fn preserves_explicit_model_without_inventing_an_official_default() {
+        let value = serde_json::json!({
+            "access_token": "access-token",
+            "account_id": "account-id",
+            "model": "current-codex-model"
+        });
+
+        let draft = parse_provider_import_draft(&value, None, None).expect("draft");
+
+        assert_eq!(draft.model.as_deref(), Some("current-codex-model"));
     }
 
     #[test]

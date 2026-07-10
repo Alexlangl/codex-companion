@@ -1,8 +1,8 @@
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
-    default_codex_dir, CodexLaunchMode, CodexLaunchOutcome, CompanionError, GroupPolicy,
-    ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode, RepairOptions, RepairOutcome,
-    RepairPlan, Result, COMPANION_PROVIDER_ID,
+    default_codex_dir, provider_endpoint_is_chat_completions, CodexLaunchMode, CodexLaunchOutcome,
+    CompanionError, GroupPolicy, ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode,
+    RepairOptions, RepairOutcome, RepairPlan, Result, COMPANION_PROVIDER_ID,
 };
 use codex_companion_provider::{selected_providers_for_group, use_group};
 use codex_companion_state::{
@@ -17,6 +17,9 @@ use std::time::Duration;
 
 const SINGLE_PROVIDER_GROUP_PREFIX: &str = "single-";
 pub(crate) const CODEX_OPENAI_PROVIDER_ID: &str = "openai";
+const CHATGPT_APP_NAME: &str = "ChatGPT";
+const LEGACY_CODEX_APP_NAME: &str = "Codex";
+const CODEX_CLIENT_DISPLAY_NAME: &str = "ChatGPT / Codex";
 
 impl CompanionDaemon {
     pub fn launch_group(
@@ -94,6 +97,12 @@ impl CompanionDaemon {
         let should_direct = match mode {
             ProviderLaunchMode::Direct => {
                 if !provider_can_direct_connect(&provider) {
+                    if provider_endpoint_is_chat_completions(&provider.base_url) {
+                        return Err(CompanionError::InvalidConfig(format!(
+                            "provider {} 只提供 Chat Completions 接口；ChatGPT / Codex 直连发送 Responses 请求，必须改用本地代理完成协议转换",
+                            provider.name
+                        )));
+                    }
                     return Err(CompanionError::InvalidConfig(format!(
                         "provider {} 缺少直连所需的账号材料、API Key 文件或环境变量",
                         provider.name
@@ -206,14 +215,15 @@ impl CompanionDaemon {
 }
 
 pub fn provider_can_direct_connect(provider: &ProviderConfig) -> bool {
-    provider
-        .direct_auth_ref
-        .as_deref()
-        .or(provider.auth_ref.as_deref())
-        .is_none_or(|auth_ref| {
-            let auth_ref = auth_ref.trim();
-            auth_ref.is_empty() || auth_ref.starts_with("env:") || auth_ref.starts_with("file:")
-        })
+    !provider_endpoint_is_chat_completions(&provider.base_url)
+        && provider
+            .direct_auth_ref
+            .as_deref()
+            .or(provider.auth_ref.as_deref())
+            .is_none_or(|auth_ref| {
+                let auth_ref = auth_ref.trim();
+                auth_ref.is_empty() || auth_ref.starts_with("env:") || auth_ref.starts_with("file:")
+            })
 }
 
 pub fn provider_relay_reason(provider: &ProviderConfig) -> &'static str {
@@ -427,14 +437,18 @@ fn ensure_codex_started(restart_required: bool) -> CodexProcessLaunch {
 
 fn direct_launch_message(provider_name: &str, codex_launch: CodexProcessLaunch) -> String {
     if codex_launch.codex_started() {
-        return format!("已直连启动 provider {provider_name}，并已重启 Codex 以载入账号/API Key");
+        return format!(
+            "已直连启动 provider {provider_name}，并已重启 {CODEX_CLIENT_DISPLAY_NAME} 以载入账号/API Key"
+        );
     }
     if codex_launch.skipped {
         return format!(
-            "已写入直连 provider {provider_name}；当前配置跳过自动启停，请手动启动/重启 Codex"
+            "已写入直连 provider {provider_name}；当前配置跳过自动启停，请手动启动/重启 {CODEX_CLIENT_DISPLAY_NAME}"
         );
     }
-    format!("已写入直连 provider {provider_name}；直连模式需要启动/重启 Codex 后才会生效")
+    format!(
+        "已写入直连 provider {provider_name}；直连模式需要启动/重启 {CODEX_CLIENT_DISPLAY_NAME} 后才会生效"
+    )
 }
 
 fn with_codex_status(message: String, codex_status: &str) -> String {
@@ -453,15 +467,17 @@ fn relay_launch_message(
 ) -> String {
     if restart_required {
         if codex_launch.codex_started() {
-            return format!("已通过本地代理启动 {target_kind} {target_name}，并已重启 Codex");
+            return format!(
+                "已通过本地代理启动 {target_kind} {target_name}，并已重启 {CODEX_CLIENT_DISPLAY_NAME}"
+            );
         }
         if codex_launch.skipped {
             return format!(
-                "已写入本地代理启动配置；当前配置跳过自动启停，请手动启动/重启 Codex 后使用 {target_kind} {target_name}"
+                "已写入本地代理启动配置；当前配置跳过自动启停，请手动启动/重启 {CODEX_CLIENT_DISPLAY_NAME} 后使用 {target_kind} {target_name}"
             );
         }
         return format!(
-            "已写入本地代理启动配置；请启动/重启 Codex 后使用 {target_kind} {target_name}"
+            "已写入本地代理启动配置；请启动/重启 {CODEX_CLIENT_DISPLAY_NAME} 后使用 {target_kind} {target_name}"
         );
     }
 
@@ -470,23 +486,25 @@ fn relay_launch_message(
             format!("已切换本地代理到 {target_kind} {target_name}，Codex 已在本地代理模式运行，无需重启")
         }
         CodexProcessAction::Start if codex_launch.succeeded => {
-            format!("已切换本地代理到 {target_kind} {target_name}，并已启动 Codex")
+            format!(
+                "已切换本地代理到 {target_kind} {target_name}，并已启动 {CODEX_CLIENT_DISPLAY_NAME}"
+            )
         }
         CodexProcessAction::Start if codex_launch.skipped => {
-            format!("已写入本地代理启动配置；当前配置跳过自动启停，请手动启动 Codex 后使用 {target_kind} {target_name}")
+            format!("已写入本地代理启动配置；当前配置跳过自动启停，请手动启动 {CODEX_CLIENT_DISPLAY_NAME} 后使用 {target_kind} {target_name}")
         }
         CodexProcessAction::Start => {
-            format!("已写入本地代理启动配置；Codex 未在运行且自动启动失败，请手动启动 Codex 后使用 {target_kind} {target_name}")
+            format!("已写入本地代理启动配置；{CODEX_CLIENT_DISPLAY_NAME} 未在运行且自动启动失败，请手动启动后使用 {target_kind} {target_name}")
         }
         CodexProcessAction::Restart => {
-            format!("已写入本地代理启动配置；请启动/重启 Codex 后使用 {target_kind} {target_name}")
+            format!("已写入本地代理启动配置；请启动/重启 {CODEX_CLIENT_DISPLAY_NAME} 后使用 {target_kind} {target_name}")
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct CodexLaunchTarget {
-    app_name: Option<String>,
+    app_names: Vec<String>,
     command: Option<String>,
     process_match: Option<String>,
     skip_restart: bool,
@@ -494,19 +512,36 @@ struct CodexLaunchTarget {
 
 impl CodexLaunchTarget {
     fn from_env() -> Self {
-        let command = env_text("CODEX_COMPANION_CODEX_COMMAND");
-        let app_data_dir =
-            env_text("CODEX_COMPANION_CODEX_APP_DATA").or_else(|| env_text("DEV_CODEX_APP_DATA"));
-        let process_match = env_text("CODEX_COMPANION_CODEX_PROCESS_MATCH")
+        let command = env_text("CODEX_COMPANION_CLIENT_COMMAND")
+            .or_else(|| env_text("CODEX_COMPANION_CODEX_COMMAND"));
+        let app_data_dir = env_text("CODEX_COMPANION_CLIENT_APP_DATA")
+            .or_else(|| env_text("CODEX_COMPANION_CODEX_APP_DATA"))
+            .or_else(|| env_text("DEV_CODEX_APP_DATA"));
+        let process_match = env_text("CODEX_COMPANION_CLIENT_PROCESS_MATCH")
+            .or_else(|| env_text("CODEX_COMPANION_CODEX_PROCESS_MATCH"))
             .or_else(|| app_data_dir.map(|path| format!("--user-data-dir={path}")));
+        let explicit_app_name = env_text("CODEX_COMPANION_CLIENT_APP_NAME")
+            .or_else(|| env_text("CODEX_COMPANION_CODEX_APP_NAME"));
         Self {
-            app_name: env_text("CODEX_COMPANION_CODEX_APP_NAME")
-                .or_else(|| command.is_none().then(|| "Codex".to_string())),
+            app_names: explicit_app_name.map(|name| vec![name]).unwrap_or_else(|| {
+                command
+                    .is_none()
+                    .then(default_codex_app_names)
+                    .unwrap_or_default()
+            }),
             command,
             process_match,
-            skip_restart: env_flag("CODEX_COMPANION_SKIP_CODEX_RESTART"),
+            skip_restart: env_flag("CODEX_COMPANION_SKIP_CLIENT_RESTART")
+                || env_flag("CODEX_COMPANION_SKIP_CODEX_RESTART"),
         }
     }
+}
+
+fn default_codex_app_names() -> Vec<String> {
+    vec![
+        CHATGPT_APP_NAME.to_string(),
+        LEGACY_CODEX_APP_NAME.to_string(),
+    ]
 }
 
 fn env_text(name: &str) -> Option<String> {
@@ -531,9 +566,9 @@ fn codex_running(target: &CodexLaunchTarget) -> bool {
         return process_match_running(pattern);
     }
     target
-        .app_name
-        .as_deref()
-        .is_some_and(|app_name| process_name_running(app_name))
+        .app_names
+        .iter()
+        .any(|app_name| process_name_running(app_name))
 }
 
 #[cfg(target_os = "windows")]
@@ -541,23 +576,16 @@ fn codex_running(target: &CodexLaunchTarget) -> bool {
     if let Some(pattern) = target.process_match.as_deref() {
         return process_match_running(pattern);
     }
-    let Some(app_name) = target.app_name.as_deref() else {
-        return false;
-    };
-    let image_name = if app_name.ends_with(".exe") {
-        app_name.to_string()
-    } else {
-        format!("{app_name}.exe")
-    };
-    Command::new("tasklist")
-        .args(["/FI", format!("IMAGENAME eq {image_name}").as_str()])
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout)
-                    .to_ascii_lowercase()
-                    .contains(&image_name.to_ascii_lowercase())
+    Command::new("tasklist").output().is_ok_and(|output| {
+        if !output.status.success() {
+            return false;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        target.app_names.iter().any(|app_name| {
+            let image_name = windows_image_name(app_name);
+            stdout.contains(&image_name.to_ascii_lowercase())
         })
+    })
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -566,9 +594,9 @@ fn codex_running(target: &CodexLaunchTarget) -> bool {
         return process_match_running(pattern);
     }
     target
-        .app_name
-        .as_deref()
-        .is_some_and(|app_name| process_name_running(app_name))
+        .app_names
+        .iter()
+        .any(|app_name| process_name_running(app_name))
 }
 
 #[cfg(target_os = "macos")]
@@ -577,14 +605,13 @@ fn stop_codex(target: &CodexLaunchTarget) {
         kill_process_match(pattern);
         return;
     }
-    let Some(app_name) = target.app_name.as_deref() else {
-        return;
-    };
-    let _ = Command::new("osascript")
-        .arg("-e")
-        .arg(format!(r#"tell application "{app_name}" to quit"#))
-        .status();
-    let _ = Command::new("pkill").args(["-x", app_name]).status();
+    for app_name in &target.app_names {
+        let _ = Command::new("osascript")
+            .arg("-e")
+            .arg(format!(r#"tell application "{app_name}" to quit"#))
+            .status();
+        let _ = Command::new("pkill").args(["-x", app_name]).status();
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -593,17 +620,12 @@ fn stop_codex(target: &CodexLaunchTarget) {
         kill_process_match(pattern);
         return;
     }
-    let Some(app_name) = target.app_name.as_deref() else {
-        return;
-    };
-    let image_name = if app_name.ends_with(".exe") {
-        app_name.to_string()
-    } else {
-        format!("{app_name}.exe")
-    };
-    let _ = Command::new("taskkill")
-        .args(["/IM", image_name.as_str(), "/F"])
-        .status();
+    for app_name in &target.app_names {
+        let image_name = windows_image_name(app_name);
+        let _ = Command::new("taskkill")
+            .args(["/IM", image_name.as_str(), "/F"])
+            .status();
+    }
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -612,10 +634,18 @@ fn stop_codex(target: &CodexLaunchTarget) {
         kill_process_match(pattern);
         return;
     }
-    let Some(app_name) = target.app_name.as_deref() else {
-        return;
-    };
-    let _ = Command::new("pkill").arg(app_name).status();
+    for app_name in &target.app_names {
+        let _ = Command::new("pkill").arg(app_name).status();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_image_name(app_name: &str) -> String {
+    if app_name.to_ascii_lowercase().ends_with(".exe") {
+        app_name.to_string()
+    } else {
+        format!("{app_name}.exe")
+    }
 }
 
 #[cfg(any(
@@ -684,12 +714,12 @@ fn start_codex(target: &CodexLaunchTarget) -> bool {
             .spawn()
             .is_ok();
     }
-    let app_name = target.app_name.as_deref().unwrap_or("Codex");
-    Command::new("open")
-        .args(["-a", app_name])
-        .status()
-        .is_ok_and(|status| status.success())
-        || Command::new("codex").spawn().is_ok()
+    target.app_names.iter().any(|app_name| {
+        Command::new("open")
+            .args(["-a", app_name])
+            .status()
+            .is_ok_and(|status| status.success())
+    }) || Command::new("codex").spawn().is_ok()
 }
 
 #[cfg(target_os = "windows")]
@@ -700,14 +730,33 @@ fn start_codex(target: &CodexLaunchTarget) -> bool {
             .status()
             .is_ok_and(|status| status.success());
     }
-    let command = target.command.clone().unwrap_or_else(|| {
-        target
-            .app_name
-            .clone()
-            .unwrap_or_else(|| "codex".to_string())
-    });
-    Command::new("cmd")
-        .args(["/C", "start", "", command.as_str()])
+    if start_windows_store_codex_app() {
+        return true;
+    }
+    target.app_names.iter().any(|app_name| {
+        Command::new("cmd")
+            .args(["/C", "start", "", app_name])
+            .status()
+            .is_ok_and(|status| status.success())
+    }) || Command::new("codex").spawn().is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn start_windows_store_codex_app() -> bool {
+    const SCRIPT: &str = r#"$entry = Get-StartApps |
+  Where-Object {
+    $_.AppID -like 'OpenAI.ChatGPT*' -or
+    $_.AppID -like 'OpenAI.Codex_*' -or
+    $_.Name -like 'ChatGPT*' -or
+    $_.Name -like 'Codex*'
+  } |
+  Sort-Object @{ Expression = { if ($_.AppID -like 'OpenAI.ChatGPT*' -or $_.Name -like 'ChatGPT*') { 0 } else { 1 } } }, Name |
+  Select-Object -First 1
+if (-not $entry -or [string]::IsNullOrWhiteSpace($entry.AppID)) { exit 1 }
+Start-Process explorer.exe -ArgumentList ('shell:AppsFolder\' + $entry.AppID)
+exit 0"#;
+    Command::new("powershell")
+        .args(["-NoProfile", "-Command", SCRIPT])
         .status()
         .is_ok_and(|status| status.success())
 }
@@ -717,9 +766,11 @@ fn start_codex(target: &CodexLaunchTarget) -> bool {
     if let Some(command) = target.command.as_deref() {
         return Command::new("sh").args(["-lc", command]).spawn().is_ok();
     }
-    Command::new(target.app_name.as_deref().unwrap_or("codex"))
-        .spawn()
-        .is_ok()
+    target
+        .app_names
+        .iter()
+        .any(|app_name| Command::new(app_name).spawn().is_ok())
+        || Command::new("codex").spawn().is_ok()
 }
 
 #[cfg(test)]
@@ -765,6 +816,17 @@ mod tests {
             Some("env:OPENROUTER_API_KEY"),
         );
         assert!(provider_can_direct_connect(&provider));
+    }
+
+    #[test]
+    fn chat_completions_only_provider_requires_relay() {
+        let mut provider = provider(
+            ProviderKind::OpenAiCompatible,
+            Some("env:OPENROUTER_API_KEY"),
+        );
+        provider.base_url = "https://example.com/v1/chat/completions".to_string();
+
+        assert!(!provider_can_direct_connect(&provider));
     }
 
     #[test]
@@ -827,7 +889,18 @@ mod tests {
                 skipped: false,
             },
         );
-        assert!(message.contains("并已启动 Codex"));
+        assert!(message.contains("并已启动 ChatGPT / Codex"));
+    }
+
+    #[test]
+    fn default_client_names_prefer_chatgpt_and_keep_legacy_codex() {
+        assert_eq!(
+            default_codex_app_names(),
+            vec![
+                CHATGPT_APP_NAME.to_string(),
+                LEGACY_CODEX_APP_NAME.to_string()
+            ]
+        );
     }
 
     #[test]

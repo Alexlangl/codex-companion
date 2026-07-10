@@ -38,6 +38,7 @@ dirs = "6.0"
 futures-util = "0.3"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rust_decimal = { version = "1.39", default-features = false, features = ["std"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

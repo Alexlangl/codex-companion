@@ -2,7 +2,9 @@
 
 中文 | [English](./README.en.md)
 
-`codex-companion` 是给 Codex Desktop / CLI 使用的本地账号与代理工具。
+`codex-companion` 是给 ChatGPT 桌面端内的 Codex（同时兼容旧版 Codex Desktop）/ Codex CLI 使用的本地账号与代理工具。
+
+新版 macOS / Windows 官方客户端虽然显示为 `ChatGPT`，仍使用 Codex 的配置目录与 CLI。Companion 会优先发现并控制 ChatGPT 客户端，同时保留对旧版 Codex 应用的兼容。
 
 它让 Codex 只需要接入一个 Companion，本地就可以管理官方 Codex 账号、API Key 中转、第三方 OpenAI-compatible provider，并支持账号分组、失败切换、健康刷新、历史会话修复和 token 用量统计。
 
@@ -20,10 +22,11 @@
 - 导入 API Key 账号 JSON，或手动添加 OpenAI-compatible provider。
 - 把多个账号编排成 Provider Group，按优先级失败切换。
 - 单个账号默认直连，也可以在账号卡片里切换为本地代理。
+- 地址明确指向 `/chat/completions` 的中转站会强制使用本地代理，由 Companion 转换 Responses、工具调用和多轮历史，避免误选直连。
 - 官方 Codex 账号由 Companion 负责 token 刷新和请求头处理。
 - 自动刷新账号健康度、订阅状态和可识别的额度信息。
 - 启动 Codex 前修复历史会话和插件状态，减少切换 provider 后上下文丢失的问题。
-- 从本地 Codex 会话记录里统计 token 用量。
+- 从本地 Codex 会话记录里统计 token 用量，并按模型估算新输入、缓存输入和输出成本。
 
 ## 截图
 
@@ -59,13 +62,13 @@
 
 ### 修复
 
-预览或修复 Codex 历史会话和插件状态，执行修复前会创建备份。
+预览或修复 Codex 历史会话和插件状态。正式修复使用独立事务备份；任一步失败会恢复本次已修改文件，成功后保留最近 10 份修复备份。
 
 <img src="assets/readme/repair.jpg" alt="Repair page" width="720">
 
 ### 用量
 
-从 Codex 本地会话记录中统计 token 使用量。
+从 Codex 本地会话记录中统计 token 使用量和估算成本。未匹配价格的模型会明确标记为“未定价”，不会当作真实 `$0`。
 
 <img src="assets/readme/token-usage.jpg" alt="Token usage page" width="720">
 
@@ -79,6 +82,29 @@
 - 使用 `修复` 预览或修复 Codex 历史会话和插件状态。
 - 使用 `用量` 查看本地 token 统计。
 - 使用 `设置` 写入或恢复 Codex 配置。
+
+### 自定义模型价格
+
+内置价格是带日期的估算快照，不代表上游账单。可以在 Companion 数据目录（默认 `~/.codex-companion`）创建 `model-pricing.json` 覆盖或补充模型价格：
+
+```json
+{
+  "models": [
+    {
+      "model": "custom-model",
+      "aliases": ["vendor/custom-latest"],
+      "inputPerMillion": "1.00",
+      "cachedInputPerMillion": "0.10",
+      "outputPerMillion": "2.00"
+    }
+  ],
+  "providerMultipliers": {
+    "paid-relay": "1.15"
+  }
+}
+```
+
+价格单位为每百万 Token 的美元估算值。`providerMultipliers` 可用于表达中转站加价或折扣。
 
 ## CLI 用法
 
@@ -151,6 +177,7 @@ API Key JSON 示例：
 ## 安全说明
 
 - 修复前可以先 dry-run 预览影响。
-- 正式修复前会备份本地 Codex 数据。
+- 正式修复使用 `~/.codex/backups/codex-companion/repair/` 下的事务备份；失败自动回滚，成功后保留最近 10 份。
 - 导入的账号材料只保存在本机。
 - Token 用量统计只读取本地 Codex 会话记录。
+- 成本是基于模型价格快照和本地覆盖配置的估算，不是 OpenAI 或中转站账单。

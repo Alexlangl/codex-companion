@@ -368,7 +368,7 @@ export function importProviderJson(jsonText: string, providerId?: string, provid
       kind: "official_codex",
       baseUrl: "https://chatgpt.com/backend-api/codex",
       authRef: `file:${mockStatus.dataDir}/auth/accounts/${id}.json`,
-      modelMap: { "gpt-5-codex": "gpt-5-codex" },
+      modelMap: {},
       priority: 50,
       enabled: true,
       refreshIntervalSeconds: 60,
@@ -1039,6 +1039,12 @@ function mockLaunchOutcome(
   restartRequired = mode === "provider_direct",
 ): CodexLaunchOutcome {
   const codexStarted = restartRequired;
+  let message = `已切换本地代理到 ${targetId}，Codex 已在本地代理模式运行，无需重启`;
+  if (mode === "provider_direct") {
+    message = `已直连启动 ${targetId}，并已重启 ChatGPT / Codex 以载入账号/API Key`;
+  } else if (restartRequired) {
+    message = `已通过本地代理启动 ${targetId}，并已重启 ChatGPT / Codex`;
+  }
   return {
     mode,
     targetId,
@@ -1064,12 +1070,7 @@ function mockLaunchOutcome(
     },
     restartRequired,
     codexStarted,
-    message:
-      mode === "provider_direct"
-        ? `已直连启动 ${targetId}，并已重启 Codex 以载入账号/API Key`
-        : restartRequired
-          ? `已通过本地代理启动 ${targetId}，并已重启 Codex`
-          : `已切换本地代理到 ${targetId}，Codex 已在本地代理模式运行，无需重启`,
+    message,
   };
 }
 

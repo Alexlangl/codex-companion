@@ -1,3 +1,4 @@
+mod pricing;
 mod token_usage;
 
 use chrono::Local;
@@ -22,6 +23,7 @@ const CODEX_API_KEY_AUTH_MODE: &str = "apikey";
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const COMPANION_MARKER_TABLE: &str = "codex_companion";
 const COMPANION_MARKER_VERSION: i64 = 1;
+const REPAIR_BACKUP_RETENTION: usize = 10;
 
 pub use token_usage::{collect_token_usage, collect_token_usage_cached};
 
@@ -55,11 +57,18 @@ pub fn install_companion_provider_with_token_source(
     let mut doc = current.parse::<DocumentMut>().map_err(|source| {
         CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
     })?;
+    let managed_target_provider =
+        CompanionConfigMarker::from_doc(&doc).and_then(|marker| marker.target_provider);
     let auth_rollback = AuthRollback::capture(&codex_dir)?;
     let mut backup = prepare_config_write(&codex_dir, &config_path, &doc)?;
     restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
     let auth_shape = detect_codex_auth_shape(&codex_dir)?;
 
+    remove_previous_managed_provider_table(
+        &mut doc,
+        managed_target_provider.as_deref(),
+        COMPANION_PROVIDER_ID,
+    );
     doc["model_provider"] = value(COMPANION_PROVIDER_ID);
     doc["model_providers"][COMPANION_PROVIDER_ID]["name"] = value(COMPANION_PROVIDER_NAME);
     doc["model_providers"][COMPANION_PROVIDER_ID]["base_url"] = value(relay.base_url());
@@ -107,23 +116,18 @@ pub fn install_direct_provider_with_options(
     let mut doc = current.parse::<DocumentMut>().map_err(|source| {
         CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
     })?;
+    let managed_target_provider =
+        CompanionConfigMarker::from_doc(&doc).and_then(|marker| marker.target_provider);
     let auth_rollback = AuthRollback::capture(&codex_dir)?;
     let mut backup = prepare_config_write(&codex_dir, &config_path, &doc)?;
     let auth_shape_before = detect_codex_auth_shape(&codex_dir)?;
     let direct_auth = resolve_direct_auth(provider)?;
     let mut token_source = direct_auth.token_source();
-    let direct_writes_auth = direct_auth.writes_auth_json();
-    let mut restored_prior_auth_write = false;
-    if options.preserve_official_codex_auth
+    let preserve_api_key_in_config = options.preserve_official_codex_auth
         && !matches!(provider.kind, ProviderKind::OfficialCodex)
-        && matches!(&direct_auth, DirectAuthMaterial::ApiKey(_))
-        && auth_shape_before.has_official_oauth()
-    {
-        return Err(CompanionError::InvalidConfig(
-            "已开启官方 Codex 登录保护：直连第三方 API key 会写入 auth.json 并影响官方登录态，请改用本地代理或环境变量直连"
-                .to_string(),
-        ));
-    }
+        && matches!(&direct_auth, DirectAuthMaterial::ApiKey(_));
+    let direct_writes_auth = direct_auth.writes_auth_json() && !preserve_api_key_in_config;
+    let mut restored_prior_auth_write = false;
 
     let mut effective_model_provider = provider.id.clone();
     let mut keychain_warning = None;
@@ -134,7 +138,7 @@ pub fn install_direct_provider_with_options(
                 provider.name
             )));
         };
-        write_official_codex_config(&mut doc, &provider.id);
+        write_official_codex_config(&mut doc, managed_target_provider.as_deref());
         ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
         ensure_auth_backup(&mut backup, &codex_dir)?;
         write_codex_auth_json(&codex_dir, &auth)?;
@@ -146,6 +150,11 @@ pub fn install_direct_provider_with_options(
         }
         effective_model_provider = CODEX_OPENAI_PROVIDER_ID.to_string();
     } else {
+        remove_previous_managed_provider_table(
+            &mut doc,
+            managed_target_provider.as_deref(),
+            &provider.id,
+        );
         doc["model_provider"] = value(&provider.id);
         doc["model_providers"][&provider.id]["name"] = value(&provider.name);
         doc["model_providers"][&provider.id]["base_url"] = value(&provider.base_url);
@@ -163,11 +172,20 @@ pub fn install_direct_provider_with_options(
             }
             DirectAuthMaterial::ApiKey(api_key) => {
                 doc["model_providers"][&provider.id]["env_key"] = Item::None;
-                doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
-                ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
-                ensure_auth_backup(&mut backup, &codex_dir)?;
-                write_codex_openai_api_key(&codex_dir, &api_key)?;
-                record_auth_write(&mut backup, &codex_dir)?;
+                if preserve_api_key_in_config {
+                    restored_prior_auth_write =
+                        restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
+                    doc["model_providers"][&provider.id]["experimental_bearer_token"] =
+                        value(api_key);
+                    token_source = "provider-scoped experimental_bearer_token in Codex config.toml; official ChatGPT OAuth auth.json preserved"
+                        .to_string();
+                } else {
+                    doc["model_providers"][&provider.id]["experimental_bearer_token"] = Item::None;
+                    ensure_managed_auth_write_unchanged(&backup, &codex_dir)?;
+                    ensure_auth_backup(&mut backup, &codex_dir)?;
+                    write_codex_openai_api_key(&codex_dir, &api_key)?;
+                    record_auth_write(&mut backup, &codex_dir)?;
+                }
             }
             DirectAuthMaterial::CodexAuth(auth) => {
                 doc["model_providers"][&provider.id]["env_key"] = Item::None;
@@ -446,17 +464,24 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
     Some(Value::Object(auth))
 }
 
-fn write_official_codex_config(doc: &mut DocumentMut, provider_id: &str) {
-    let previous_provider = doc
-        .get("model_provider")
-        .and_then(Item::as_str)
-        .map(ToOwned::to_owned);
+fn write_official_codex_config(doc: &mut DocumentMut, managed_target_provider: Option<&str>) {
     doc["openai_base_url"] = Item::None;
     doc["model_provider"] = value(CODEX_OPENAI_PROVIDER_ID);
-    remove_model_provider_table(doc, provider_id);
-    if let Some(previous_provider) = previous_provider.as_deref() {
-        remove_model_provider_table(doc, previous_provider);
+    remove_previous_managed_provider_table(doc, managed_target_provider, CODEX_OPENAI_PROVIDER_ID);
+}
+
+fn remove_previous_managed_provider_table(
+    doc: &mut DocumentMut,
+    managed_target_provider: Option<&str>,
+    next_provider: &str,
+) {
+    let Some(previous_provider) = managed_target_provider else {
+        return;
+    };
+    if previous_provider == next_provider || previous_provider == CODEX_OPENAI_PROVIDER_ID {
+        return;
     }
+    remove_model_provider_table(doc, previous_provider);
 }
 
 fn remove_model_provider_table(doc: &mut DocumentMut, provider_id: &str) {
@@ -1478,47 +1503,63 @@ pub fn repair_state(options: RepairOptions) -> Result<RepairOutcome> {
         });
     }
 
-    let mut migrated_history_files = 0;
-    let mut migrated_history_lines = 0;
-    let mut migrated_plugin_files = 0;
-    let mut migrated_state_rows = 0;
-    let mut backup_root = None;
+    let (
+        backup_root,
+        (
+            migrated_history_files,
+            migrated_history_lines,
+            migrated_plugin_files,
+            migrated_state_rows,
+        ),
+    ) = run_repair_transaction(&options.codex_dir, |backup_root| {
+        let mut migrated_history_files = 0;
+        let mut migrated_history_lines = 0;
+        let mut migrated_plugin_files = 0;
+        let mut migrated_state_rows = 0;
 
-    if options.history && history_lines > 0 {
-        let backup_root = ensure_backup_root(&mut backup_root, &options.codex_dir)?;
-        let history_migration = rewrite_history_files(
-            &jsonl_files,
-            &source_provider_ids,
-            &target_provider_id,
-            backup_root,
-            &options.codex_dir,
-        )?;
-        migrated_history_files = history_migration.files;
-        migrated_history_lines = history_migration.lines;
-    }
-
-    if options.history && db_path.exists() && state_rows > 0 {
-        let backup_root = ensure_backup_root(&mut backup_root, &options.codex_dir)?;
-        backup_file(&db_path, backup_root, &options.codex_dir)?;
-        migrated_state_rows = repair_sqlite_threads(
-            &db_path,
-            &source_provider_ids,
-            &target_provider_id,
-            &session_metadata,
-        )?;
-    }
-
-    for path in &plugin_files {
-        if rewrite_plugin_file(
-            path,
-            &source_provider_ids,
-            &target_provider_id,
-            &mut backup_root,
-            &options.codex_dir,
-        )? {
-            migrated_plugin_files += 1;
+        if options.history && history_lines > 0 {
+            let backup_root = ensure_repair_backup_root(backup_root, &options.codex_dir)?;
+            let history_migration = rewrite_history_files(
+                &jsonl_files,
+                &source_provider_ids,
+                &target_provider_id,
+                backup_root,
+                &options.codex_dir,
+            )?;
+            migrated_history_files = history_migration.files;
+            migrated_history_lines = history_migration.lines;
         }
-    }
+
+        if options.history && db_path.exists() && state_rows > 0 {
+            let backup_root = ensure_repair_backup_root(backup_root, &options.codex_dir)?;
+            backup_file(&db_path, backup_root, &options.codex_dir)?;
+            migrated_state_rows = repair_sqlite_threads(
+                &db_path,
+                &source_provider_ids,
+                &target_provider_id,
+                &session_metadata,
+            )?;
+        }
+
+        for path in &plugin_files {
+            if rewrite_plugin_file(
+                path,
+                &source_provider_ids,
+                &target_provider_id,
+                backup_root,
+                &options.codex_dir,
+            )? {
+                migrated_plugin_files += 1;
+            }
+        }
+
+        Ok((
+            migrated_history_files,
+            migrated_history_lines,
+            migrated_plugin_files,
+            migrated_state_rows,
+        ))
+    })?;
 
     let skipped_reason =
         if migrated_history_files == 0 && migrated_plugin_files == 0 && migrated_state_rows == 0 {
@@ -2075,7 +2116,7 @@ fn rewrite_plugin_file(
         return Ok(false);
     };
     if rewrite_provider_fields(&mut value, source_ids, target_provider_id) {
-        let backup_root = ensure_backup_root(backup_root, codex_dir)?;
+        let backup_root = ensure_repair_backup_root(backup_root, codex_dir)?;
         backup_file(path, backup_root, codex_dir)?;
         let next = serde_json::to_string_pretty(&value)
             .map_err(|source| CompanionError::json(path, source))?;
@@ -2083,6 +2124,126 @@ fn rewrite_plugin_file(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn run_repair_transaction<T>(
+    codex_dir: &Path,
+    mutate: impl FnOnce(&mut Option<PathBuf>) -> Result<T>,
+) -> Result<(Option<PathBuf>, T)> {
+    let mut backup_root = None;
+    match mutate(&mut backup_root) {
+        Ok(value) => {
+            if backup_root.is_some() {
+                let _ = cleanup_old_repair_backups(codex_dir, REPAIR_BACKUP_RETENTION);
+            }
+            Ok((backup_root, value))
+        }
+        Err(error) => {
+            let Some(root) = backup_root.as_deref() else {
+                return Err(error);
+            };
+            match restore_repair_backup(root, codex_dir) {
+                Ok(()) => Err(CompanionError::InvalidConfig(format!(
+                    "{error}；修复未完成，已从 {} 回滚已修改文件",
+                    root.display()
+                ))),
+                Err(rollback_error) => Err(CompanionError::InvalidConfig(format!(
+                    "{error}；自动回滚也失败: {rollback_error}；备份位于 {}",
+                    root.display()
+                ))),
+            }
+        }
+    }
+}
+
+fn repair_backup_parent(codex_dir: &Path) -> PathBuf {
+    codex_dir
+        .join("backups")
+        .join("codex-companion")
+        .join("repair")
+}
+
+fn create_repair_backup_root(codex_dir: &Path) -> Result<PathBuf> {
+    let parent = repair_backup_parent(codex_dir);
+    fs::create_dir_all(&parent).map_err(|source| CompanionError::io(&parent, source))?;
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
+    for suffix in 0..1000 {
+        let name = if suffix == 0 {
+            timestamp.clone()
+        } else {
+            format!("{timestamp}-{suffix}")
+        };
+        let root = parent.join(name);
+        match fs::create_dir(&root) {
+            Ok(()) => return Ok(root),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(CompanionError::io(&root, source)),
+        }
+    }
+    Err(CompanionError::InvalidConfig(
+        "无法创建唯一的会话修复备份目录".to_string(),
+    ))
+}
+
+fn ensure_repair_backup_root<'a>(
+    backup_root: &'a mut Option<PathBuf>,
+    codex_dir: &Path,
+) -> Result<&'a Path> {
+    if backup_root.is_none() {
+        *backup_root = Some(create_repair_backup_root(codex_dir)?);
+    }
+    Ok(backup_root.as_deref().expect("repair backup root"))
+}
+
+fn restore_repair_backup(backup_root: &Path, codex_dir: &Path) -> Result<()> {
+    let mut files = WalkDir::new(backup_root)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    files.sort();
+    for backup_path in files {
+        let relative = backup_path.strip_prefix(backup_root).map_err(|source| {
+            CompanionError::InvalidConfig(format!(
+                "无法解析修复备份路径 {}: {source}",
+                backup_path.display()
+            ))
+        })?;
+        let target = codex_dir.join(relative);
+        if target.is_dir() {
+            fs::remove_dir_all(&target).map_err(|source| CompanionError::io(&target, source))?;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
+        }
+        fs::copy(&backup_path, &target)
+            .map_err(|source| CompanionError::io(&backup_path, source))?;
+    }
+    Ok(())
+}
+
+fn cleanup_old_repair_backups(codex_dir: &Path, retain: usize) -> Result<()> {
+    let parent = repair_backup_parent(codex_dir);
+    let Ok(entries) = fs::read_dir(&parent) else {
+        return Ok(());
+    };
+    let mut directories = entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| entry.path())
+        })
+        .collect::<Vec<_>>();
+    directories.sort();
+    let remove_count = directories.len().saturating_sub(retain);
+    for path in directories.into_iter().take(remove_count) {
+        fs::remove_dir_all(&path).map_err(|source| CompanionError::io(&path, source))?;
+    }
+    Ok(())
 }
 
 fn rewrite_provider_fields(
@@ -2129,16 +2290,6 @@ fn create_backup_root(codex_dir: &Path) -> Result<PathBuf> {
         .join(timestamp);
     fs::create_dir_all(&root).map_err(|source| CompanionError::io(&root, source))?;
     Ok(root)
-}
-
-fn ensure_backup_root<'a>(
-    backup_root: &'a mut Option<PathBuf>,
-    codex_dir: &Path,
-) -> Result<&'a Path> {
-    if backup_root.is_none() {
-        *backup_root = Some(create_backup_root(codex_dir)?);
-    }
-    Ok(backup_root.as_deref().expect("backup root"))
 }
 
 fn backup_file(path: &Path, backup_root: &Path, codex_dir: &Path) -> Result<()> {
@@ -2409,7 +2560,7 @@ mod tests {
     }
 
     #[test]
-    fn preserve_official_auth_blocks_third_party_api_key_auth_write() {
+    fn preserve_official_auth_moves_third_party_api_key_into_provider_config() {
         let temp = tempfile::tempdir().expect("tempdir");
         let original_auth = serde_json::json!({
             "OPENAI_API_KEY": null,
@@ -2421,21 +2572,26 @@ mod tests {
         fs::write(&auth_path, r#"{"api_key":"sk-test"}"#).expect("provider auth");
         let provider = api_key_provider(Some(format!("file:{}", auth_path.display())), None);
 
-        let error = install_direct_provider_with_options(
+        let status = install_direct_provider_with_options(
             Some(temp.path().to_path_buf()),
             &provider,
             DirectInstallOptions {
                 preserve_official_codex_auth: true,
             },
         )
-        .expect_err("preserve setting should block direct auth write");
+        .expect("preserve setting should use config-only auth");
 
-        assert!(error.to_string().contains("官方 Codex 登录保护"));
+        assert!(status
+            .message
+            .contains("provider-scoped experimental_bearer_token"));
         assert_eq!(
             fs::read_to_string(temp.path().join("auth.json")).expect("auth"),
             original_auth
         );
-        assert!(!temp.path().join("config.toml").exists());
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains("model_provider = \"openrouter\""));
+        assert!(config.contains("experimental_bearer_token = \"sk-test\""));
+        assert!(!config.contains("auth_write_hash = \""));
     }
 
     #[test]
@@ -2740,6 +2896,58 @@ mod tests {
         assert_eq!(outcome.plan.history_lines, 1);
         let text = fs::read_to_string(&file).expect("read");
         assert!(text.contains("\"openai\""));
+        assert!(!repair_backup_parent(temp.path()).exists());
+    }
+
+    #[test]
+    fn repair_transaction_rolls_back_files_after_later_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        let file = sessions.join("session.jsonl");
+        let original = "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"openai\"}}\n";
+        fs::write(&file, original).expect("write original");
+
+        let error = run_repair_transaction(temp.path(), |backup_root| -> Result<()> {
+            let root = ensure_repair_backup_root(backup_root, temp.path())?;
+            backup_file(&file, root, temp.path())?;
+            fs::write(
+                &file,
+                "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"codex-companion\"}}\n",
+            )
+            .map_err(|source| CompanionError::io(&file, source))?;
+            Err(CompanionError::InvalidConfig(
+                "simulated later repair failure".to_string(),
+            ))
+        })
+        .expect_err("repair should fail");
+
+        assert!(error.to_string().contains("已从"));
+        assert_eq!(fs::read_to_string(&file).expect("restored file"), original);
+        let backups = fs::read_dir(repair_backup_parent(temp.path()))
+            .expect("repair backups")
+            .count();
+        assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn repair_backup_cleanup_keeps_newest_directories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = repair_backup_parent(temp.path());
+        fs::create_dir_all(&parent).expect("repair parent");
+        for name in ["001", "002", "003", "004", "005"] {
+            fs::create_dir(parent.join(name)).expect("backup dir");
+        }
+
+        cleanup_old_repair_backups(temp.path(), 3).expect("cleanup");
+
+        let mut names = fs::read_dir(&parent)
+            .expect("repair backups")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["003", "004", "005"]);
     }
 
     #[test]
@@ -3168,7 +3376,7 @@ base_url = "https://keep.example/v1"
         assert_eq!(status.model_provider.as_deref(), Some("openai"));
         let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
         assert!(config.contains("model_provider = \"openai\""));
-        assert!(!config.contains("[model_providers.old-direct]"));
+        assert!(config.contains("[model_providers.old-direct]"));
         assert!(!config.contains("[model_providers.official-mark]"));
         assert!(config.contains("[model_providers.keep-me]"));
         assert!(!config.contains("openai_base_url"));

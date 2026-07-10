@@ -135,6 +135,12 @@ export interface TokenUsageSummary {
   cachedInputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  cost: TokenCostBreakdown;
+  pricedEvents: number;
+  unpricedEvents: number;
+  unpricedModels: string[];
+  pricingAsOf: string;
+  pricingOverridePath?: string | null;
   byDay: TokenUsageBucket[];
   byModel: TokenUsageBucket[];
   byProvider: TokenUsageBucket[];
@@ -148,6 +154,16 @@ export interface TokenUsageBucket {
   cachedInputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  cost: TokenCostBreakdown;
+  pricedEvents: number;
+  unpricedEvents: number;
+}
+
+export interface TokenCostBreakdown {
+  freshInputUsd: string;
+  cachedInputUsd: string;
+  outputUsd: string;
+  totalUsd: string;
 }
 
 export interface TokenUsageEvent {
@@ -159,6 +175,8 @@ export interface TokenUsageEvent {
   cachedInputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  cost?: TokenCostBreakdown | null;
+  pricingModel?: string | null;
 }
 
 export interface ProviderUpsert {

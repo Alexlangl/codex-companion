@@ -2,7 +2,9 @@
 
 [中文](./README.md) | English
 
-`codex-companion` is a local account and proxy tool for Codex Desktop / CLI.
+`codex-companion` is a local account and proxy tool for Codex inside the ChatGPT desktop app (with legacy Codex Desktop compatibility) and the Codex CLI.
+
+The current macOS and Windows client is displayed as `ChatGPT` while continuing to use Codex configuration and CLI state. Companion prefers the ChatGPT client for lifecycle control and falls back to the legacy Codex app.
 
 It lets Codex connect to one Companion runtime while you manage official Codex accounts, API-key gateways, and third-party OpenAI-compatible providers locally. It supports provider groups, fallback, health refresh, history repair, plugin state repair, and token usage stats.
 
@@ -20,10 +22,11 @@ It provides:
 - Import API Key account JSON or manually add OpenAI-compatible providers.
 - Compose multiple accounts into a Provider Group and fallback by priority.
 - Single accounts default to direct mode, and you can switch them to local proxy mode from the account card.
+- Relay providers whose URL explicitly targets `/chat/completions` are forced through the local relay so Companion can translate Responses requests, tool calls, and multi-turn history.
 - Let Companion handle token refresh and request headers for official Codex accounts.
 - Refresh account health, subscription state, and recognizable quota information.
 - Repair Codex history and plugin state before launching Codex, reducing provider-switch continuity issues.
-- Scan local Codex session logs for token usage stats.
+- Scan local Codex session logs for token usage and estimate fresh-input, cached-input, and output cost by model.
 
 ## Screenshots
 
@@ -59,13 +62,13 @@ Inspect Companion local proxy status, request logs, upstream errors, and fallbac
 
 ### Repair
 
-Preview or repair Codex history and plugin state. Real repair creates backups first.
+Preview or repair Codex history and plugin state. Real repair uses an isolated transactional backup, restores files changed by the current run if any later step fails, and keeps the 10 newest repair backups after a successful run.
 
 <img src="assets/readme/repair.jpg" alt="Repair page" width="720">
 
 ### Usage
 
-Read token usage from local Codex session logs.
+Read token usage and estimated cost from local Codex session logs. Models without a matching price are shown as unpriced instead of being reported as a real `$0`.
 
 <img src="assets/readme/token-usage.jpg" alt="Token usage page" width="720">
 
@@ -79,6 +82,29 @@ After opening the desktop app:
 - Use `Repair` to preview or repair Codex history and plugin state.
 - Use `Usage` to view local token stats.
 - Use `Settings` to install or restore Codex configuration.
+
+### Custom Model Pricing
+
+Built-in prices are dated estimation snapshots, not upstream billing records. Create `model-pricing.json` in the Companion data directory (default `~/.codex-companion`) to override or add model prices:
+
+```json
+{
+  "models": [
+    {
+      "model": "custom-model",
+      "aliases": ["vendor/custom-latest"],
+      "inputPerMillion": "1.00",
+      "cachedInputPerMillion": "0.10",
+      "outputPerMillion": "2.00"
+    }
+  ],
+  "providerMultipliers": {
+    "paid-relay": "1.15"
+  }
+}
+```
+
+Prices are USD estimates per one million tokens. Use `providerMultipliers` to represent a gateway markup or discount.
 
 ## CLI Usage
 
@@ -151,6 +177,7 @@ API Key JSON example:
 ## Safety Notes
 
 - You can run dry-run before writing repair changes.
-- Real repair backs up local Codex data first.
+- Real repair uses transactional backups under `~/.codex/backups/codex-companion/repair/`; failures roll back automatically and a successful run keeps the 10 newest repair backups.
 - Imported account material stays on your machine.
 - Token usage stats only read local Codex session logs.
+- Cost is an estimate based on the model price snapshot and local overrides, not an OpenAI or gateway invoice.

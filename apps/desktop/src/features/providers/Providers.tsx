@@ -105,7 +105,7 @@ export function Providers({
       refreshIntervalSeconds: Number(apiKeyForm.refreshIntervalSeconds) || 60,
     };
     if (!input.apiKey && !input.envVar) {
-      setApiKeyError("至少填写 API Key 或 API Key 环境变量名。直连使用 API key 文件时会合并写入 Codex auth.json；本地代理由 Companion 注入密钥且不写 auth.json。");
+      setApiKeyError("至少填写 API Key 或 API Key 环境变量名。直连的密钥写入方式受“保留官方 Codex 登录”设置控制；本地代理由 Companion 注入密钥且不写 auth.json。");
       return;
     }
     await onImportApiKey(input);
@@ -659,7 +659,7 @@ function ProviderAddTabs({
           </Field>
           {apiKeyError ? <p className="field-error">{apiKeyError}</p> : null}
           <p className="field-hint">
-            创建时只保存账号材料，不会自动加入分组；请求地址不决定直连或代理，启动方式以账号卡片上的选择为准。直连需要重启 Codex 以读取账号/API Key，本地代理切换账号无需重启。
+            创建时只保存账号材料，不会自动加入分组；请求地址不决定直连或代理，启动方式以账号卡片上的选择为准。直连需要重启 ChatGPT / Codex 以读取账号/API Key，本地代理切换账号无需重启。
           </p>
           <div className="actions">
             <Button disabled={disabled} type="submit">

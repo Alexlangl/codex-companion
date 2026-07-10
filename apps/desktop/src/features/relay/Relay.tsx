@@ -13,7 +13,7 @@ export function Relay({ status }: { status: CompanionStatus }) {
           <div className="relay-url-card">
             <RadioTower size={20} />
             <div>
-              <span>Codex 使用这个地址时，账号切换不需要重启 Codex</span>
+              <span>Codex 使用这个地址时，账号切换不需要重启 ChatGPT / Codex</span>
               <strong>{status.relayBaseUrl}</strong>
             </div>
           </div>

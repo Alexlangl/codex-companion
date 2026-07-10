@@ -339,6 +339,12 @@ pub struct TokenUsageSummary {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub cost: TokenCostBreakdown,
+    pub priced_events: usize,
+    pub unpriced_events: usize,
+    pub unpriced_models: Vec<String>,
+    pub pricing_as_of: String,
+    pub pricing_override_path: Option<PathBuf>,
     pub by_day: Vec<TokenUsageBucket>,
     pub by_model: Vec<TokenUsageBucket>,
     pub by_provider: Vec<TokenUsageBucket>,
@@ -354,6 +360,29 @@ pub struct TokenUsageBucket {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub cost: TokenCostBreakdown,
+    pub priced_events: usize,
+    pub unpriced_events: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenCostBreakdown {
+    pub fresh_input_usd: String,
+    pub cached_input_usd: String,
+    pub output_usd: String,
+    pub total_usd: String,
+}
+
+impl Default for TokenCostBreakdown {
+    fn default() -> Self {
+        Self {
+            fresh_input_usd: "0".to_string(),
+            cached_input_usd: "0".to_string(),
+            output_usd: "0".to_string(),
+            total_usd: "0".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -367,6 +396,8 @@ pub struct TokenUsageEvent {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub cost: Option<TokenCostBreakdown>,
+    pub pricing_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

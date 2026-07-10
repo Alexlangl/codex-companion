@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const OFFICIAL_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-pub const DEFAULT_CODEX_MODEL: &str = "gpt-5-codex";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,7 +78,7 @@ pub struct ProviderImportDraft {
     pub base_url: String,
     pub auth_ref: String,
     pub account_id: String,
-    pub model: String,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

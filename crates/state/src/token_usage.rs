@@ -1,3 +1,4 @@
+use crate::pricing::{default_pricing_override_path, CostBreakdown, PricingCatalog, PRICING_AS_OF};
 use chrono::{DateTime, Local};
 use codex_companion_core::{
     CompanionError, Result, TokenUsageBucket, TokenUsageEvent, TokenUsageSummary,
@@ -10,7 +11,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-const TOKEN_USAGE_CACHE_VERSION: u32 = 1;
+const TOKEN_USAGE_CACHE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default)]
 struct CumulativeTokens {
@@ -79,7 +80,12 @@ pub fn collect_token_usage(codex_dir: PathBuf) -> Result<TokenUsageSummary> {
     for file in &files {
         all_events.extend(parse_session_file(file)?);
     }
-    Ok(summarize_token_events(codex_dir, files.len(), all_events))
+    Ok(summarize_token_events(
+        codex_dir,
+        files.len(),
+        all_events,
+        &PricingCatalog::builtin(),
+    ))
 }
 
 pub fn collect_token_usage_cached(
@@ -129,26 +135,38 @@ pub fn collect_token_usage_cached(
     cache.files = next_files;
     let _ = write_token_usage_cache(&cache_path, &cache);
 
-    Ok(summarize_token_events(codex_dir, files.len(), all_events))
+    let pricing_path = default_pricing_override_path(&cache_dir);
+    let catalog = PricingCatalog::builtin().load_override(&pricing_path)?;
+    Ok(summarize_token_events(
+        codex_dir,
+        files.len(),
+        all_events,
+        &catalog,
+    ))
 }
 
 fn summarize_token_events(
     codex_dir: PathBuf,
     files_scanned: usize,
     events: Vec<TokenUsageEvent>,
+    pricing: &PricingCatalog,
 ) -> TokenUsageSummary {
     let mut summary = TokenUsageSummary {
         codex_dir,
         files_scanned,
+        pricing_as_of: PRICING_AS_OF.to_string(),
+        pricing_override_path: pricing.override_path.clone(),
         ..TokenUsageSummary::default()
     };
+    let mut summary_cost = CostBreakdown::default();
     let mut sessions = BTreeSet::new();
-    let mut by_day = BTreeMap::<String, TokenUsageBucket>::new();
-    let mut by_model = BTreeMap::<String, TokenUsageBucket>::new();
-    let mut by_provider = BTreeMap::<String, TokenUsageBucket>::new();
+    let mut unpriced_models = BTreeSet::new();
+    let mut by_day = BTreeMap::<String, TokenUsageBucketAccumulator>::new();
+    let mut by_model = BTreeMap::<String, TokenUsageBucketAccumulator>::new();
+    let mut by_provider = BTreeMap::<String, TokenUsageBucketAccumulator>::new();
     let mut seen_events = BTreeSet::<String>::new();
 
-    for event in events {
+    for mut event in events {
         if !seen_events.insert(token_event_fingerprint(&event)) {
             continue;
         }
@@ -160,17 +178,39 @@ fn summarize_token_events(
         summary.cached_input_tokens += event.cached_input_tokens;
         summary.output_tokens += event.output_tokens;
         summary.total_tokens += event.total_tokens;
+        let event_cost = pricing
+            .estimate(
+                &event.model,
+                event.provider_id.as_deref(),
+                event.input_tokens,
+                event.cached_input_tokens,
+                event.output_tokens,
+            )
+            .map(|(matched, cost)| {
+                event.pricing_model = Some(matched.model.clone());
+                event.cost = Some(cost.to_api());
+                cost
+            });
+        if let Some(cost) = event_cost.as_ref() {
+            summary.priced_events += 1;
+            summary_cost.add_assign(cost);
+        } else {
+            summary.unpriced_events += 1;
+            unpriced_models.insert(event.model.clone());
+        }
 
         let day = day_key(event.timestamp.as_deref());
         add_to_bucket(
             by_day.entry(day.clone()).or_insert_with(|| bucket(&day)),
             &event,
+            event_cost.as_ref(),
         );
         add_to_bucket(
             by_model
                 .entry(event.model.clone())
                 .or_insert_with(|| bucket(&event.model)),
             &event,
+            event_cost.as_ref(),
         );
         let provider_id = event.provider_id.as_deref().unwrap_or("unknown");
         add_to_bucket(
@@ -178,11 +218,14 @@ fn summarize_token_events(
                 .entry(provider_id.to_string())
                 .or_insert_with(|| bucket(provider_id)),
             &event,
+            event_cost.as_ref(),
         );
         summary.recent_events.push(event);
     }
 
     summary.sessions = sessions.len();
+    summary.cost = summary_cost.to_api();
+    summary.unpriced_models = unpriced_models.into_iter().collect();
     summary.by_day = buckets_desc(by_day, false);
     summary.by_model = buckets_desc(by_model, true);
     summary.by_provider = buckets_desc(by_provider, true);
@@ -321,9 +364,7 @@ fn parse_token_event(state: &mut FileParseState, value: &Value) -> Option<TokenU
     update_model_and_provider(state, info);
     update_model_and_provider(state, payload);
 
-    let Some(delta) = token_event_delta(state, info) else {
-        return None;
-    };
+    let delta = token_event_delta(state, info)?;
     let delta = DeltaTokens {
         cached_input: delta.cached_input.min(delta.input),
         ..delta
@@ -341,6 +382,8 @@ fn parse_token_event(state: &mut FileParseState, value: &Value) -> Option<TokenU
         cached_input_tokens: delta.cached_input,
         output_tokens: delta.output,
         total_tokens: delta.total(),
+        cost: None,
+        pricing_model: None,
     })
 }
 
@@ -473,12 +516,35 @@ fn collect_jsonl_recursive(dir: &Path, files: &mut Vec<PathBuf>, depth: u32, max
     }
 }
 
-fn add_to_bucket(bucket: &mut TokenUsageBucket, event: &TokenUsageEvent) {
-    bucket.events += 1;
-    bucket.input_tokens += event.input_tokens;
-    bucket.cached_input_tokens += event.cached_input_tokens;
-    bucket.output_tokens += event.output_tokens;
-    bucket.total_tokens += event.total_tokens;
+#[derive(Debug, Default)]
+struct TokenUsageBucketAccumulator {
+    bucket: TokenUsageBucket,
+    cost: CostBreakdown,
+}
+
+impl TokenUsageBucketAccumulator {
+    fn finish(mut self) -> TokenUsageBucket {
+        self.bucket.cost = self.cost.to_api();
+        self.bucket
+    }
+}
+
+fn add_to_bucket(
+    accumulator: &mut TokenUsageBucketAccumulator,
+    event: &TokenUsageEvent,
+    cost: Option<&CostBreakdown>,
+) {
+    accumulator.bucket.events += 1;
+    accumulator.bucket.input_tokens += event.input_tokens;
+    accumulator.bucket.cached_input_tokens += event.cached_input_tokens;
+    accumulator.bucket.output_tokens += event.output_tokens;
+    accumulator.bucket.total_tokens += event.total_tokens;
+    if let Some(cost) = cost {
+        accumulator.bucket.priced_events += 1;
+        accumulator.cost.add_assign(cost);
+    } else {
+        accumulator.bucket.unpriced_events += 1;
+    }
 }
 
 fn day_key(timestamp: Option<&str>) -> String {
@@ -507,15 +573,24 @@ fn token_event_fingerprint(event: &TokenUsageEvent) -> String {
     )
 }
 
-fn bucket(key: &str) -> TokenUsageBucket {
-    TokenUsageBucket {
-        key: key.to_string(),
-        ..TokenUsageBucket::default()
+fn bucket(key: &str) -> TokenUsageBucketAccumulator {
+    TokenUsageBucketAccumulator {
+        bucket: TokenUsageBucket {
+            key: key.to_string(),
+            ..TokenUsageBucket::default()
+        },
+        ..TokenUsageBucketAccumulator::default()
     }
 }
 
-fn buckets_desc(map: BTreeMap<String, TokenUsageBucket>, by_total: bool) -> Vec<TokenUsageBucket> {
-    let mut buckets = map.into_values().collect::<Vec<_>>();
+fn buckets_desc(
+    map: BTreeMap<String, TokenUsageBucketAccumulator>,
+    by_total: bool,
+) -> Vec<TokenUsageBucket> {
+    let mut buckets = map
+        .into_values()
+        .map(TokenUsageBucketAccumulator::finish)
+        .collect::<Vec<_>>();
     if by_total {
         buckets.sort_by(|left, right| {
             right
@@ -647,7 +722,7 @@ mod tests {
             day.join("session.jsonl"),
             r#"{"type":"session_meta","payload":{"id":"s1","model_provider":"codex-companion"}}"#.to_string()
                 + "\n"
-                + r#"{"type":"turn_context","payload":{"model":"openai/gpt-5-codex-2026-06-07"}}"#
+                + r#"{"type":"turn_context","payload":{"model":"openai/gpt-5.3-codex-2026-06-07"}}"#
                 + "\n"
                 + r#"{"timestamp":"2026-06-07T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10}}}}"#
                 + "\n"
@@ -666,8 +741,14 @@ mod tests {
         assert_eq!(summary.cached_input_tokens, 30);
         assert_eq!(summary.output_tokens, 30);
         assert_eq!(summary.total_tokens, 190);
-        assert_eq!(summary.by_model[0].key, "gpt-5-codex");
+        assert_eq!(summary.by_model[0].key, "gpt-5.3-codex");
         assert_eq!(summary.by_provider[0].key, "codex-companion");
+        assert_eq!(summary.priced_events, 2);
+        assert_eq!(summary.unpriced_events, 0);
+        assert_eq!(summary.cost.fresh_input_usd, "0.0002275");
+        assert_eq!(summary.cost.cached_input_usd, "0.00000525");
+        assert_eq!(summary.cost.output_usd, "0.00042");
+        assert_eq!(summary.cost.total_usd, "0.00065275");
     }
 
     #[test]

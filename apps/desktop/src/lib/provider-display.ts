@@ -5,6 +5,7 @@ import type {
   ProviderQuotaWindow,
 } from "../types/domain";
 import { daysUntil, formatPercent, formatTime } from "./format";
+import { providerEndpointIsChatCompletions } from "./provider-url";
 
 export function providerAccountTitle(provider: ProviderConfig) {
   const account = provider.account;
@@ -52,6 +53,7 @@ export function providerSecondaryLine(provider: ProviderConfig) {
 }
 
 export function providerRunMode(provider: ProviderConfig) {
+  if (providerEndpointIsChatCompletions(provider.baseUrl)) return "仅代理（Chat Completions）";
   if (provider.kind === "official_codex") return "可直连";
   const directAuthRef = provider.directAuthRef?.trim();
   const authRef = provider.authRef?.trim();

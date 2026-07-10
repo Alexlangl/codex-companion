@@ -38,17 +38,18 @@ export function Settings({
         </dl>
         <label className="toggle-row">
           <input
+            aria-describedby="preserve-official-codex-auth-hint"
             checked={Boolean(status.config.app.preserveOfficialCodexAuth)}
             disabled={disabled}
             onChange={(event) => void onPreserveOfficialCodexAuth(event.currentTarget.checked)}
             type="checkbox"
           />
           <span>
-            <ShieldCheck size={15} /> 保留官方 Codex 登录
+            <ShieldCheck aria-hidden="true" size={15} /> 保留官方 Codex 登录
           </span>
         </label>
-        <p className="field-hint">
-          开启后，第三方 API key 直连如果会写入 auth.json 并影响官方 OAuth，会被拦截；本地代理仍由 Companion 注入密钥。
+        <p className="field-hint" id="preserve-official-codex-auth-hint">
+          开启后，第三方 API key 直连会写入对应 provider 的 experimental_bearer_token，官方 ChatGPT OAuth 继续保留在 auth.json；本地代理仍由 Companion 注入密钥。
         </p>
         <div className="actions">
           <Button disabled={disabled} onClick={() => void onInstall()}>

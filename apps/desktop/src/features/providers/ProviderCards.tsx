@@ -13,8 +13,13 @@ import {
   validityLabel,
   validityTone,
 } from "../../lib/provider-display";
+import { providerEndpointIsChatCompletions } from "../../lib/provider-url";
 import type { CompanionStatus, ProviderConfig, ProviderLaunchMode } from "../../types/domain";
-import { canDirectLaunch, launchModeLabel, resolveProviderLaunchMode } from "./provider-launch";
+import {
+  canDirectLaunch,
+  launchModeLabel,
+  resolveProviderLaunchMode,
+} from "./provider-launch";
 
 export function ProviderCompactItem({
   disabled,
@@ -62,6 +67,7 @@ export function ProviderCompactItem({
         compact
         disabled={disabled}
         mode={effectiveLaunchMode}
+        preserveOfficialCodexAuth={Boolean(status.config.app.preserveOfficialCodexAuth)}
         provider={provider}
         onChange={(mode) => void onLaunchModeChange(provider.id, mode)}
       />
@@ -177,6 +183,7 @@ export function ProviderCard({
           <LaunchModeControl
             disabled={disabled}
             mode={effectiveLaunchMode}
+            preserveOfficialCodexAuth={Boolean(status.config.app.preserveOfficialCodexAuth)}
             provider={provider}
             onChange={(mode) => void onLaunchModeChange(provider.id, mode)}
           />
@@ -193,22 +200,29 @@ function LaunchModeControl({
   compact,
   disabled,
   mode,
+  preserveOfficialCodexAuth,
   provider,
   onChange,
 }: {
   compact?: boolean;
   disabled: boolean;
   mode: ProviderLaunchMode;
+  preserveOfficialCodexAuth: boolean;
   provider: ProviderConfig;
   onChange: (mode: ProviderLaunchMode) => void;
 }) {
   const canDirect = canDirectLaunch(provider);
-  const directTitle =
-    provider.kind === "official_codex"
-      ? "直连会把官方账号 OAuth token 合并写入 Codex auth.json，启动后需要重启 Codex"
-      : canDirect
-        ? "直连会写入 Codex 配置；API key 文件会合并进 auth.json，并可能影响官方登录态"
-        : "直连需要 API Key 文件、官方账号 auth 文件或环境变量";
+  let directTitle = "直连需要 API Key 文件、官方账号 auth 文件或环境变量";
+  if (providerEndpointIsChatCompletions(provider.baseUrl)) {
+    directTitle =
+      "该地址只接受 Chat Completions；ChatGPT / Codex 直连发送 Responses 请求，需使用 Companion 本地代理转换协议";
+  } else if (provider.kind === "official_codex") {
+    directTitle = "直连会把官方账号 OAuth token 合并写入 Codex auth.json，启动后需要重启 ChatGPT / Codex";
+  } else if (canDirect && preserveOfficialCodexAuth) {
+    directTitle = "直连会把 API key 写入 provider-scoped config.toml，并保留官方 ChatGPT OAuth auth.json";
+  } else if (canDirect) {
+    directTitle = "直连会写入 Codex 配置；API key 文件会合并进 auth.json，并可能影响官方登录态";
+  }
   const relayTitle =
     provider.kind === "official_codex"
       ? "本地代理由 Companion 续期并注入官方账号 headers，不写入 Codex auth.json"
