@@ -3,10 +3,10 @@ import * as Progress from "@radix-ui/react-progress";
 import * as Tabs from "@radix-ui/react-tabs";
 import * as Toast from "@radix-ui/react-toast";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { Boxes, Gauge, GitBranch, Hammer, LayoutDashboard, Moon, RadioTower, Settings as SettingsIcon, Sun, X } from "lucide-react";
+import { Boxes, Command, Gauge, GitBranch, Hammer, LayoutDashboard, Moon, RadioTower, Settings as SettingsIcon, Sun, X } from "lucide-react";
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { Badge, Button, IconButton } from "../components/ui";
+import { Button, IconButton } from "../components/ui";
 import { Dashboard } from "../features/dashboard/Dashboard";
 import { Groups } from "../features/groups/Groups";
 import { Providers } from "../features/providers/Providers";
@@ -25,6 +25,16 @@ import "../styles/radix.css";
 import type { ProviderConfig, ProviderLaunchMode } from "../types/domain";
 
 const root = document.querySelector<HTMLDivElement>("#app");
+
+const pageTitles: Record<string, string> = {
+  dashboard: "总览",
+  providers: "账号",
+  groups: "分组",
+  relay: "转发",
+  token: "用量",
+  repair: "修复",
+  settings: "设置",
+};
 
 if (!root) {
   throw new Error("Missing #app root");
@@ -75,9 +85,7 @@ function App() {
           <Tabs.Root className="tabs-root app-tabs-root" onValueChange={actions.setActiveTab} value={activeTab}>
             <main className="app-shell">
               <aside className="sidebar">
-                <div className="brand" aria-label="Codex Companion">
-                  <div className="brand-icon">CC</div>
-                </div>
+                <Brand />
                 <Tabs.List className="tabs-list sidebar-tabs" aria-label="Codex Companion">
                   <Tab value="dashboard" icon={<LayoutDashboard size={16} />} label="总览" />
                   <Tab value="providers" icon={<Boxes size={16} />} label="账号" />
@@ -87,14 +95,15 @@ function App() {
                   <Tab value="repair" icon={<Hammer size={16} />} label="修复" />
                   <Tab value="settings" icon={<SettingsIcon size={16} />} label="设置" />
                 </Tabs.List>
+                <div className="sidebar-status" aria-live="polite">
+                  <span className={`status-dot ${busy === "idle" ? "status-dot-ok" : "status-dot-busy"}`} />
+                  <span>{busy === "idle" ? "本地服务正常" : "正在处理"}</span>
+                </div>
               </aside>
 
               <section className="workspace">
                 <header className="topbar">
-                  <div>
-                    <h1>Codex Companion</h1>
-                    <p>本地代理、账号分组、失败切换与 Codex 状态修复。</p>
-                  </div>
+                  <h1>{pageTitles[activeTab] ?? "Companion"}</h1>
                   <div className="topbar-actions">
                     <IconButton
                       label={status.config.app.theme === "dark" ? "切换到亮色主题" : "切换到暗色主题"}
@@ -102,7 +111,6 @@ function App() {
                     >
                       {status.config.app.theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
                     </IconButton>
-                    <Badge tone={busy === "idle" ? "ok" : "warn"}>{busy === "idle" ? "就绪" : "处理中"}</Badge>
                   </div>
                 </header>
 
@@ -172,9 +180,7 @@ function App() {
         ) : (
           <main className="app-shell">
             <aside className="sidebar">
-              <div className="brand" aria-label="Codex Companion">
-                <div className="brand-icon">CC</div>
-              </div>
+              <Brand />
             </aside>
             <section className="workspace">
               <div className="loading-panel">正在加载 Companion 状态</div>
@@ -229,6 +235,20 @@ function App() {
       </Toast.Root>
       <Toast.Viewport className="toast-viewport" />
     </Toast.Provider>
+  );
+}
+
+function Brand() {
+  return (
+    <div className="brand" aria-label="Codex Companion">
+      <div className="brand-icon" aria-hidden="true">
+        <Command size={16} strokeWidth={2.2} />
+      </div>
+      <div className="brand-copy">
+        <strong>Companion</strong>
+        <span>Codex 本地工具</span>
+      </div>
+    </div>
   );
 }
 
