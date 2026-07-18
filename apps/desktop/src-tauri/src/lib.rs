@@ -1,11 +1,13 @@
 use codex_companion_core::{
-    default_codex_dir, ProviderKind, ProviderLaunchMode, ProviderViewMode, RepairOptions, ThemeMode,
+    default_codex_dir, ApiClientCreate, ApiClientUpdate, ProviderKind, ProviderLaunchMode,
+    ProviderViewMode, RelaySettingsUpdate, RepairOptions, ThemeMode,
 };
 use codex_companion_daemon::CompanionDaemon;
 use codex_companion_provider::{
     ApiKeyProviderUpdate, GroupUpsert, ProviderExportFormat, ProviderUpsert,
 };
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 fn daemon() -> Result<CompanionDaemon, String> {
     CompanionDaemon::default().map_err(|error| error.to_string())
@@ -14,6 +16,64 @@ fn daemon() -> Result<CompanionDaemon, String> {
 #[tauri::command]
 fn get_status() -> Result<codex_companion_core::CompanionStatus, String> {
     daemon()?.status().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_api_service_snapshot() -> Result<codex_companion_core::ApiServiceSnapshot, String> {
+    daemon()?
+        .api_service_snapshot()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn create_api_client(
+    input: ApiClientCreate,
+) -> Result<codex_companion_core::ApiClientSecret, String> {
+    daemon()?
+        .create_api_client(input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn update_api_client(input: ApiClientUpdate) -> Result<codex_companion_core::ApiClient, String> {
+    daemon()?
+        .update_api_client(input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn rotate_api_client_key(id: String) -> Result<codex_companion_core::ApiClientSecret, String> {
+    daemon()?
+        .rotate_api_client_key(&id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_api_client(id: String) -> Result<bool, String> {
+    daemon()?
+        .delete_api_client(&id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_api_request_logs() -> Result<usize, String> {
+    daemon()?
+        .clear_api_request_logs()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn update_relay_settings(
+    input: RelaySettingsUpdate,
+) -> Result<codex_companion_core::RelayConfig, String> {
+    daemon()?
+        .update_relay_settings(input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn api_service_self_test() -> Result<codex_companion_core::ApiServiceSelfTest, String> {
+    Ok(daemon()?.api_service_self_test().await)
 }
 
 #[tauri::command]
@@ -264,15 +324,28 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|_app| {
             tauri::async_runtime::spawn(async {
-                match CompanionDaemon::default() {
-                    Ok(daemon) => {
-                        daemon.start_background_tasks();
-                        if let Err(error) = daemon.start_relay().await {
-                            eprintln!("Codex Companion relay stopped: {error}");
+                let mut retry_delay = Duration::from_secs(1);
+                loop {
+                    let daemon = match CompanionDaemon::default() {
+                        Ok(daemon) => daemon,
+                        Err(error) => {
+                            eprintln!("Codex Companion daemon init failed; retrying: {error}");
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+                            continue;
                         }
+                    };
+                    let started_at = Instant::now();
+                    if let Err(error) = daemon.start_relay().await {
+                        eprintln!("Codex Companion relay stopped; retrying: {error}");
                     }
-                    Err(error) => {
-                        eprintln!("Codex Companion daemon init failed: {error}");
+                    let had_stable_run = started_at.elapsed() >= Duration::from_secs(60);
+                    if had_stable_run {
+                        retry_delay = Duration::from_secs(1);
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                    if !had_stable_run {
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
                     }
                 }
             });
@@ -280,6 +353,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
+            get_api_service_snapshot,
+            create_api_client,
+            update_api_client,
+            rotate_api_client_key,
+            delete_api_client,
+            clear_api_request_logs,
+            update_relay_settings,
+            api_service_self_test,
             install,
             uninstall,
             add_provider,

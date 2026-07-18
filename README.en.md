@@ -21,6 +21,8 @@ It provides:
 - Import official Codex account JSON, including Codex Companion, CPA, and sub2api formats.
 - Import API Key account JSON or manually add OpenAI-compatible providers.
 - Compose multiple accounts into a Provider Group and fallback by priority.
+- Expose the active account group as a local OpenAI-compatible API with `/v1/responses` and `/v1/models`.
+- Create independent API clients with one-time secrets, model allowlists, disable, rotate, and delete controls.
 - Single accounts default to direct mode, and you can switch them to local proxy mode from the account card.
 - Relay providers whose URL explicitly targets `/chat/completions` are forced through the local relay so Companion can translate Responses requests, tool calls, and multi-turn history.
 - Let Companion handle token refresh and request headers for official Codex accounts.
@@ -56,7 +58,7 @@ Put multiple accounts into one group and fallback in order.
 
 ### Local Proxy
 
-Inspect Companion local proxy status, request logs, upstream errors, and fallback events.
+Inspect the local API service, verified listener state, clients, request logs, model cooldowns, upstream errors, and fallback events.
 
 <img src="assets/readme/relay.jpg" alt="Relay page" width="720">
 
@@ -82,6 +84,24 @@ After opening the desktop app:
 - Use `Repair` to preview or repair Codex history and plugin state.
 - Use `Usage` to view local token stats.
 - Use `Settings` to install or restore Codex configuration.
+
+### Local API Service
+
+The active account group is exposed at `http://127.0.0.1:17687/v1`. Clients use the Responses API while Companion handles official OAuth, Responses / Chat Completions translation, session affinity, account fallback, and stream termination checks.
+
+```bash
+curl http://127.0.0.1:17687/v1/responses \
+  -H "Authorization: Bearer YOUR_CODEX_COMPANION_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-model","input":"hello","stream":false}'
+```
+
+- Supports `POST /v1/responses` and `GET /v1/models`.
+- API client secrets are shown once; SQLite stores only a SHA-256 hash and short prefix.
+- Each client can have its own model allowlist and can be disabled, rotated, or deleted independently.
+- Cross-origin browser requests always require a valid client key. Local non-browser requests can use compatibility mode or enforce keys.
+- Request logs store routing metadata only, never prompts, response bodies, or complete keys.
+- If an upstream stream ends without a terminal event, Companion emits `response.failed` and updates provider health and request audit state.
 
 ### Custom Model Pricing
 
@@ -144,6 +164,21 @@ Start local proxy:
 codex-companion relay start
 ```
 
+Manage the local API:
+
+```bash
+codex-companion relay status
+codex-companion relay self-test
+codex-companion relay client create --name local-script --models model-a,model-b
+codex-companion relay client list
+codex-companion relay client update --id CLIENT_ID --enabled false
+codex-companion relay client rotate CLIENT_ID
+codex-companion relay client delete CLIENT_ID
+codex-companion relay logs --limit 50
+codex-companion relay clear-logs
+codex-companion relay settings --require-api-key true --retry-budget 2
+```
+
 ## TUI Usage
 
 ```bash
@@ -179,5 +214,6 @@ API Key JSON example:
 - You can run dry-run before writing repair changes.
 - Real repair uses transactional backups under `~/.codex/backups/codex-companion/repair/`; failures roll back automatically and a successful run keeps the 10 newest repair backups.
 - Imported account material stays on your machine.
+- Local API client secrets are shown once and stored only as hashes; request audit records do not store request or response bodies.
 - Token usage stats only read local Codex session logs.
 - Cost is an estimate based on the model price snapshot and local overrides, not an OpenAI or gateway invoice.

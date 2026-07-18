@@ -155,7 +155,7 @@ function App() {
                   />
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="relay">
-                  <Relay status={status} />
+                  <Relay active={activeTab === "relay"} status={status} />
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="token">
                   <TokenStats active={activeTab === "token"} status={status} onLoad={actions.loadTokenUsage} />

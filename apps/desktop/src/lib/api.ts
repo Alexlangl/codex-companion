@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ApiClient,
+  ApiClientCreate,
+  ApiClientSecret,
+  ApiClientUpdate,
+  ApiServiceSelfTest,
+  ApiServiceSnapshot,
   ApiKeyProviderUpdate,
   AppSettings,
   CodexLaunchOutcome,
@@ -17,6 +23,8 @@ import type {
   ProviderViewMode,
   ProviderUpsert,
   RepairOutcome,
+  RelayConfig,
+  RelaySettingsUpdate,
   ThemeMode,
 } from "../types/domain";
 import { extractQuotaWindows, findNumber, findString, isApiKeyJson, lowestQuotaPercent, providerNameFromBaseUrl } from "./provider-json";
@@ -28,10 +36,120 @@ const MOCK_DATA_DIR = `${MOCK_HOME_DIR}/.codex-companion`;
 const MOCK_CODEX_DIR = `${MOCK_HOME_DIR}/.codex`;
 
 let mockStatus = createMockStatus();
+let mockApiService = createMockApiServiceSnapshot();
 
 export function getStatus() {
   if (!isTauri()) return Promise.resolve(mockStatus);
   return invoke<CompanionStatus>("get_status");
+}
+
+export function getApiServiceSnapshot() {
+  if (!isTauri()) return Promise.resolve(structuredClone(mockApiService));
+  return invoke<ApiServiceSnapshot>("get_api_service_snapshot");
+}
+
+export function createApiClient(input: ApiClientCreate) {
+  if (!isTauri()) {
+    const now = new Date().toISOString();
+    const apiKey = `cc_live_mock_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+    const client: ApiClient = {
+      id: `client_${Date.now()}`,
+      name: input.name.trim(),
+      keyPrefix: apiKey.slice(0, 16),
+      allowedModels: [...new Set(input.allowedModels.map((model) => model.trim()).filter(Boolean))].sort(),
+      enabled: true,
+      createdAt: now,
+      lastUsedAt: null,
+      requestCount: 0,
+    };
+    mockApiService = { ...mockApiService, clients: [client, ...mockApiService.clients] };
+    return Promise.resolve<ApiClientSecret>({ client, apiKey });
+  }
+  return invoke<ApiClientSecret>("create_api_client", { input });
+}
+
+export function updateApiClient(input: ApiClientUpdate) {
+  if (!isTauri()) {
+    const existing = mockApiService.clients.find((client) => client.id === input.id);
+    if (!existing) return Promise.reject(new Error(`unknown API client: ${input.id}`));
+    const client: ApiClient = {
+      ...existing,
+      name: input.name.trim(),
+      allowedModels: [...new Set(input.allowedModels.map((model) => model.trim()).filter(Boolean))].sort(),
+      enabled: input.enabled,
+    };
+    mockApiService = {
+      ...mockApiService,
+      clients: mockApiService.clients.map((item) => (item.id === client.id ? client : item)),
+    };
+    return Promise.resolve(client);
+  }
+  return invoke<ApiClient>("update_api_client", { input });
+}
+
+export function rotateApiClientKey(id: string) {
+  if (!isTauri()) {
+    const client = mockApiService.clients.find((item) => item.id === id);
+    if (!client) return Promise.reject(new Error(`unknown API client: ${id}`));
+    const apiKey = `cc_live_mock_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+    const rotated = { ...client, keyPrefix: apiKey.slice(0, 16) };
+    mockApiService = {
+      ...mockApiService,
+      clients: mockApiService.clients.map((item) => (item.id === id ? rotated : item)),
+    };
+    return Promise.resolve<ApiClientSecret>({ client: rotated, apiKey });
+  }
+  return invoke<ApiClientSecret>("rotate_api_client_key", { id });
+}
+
+export function deleteApiClient(id: string) {
+  if (!isTauri()) {
+    const existed = mockApiService.clients.some((client) => client.id === id);
+    mockApiService = {
+      ...mockApiService,
+      clients: mockApiService.clients.filter((client) => client.id !== id),
+    };
+    return Promise.resolve(existed);
+  }
+  return invoke<boolean>("delete_api_client", { id });
+}
+
+export function clearApiRequestLogs() {
+  if (!isTauri()) {
+    const count = mockApiService.recentRequests.length;
+    mockApiService = { ...mockApiService, recentRequests: [] };
+    return Promise.resolve(count);
+  }
+  return invoke<number>("clear_api_request_logs");
+}
+
+export function updateRelaySettings(input: RelaySettingsUpdate) {
+  if (!isTauri()) {
+    if (input.requireApiKey && !mockApiService.clients.some((client) => client.enabled)) {
+      return Promise.reject(new Error("启用强制密钥前，至少需要一个已启用的 API client"));
+    }
+    const relay = { ...mockStatus.config.relay, ...input };
+    mockStatus = {
+      ...mockStatus,
+      config: { ...mockStatus.config, relay },
+    };
+    return Promise.resolve<RelayConfig>(relay);
+  }
+  return invoke<RelayConfig>("update_relay_settings", { input });
+}
+
+export function apiServiceSelfTest() {
+  if (!isTauri()) {
+    return Promise.resolve<ApiServiceSelfTest>({
+      ok: true,
+      baseUrl: mockStatus.relayBaseUrl,
+      latencyMs: 7,
+      databaseOk: true,
+      listenerOk: true,
+      message: "配置数据库与本地 HTTP 监听均可用；未消耗上游账号额度",
+    });
+  }
+  return invoke<ApiServiceSelfTest>("api_service_self_test");
 }
 
 export function install(codexDir?: string) {
@@ -1106,6 +1224,11 @@ function createMockStatus(): CompanionStatus {
         host: "127.0.0.1",
         port: 17687,
         activeGroupId: "default",
+        requireApiKey: false,
+        retryBudget: 0,
+        modelCooldownSeconds: 300,
+        sessionAffinityTtlSeconds: 3600,
+        requestLogRetentionDays: 30,
       },
       providers: {},
       groups: {
@@ -1135,6 +1258,57 @@ function createMockStatus(): CompanionStatus {
     },
     recentEvents: [],
   });
+}
+
+function createMockApiServiceSnapshot(): ApiServiceSnapshot {
+  const now = Date.now();
+  return {
+    clients: [
+      {
+        id: "client_local_cli",
+        name: "本地开发 CLI",
+        keyPrefix: "cc_live_demo_8f1",
+        allowedModels: ["gpt-5.6", "gpt-5.6-codex"],
+        enabled: true,
+        createdAt: new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString(),
+        lastUsedAt: new Date(now - 90 * 1000).toISOString(),
+        requestCount: 128,
+      },
+    ],
+    recentRequests: [
+      {
+        requestId: "cc-demo-01",
+        startedAt: new Date(now - 90 * 1000).toISOString(),
+        method: "POST",
+        path: "/v1/responses",
+        model: "gpt-5.6-codex",
+        clientId: "client_local_cli",
+        clientName: "本地开发 CLI",
+        providerId: "official-team",
+        statusCode: 200,
+        outcome: "succeeded",
+        attempts: 1,
+        latencyMs: 842,
+        error: null,
+      },
+      {
+        requestId: "cc-demo-02",
+        startedAt: new Date(now - 8 * 60 * 1000).toISOString(),
+        method: "POST",
+        path: "/v1/responses",
+        model: "gpt-5.6",
+        clientId: "client_local_cli",
+        clientName: "本地开发 CLI",
+        providerId: "backup-api",
+        statusCode: 200,
+        outcome: "succeeded",
+        attempts: 2,
+        latencyMs: 1240,
+        error: null,
+      },
+    ],
+    modelCooldowns: [],
+  };
 }
 
 function defaultAppSettings(): AppSettings {

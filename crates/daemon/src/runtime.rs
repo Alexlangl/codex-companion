@@ -7,6 +7,7 @@ pub struct CompanionDaemon {
 }
 
 impl CompanionDaemon {
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Result<Self> {
         Ok(Self {
             store: ConfigStore::default()?,

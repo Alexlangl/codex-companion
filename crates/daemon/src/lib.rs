@@ -1,3 +1,4 @@
+mod api_service;
 mod groups;
 mod health_loop;
 mod launch;

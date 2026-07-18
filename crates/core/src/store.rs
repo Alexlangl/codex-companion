@@ -11,6 +11,7 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Result<Self> {
         Ok(Self {
             path: default_config_path()?,

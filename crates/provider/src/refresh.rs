@@ -78,15 +78,7 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
                         provider.account = Some(account);
                     } else if let Some(error) = api_usage_error {
                         let mut account = provider.account.clone().unwrap_or_default();
-                        account.display_name =
-                            account.display_name.or_else(|| Some(provider.name.clone()));
-                        account.subscription_type = account
-                            .subscription_type
-                            .or_else(|| Some("API Key".to_string()));
-                        account.subscription_status = Some("连接正常".to_string());
-                        clear_api_key_usage(&mut account);
-                        account.quota_label = Some(error);
-                        account.last_refresh_at = Some(now.to_rfc3339());
+                        apply_usage_refresh_failure(&mut account, &provider.name, &error, now);
                         provider.account = Some(account);
                     } else if let Some(account) = provider.account.as_mut() {
                         if provider.kind != ProviderKind::OfficialCodex {
@@ -106,6 +98,38 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
     })
 }
 
+fn apply_usage_refresh_failure(
+    account: &mut codex_companion_core::ProviderAccountInfo,
+    provider_name: &str,
+    error: &str,
+    now: chrono::DateTime<Utc>,
+) {
+    account.display_name = account
+        .display_name
+        .clone()
+        .or_else(|| Some(provider_name.to_string()));
+    account.subscription_type = account
+        .subscription_type
+        .clone()
+        .or_else(|| Some("API Key".to_string()));
+    if has_usage_snapshot(account) {
+        account.subscription_status = Some(format!("连接正常；额度刷新失败：{error}"));
+    } else {
+        account.subscription_status = Some("连接正常".to_string());
+        clear_api_key_usage(account);
+        account.quota_label = Some(error.to_string());
+        account.last_refresh_at = Some(now.to_rfc3339());
+    }
+}
+
+fn has_usage_snapshot(account: &codex_companion_core::ProviderAccountInfo) -> bool {
+    account.usage_total.is_some()
+        || account.usage_used.is_some()
+        || account.usage_available.is_some()
+        || account.quota_percent.is_some()
+        || !account.quota_windows.is_empty()
+}
+
 fn clear_api_key_usage(account: &mut codex_companion_core::ProviderAccountInfo) {
     account.quota_label = None;
     account.quota_percent = None;
@@ -114,4 +138,60 @@ fn clear_api_key_usage(account: &mut codex_companion_core::ProviderAccountInfo) 
     account.usage_total = None;
     account.usage_used = None;
     account.usage_available = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_companion_core::{ProviderAccountInfo, ProviderQuotaWindow};
+
+    #[test]
+    fn transient_usage_failure_preserves_last_successful_snapshot() {
+        let refreshed_at = "2026-07-18T08:00:00Z".to_string();
+        let mut account = ProviderAccountInfo {
+            quota_label: Some("本月剩余".to_string()),
+            quota_percent: Some(75.0),
+            quota_windows: vec![ProviderQuotaWindow {
+                label: "月".to_string(),
+                remaining_percent: 75.0,
+                reset_at: None,
+                window_minutes: None,
+            }],
+            usage_total: Some(100.0),
+            usage_used: Some(25.0),
+            usage_available: Some(75.0),
+            last_refresh_at: Some(refreshed_at.clone()),
+            ..ProviderAccountInfo::default()
+        };
+
+        apply_usage_refresh_failure(
+            &mut account,
+            "Provider",
+            "429 Too Many Requests",
+            Utc::now(),
+        );
+
+        assert_eq!(account.usage_available, Some(75.0));
+        assert_eq!(account.quota_percent, Some(75.0));
+        assert_eq!(account.quota_windows.len(), 1);
+        assert_eq!(account.quota_label.as_deref(), Some("本月剩余"));
+        assert_eq!(
+            account.last_refresh_at.as_deref(),
+            Some(refreshed_at.as_str())
+        );
+        assert!(account
+            .subscription_status
+            .as_deref()
+            .is_some_and(|status| status.contains("额度刷新失败")));
+    }
+
+    #[test]
+    fn first_usage_failure_exposes_error_without_inventing_snapshot() {
+        let mut account = ProviderAccountInfo::default();
+        apply_usage_refresh_failure(&mut account, "Provider", "timeout", Utc::now());
+
+        assert_eq!(account.quota_label.as_deref(), Some("timeout"));
+        assert!(account.last_refresh_at.is_some());
+        assert!(!has_usage_snapshot(&account));
+    }
 }

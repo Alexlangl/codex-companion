@@ -8,6 +8,83 @@ export interface RelayConfig {
   host: string;
   port: number;
   activeGroupId: string;
+  requireApiKey: boolean;
+  retryBudget: number;
+  modelCooldownSeconds: number;
+  sessionAffinityTtlSeconds: number;
+  requestLogRetentionDays: number;
+}
+
+export interface RelaySettingsUpdate {
+  requireApiKey: boolean;
+  retryBudget: number;
+  modelCooldownSeconds: number;
+  sessionAffinityTtlSeconds: number;
+  requestLogRetentionDays: number;
+}
+
+export interface ApiClient {
+  id: string;
+  name: string;
+  keyPrefix: string;
+  allowedModels: string[];
+  enabled: boolean;
+  createdAt: string;
+  lastUsedAt?: string | null;
+  requestCount: number;
+}
+
+export interface ApiClientCreate {
+  name: string;
+  allowedModels: string[];
+}
+
+export interface ApiClientUpdate extends ApiClientCreate {
+  id: string;
+  enabled: boolean;
+}
+
+export interface ApiClientSecret {
+  client: ApiClient;
+  apiKey: string;
+}
+
+export interface ApiRequestLog {
+  requestId: string;
+  startedAt: string;
+  method: string;
+  path: string;
+  model?: string | null;
+  clientId?: string | null;
+  clientName?: string | null;
+  providerId?: string | null;
+  statusCode?: number | null;
+  outcome: string;
+  attempts: number;
+  latencyMs?: number | null;
+  error?: string | null;
+}
+
+export interface ModelCooldown {
+  providerId: string;
+  model: string;
+  reason: string;
+  cooldownUntil: string;
+}
+
+export interface ApiServiceSnapshot {
+  clients: ApiClient[];
+  recentRequests: ApiRequestLog[];
+  modelCooldowns: ModelCooldown[];
+}
+
+export interface ApiServiceSelfTest {
+  ok: boolean;
+  baseUrl: string;
+  latencyMs: number;
+  databaseOk: boolean;
+  listenerOk: boolean;
+  message: string;
 }
 
 export interface ProviderConfig {

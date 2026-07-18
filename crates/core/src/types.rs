@@ -4,45 +4,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
+    #[default]
     Light,
     Dark,
     System,
 }
 
-impl Default for ThemeMode {
-    fn default() -> Self {
-        Self::Light
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderViewMode {
+    #[default]
     Compact,
     Cards,
 }
 
-impl Default for ProviderViewMode {
-    fn default() -> Self {
-        Self::Compact
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderLaunchMode {
+    #[default]
     Auto,
     Direct,
     Relay,
-}
-
-impl Default for ProviderLaunchMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +78,16 @@ pub struct RelayConfig {
     pub host: String,
     pub port: u16,
     pub active_group_id: String,
+    #[serde(default)]
+    pub require_api_key: bool,
+    #[serde(default)]
+    pub retry_budget: u16,
+    #[serde(default = "default_model_cooldown_seconds")]
+    pub model_cooldown_seconds: u64,
+    #[serde(default = "default_session_affinity_ttl_seconds")]
+    pub session_affinity_ttl_seconds: u64,
+    #[serde(default = "default_request_log_retention_days")]
+    pub request_log_retention_days: u16,
 }
 
 impl Default for RelayConfig {
@@ -101,6 +96,11 @@ impl Default for RelayConfig {
             host: DEFAULT_RELAY_HOST.to_string(),
             port: DEFAULT_RELAY_PORT,
             active_group_id: DEFAULT_GROUP_ID.to_string(),
+            require_api_key: false,
+            retry_budget: 0,
+            model_cooldown_seconds: default_model_cooldown_seconds(),
+            session_affinity_ttl_seconds: default_session_affinity_ttl_seconds(),
+            request_log_retention_days: default_request_log_retention_days(),
         }
     }
 }
@@ -215,6 +215,112 @@ impl Default for ProviderHealth {
 
 pub fn default_refresh_interval_seconds() -> u64 {
     60
+}
+
+pub fn default_model_cooldown_seconds() -> u64 {
+    300
+}
+
+pub fn default_session_affinity_ttl_seconds() -> u64 {
+    3600
+}
+
+pub fn default_request_log_retention_days() -> u16 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelaySettingsUpdate {
+    pub require_api_key: bool,
+    pub retry_budget: u16,
+    pub model_cooldown_seconds: u64,
+    pub session_affinity_ttl_seconds: u64,
+    pub request_log_retention_days: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiClient {
+    pub id: String,
+    pub name: String,
+    pub key_prefix: String,
+    pub allowed_models: Vec<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub request_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiClientCreate {
+    pub name: String,
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiClientUpdate {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiClientSecret {
+    pub client: ApiClient,
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiRequestLog {
+    pub request_id: String,
+    pub started_at: DateTime<Utc>,
+    pub method: String,
+    pub path: String,
+    pub model: Option<String>,
+    pub client_id: Option<String>,
+    pub client_name: Option<String>,
+    pub provider_id: Option<String>,
+    pub status_code: Option<u16>,
+    pub outcome: String,
+    pub attempts: u16,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCooldown {
+    pub provider_id: String,
+    pub model: String,
+    pub reason: String,
+    pub cooldown_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiServiceSnapshot {
+    pub clients: Vec<ApiClient>,
+    pub recent_requests: Vec<ApiRequestLog>,
+    pub model_cooldowns: Vec<ModelCooldown>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiServiceSelfTest {
+    pub ok: bool,
+    pub base_url: String,
+    pub latency_ms: u64,
+    pub database_ok: bool,
+    pub listener_ok: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

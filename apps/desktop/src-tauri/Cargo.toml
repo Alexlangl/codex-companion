@@ -24,4 +24,4 @@ codex-companion-daemon.workspace = true
 codex-companion-provider.workspace = true
 serde.workspace = true
 tauri.workspace = true
-
+tokio.workspace = true

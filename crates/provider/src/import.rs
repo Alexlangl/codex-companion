@@ -141,6 +141,7 @@ pub fn import_provider_json_many(
     Ok(outcomes)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn import_api_key_provider(
     store: &ConfigStore,
     provider_name: String,
@@ -369,7 +370,47 @@ pub fn import_local_codex_provider(
     }
 
     if value.get("tokens").is_some() {
-        return import_provider_json(store, &text, None, None);
+        let live_auth_ref = format!("file:{}", auth_path.display());
+        let config = store.load()?;
+        let existing_local_provider_id = config
+            .groups
+            .get(&config.relay.active_group_id)
+            .into_iter()
+            .flat_map(|group| group.provider_order.iter())
+            .filter_map(|id| config.providers.get(id).map(|provider| (id, provider)))
+            .chain(config.providers.iter())
+            .find(|(_, provider)| {
+                provider.kind == ProviderKind::OfficialCodex
+                    && (provider.auth_ref.as_deref() == Some(live_auth_ref.as_str())
+                        || provider.direct_auth_ref.as_deref() == Some(live_auth_ref.as_str()))
+            })
+            .map(|(id, _)| id.clone());
+        let mut outcome = import_provider_json(store, &text, existing_local_provider_id, None)?;
+        let provider = store.update(|config| {
+            let provider = config
+                .providers
+                .get_mut(&outcome.provider.id)
+                .ok_or_else(|| {
+                    CompanionError::InvalidConfig(format!(
+                        "本地 Codex provider 导入后不存在: {}",
+                        outcome.provider.id
+                    ))
+                })?;
+            provider.auth_ref = Some(live_auth_ref.clone());
+            provider.direct_auth_ref = Some(live_auth_ref);
+            if let Some(model) = config_provider.model.as_ref() {
+                provider.model_map.insert(model.clone(), model.clone());
+            }
+            Ok(provider.clone())
+        })?;
+        outcome.provider = provider;
+        outcome.auth_path = auth_path;
+        outcome.message = if outcome.created {
+            "已导入本地 Codex 账号，并跟随 live auth.json 自动续期".to_string()
+        } else {
+            "已更新本地 Codex 账号，并切换为 live auth.json 自动续期".to_string()
+        };
+        return Ok(outcome);
     }
 
     if let Some(api_key) = extract_api_key(&value) {
@@ -404,7 +445,7 @@ pub fn parse_provider_import_draft(
     let account_id = extract_oauth_account_id(value, &auth).unwrap_or_else(|| {
         format!(
             "openai_account_{}",
-            stable_hash(&auth.to_string())
+            stable_hash(auth.to_string())
                 .chars()
                 .take(8)
                 .collect::<String>()
@@ -1165,12 +1206,6 @@ fn sanitize_provider_id(raw: &str) -> Option<String> {
         let mapped = if ch.is_ascii_alphanumeric() {
             previous_separator = false;
             ch.to_ascii_lowercase()
-        } else if matches!(ch, '-' | '_' | '.') {
-            if previous_separator {
-                continue;
-            }
-            previous_separator = true;
-            '_'
         } else {
             if previous_separator {
                 continue;
@@ -1383,9 +1418,29 @@ mod tests {
             .to_string(),
         )
         .expect("auth");
+        fs::write(codex_dir.join("config.toml"), "model = \"gpt-live\"\n").expect("config");
 
-        let outcome = import_local_codex_provider(&store, Some(codex_dir)).expect("import");
+        let outcome = import_local_codex_provider(&store, Some(codex_dir.clone())).expect("import");
         assert_eq!(outcome.provider.kind, ProviderKind::OfficialCodex);
+        assert_eq!(outcome.auth_path, codex_dir.join("auth.json"));
+        assert_eq!(
+            outcome.provider.auth_ref.as_deref(),
+            Some(format!("file:{}", codex_dir.join("auth.json").display()).as_str())
+        );
+        assert_eq!(outcome.provider.auth_ref, outcome.provider.direct_auth_ref);
+        assert_eq!(
+            outcome
+                .provider
+                .model_map
+                .get("gpt-live")
+                .map(String::as_str),
+            Some("gpt-live")
+        );
+        let provider_id = outcome.provider.id.clone();
+        let repeated =
+            import_local_codex_provider(&store, Some(codex_dir.clone())).expect("reimport");
+        assert_eq!(repeated.provider.id, provider_id);
+        assert_eq!(store.load().expect("config").providers.len(), 1);
         assert_eq!(
             outcome
                 .provider

@@ -381,9 +381,7 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
             &["tokens", "refresh_token"],
         ],
     );
-    if access_token.is_none() {
-        return None;
-    }
+    access_token.as_ref()?;
 
     let mut tokens = tokens_source
         .as_object()
@@ -2268,9 +2266,13 @@ fn rewrite_provider_fields(
             }
             changed
         }
-        Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
-            rewrite_provider_fields(item, source_ids, target_provider_id) || changed
-        }),
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed = rewrite_provider_fields(item, source_ids, target_provider_id) || changed;
+            }
+            changed
+        }
         _ => false,
     }
 }

@@ -130,10 +130,12 @@ mod tests {
 
     #[test]
     fn honors_group_provider_order() {
-        let mut config = CompanionConfig::default();
-        config.relay = RelayConfig {
-            active_group_id: "main".to_string(),
-            ..RelayConfig::default()
+        let mut config = CompanionConfig {
+            relay: RelayConfig {
+                active_group_id: "main".to_string(),
+                ..RelayConfig::default()
+            },
+            ..CompanionConfig::default()
         };
         config.providers.insert("a".to_string(), provider("a", 20));
         config.providers.insert("b".to_string(), provider("b", 10));

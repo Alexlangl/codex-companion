@@ -1673,6 +1673,451 @@ dd {
   width: min(820px, calc(100vw - 32px));
 }
 
+.api-service-stack {
+  display: grid;
+  gap: 24px;
+}
+
+.api-service-overview {
+  display: grid;
+  gap: 16px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 22px;
+}
+
+.api-service-overview-main {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.api-service-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: var(--radius);
+  color: var(--primary-foreground);
+  background: var(--primary);
+}
+
+.api-service-overview h2 {
+  margin: 1px 0 5px;
+  font-size: 18px;
+}
+
+.api-service-overview p,
+.api-usage-grid p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.api-service-endpoint {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 32px;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 9px 8px 12px;
+  background: var(--surface-solid);
+}
+
+.api-service-endpoint > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.api-service-endpoint code,
+.api-secret-reveal > code,
+.api-client-main code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-service-health-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.api-status-item {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  padding: 10px 12px;
+  border-right: 1px solid var(--border);
+}
+
+.api-status-item:last-child {
+  border-right: 0;
+}
+
+.api-status-item > span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.api-status-item > strong {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-status-item > strong svg {
+  flex: 0 0 auto;
+  color: var(--ok);
+}
+
+.api-service-toolbar,
+.api-log-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.api-service-toolbar {
+  justify-content: flex-start;
+}
+
+.api-self-test-result {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.api-self-test-ok svg {
+  color: var(--ok);
+}
+
+.api-self-test-failed,
+.api-self-test-failed svg {
+  color: var(--danger);
+}
+
+.api-service-error {
+  margin: -12px 0 0;
+}
+
+.api-secret-reveal {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(260px, 1.2fr);
+  gap: 12px 18px;
+  align-items: center;
+  border: 1px solid color-mix(in srgb, var(--accent) 46%, var(--border));
+  border-radius: var(--radius);
+  padding: 14px;
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface-solid));
+}
+
+.api-secret-reveal > div:first-child {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 9px;
+  align-items: center;
+}
+
+.api-secret-reveal > div:first-child > svg {
+  color: var(--accent);
+}
+
+.api-secret-reveal > div:first-child div {
+  display: grid;
+  gap: 3px;
+}
+
+.api-secret-reveal strong {
+  font-size: 13px;
+}
+
+.api-secret-reveal span {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.api-secret-reveal > code {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 9px 10px;
+  background: var(--surface-solid);
+}
+
+.api-secret-reveal .actions {
+  grid-column: 1 / -1;
+  margin-top: 0;
+}
+
+.api-service-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr);
+  gap: 24px;
+}
+
+.api-client-create {
+  border-bottom: 1px solid var(--border);
+  padding: 0 0 14px;
+}
+
+.api-client-create .field:first-child {
+  margin-top: 0;
+}
+
+.api-client-create .button {
+  margin-top: 12px;
+}
+
+.api-client-list {
+  display: grid;
+  margin-top: 6px;
+}
+
+.api-client-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  padding: 11px 2px;
+}
+
+.api-client-main {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.api-client-title {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+}
+
+.api-client-title strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-client-main > span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-client-actions {
+  display: flex;
+  gap: 5px;
+}
+
+.api-client-actions .icon-button {
+  width: 29px;
+  height: 29px;
+}
+
+.api-settings-form {
+  display: grid;
+  gap: 12px;
+}
+
+.api-key-policy-toggle {
+  margin-top: 0;
+}
+
+.api-settings-form .field {
+  margin-top: 0;
+}
+
+.api-setting-notes {
+  display: grid;
+  gap: 5px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.api-settings-form > .button {
+  width: fit-content;
+}
+
+.api-cooldown-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.api-cooldown-list > strong {
+  font-size: 12px;
+}
+
+.api-cooldown-list > div {
+  display: grid;
+  gap: 2px;
+}
+
+.api-cooldown-list span {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.api-cooldown-list small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.api-usage-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.7fr) minmax(420px, 1.3fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.api-usage-grid > div:first-child {
+  display: grid;
+  gap: 7px;
+}
+
+.api-usage-grid > div:first-child > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.api-usage-grid strong {
+  font-size: 13px;
+}
+
+.api-code-sample {
+  min-width: 0;
+  margin: 0;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  color: var(--foreground);
+  background: var(--muted-bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.api-log-toolbar .relay-help {
+  margin-bottom: 0;
+}
+
+.api-request-table {
+  display: grid;
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.api-request-head,
+.api-request-row {
+  display: grid;
+  grid-template-columns: minmax(145px, 0.85fr) minmax(220px, 1.3fr) minmax(145px, 0.85fr) minmax(118px, 0.65fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.api-request-head {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.api-request-row {
+  border-bottom: 1px solid var(--border);
+  padding: 10px 4px;
+}
+
+.api-request-row > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.api-request-row strong,
+.api-request-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-request-row strong {
+  font-size: 11px;
+}
+
+.api-request-row span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.api-request-row .badge {
+  width: fit-content;
+}
+
+.api-compact-empty {
+  display: flex;
+  min-height: 68px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.api-diagnostics {
+  margin-top: -8px;
+}
+
+.api-diagnostics .relay-event-list {
+  margin-top: 12px;
+}
+
+.api-client-dialog {
+  width: min(560px, calc(100vw - 32px));
+}
+
+.api-editor-form textarea {
+  min-height: 120px;
+}
+
 .relay-summary {
   display: grid;
   gap: 12px;
@@ -1793,7 +2238,44 @@ dd {
   }
 }
 
+@media (max-width: 980px) {
+  .api-service-grid,
+  .api-usage-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .api-request-head {
+    display: none;
+  }
+
+  .api-request-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
 @media (max-width: 700px) {
+  .api-service-health-row {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .api-status-item:nth-child(2) {
+    border-right: 0;
+  }
+
+  .api-status-item:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .api-secret-reveal,
+  .api-client-row,
+  .api-request-row {
+    grid-template-columns: 1fr;
+  }
+
+  .api-client-actions {
+    justify-content: flex-start;
+  }
+
   .provider-card-top,
   .provider-card-bottom {
     align-items: flex-start;

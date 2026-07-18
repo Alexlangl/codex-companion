@@ -1,167 +1,587 @@
-import { Copy, GitBranch, RadioTower, Route, ShieldCheck } from "lucide-react";
-import type { ReactNode } from "react";
-import { Badge, Button, Panel } from "../../components/ui";
+import * as Dialog from "@radix-ui/react-dialog";
+import {
+  CheckCircle2,
+  Copy,
+  Database,
+  KeyRound,
+  Plus,
+  RadioTower,
+  RefreshCw,
+  RotateCw,
+  Settings2,
+  ShieldCheck,
+  Trash2,
+  X,
+  XCircle,
+} from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Badge, Button, Field, IconButton, Panel } from "../../components/ui";
+import {
+  apiServiceSelfTest,
+  clearApiRequestLogs,
+  createApiClient,
+  deleteApiClient,
+  getApiServiceSnapshot,
+  rotateApiClientKey,
+  updateApiClient,
+  updateRelaySettings,
+} from "../../lib/api";
 import { formatTime } from "../../lib/format";
-import { providerAccountSubtitle, providerAccountTitle, shortId } from "../../lib/provider-display";
-import type { CompanionStatus, RelayEvent } from "../../types/domain";
+import { providerAccountTitle, shortId } from "../../lib/provider-display";
+import type {
+  ApiClient,
+  ApiClientSecret,
+  ApiRequestLog,
+  ApiServiceSelfTest,
+  ApiServiceSnapshot,
+  CompanionStatus,
+  RelayEvent,
+  RelaySettingsUpdate,
+} from "../../types/domain";
 
-export function Relay({ status }: { status: CompanionStatus }) {
+type RelayProps = {
+  active: boolean;
+  status: CompanionStatus;
+};
+
+type ClientEditor = {
+  id: string;
+  name: string;
+  models: string;
+  enabled: boolean;
+};
+
+export function Relay({ active, status }: RelayProps) {
+  const [snapshot, setSnapshot] = useState<ApiServiceSnapshot | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [action, setAction] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [clientName, setClientName] = useState("");
+  const [clientModels, setClientModels] = useState("");
+  const [revealedSecret, setRevealedSecret] = useState<ApiClientSecret | null>(null);
+  const [editor, setEditor] = useState<ClientEditor | null>(null);
+  const [selfTest, setSelfTest] = useState<ApiServiceSelfTest | null>(null);
+  const [settings, setSettings] = useState<RelaySettingsUpdate>(() => relaySettingsFromStatus(status));
+
+  const loadSnapshot = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [nextSnapshot, nextSelfTest] = await Promise.all([
+        getApiServiceSnapshot(),
+        apiServiceSelfTest(),
+      ]);
+      setSnapshot(nextSnapshot);
+      setSelfTest(nextSelfTest);
+      setError(null);
+    } catch (unknownError) {
+      setError(String(unknownError));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (active) void loadSnapshot();
+  }, [active, loadSnapshot]);
+
+  useEffect(() => {
+    setSettings(relaySettingsFromStatus(status));
+  }, [status]);
+
+  async function runAction(label: string, task: () => Promise<void>) {
+    setAction(label);
+    setError(null);
+    try {
+      await task();
+      await loadSnapshot();
+    } catch (unknownError) {
+      setError(String(unknownError));
+    } finally {
+      setAction(null);
+    }
+  }
+
+  function handleCreateClient() {
+    const name = clientName.trim();
+    if (!name) {
+      setError("请输入 API client 名称");
+      return;
+    }
+    void runAction("create-client", async () => {
+      const secret = await createApiClient({ name, allowedModels: parseModels(clientModels) });
+      setRevealedSecret(secret);
+      setClientName("");
+      setClientModels("");
+    });
+  }
+
+  function handleRotateClient(client: ApiClient) {
+    if (!window.confirm(`轮换“${client.name}”的密钥？旧密钥会立即失效。`)) return;
+    void runAction(`rotate-${client.id}`, async () => {
+      setRevealedSecret(await rotateApiClientKey(client.id));
+    });
+  }
+
+  function handleDeleteClient(client: ApiClient) {
+    if (!window.confirm(`删除 API client“${client.name}”？此操作不可撤销。`)) return;
+    void runAction(`delete-${client.id}`, async () => {
+      await deleteApiClient(client.id);
+      if (revealedSecret?.client.id === client.id) setRevealedSecret(null);
+    });
+  }
+
+  function handleSaveClient() {
+    if (!editor) return;
+    void runAction(`update-${editor.id}`, async () => {
+      await updateApiClient({
+        id: editor.id,
+        name: editor.name,
+        allowedModels: parseModels(editor.models),
+        enabled: editor.enabled,
+      });
+      setEditor(null);
+    });
+  }
+
+  function handleSaveSettings() {
+    void runAction("save-settings", async () => {
+      await updateRelaySettings(settings);
+    });
+  }
+
+  function handleSelfTest() {
+    void runAction("self-test", () => Promise.resolve());
+  }
+
+  function handleClearLogs() {
+    if (!window.confirm("清空本地 API 请求日志？client 和配置不会被删除。")) return;
+    void runAction("clear-logs", async () => {
+      await clearApiRequestLogs();
+    });
+  }
+
+  const clients = snapshot?.clients ?? [];
+  const requests = snapshot?.recentRequests ?? [];
+  const cooldowns = snapshot?.modelCooldowns ?? [];
+  const secretForExample = revealedSecret?.apiKey ?? "YOUR_CODEX_COMPANION_API_KEY";
+  const curlExample = [
+    `curl ${status.relayBaseUrl}/responses \\`,
+    `  -H "Authorization: Bearer ${secretForExample}" \\`,
+    '  -H "Content-Type: application/json" \\',
+    `  -d '{"model":"gpt-5.6-codex","input":"hello"}'`,
+  ].join("\n");
+
   return (
-    <div className="content-grid">
-      <Panel eyebrow="本地代理" title="Companion 代理服务">
-        <div className="relay-summary">
-          <div className="relay-url-card">
-            <RadioTower size={20} />
+    <div className="api-service-stack">
+      <section className="api-service-overview" aria-labelledby="api-service-title">
+        <div className="api-service-overview-main">
+          <div className="api-service-icon" aria-hidden="true">
+            <RadioTower size={18} />
+          </div>
+          <div>
+            <span className="panel-eyebrow">LOCAL OPENAI-COMPATIBLE API</span>
+            <h2 id="api-service-title">把当前账号分组作为本地 API</h2>
+            <p>应用只连接一个地址，Companion 负责 OAuth、协议转换、会话亲和、故障切换与审计。</p>
+          </div>
+        </div>
+        <div className="api-service-endpoint">
+          <span>Base URL</span>
+          <code>{status.relayBaseUrl}</code>
+          <IconButton label="复制 API Base URL" onClick={() => void navigator.clipboard.writeText(status.relayBaseUrl)}>
+            <Copy size={15} />
+          </IconButton>
+        </div>
+        <div className="api-service-health-row">
+          <StatusItem
+            label="HTTP 监听"
+            state={selfTest === null ? "pending" : selfTest.listenerOk ? "ok" : "error"}
+            value={`${status.config.relay.host}:${status.config.relay.port}`}
+          />
+          <StatusItem
+            label="当前分组"
+            state={status.activeGroup ? "ok" : "error"}
+            value={status.activeGroup?.name ?? status.config.relay.activeGroupId}
+          />
+          <StatusItem
+            label="可用账号"
+            state={status.activeProviders.length > 0 ? "ok" : "error"}
+            value={`${status.activeProviders.length}`}
+          />
+          <StatusItem
+            label="访问策略"
+            state="ok"
+            value={settings.requireApiKey ? "强制密钥" : "本机兼容"}
+          />
+        </div>
+        <div className="api-service-toolbar">
+          <Button disabled={action !== null} onClick={handleSelfTest} variant="secondary">
+            <ShieldCheck size={15} /> {action === "self-test" ? "正在自检" : "运行本地自检"}
+          </Button>
+          <Button disabled={loading} onClick={() => void loadSnapshot()} variant="ghost">
+            <RefreshCw className={loading ? "spin-icon" : undefined} size={15} /> 刷新数据
+          </Button>
+          {selfTest ? (
+            <span className={`api-self-test-result ${selfTest.ok ? "api-self-test-ok" : "api-self-test-failed"}`}>
+              {selfTest.ok ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+              {selfTest.message} · {selfTest.latencyMs} ms
+            </span>
+          ) : null}
+        </div>
+      </section>
+
+      {error ? <div className="error-banner api-service-error">{error}</div> : null}
+
+      {revealedSecret ? (
+        <section className="api-secret-reveal" aria-live="polite">
+          <div>
+            <KeyRound size={17} />
             <div>
-              <span>Codex 使用这个地址时，账号切换不需要重启 ChatGPT / Codex</span>
-              <strong>{status.relayBaseUrl}</strong>
+              <strong>{revealedSecret.client.name} 的新密钥</strong>
+              <span>只显示这一次。数据库仅保存 SHA-256 哈希，请现在复制到调用方。</span>
             </div>
           </div>
+          <code>{revealedSecret.apiKey}</code>
           <div className="actions">
-            <Button onClick={() => void navigator.clipboard.writeText(status.relayBaseUrl)} variant="secondary">
-              <Copy size={15} /> 复制地址
+            <Button onClick={() => void navigator.clipboard.writeText(revealedSecret.apiKey)}>
+              <Copy size={14} /> 复制密钥
+            </Button>
+            <Button onClick={() => setRevealedSecret(null)} variant="ghost">我已保存</Button>
+          </div>
+        </section>
+      ) : null}
+
+      <div className="api-service-grid">
+        <Panel eyebrow="访问控制" title="API clients">
+          <p className="relay-help">为每个调用方创建独立密钥和模型权限。停用、轮换或删除不会影响其他 client。</p>
+          <div className="api-client-create">
+            <Field label="Client 名称">
+              <input
+                aria-label="API client 名称"
+                onChange={(event) => setClientName(event.target.value)}
+                placeholder="例如：本地 CLI / 自动化脚本"
+                value={clientName}
+              />
+            </Field>
+            <Field label="允许模型（可选）">
+              <input
+                aria-describedby="api-model-help"
+                onChange={(event) => setClientModels(event.target.value)}
+                placeholder="gpt-5.6, gpt-5.6-codex"
+                value={clientModels}
+              />
+            </Field>
+            <p className="field-hint" id="api-model-help">逗号或换行分隔；留空表示允许全部模型。</p>
+            <Button disabled={action !== null} onClick={handleCreateClient}>
+              <Plus size={15} /> 创建并显示密钥
             </Button>
           </div>
-        </div>
-        <dl className="details-grid details-top">
-          <dt>监听地址</dt>
-          <dd>{status.config.relay.host}:{status.config.relay.port}</dd>
-          <dt>当前分组</dt>
-          <dd>{status.config.relay.activeGroupId}</dd>
-          <dt>账号数量</dt>
-          <dd>{status.activeProviders.length}</dd>
-        </dl>
-      </Panel>
-
-      <Panel eyebrow="什么时候使用" title="转发模式">
-        <div className="relay-mode-list">
-          <RelayMode icon={<GitBranch size={16} />} title="启动账号分组" text="Codex 固定指向 Companion，分组内按优先级失败切换。" />
-          <RelayMode icon={<ShieldCheck size={16} />} title="启动官方 Codex 账号" text="Companion 负责 OAuth token、账号 ID 和请求头注入。" />
-          <RelayMode icon={<Route size={16} />} title="账号选择本地代理启动" text="API Key 账号也可以走这里，由 Companion 注入密钥、记录请求并参与分组代理。" />
-        </div>
-      </Panel>
-
-      <Panel eyebrow="请求日志" title="本地代理记录">
-        <p className="relay-help">
-          这里记录 Codex 发到 Companion 本地代理服务的请求、上游错误和自动切换。直连账号不会经过这里。
-        </p>
-        {status.recentEvents.length === 0 ? (
-          <div className="empty-state">
-            <RadioTower size={28} />
-            <p>启动账号分组、官方账号或本地代理 API Key 后，这里会显示请求记录。</p>
+          <div className="api-client-list">
+            {clients.length === 0 ? (
+              <div className="api-compact-empty">尚未创建 client。先创建一个，再开启强制密钥。</div>
+            ) : (
+              clients.map((client) => (
+                <div className="api-client-row" key={client.id}>
+                  <div className="api-client-main">
+                    <div className="api-client-title">
+                      <strong>{client.name}</strong>
+                      <Badge tone={client.enabled ? "ok" : "neutral"}>{client.enabled ? "启用" : "停用"}</Badge>
+                    </div>
+                    <code>{client.keyPrefix}••••••••</code>
+                    <span>
+                      {client.allowedModels.length === 0 ? "全部模型" : client.allowedModels.join(" · ")}
+                      {` · ${client.requestCount} 次请求`}
+                      {client.lastUsedAt ? ` · 最近 ${formatTime(client.lastUsedAt)}` : " · 尚未使用"}
+                    </span>
+                  </div>
+                  <div className="api-client-actions">
+                    <IconButton label={`编辑 ${client.name}`} onClick={() => setEditor(editorFromClient(client))}>
+                      <Settings2 size={14} />
+                    </IconButton>
+                    <IconButton label={`轮换 ${client.name} 密钥`} onClick={() => handleRotateClient(client)}>
+                      <RotateCw size={14} />
+                    </IconButton>
+                    <IconButton label={`删除 ${client.name}`} onClick={() => handleDeleteClient(client)}>
+                      <Trash2 size={14} />
+                    </IconButton>
+                  </div>
+                </div>
+              ))
+            )}
           </div>
+        </Panel>
+
+        <Panel eyebrow="运行策略" title="可靠性与保留策略">
+          <div className="api-settings-form">
+            <label className="toggle-row api-key-policy-toggle">
+              <input
+                checked={settings.requireApiKey}
+                onChange={(event) => setSettings((current) => ({ ...current, requireApiKey: event.target.checked }))}
+                type="checkbox"
+              />
+              <span>所有非浏览器 API 请求强制使用 client 密钥</span>
+            </label>
+            <p className="field-hint">
+              默认“本机兼容”保留当前 Codex 无感连接；浏览器跨域请求始终需要有效密钥。开启严格模式前请先创建 client。
+            </p>
+            <div className="form-grid">
+              <NumberSetting
+                label="重试预算"
+                max={20}
+                min={0}
+                onChange={(retryBudget) => setSettings((current) => ({ ...current, retryBudget }))}
+                value={settings.retryBudget}
+              />
+              <NumberSetting
+                label="模型冷却（秒）"
+                max={86400}
+                min={5}
+                onChange={(modelCooldownSeconds) => setSettings((current) => ({ ...current, modelCooldownSeconds }))}
+                value={settings.modelCooldownSeconds}
+              />
+              <NumberSetting
+                label="会话亲和（秒）"
+                max={86400}
+                min={60}
+                onChange={(sessionAffinityTtlSeconds) => setSettings((current) => ({ ...current, sessionAffinityTtlSeconds }))}
+                value={settings.sessionAffinityTtlSeconds}
+              />
+              <NumberSetting
+                label="日志保留（天）"
+                max={3650}
+                min={1}
+                onChange={(requestLogRetentionDays) => setSettings((current) => ({ ...current, requestLogRetentionDays }))}
+                value={settings.requestLogRetentionDays}
+              />
+            </div>
+            <div className="api-setting-notes">
+              <span>重试预算 0 = 尝试分组内全部账号</span>
+              <span>模型 404 / 429 只冷却“账号 + 模型”，不会误伤该账号的其他模型</span>
+            </div>
+            <Button disabled={action !== null} onClick={handleSaveSettings}>
+              保存运行策略
+            </Button>
+          </div>
+          {cooldowns.length > 0 ? (
+            <div className="api-cooldown-list">
+              <strong>当前模型冷却</strong>
+              {cooldowns.map((cooldown) => (
+                <div key={`${cooldown.providerId}-${cooldown.model}`}>
+                  <span>{cooldown.model}</span>
+                  <small>{providerTitle(status, cooldown.providerId)} · 至 {formatTime(cooldown.cooldownUntil)}</small>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </Panel>
+      </div>
+
+      <Panel eyebrow="接入" title="OpenAI-compatible 调用方式">
+        <div className="api-usage-grid">
+          <div>
+            <span>支持路径</span>
+            <strong><code>/v1/responses</code> 与 <code>/v1/models</code></strong>
+            <p>上游只有 Chat Completions 时，Companion 会独立完成请求、SSE、工具调用和错误语义转换。</p>
+          </div>
+          <pre className="api-code-sample"><code>{curlExample}</code></pre>
+        </div>
+      </Panel>
+
+      <Panel eyebrow="结构化审计" title="API 请求日志">
+        <div className="api-log-toolbar">
+          <p className="relay-help">只记录路由元数据，不保存提示词、响应正文或完整密钥。日志持久化在本机 SQLite。</p>
+          <Button disabled={requests.length === 0 || action !== null} onClick={handleClearLogs} variant="ghost">
+            <Trash2 size={14} /> 清空日志
+          </Button>
+        </div>
+        {requests.length === 0 ? (
+          <div className="api-compact-empty"><Database size={18} /> 暂无 API 请求</div>
         ) : (
-          <div className="relay-event-list">
-            {status.recentEvents.map((event) => (
+          <div className="api-request-table" role="table" aria-label="API 请求日志">
+            <div className="api-request-head" role="row">
+              <span>时间 / Client</span><span>请求</span><span>路由</span><span>结果</span>
+            </div>
+            {requests.map((request) => <RequestRow key={request.requestId} request={request} status={status} />)}
+          </div>
+        )}
+      </Panel>
+
+      <details className="advanced-details api-diagnostics">
+        <summary>查看底层转发诊断事件（{status.recentEvents.length}）</summary>
+        <div className="relay-event-list">
+          {status.recentEvents.length === 0 ? (
+            <div className="api-compact-empty">暂无诊断事件</div>
+          ) : (
+            status.recentEvents.map((event) => (
               <div className={`relay-event-row relay-event-${event.kind}`} key={`${event.timestamp}-${event.message}`}>
                 <div>
                   <strong>{relayEventTitle(status, event)}</strong>
-                  {relayEventProviderHint(status, event) ? <small className="relay-event-provider">{relayEventProviderHint(status, event)}</small> : null}
-                  <span className="relay-event-message" title={relayEventMessage(event.providerId, event.message)}>
-                    {relayEventMessage(event.providerId, event.message)}
-                  </span>
+                  <span className="relay-event-message">{relayEventMessage(event.providerId, event.message)}</span>
                 </div>
                 <div className="relay-event-meta">
                   <Badge tone={event.kind === "error" ? "danger" : event.kind === "fallback" ? "warn" : "info"}>{eventKindLabel(event.kind)}</Badge>
                   <small>{formatTime(event.timestamp)}</small>
                 </div>
               </div>
-            ))}
-          </div>
-        )}
-      </Panel>
+            ))
+          )}
+        </div>
+      </details>
+
+      <Dialog.Root open={Boolean(editor)} onOpenChange={(open) => !open && setEditor(null)}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="dialog-content api-client-dialog">
+            <div className="dialog-header">
+              <div>
+                <Dialog.Title className="dialog-title">编辑 API client</Dialog.Title>
+                <Dialog.Description className="dialog-description">修改名称、启用状态和允许模型；不会改变当前密钥。</Dialog.Description>
+              </div>
+              <Dialog.Close className="icon-button" aria-label="关闭"><X size={16} /></Dialog.Close>
+            </div>
+            {editor ? (
+              <div className="api-editor-form">
+                <Field label="Client 名称">
+                  <input onChange={(event) => setEditor({ ...editor, name: event.target.value })} value={editor.name} />
+                </Field>
+                <Field label="允许模型">
+                  <textarea onChange={(event) => setEditor({ ...editor, models: event.target.value })} value={editor.models} />
+                </Field>
+                <label className="toggle-row">
+                  <input checked={editor.enabled} onChange={(event) => setEditor({ ...editor, enabled: event.target.checked })} type="checkbox" />
+                  <span>启用此 client</span>
+                </label>
+                <div className="actions">
+                  <Button disabled={action !== null} onClick={handleSaveClient}>保存 client</Button>
+                  <Dialog.Close asChild><Button variant="secondary">取消</Button></Dialog.Close>
+                </div>
+              </div>
+            ) : null}
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   );
+}
+
+function StatusItem({
+  label,
+  state,
+  value,
+}: {
+  label: string;
+  state: "error" | "ok" | "pending";
+  value: string;
+}) {
+  return (
+    <div className="api-status-item">
+      <span>{label}</span>
+      <strong>
+        {state === "pending" ? (
+          <RefreshCw className="spin-icon" size={13} />
+        ) : state === "ok" ? (
+          <CheckCircle2 size={13} />
+        ) : (
+          <XCircle size={13} />
+        )}
+        {value}
+      </strong>
+    </div>
+  );
+}
+
+function NumberSetting(props: {
+  label: string;
+  max: number;
+  min: number;
+  onChange: (value: number) => void;
+  value: number;
+}) {
+  return (
+    <Field label={props.label}>
+      <input
+        max={props.max}
+        min={props.min}
+        onChange={(event) => props.onChange(Number(event.target.value))}
+        type="number"
+        value={props.value}
+      />
+    </Field>
+  );
+}
+
+function RequestRow({ request, status }: { request: ApiRequestLog; status: CompanionStatus }) {
+  const successful = request.outcome === "succeeded" || request.outcome === "local";
+  const tone = successful ? "ok" : request.outcome === "processing" ? "info" : "danger";
+  const provider = request.providerId ? providerTitle(status, request.providerId) : "本地处理";
+  return (
+    <div className="api-request-row" role="row" title={request.error ?? undefined}>
+      <div><strong>{formatTime(request.startedAt)}</strong><span>{request.clientName ?? "本机兼容调用"}</span></div>
+      <div><strong>{request.method} {request.path}</strong><span>{request.model ?? "未指定模型"}</span></div>
+      <div><strong>{provider}</strong><span>{request.attempts > 0 ? `${request.attempts} 次尝试` : "未访问上游"}</span></div>
+      <div><Badge tone={tone}>{request.statusCode ?? "—"} · {outcomeLabel(request.outcome)}</Badge><span>{request.latencyMs ?? 0} ms</span></div>
+    </div>
+  );
+}
+
+function relaySettingsFromStatus(status: CompanionStatus): RelaySettingsUpdate {
+  const relay = status.config.relay;
+  return {
+    requireApiKey: relay.requireApiKey,
+    retryBudget: relay.retryBudget,
+    modelCooldownSeconds: relay.modelCooldownSeconds,
+    sessionAffinityTtlSeconds: relay.sessionAffinityTtlSeconds,
+    requestLogRetentionDays: relay.requestLogRetentionDays,
+  };
+}
+
+function parseModels(value: string) {
+  return [...new Set(value.split(/[\n,]/).map((model) => model.trim()).filter(Boolean))];
+}
+
+function editorFromClient(client: ApiClient): ClientEditor {
+  return {
+    id: client.id,
+    name: client.name,
+    models: client.allowedModels.join("\n"),
+    enabled: client.enabled,
+  };
+}
+
+function providerTitle(status: CompanionStatus, providerId: string) {
+  const provider = status.config.providers[providerId];
+  return provider ? providerAccountTitle(provider) : shortId(providerId, 28);
+}
+
+function outcomeLabel(outcome: string) {
+  switch (outcome) {
+    case "succeeded": return "成功";
+    case "local": return "本地";
+    case "failed": return "失败";
+    case "rejected": return "拒绝";
+    case "processing": return "处理中";
+    default: return outcome;
+  }
 }
 
 function relayEventTitle(status: CompanionStatus, event: RelayEvent) {
-  const providerTitle = event.providerId ? providerEventTitle(status, event.providerId) : "Companion";
-  switch (event.kind) {
-    case "error":
-      return `上游错误 · ${providerTitle}`;
-    case "fallback":
-      return `失败切换 · ${providerTitle}`;
-    case "request":
-      return event.providerId ? `请求 · ${providerTitle}` : "Companion 请求";
-    case "health":
-      return `健康检查 · ${providerTitle}`;
-    default:
-      return providerTitle;
-  }
-}
-
-function providerEventTitle(status: CompanionStatus, providerId: string) {
-  const provider = status.config.providers[providerId];
-  return provider ? providerAccountTitle(provider) : shortId(providerId, 34);
-}
-
-function relayEventProviderHint(status: CompanionStatus, event: RelayEvent) {
-  if (!event.providerId) return null;
-  const provider = status.config.providers[event.providerId];
-  if (!provider) return `Provider ID: ${shortId(event.providerId, 42)}`;
-  const subtitle = providerAccountSubtitle(provider);
-  return subtitle && subtitle !== event.providerId
-    ? subtitle
-    : `Provider ID: ${shortId(event.providerId, 42)}`;
+  const provider = event.providerId ? providerTitle(status, event.providerId) : "Companion";
+  if (event.kind === "error") return `上游错误 · ${provider}`;
+  if (event.kind === "fallback") return `失败切换 · ${provider}`;
+  if (event.kind === "request") return `请求 · ${provider}`;
+  return provider;
 }
 
 function relayEventMessage(providerId: string | null | undefined, message: string) {
-  const rawMessage = message || "";
-  const companionMessage = explainRelayEventMessage(rawMessage);
-  if (!providerId) return companionMessage || rawMessage || "Companion 本地代理事件";
-  const returnedPrefix = `${providerId} returned `;
-  if (message.startsWith(returnedPrefix)) {
-    const detail = message.slice(returnedPrefix.length) || "错误响应";
-    return explainRelayEventMessage(detail) || `上游返回 ${detail}`;
-  }
-  const failedPrefix = `${providerId} failed before stream: `;
-  if (message.startsWith(failedPrefix)) {
-    const detail = message.slice(failedPrefix.length) || "请求未写回 Codex，可继续 fallback";
-    return explainRelayEventMessage(detail) || `stream 开始前请求失败：${detail}`;
-  }
-  const stripped = message.startsWith(providerId) ? message.slice(providerId.length).trimStart() : message;
-  return explainRelayEventMessage(stripped) || stripped || "上游请求失败";
-}
-
-function explainRelayEventMessage(message: string) {
-  const normalized = message.replace(/\s+/g, " ").trim();
-  const lower = normalized.toLowerCase();
-  if (!normalized) return null;
-  if (normalized === "GET /v1") {
-    return "Codex 正在探测 Companion 本地代理根地址。";
-  }
-  if (lower.includes("client_version") && lower.includes("field required")) {
-    return "官方 Codex 请求缺少 client_version。当前版本已自动补齐；这是旧转发请求留下的日志，不是账号或额度问题。";
-  }
-  if (normalized.includes("404 Not Found") && (normalized.includes('"detail":"Not Found"') || normalized.includes('"detail": "Not Found"'))) {
-    return "Codex 探测 /v1 根路径时官方后端返回 404。当前已由 Companion 本地处理；只要 /v1/models 成功，这条不影响使用。";
-  }
-  return null;
-}
-
-function RelayMode({ icon, title, text }: { icon: ReactNode; title: string; text: string }) {
-  return (
-    <div className="relay-mode-row">
-      <div className="relay-mode-icon">{icon}</div>
-      <div>
-        <strong>{title}</strong>
-        <span>{text}</span>
-      </div>
-    </div>
-  );
+  const requestPrefix = message.match(/^\[[^\]]+\]\s*/)?.[0] ?? "";
+  const normalized = requestPrefix ? message.slice(requestPrefix.length) : message;
+  if (!providerId) return normalized || "Companion 本地代理事件";
+  return normalized.startsWith(providerId) ? normalized.slice(providerId.length).trimStart() : normalized;
 }
 
 function eventKindLabel(kind: string) {
-  switch (kind) {
-    case "fallback":
-      return "失败切换";
-    case "error":
-      return "错误";
-    case "request":
-      return "请求";
-    case "health":
-      return "健康检查";
-    default:
-      return kind;
-  }
+  if (kind === "fallback") return "失败切换";
+  if (kind === "error") return "错误";
+  if (kind === "request") return "请求";
+  if (kind === "health") return "健康检查";
+  return kind;
 }

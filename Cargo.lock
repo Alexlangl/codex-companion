@@ -602,6 +602,7 @@ dependencies = [
  "codex-companion-provider",
  "codex-companion-relay",
  "codex-companion-state",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",
@@ -617,6 +618,7 @@ dependencies = [
  "serde",
  "tauri",
  "tauri-build",
+ "tokio",
 ]
 
 [[package]]
@@ -652,14 +654,20 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "bytes",
+ "chrono",
  "codex-companion-core",
  "codex-companion-health",
  "codex-companion-provider",
  "futures-util",
+ "rand 0.9.4",
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

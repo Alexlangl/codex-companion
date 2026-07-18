@@ -1,3 +1,4 @@
+use crate::api_service::ApiServiceStore;
 use axum::{
     body::Body,
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
@@ -5,9 +6,10 @@ use axum::{
 };
 use bytes::Bytes;
 use codex_companion_core::{
-    provider_base_url_is_endpoint, provider_endpoint_is_chat_completions, ProviderConfig,
-    ProviderKind,
+    provider_base_url_is_endpoint, provider_endpoint_is_chat_completions, ConfigStore,
+    ProviderConfig, ProviderKind,
 };
+use codex_companion_health::{classify_failure, mark_failure};
 use codex_companion_provider::{ensure_codex_auth_snapshot, resolve_auth_token};
 use futures_util::{stream, Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
@@ -17,7 +19,10 @@ use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) struct UpstreamResponse {
-    response: reqwest::Response,
+    response: Option<reqwest::Response>,
+    buffered_body: Option<Bytes>,
+    status: StatusCode,
+    headers: HeaderMap,
     transform: ResponseTransform,
     tool_context: ChatToolContext,
     chat_messages: Vec<Value>,
@@ -25,11 +30,19 @@ pub(crate) struct UpstreamResponse {
 
 impl UpstreamResponse {
     pub(crate) fn status(&self) -> StatusCode {
-        self.response.status()
+        self.status
     }
 
-    pub(crate) async fn text(self) -> Result<String, reqwest::Error> {
-        self.response.text().await
+    pub(crate) async fn text(mut self) -> Result<String, String> {
+        if let Some(body) = self.buffered_body.take() {
+            return Ok(String::from_utf8_lossy(&body).into_owned());
+        }
+        self.response
+            .take()
+            .ok_or_else(|| "upstream response body is unavailable".to_string())?
+            .text()
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -37,6 +50,7 @@ impl UpstreamResponse {
 enum ResponseTransform {
     None,
     ChatCompletionsToResponses,
+    OfficialCodexStreamToResponse,
 }
 
 pub(crate) async fn send_upstream(
@@ -50,7 +64,14 @@ pub(crate) async fn send_upstream(
 ) -> std::result::Result<UpstreamResponse, String> {
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|error| format!("invalid method: {error}"))?;
-    let transform = response_transform(provider, method, uri);
+    let transform = match response_transform(provider, method, uri) {
+        ResponseTransform::None
+            if official_codex_needs_non_stream_bridge(provider, method, uri, &body) =>
+        {
+            ResponseTransform::OfficialCodexStreamToResponse
+        }
+        transform => transform,
+    };
     let upstream = if transform == ResponseTransform::ChatCompletionsToResponses {
         chat_completions_url(provider, upstream)
     } else {
@@ -83,6 +104,20 @@ pub(crate) async fn send_upstream(
     } else if let Some(token) = resolve_auth_token(provider) {
         request = request.bearer_auth(token);
     }
+    let session_identity = official_codex_session_identity(provider, method, uri, headers, &body);
+    if let Some(value) = session_identity
+        .as_deref()
+        .and_then(|value| HeaderValue::from_str(value).ok())
+    {
+        request = request.header("session_id", value);
+    }
+    let body = normalize_official_responses_input(
+        provider,
+        method,
+        uri,
+        body,
+        session_identity.as_deref(),
+    );
     let body = rewrite_model(provider, body);
     let (body, tool_context, chat_messages) =
         if transform == ResponseTransform::ChatCompletionsToResponses {
@@ -90,17 +125,191 @@ pub(crate) async fn send_upstream(
         } else {
             (body, ChatToolContext::default(), Vec::new())
         };
-    request
+    let response = request
         .body(body)
         .send()
         .await
-        .map_err(|error| error.to_string())
-        .map(|response| UpstreamResponse {
-            response,
-            transform,
-            tool_context,
-            chat_messages,
-        })
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let inspect_body = status.is_success()
+        && method == Method::POST
+        && uri
+            .path_and_query()
+            .is_some_and(|value| is_responses_url(value.as_str()))
+        && !is_event_stream(&headers);
+    let (response, buffered_body) = if inspect_body {
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| format!("读取上游成功响应失败: {error}"))?;
+        if !looks_like_sse(&body) {
+            if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+                if let Some(message) = semantic_failure_message(&value) {
+                    return Err(format!("upstream semantic failure: {message}"));
+                }
+            }
+        }
+        (None, Some(body))
+    } else {
+        (Some(response), None)
+    };
+    Ok(UpstreamResponse {
+        response,
+        buffered_body,
+        status,
+        headers,
+        transform,
+        tool_context,
+        chat_messages,
+    })
+}
+
+fn normalize_official_responses_input(
+    provider: &ProviderConfig,
+    method: &Method,
+    uri: &Uri,
+    body: Bytes,
+    session_identity: Option<&str>,
+) -> Bytes {
+    if provider.kind != ProviderKind::OfficialCodex
+        || method != Method::POST
+        || !uri
+            .path_and_query()
+            .is_some_and(|value| is_responses_url(value.as_str()))
+    {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    value["store"] = Value::Bool(false);
+    value["stream"] = Value::Bool(true);
+    if let Some(object) = value.as_object_mut() {
+        for key in [
+            "max_output_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "top_p",
+            "truncation",
+            "user",
+            "context_management",
+        ] {
+            object.remove(key);
+        }
+        if object
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .is_some_and(|tier| tier != "priority")
+        {
+            object.remove("service_tier");
+        }
+        object
+            .entry("parallel_tool_calls")
+            .or_insert(Value::Bool(true));
+    }
+    if value.get("prompt_cache_key").is_none() {
+        if let Some(session_identity) = session_identity {
+            value["prompt_cache_key"] = Value::String(session_identity.to_string());
+        }
+    }
+    match value.get_mut("include") {
+        Some(Value::Array(include))
+            if !include
+                .iter()
+                .any(|item| item.as_str() == Some("reasoning.encrypted_content")) =>
+        {
+            include.push(Value::String("reasoning.encrypted_content".to_string()));
+        }
+        Some(Value::Array(_)) => {}
+        None => {
+            value["include"] = json!(["reasoning.encrypted_content"]);
+        }
+        _ => {}
+    }
+    if let Some(input) = value
+        .get("input")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        value["input"] = json!([{
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": input
+            }]
+        }]);
+    }
+    if let Some(items) = value.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items {
+            if item.get("role").and_then(Value::as_str) == Some("system") {
+                item["role"] = Value::String("developer".to_string());
+            }
+        }
+    }
+    serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
+}
+
+fn official_codex_session_identity(
+    provider: &ProviderConfig,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Option<String> {
+    if provider.kind != ProviderKind::OfficialCodex
+        || method != Method::POST
+        || !uri
+            .path_and_query()
+            .is_some_and(|value| is_responses_generation_url(value.as_str()))
+    {
+        return None;
+    }
+    for header in ["session_id", "x-session-id", "x-client-request-id"] {
+        if let Some(value) = headers
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let identity = [
+        value.get("prompt_cache_key"),
+        value.get("session_id"),
+        value.pointer("/metadata/session_id"),
+        value.get("conversation_id"),
+        value.get("thread_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(ToOwned::to_owned);
+    identity
+}
+
+fn official_codex_needs_non_stream_bridge(
+    provider: &ProviderConfig,
+    method: &Method,
+    uri: &Uri,
+    body: &[u8],
+) -> bool {
+    if provider.kind != ProviderKind::OfficialCodex
+        || method != Method::POST
+        || !uri
+            .path_and_query()
+            .is_some_and(|value| is_responses_generation_url(value.as_str()))
+    {
+        return false;
+    }
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(Value::as_bool))
+        != Some(true)
 }
 
 fn rewrite_model(provider: &ProviderConfig, body: Bytes) -> Bytes {
@@ -129,28 +338,65 @@ fn rewrite_model(provider: &ProviderConfig, body: Bytes) -> Bytes {
     serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
 }
 
-pub(crate) async fn stream_response(provider_id: String, upstream: UpstreamResponse) -> Response {
-    let status = upstream.response.status();
-    let headers = upstream.response.headers().clone();
-    if upstream.transform == ResponseTransform::ChatCompletionsToResponses {
-        if is_event_stream(&headers) {
+pub(crate) async fn stream_response(
+    store: ConfigStore,
+    request_id: String,
+    provider_id: String,
+    upstream: UpstreamResponse,
+) -> Response {
+    let UpstreamResponse {
+        response,
+        buffered_body,
+        status,
+        headers,
+        transform,
+        tool_context,
+        chat_messages,
+    } = upstream;
+    if transform == ResponseTransform::OfficialCodexStreamToResponse && status.is_success() {
+        let body = match response {
+            Some(response) => response.bytes().await.map_err(|error| error.to_string()),
+            None => Ok(buffered_body.unwrap_or_default()),
+        };
+        return match body.and_then(|body| terminal_response_from_sse(&body)) {
+            Ok(value) => Response::builder()
+                .status(status)
+                .header(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json; charset=utf-8"),
+                )
+                .header("x-codex-companion-provider", provider_id)
+                .body(Body::from(value.to_string()))
+                .unwrap_or_else(|error| {
+                    text_response(
+                        StatusCode::BAD_GATEWAY,
+                        format!("response build failed: {error}"),
+                    )
+                }),
+            Err(error) => text_response(
+                StatusCode::BAD_GATEWAY,
+                format!("invalid official Codex stream: {error}"),
+            ),
+        };
+    }
+    if transform == ResponseTransform::ChatCompletionsToResponses {
+        if is_event_stream(&headers)
+            || buffered_body
+                .as_ref()
+                .is_some_and(|body| looks_like_sse(body))
+        {
             return chat_sse_response(
                 provider_id,
                 status,
-                upstream.response,
-                upstream.tool_context,
-                upstream.chat_messages,
+                response_byte_stream(response, buffered_body),
+                tool_context,
+                chat_messages,
+                store,
+                request_id,
             );
         }
-        let body = match upstream.response.text().await {
-            Ok(body) => body,
-            Err(error) => {
-                return text_response(
-                    StatusCode::BAD_GATEWAY,
-                    format!("读取上游响应失败: {error}"),
-                )
-            }
-        };
+        let body =
+            String::from_utf8_lossy(buffered_body.as_deref().unwrap_or_default()).into_owned();
         let value = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| {
             json!({
                 "choices": [{
@@ -161,13 +407,13 @@ pub(crate) async fn stream_response(provider_id: String, upstream: UpstreamRespo
                 }]
             })
         });
-        let converted = chat_json_to_responses_json(value.clone(), &upstream.tool_context);
+        let converted = chat_json_to_responses_json(value.clone(), &tool_context);
         store_non_stream_chat_history(
             &provider_id,
             &converted,
             &value,
-            &upstream.tool_context,
-            &upstream.chat_messages,
+            &tool_context,
+            &chat_messages,
         );
         let body = converted.to_string();
         return Response::builder()
@@ -186,7 +432,19 @@ pub(crate) async fn stream_response(provider_id: String, upstream: UpstreamRespo
             });
     }
 
-    let stream = upstream.response.bytes_stream().map_err(io::Error::other);
+    let observe_responses_stream = is_event_stream(&headers)
+        || buffered_body
+            .as_ref()
+            .is_some_and(|body| looks_like_sse(body));
+    let stream = response_byte_stream(response, buffered_body);
+    let stream = if observe_responses_stream {
+        responses_sse_observer_stream(
+            stream,
+            ResponsesSseObserverState::new(store, provider_id.clone(), request_id),
+        )
+    } else {
+        stream
+    };
     let mut builder = Response::builder().status(status);
     for (name, value) in headers.iter() {
         if matches!(*name, header::CONNECTION | header::TRANSFER_ENCODING) {
@@ -208,16 +466,15 @@ pub(crate) async fn stream_response(provider_id: String, upstream: UpstreamRespo
 fn chat_sse_response(
     provider_id: String,
     status: StatusCode,
-    upstream: reqwest::Response,
+    upstream: ResponseByteStream,
     tool_context: ChatToolContext,
     chat_messages: Vec<Value>,
+    store: ConfigStore,
+    request_id: String,
 ) -> Response {
-    let stream = chat_sse_to_responses_stream(
-        upstream.bytes_stream(),
-        provider_id.clone(),
-        tool_context,
-        chat_messages,
-    );
+    let state = ChatSseTransformState::new(provider_id.clone(), tool_context, chat_messages)
+        .with_observer(store, request_id);
+    let stream = chat_sse_to_responses_stream(upstream, state);
     Response::builder()
         .status(status)
         .header(
@@ -235,11 +492,302 @@ fn chat_sse_response(
         })
 }
 
+fn response_byte_stream(
+    response: Option<reqwest::Response>,
+    buffered_body: Option<Bytes>,
+) -> ResponseByteStream {
+    if let Some(body) = buffered_body {
+        return Box::pin(stream::once(async move { Ok(body) }));
+    }
+    match response {
+        Some(response) => Box::pin(response.bytes_stream().map_err(io::Error::other)),
+        None => Box::pin(stream::empty()),
+    }
+}
+
+fn responses_sse_observer_stream(
+    upstream: ResponseByteStream,
+    state: ResponsesSseObserverState,
+) -> ResponseByteStream {
+    Box::pin(stream::unfold(
+        (state, upstream),
+        |(mut state, mut upstream)| async move {
+            if let Some(bytes) = state.pending.pop_front() {
+                return Some((Ok(bytes), (state, upstream)));
+            }
+            match upstream.next().await {
+                Some(Ok(chunk)) => {
+                    state.push_chunk(&chunk);
+                    Some((Ok(chunk), (state, upstream)))
+                }
+                Some(Err(error)) => {
+                    state.fail_incomplete(&format!("上游流读取失败: {error}"));
+                    state
+                        .pending
+                        .pop_front()
+                        .map(|bytes| (Ok(bytes), (state, upstream)))
+                }
+                None => {
+                    state.finish_stream();
+                    state
+                        .pending
+                        .pop_front()
+                        .map(|bytes| (Ok(bytes), (state, upstream)))
+                }
+            }
+        },
+    ))
+}
+
+#[derive(Debug)]
+struct ResponsesSseObserverState {
+    buffer: Vec<u8>,
+    pending: VecDeque<Bytes>,
+    terminal: bool,
+    failure_recorded: bool,
+    response_id: String,
+    model: String,
+    store: ConfigStore,
+    api_service: ApiServiceStore,
+    provider_id: String,
+    request_id: String,
+}
+
+impl ResponsesSseObserverState {
+    fn new(store: ConfigStore, provider_id: String, request_id: String) -> Self {
+        Self {
+            buffer: Vec::new(),
+            pending: VecDeque::new(),
+            terminal: false,
+            failure_recorded: false,
+            response_id: "resp_codex_companion".to_string(),
+            model: String::new(),
+            api_service: ApiServiceStore::from_config_store(&store),
+            store,
+            provider_id,
+            request_id,
+        }
+    }
+
+    fn push_chunk(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(chunk);
+        while let Some(index) = next_sse_block_index(&self.buffer) {
+            let block = String::from_utf8_lossy(&self.buffer[..index]).into_owned();
+            let drain_to = if self.buffer[index..].starts_with(b"\r\n\r\n") {
+                index + 4
+            } else {
+                index + 2
+            };
+            self.buffer.drain(..drain_to);
+            self.process_block(&block);
+        }
+    }
+
+    fn process_block(&mut self, block: &str) {
+        let data = block
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            return;
+        };
+        if let Some(id) = value
+            .pointer("/response/id")
+            .or_else(|| value.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            self.response_id = id.to_string();
+        }
+        if let Some(model) = value
+            .pointer("/response/model")
+            .or_else(|| value.get("model"))
+            .and_then(Value::as_str)
+        {
+            self.model = model.to_string();
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.completed" | "response.incomplete") => self.terminal = true,
+            Some("response.failed" | "error") => {
+                self.terminal = true;
+                self.record_failure(&compact_json_error(&value));
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_stream(&mut self) {
+        if !self.buffer.is_empty() {
+            let block = String::from_utf8_lossy(&self.buffer).into_owned();
+            self.buffer.clear();
+            self.process_block(&block);
+        }
+        if !self.terminal {
+            self.fail_incomplete("上游流在完成事件前中断");
+        }
+    }
+
+    fn fail_incomplete(&mut self, detail: &str) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        self.record_failure(detail);
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "id": self.response_id,
+                "object": "response",
+                "status": "failed",
+                "model": self.model,
+                "output": [],
+                "error": {
+                    "code": "upstream_stream_incomplete",
+                    "message": detail
+                }
+            }
+        });
+        self.pending
+            .push_back(Bytes::from(format!("data: {event}\n\n")));
+    }
+
+    fn record_failure(&mut self, detail: &str) {
+        if self.failure_recorded {
+            return;
+        }
+        self.failure_recorded = true;
+        let detail = detail.trim();
+        let message = format!("[{}] upstream_stream_incomplete: {detail}", self.request_id);
+        let failure = classify_failure(None, &message);
+        crate::events::update_health(&self.store, &self.provider_id, |health| {
+            mark_failure(health, &failure, message.clone())
+        });
+        crate::events::append_event(
+            &self.store,
+            "error",
+            Some(self.provider_id.clone()),
+            message,
+        );
+        let _ = self.api_service.record_stream_outcome(
+            &self.request_id,
+            "failed",
+            Some(if detail.is_empty() {
+                "upstream_stream_failed"
+            } else {
+                detail
+            }),
+        );
+    }
+}
+
+fn next_sse_block_index(buffer: &[u8]) -> Option<usize> {
+    match (find_bytes(buffer, b"\n\n"), find_bytes(buffer, b"\r\n\r\n")) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 fn is_event_stream(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+fn looks_like_sse(body: &[u8]) -> bool {
+    body.iter()
+        .copied()
+        .skip_while(u8::is_ascii_whitespace)
+        .take(5)
+        .eq(b"data:".iter().copied())
+}
+
+fn terminal_response_from_sse(body: &[u8]) -> Result<Value, String> {
+    let text = std::str::from_utf8(body).map_err(|error| format!("invalid UTF-8: {error}"))?;
+    let normalized = text.replace("\r\n", "\n");
+    let mut failure = None;
+    let mut output_items = BTreeMap::<u64, Value>::new();
+    for event in normalized.split("\n\n") {
+        let data = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_item.done") => {
+                if let (Some(index), Some(item)) = (
+                    value.get("output_index").and_then(Value::as_u64),
+                    value.get("item").cloned(),
+                ) {
+                    output_items.insert(index, item);
+                }
+            }
+            Some("response.completed" | "response.incomplete") => {
+                let mut response = value
+                    .get("response")
+                    .cloned()
+                    .ok_or_else(|| "terminal event did not include a response".to_string())?;
+                if response
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                    && !output_items.is_empty()
+                {
+                    response["output"] = Value::Array(output_items.into_values().collect());
+                }
+                return Ok(response);
+            }
+            Some("response.failed" | "error") => {
+                failure = Some(compact_json_error(&value));
+            }
+            _ => {}
+        }
+    }
+    Err(failure.unwrap_or_else(|| "stream ended without a terminal response event".to_string()))
+}
+
+fn semantic_failure_message(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    if let Some(error) = object.get("error").filter(|error| !error.is_null()) {
+        return Some(compact_json_error(error));
+    }
+    if object
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "failed")
+    {
+        return Some(compact_json_error(value));
+    }
+    if object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "error" | "response.failed"))
+    {
+        return Some(compact_json_error(value));
+    }
+    None
+}
+
+fn compact_json_error(value: &Value) -> String {
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/error/message").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn response_transform(provider: &ProviderConfig, method: &Method, uri: &Uri) -> ResponseTransform {
@@ -259,6 +807,12 @@ fn is_responses_url(url: &str) -> bool {
     url.split('?')
         .next()
         .is_some_and(|path| path.ends_with("/responses") || path.ends_with("/responses/compact"))
+}
+
+fn is_responses_generation_url(url: &str) -> bool {
+    url.split('?')
+        .next()
+        .is_some_and(|path| path.ends_with("/responses"))
 }
 
 fn chat_completions_url(provider: &ProviderConfig, upstream: &str) -> String {
@@ -1153,13 +1707,10 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
 type ResponseByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
 
 fn chat_sse_to_responses_stream(
-    upstream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-    provider_id: String,
-    tool_context: ChatToolContext,
-    chat_messages: Vec<Value>,
+    upstream: impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+    state: ChatSseTransformState,
 ) -> ResponseByteStream {
     let upstream = Box::pin(upstream);
-    let state = ChatSseTransformState::new(provider_id, tool_context, chat_messages);
     Box::pin(stream::unfold(
         (state, upstream),
         |(mut state, mut upstream)| async move {
@@ -1172,10 +1723,14 @@ fn chat_sse_to_responses_stream(
                         state.push_chunk(&chunk);
                     }
                     Some(Err(error)) => {
-                        return Some((Err(io::Error::other(error)), (state, upstream)));
+                        state.fail_incomplete_with_message(&format!("上游流读取失败: {error}"));
+                        if let Some(bytes) = state.pending.pop_front() {
+                            return Some((Ok(bytes), (state, upstream)));
+                        }
+                        return None;
                     }
                     None => {
-                        state.finish();
+                        state.finish_stream();
                         if let Some(bytes) = state.pending.pop_front() {
                             return Some((Ok(bytes), (state, upstream)));
                         }
@@ -1189,7 +1744,7 @@ fn chat_sse_to_responses_stream(
 
 #[derive(Debug)]
 struct ChatSseTransformState {
-    buffer: String,
+    buffer: Vec<u8>,
     pending: VecDeque<Bytes>,
     response_id: String,
     model: String,
@@ -1197,8 +1752,10 @@ struct ChatSseTransformState {
     text: String,
     started: bool,
     completed: bool,
+    saw_terminal_signal: bool,
     latest_usage: Value,
     provider_id: String,
+    observer: Option<(ConfigStore, ApiServiceStore, String)>,
     tool_context: ChatToolContext,
     chat_messages: Vec<Value>,
     tools: BTreeMap<usize, ChatToolCallState>,
@@ -1224,7 +1781,7 @@ impl Default for ChatSseTransformState {
 impl ChatSseTransformState {
     fn new(provider_id: String, tool_context: ChatToolContext, chat_messages: Vec<Value>) -> Self {
         Self {
-            buffer: String::new(),
+            buffer: Vec::new(),
             pending: VecDeque::new(),
             response_id: "resp_codex_companion".to_string(),
             model: String::new(),
@@ -1232,19 +1789,27 @@ impl ChatSseTransformState {
             text: String::new(),
             started: false,
             completed: false,
+            saw_terminal_signal: false,
             latest_usage: Value::Null,
             provider_id,
+            observer: None,
             tool_context,
             chat_messages,
             tools: BTreeMap::new(),
         }
     }
 
+    fn with_observer(mut self, store: ConfigStore, request_id: String) -> Self {
+        let api_service = ApiServiceStore::from_config_store(&store);
+        self.observer = Some((store, api_service, request_id));
+        self
+    }
+
     fn push_chunk(&mut self, chunk: &[u8]) {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        self.buffer.extend_from_slice(chunk);
         while let Some(index) = self.next_block_index() {
-            let block = self.buffer[..index].to_string();
-            let drain_to = if self.buffer[index..].starts_with("\r\n\r\n") {
+            let block = String::from_utf8_lossy(&self.buffer[..index]).into_owned();
+            let drain_to = if self.buffer[index..].starts_with(b"\r\n\r\n") {
                 index + 4
             } else {
                 index + 2
@@ -1255,7 +1820,10 @@ impl ChatSseTransformState {
     }
 
     fn next_block_index(&self) -> Option<usize> {
-        match (self.buffer.find("\n\n"), self.buffer.find("\r\n\r\n")) {
+        match (
+            find_bytes(&self.buffer, b"\n\n"),
+            find_bytes(&self.buffer, b"\r\n\r\n"),
+        ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -1277,6 +1845,7 @@ impl ChatSseTransformState {
             return;
         }
         if data.trim() == "[DONE]" {
+            self.saw_terminal_signal = true;
             self.finish();
             return;
         }
@@ -1299,6 +1868,12 @@ impl ChatSseTransformState {
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first());
+        if choice
+            .and_then(|choice| choice.get("finish_reason"))
+            .is_some_and(|reason| !reason.is_null())
+        {
+            self.saw_terminal_signal = true;
+        }
         if let Some(delta) = choice.and_then(|choice| choice.get("delta")) {
             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                 if !text.is_empty() {
@@ -1317,6 +1892,56 @@ impl ChatSseTransformState {
                     self.append_tool_call_delta(tool_call);
                 }
             }
+        }
+    }
+
+    fn finish_stream(&mut self) {
+        if !self.buffer.is_empty() {
+            let block = String::from_utf8_lossy(&self.buffer).into_owned();
+            self.buffer.clear();
+            self.process_block(&block);
+        }
+        if self.completed {
+            return;
+        }
+        if self.saw_terminal_signal {
+            self.finish();
+        } else {
+            self.fail_incomplete();
+        }
+    }
+
+    fn fail_incomplete(&mut self) {
+        self.fail_incomplete_with_message("上游流在完成事件前中断");
+    }
+
+    fn fail_incomplete_with_message(&mut self, detail: &str) {
+        if self.completed {
+            return;
+        }
+        self.ensure_started();
+        self.completed = true;
+        let mut response = self.response_object("failed");
+        response["error"] = json!({
+            "code": "upstream_stream_incomplete",
+            "message": detail
+        });
+        self.emit(json!({
+            "type": "response.failed",
+            "response": response
+        }));
+        if let Some((store, api_service, request_id)) = self.observer.as_ref() {
+            let message = format!("[{request_id}] upstream_stream_incomplete: {detail}");
+            let failure = classify_failure(None, &message);
+            crate::events::update_health(store, &self.provider_id, |health| {
+                mark_failure(health, &failure, message.clone())
+            });
+            crate::events::append_event(store, "error", Some(self.provider_id.clone()), message);
+            let _ = api_service.record_stream_outcome(
+                request_id,
+                "failed",
+                Some("upstream_stream_incomplete"),
+            );
         }
     }
 
@@ -1402,6 +2027,9 @@ impl ChatSseTransformState {
             "type": "response.completed",
             "response": self.response_object("completed")
         }));
+        if let Some((_, api_service, request_id)) = self.observer.as_ref() {
+            let _ = api_service.record_stream_outcome(request_id, "succeeded", None);
+        }
     }
 
     fn store_history(&self) {
@@ -1590,6 +2218,12 @@ impl ChatSseTransformState {
     }
 }
 
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 fn response_id_from_chat_id(id: &str) -> String {
     if id.starts_with("resp_") {
         id.to_string()
@@ -1672,6 +2306,22 @@ mod tests {
     use codex_companion_core::{default_refresh_interval_seconds, ProviderKind};
     use std::collections::BTreeMap;
 
+    fn official_provider(base_url: &str) -> ProviderConfig {
+        ProviderConfig {
+            id: "official".to_string(),
+            name: "Official".to_string(),
+            kind: ProviderKind::OfficialCodex,
+            base_url: base_url.to_string(),
+            auth_ref: None,
+            direct_auth_ref: None,
+            model_map: BTreeMap::new(),
+            priority: 0,
+            enabled: true,
+            refresh_interval_seconds: default_refresh_interval_seconds(),
+            account: None,
+        }
+    }
+
     #[test]
     fn builds_upstream_url_from_v1_base() {
         let provider = ProviderConfig {
@@ -1692,6 +2342,21 @@ mod tests {
             upstream_url(&provider, &uri),
             "https://api.example.com/v1/chat/completions?stream=true"
         );
+    }
+
+    #[test]
+    fn semantic_failure_detection_does_not_reject_valid_incomplete_response() {
+        assert!(semantic_failure_message(&json!({
+            "status": "failed",
+            "error": {"message": "overloaded"}
+        }))
+        .is_some());
+        assert!(semantic_failure_message(&json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "message"}]
+        }))
+        .is_none());
     }
 
     #[test]
@@ -1717,6 +2382,141 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(value["model"], "deepseek-chat");
+    }
+
+    #[test]
+    fn official_codex_normalizes_standard_string_input_to_item_list() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let uri: Uri = "/v1/responses".parse().expect("uri");
+        let body = normalize_official_responses_input(
+            &provider,
+            &Method::POST,
+            &uri,
+            Bytes::from_static(
+                br#"{"model":"gpt-test","input":"hello","max_output_tokens":16,"temperature":0.2,"top_p":0.9,"truncation":"auto","user":"client-user","context_management":{}}"#,
+            ),
+            None,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(value["input"][0]["content"][0]["text"], "hello");
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["parallel_tool_calls"], true);
+        for key in [
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "truncation",
+            "user",
+            "context_management",
+        ] {
+            assert!(value.get(key).is_none(), "{key} should be removed");
+        }
+    }
+
+    #[test]
+    fn official_codex_preserves_existing_input_item_list() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let uri: Uri = "/v1/responses".parse().expect("uri");
+        let original =
+            Bytes::from_static(br#"{"model":"gpt-test","input":[{"role":"user","content":[]}]}"#);
+        let body = normalize_official_responses_input(
+            &provider,
+            &Method::POST,
+            &uri,
+            original.clone(),
+            None,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], true);
+    }
+
+    #[test]
+    fn official_codex_uses_real_client_session_for_cache_identity() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let uri: Uri = "/v1/responses".parse().expect("uri");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("session-42"));
+        let original = Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#);
+        let identity =
+            official_codex_session_identity(&provider, &Method::POST, &uri, &headers, &original);
+        assert_eq!(identity.as_deref(), Some("session-42"));
+        let body = normalize_official_responses_input(
+            &provider,
+            &Method::POST,
+            &uri,
+            original,
+            identity.as_deref(),
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["prompt_cache_key"], "session-42");
+        assert_eq!(value["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn official_codex_preserves_explicit_cache_key() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let uri: Uri = "/v1/responses".parse().expect("uri");
+        let body = normalize_official_responses_input(
+            &provider,
+            &Method::POST,
+            &uri,
+            Bytes::from_static(
+                br#"{"model":"gpt-test","input":"hello","prompt_cache_key":"explicit"}"#,
+            ),
+            Some("session-42"),
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["prompt_cache_key"], "explicit");
+    }
+
+    #[test]
+    fn official_codex_converts_system_input_role_to_developer() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let uri: Uri = "/v1/responses".parse().expect("uri");
+        let body = normalize_official_responses_input(
+            &provider,
+            &Method::POST,
+            &uri,
+            Bytes::from_static(
+                br#"{"model":"gpt-test","input":[{"role":"system","content":[]},{"role":"user","content":[]}]}"#,
+            ),
+            None,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["input"][0]["role"], "developer");
+        assert_eq!(value["input"][1]["role"], "user");
+    }
+
+    #[test]
+    fn official_codex_bridges_standard_non_stream_responses_requests() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let uri: Uri = "/v1/responses".parse().expect("uri");
+        assert!(official_codex_needs_non_stream_bridge(
+            &provider,
+            &Method::POST,
+            &uri,
+            br#"{"model":"gpt-test","input":"hello"}"#,
+        ));
+        assert!(!official_codex_needs_non_stream_bridge(
+            &provider,
+            &Method::POST,
+            &uri,
+            br#"{"model":"gpt-test","input":"hello","stream":true}"#,
+        ));
+    }
+
+    #[test]
+    fn extracts_terminal_response_from_official_codex_sse() {
+        let body = b"event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"OK\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n";
+        let response = terminal_response_from_sse(body).expect("terminal response");
+        assert_eq!(response["id"], "resp_1");
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"][0]["content"][0]["text"], "OK");
     }
 
     #[test]
@@ -2082,6 +2882,119 @@ mod tests {
         assert!(output.contains("response.output_text.delta"));
         assert!(output.contains("response.completed"));
         assert!(output.contains("ok"));
+    }
+
+    #[test]
+    fn chat_sse_transform_preserves_utf8_across_transport_chunks() {
+        let mut state = ChatSseTransformState::default();
+        let event = concat!(
+            "data: {\"id\":\"chatcmpl_utf8\",\"model\":\"deepseek-chat\",",
+            "\"choices\":[{\"delta\":{\"content\":\"你好\"},\"finish_reason\":\"stop\"}]}\n\n"
+        )
+        .as_bytes();
+        let split = event
+            .windows("你".len())
+            .position(|window| window == "你".as_bytes())
+            .expect("utf8 character")
+            + 1;
+
+        state.push_chunk(&event[..split]);
+        state.push_chunk(&event[split..]);
+        state.finish_stream();
+
+        let output = state
+            .pending
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect::<String>();
+        assert!(output.contains("你好"));
+        assert!(!output.contains('\u{fffd}'));
+        assert!(output.contains("response.completed"));
+    }
+
+    #[test]
+    fn chat_sse_transform_reports_incomplete_eof_as_failed() {
+        let mut state = ChatSseTransformState::default();
+        state.push_chunk(
+            br#"data: {"id":"chatcmpl_cut","model":"deepseek-chat","choices":[{"delta":{"content":"partial"},"finish_reason":null}]}
+
+"#,
+        );
+
+        state.finish_stream();
+
+        let output = state
+            .pending
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect::<String>();
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("upstream_stream_incomplete"));
+        assert!(!output.contains("response.completed"));
+    }
+
+    #[test]
+    fn direct_responses_sse_observer_reports_incomplete_eof() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.keep().join("config.json"));
+        store.load().expect("initialize config");
+        let mut state = ResponsesSseObserverState::new(
+            store.clone(),
+            "official".to_string(),
+            "request-1".to_string(),
+        );
+        state.push_chunk(
+            br#"data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test"}}
+
+"#,
+        );
+
+        state.finish_stream();
+
+        let output = state
+            .pending
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect::<String>();
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("upstream_stream_incomplete"));
+        assert_eq!(
+            store
+                .load()
+                .expect("config")
+                .health
+                .get("official")
+                .and_then(|health| health.last_failure_kind.clone()),
+            Some(codex_companion_core::HealthFailureKind::UpstreamFailed)
+        );
+    }
+
+    #[test]
+    fn direct_responses_sse_observer_accepts_terminal_event_across_chunks() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.keep().join("config.json"));
+        store.load().expect("initialize config");
+        let mut state = ResponsesSseObserverState::new(
+            store.clone(),
+            "official".to_string(),
+            "request-2".to_string(),
+        );
+        let event =
+            br#"data: {"type":"response.completed","response":{"id":"resp_2","status":"completed"}}
+
+"#;
+        let split = event.len() / 2;
+        state.push_chunk(&event[..split]);
+        state.push_chunk(&event[split..]);
+        state.finish_stream();
+
+        assert!(state.pending.is_empty());
+        assert!(state.terminal);
+        assert!(!store
+            .load()
+            .expect("config")
+            .health
+            .contains_key("official"));
     }
 
     #[test]

@@ -43,6 +43,7 @@ impl CompanionDaemon {
         import_provider_json_many(&self.store, json_text, provider_id, provider_name)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn import_api_key_provider(
         &self,
         provider_name: String,

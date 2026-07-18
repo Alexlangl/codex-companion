@@ -33,6 +33,12 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
     if lower.contains("model_not_found") || lower.contains("model not found") {
         return class(HealthFailureKind::ModelMissing, true, true);
     }
+    if lower.contains("upstream semantic failure")
+        || lower.contains("response.failed")
+        || lower.contains("upstream_stream_incomplete")
+    {
+        return class(HealthFailureKind::UpstreamFailed, true, true);
+    }
     if status.is_some_and(|value| value >= 500) {
         return class(HealthFailureKind::UpstreamFailed, true, true);
     }
@@ -80,6 +86,18 @@ pub fn mark_failure(health: &mut ProviderHealth, failure: &FailureClassification
         ) {
             health.status = HealthStatusKind::Cooldown;
         }
+    }
+}
+
+pub fn mark_model_failure(
+    health: &mut ProviderHealth,
+    failure: &FailureClassification,
+    message: String,
+) {
+    mark_failure(health, failure, message);
+    health.cooldown_until = None;
+    if matches!(health.status, HealthStatusKind::Cooldown) {
+        health.status = HealthStatusKind::Degraded;
     }
 }
 
@@ -143,6 +161,10 @@ mod tests {
             HealthFailureKind::UpstreamFailed
         );
         assert_eq!(
+            classify_failure(None, "upstream semantic failure: overloaded").kind,
+            HealthFailureKind::UpstreamFailed
+        );
+        assert_eq!(
             classify_failure(None, "timeout").kind,
             HealthFailureKind::NetworkFailed
         );
@@ -165,5 +187,14 @@ mod tests {
         mark_success(&mut health);
         assert!(!cooldown_active(&health));
         assert_eq!(health.status, HealthStatusKind::Healthy);
+    }
+
+    #[test]
+    fn model_failure_does_not_cool_down_unrelated_models() {
+        let failure = classify_failure(Some(429), "rate limit");
+        let mut health = ProviderHealth::default();
+        mark_model_failure(&mut health, &failure, "model rate limit".to_string());
+        assert!(!cooldown_active(&health));
+        assert_eq!(health.failure_count, 1);
     }
 }

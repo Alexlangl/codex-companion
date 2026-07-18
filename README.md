@@ -21,6 +21,8 @@
 - 导入官方 Codex 账号 JSON，例如 Codex Companion、CPA 或 sub2api 格式。
 - 导入 API Key 账号 JSON，或手动添加 OpenAI-compatible provider。
 - 把多个账号编排成 Provider Group，按优先级失败切换。
+- 把当前账号分组作为本地 OpenAI-compatible API，提供 `/v1/responses` 和 `/v1/models`。
+- 为不同调用方创建独立 API client，支持一次性密钥显示、模型白名单、停用、轮换和删除。
 - 单个账号默认直连，也可以在账号卡片里切换为本地代理。
 - 地址明确指向 `/chat/completions` 的中转站会强制使用本地代理，由 Companion 转换 Responses、工具调用和多轮历史，避免误选直连。
 - 官方 Codex 账号由 Companion 负责 token 刷新和请求头处理。
@@ -56,7 +58,7 @@
 
 ### 本地代理
 
-查看 Companion 本地代理服务、请求记录、上游错误和切换事件。
+查看 Companion 本地 API 服务、真实监听状态、client、请求记录、模型冷却、上游错误和切换事件。
 
 <img src="assets/readme/relay.jpg" alt="Relay page" width="720">
 
@@ -82,6 +84,24 @@
 - 使用 `修复` 预览或修复 Codex 历史会话和插件状态。
 - 使用 `用量` 查看本地 token 统计。
 - 使用 `设置` 写入或恢复 Codex 配置。
+
+### 本地 API 服务
+
+当前账号分组会暴露为 `http://127.0.0.1:17687/v1`。调用方使用 Responses API；Companion 负责官方 OAuth、Responses / Chat Completions 协议转换、会话亲和、账号失败切换和流式终止检查。
+
+```bash
+curl http://127.0.0.1:17687/v1/responses \
+  -H "Authorization: Bearer YOUR_CODEX_COMPANION_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-model","input":"hello","stream":false}'
+```
+
+- 支持 `POST /v1/responses` 和 `GET /v1/models`。
+- API client 密钥只显示一次；SQLite 只保存 SHA-256 哈希和短前缀。
+- 可为每个 client 限制允许模型，并单独停用、轮换或删除。
+- 浏览器跨域请求始终需要有效 client 密钥；非浏览器本机请求可选择兼容模式或强制密钥。
+- 请求日志只保存路由元数据，不保存提示词、响应正文或完整密钥。
+- 上游流未产生终止事件就断开时，Companion 会返回 `response.failed`，并同步更新账号健康状态和请求审计。
 
 ### 自定义模型价格
 
@@ -144,6 +164,21 @@ codex-companion repair --history --plugins --dry-run
 codex-companion relay start
 ```
 
+管理本地 API：
+
+```bash
+codex-companion relay status
+codex-companion relay self-test
+codex-companion relay client create --name local-script --models model-a,model-b
+codex-companion relay client list
+codex-companion relay client update --id CLIENT_ID --enabled false
+codex-companion relay client rotate CLIENT_ID
+codex-companion relay client delete CLIENT_ID
+codex-companion relay logs --limit 50
+codex-companion relay clear-logs
+codex-companion relay settings --require-api-key true --retry-budget 2
+```
+
 ## TUI 用法
 
 ```bash
@@ -179,5 +214,6 @@ API Key JSON 示例：
 - 修复前可以先 dry-run 预览影响。
 - 正式修复使用 `~/.codex/backups/codex-companion/repair/` 下的事务备份；失败自动回滚，成功后保留最近 10 份。
 - 导入的账号材料只保存在本机。
+- 本地 API client 密钥只显示一次，持久化时只保存哈希；请求审计不保存请求或响应正文。
 - Token 用量统计只读取本地 Codex 会话记录。
 - 成本是基于模型价格快照和本地覆盖配置的估算，不是 OpenAI 或中转站账单。
