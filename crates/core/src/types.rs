@@ -443,6 +443,7 @@ pub struct TokenUsageSummary {
     pub events: usize,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub cost: TokenCostBreakdown,
@@ -464,6 +465,7 @@ pub struct TokenUsageBucket {
     pub events: usize,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub cost: TokenCostBreakdown,
@@ -476,6 +478,7 @@ pub struct TokenUsageBucket {
 pub struct TokenCostBreakdown {
     pub fresh_input_usd: String,
     pub cached_input_usd: String,
+    pub cache_write_input_usd: String,
     pub output_usd: String,
     pub total_usd: String,
 }
@@ -485,6 +488,7 @@ impl Default for TokenCostBreakdown {
         Self {
             fresh_input_usd: "0".to_string(),
             cached_input_usd: "0".to_string(),
+            cache_write_input_usd: "0".to_string(),
             output_usd: "0".to_string(),
             total_usd: "0".to_string(),
         }
@@ -500,6 +504,7 @@ pub struct TokenUsageEvent {
     pub provider_id: Option<String>,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub cost: Option<TokenCostBreakdown>,

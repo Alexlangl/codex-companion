@@ -11,12 +11,13 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-const TOKEN_USAGE_CACHE_VERSION: u32 = 2;
+const TOKEN_USAGE_CACHE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Default)]
 struct CumulativeTokens {
     input: u64,
     cached_input: u64,
+    cache_write_input: u64,
     output: u64,
 }
 
@@ -24,20 +25,23 @@ struct CumulativeTokens {
 struct DeltaTokens {
     input: u64,
     cached_input: u64,
+    cache_write_input: u64,
     output: u64,
 }
 
 impl DeltaTokens {
     fn is_zero(&self) -> bool {
-        self.input == 0 && self.cached_input == 0 && self.output == 0
+        self.input == 0 && self.cached_input == 0 && self.cache_write_input == 0 && self.output == 0
     }
 
     fn fresh_input(&self) -> u64 {
-        self.input.saturating_sub(self.cached_input)
+        self.input
+            .saturating_sub(self.cached_input)
+            .saturating_sub(self.cache_write_input)
     }
 
     fn total(&self) -> u64 {
-        self.fresh_input() + self.cached_input + self.output
+        self.fresh_input() + self.cached_input + self.cache_write_input + self.output
     }
 }
 
@@ -47,6 +51,12 @@ struct FileParseState {
     current_model: String,
     current_provider_id: Option<String>,
     prev_total: Option<CumulativeTokens>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexSessionIdentity {
+    thread_id: String,
+    carries_history_snapshot: bool,
 }
 
 impl Default for FileParseState {
@@ -176,6 +186,7 @@ fn summarize_token_events(
         summary.events += 1;
         summary.input_tokens += event.input_tokens;
         summary.cached_input_tokens += event.cached_input_tokens;
+        summary.cache_write_input_tokens += event.cache_write_input_tokens;
         summary.output_tokens += event.output_tokens;
         summary.total_tokens += event.total_tokens;
         let event_cost = pricing
@@ -184,6 +195,7 @@ fn summarize_token_events(
                 event.provider_id.as_deref(),
                 event.input_tokens,
                 event.cached_input_tokens,
+                event.cache_write_input_tokens,
                 event.output_tokens,
             )
             .map(|(matched, cost)| {
@@ -246,14 +258,19 @@ fn summarize_token_events(
 fn parse_session_file(path: &Path) -> Result<Vec<TokenUsageEvent>> {
     let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
     let reader = BufReader::new(file);
-    let mut state = FileParseState::default();
+    let lines = reader
+        .lines()
+        .map_while(std::result::Result::ok)
+        .collect::<Vec<_>>();
+    let identity = session_identity_from_lines(&lines);
+    let history_boundary = history_replay_boundary(&lines, identity.as_ref());
+    let mut state = FileParseState {
+        session_id: identity.map(|identity| identity.thread_id),
+        ..FileParseState::default()
+    };
     let mut events = Vec::new();
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => continue,
-        };
+    for (line_index, line) in lines.into_iter().enumerate() {
         if !line.contains("token_count")
             && !line.contains("turn_context")
             && !line.contains("session_meta")
@@ -271,7 +288,9 @@ fn parse_session_file(path: &Path) -> Result<Vec<TokenUsageEvent>> {
             "turn_context" => apply_turn_context(&mut state, &value),
             "event_msg" => {
                 if let Some(event) = parse_token_event(&mut state, &value) {
-                    events.push(event);
+                    if history_boundary.is_none_or(|boundary| line_index + 1 >= boundary) {
+                        events.push(event);
+                    }
                 }
             }
             _ => {}
@@ -279,6 +298,70 @@ fn parse_session_file(path: &Path) -> Result<Vec<TokenUsageEvent>> {
     }
 
     Ok(events)
+}
+
+fn session_identity_from_lines(lines: &[String]) -> Option<CodexSessionIdentity> {
+    lines.iter().find_map(|line| {
+        if !line.contains("session_meta") {
+            return None;
+        }
+        let value = serde_json::from_str::<Value>(line).ok()?;
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            return None;
+        }
+        value.get("payload").and_then(parse_codex_session_identity)
+    })
+}
+
+fn parse_codex_session_identity(payload: &Value) -> Option<CodexSessionIdentity> {
+    let thread_id = pick_string(
+        payload,
+        &[
+            &["id"],
+            &["thread_id"],
+            &["threadId"],
+            &["session_id"],
+            &["sessionId"],
+        ],
+    )?;
+    let parent_session_id = pick_string(payload, &[&["session_id"], &["sessionId"]]);
+    let carries_history_snapshot = payload
+        .get("forked_from_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+        || payload
+            .get("source")
+            .and_then(|source| source.get("subagent"))
+            .is_some()
+        || parent_session_id
+            .as_deref()
+            .is_some_and(|parent| parent != thread_id);
+    Some(CodexSessionIdentity {
+        thread_id,
+        carries_history_snapshot,
+    })
+}
+
+fn history_replay_boundary(
+    lines: &[String],
+    identity: Option<&CodexSessionIdentity>,
+) -> Option<usize> {
+    if !identity.is_some_and(|identity| identity.carries_history_snapshot) {
+        return None;
+    }
+    lines.iter().enumerate().find_map(|(index, line)| {
+        if !line.contains("thread_settings_applied") && !line.contains("inter_agent_communication")
+        {
+            return None;
+        }
+        let value = serde_json::from_str::<Value>(line).ok()?;
+        let event_type = value.get("type").and_then(Value::as_str)?;
+        let is_boundary = event_type.starts_with("inter_agent_communication")
+            || (event_type == "event_msg"
+                && value.pointer("/payload/type").and_then(Value::as_str)
+                    == Some("thread_settings_applied"));
+        is_boundary.then_some(index + 1)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -344,7 +427,16 @@ fn apply_session_meta(state: &mut FileParseState, value: &Value) {
         return;
     };
     if state.session_id.is_none() {
-        state.session_id = pick_string(payload, &[&["session_id"], &["sessionId"], &["id"]]);
+        state.session_id = pick_string(
+            payload,
+            &[
+                &["id"],
+                &["thread_id"],
+                &["threadId"],
+                &["session_id"],
+                &["sessionId"],
+            ],
+        );
     }
     update_model_and_provider(state, payload);
 }
@@ -365,8 +457,12 @@ fn parse_token_event(state: &mut FileParseState, value: &Value) -> Option<TokenU
     update_model_and_provider(state, payload);
 
     let delta = token_event_delta(state, info)?;
+    let cached_input = delta.cached_input.min(delta.input);
     let delta = DeltaTokens {
-        cached_input: delta.cached_input.min(delta.input),
+        cached_input,
+        cache_write_input: delta
+            .cache_write_input
+            .min(delta.input.saturating_sub(cached_input)),
         ..delta
     };
     if delta.is_zero() {
@@ -380,6 +476,7 @@ fn parse_token_event(state: &mut FileParseState, value: &Value) -> Option<TokenU
         provider_id: state.current_provider_id.clone(),
         input_tokens: delta.fresh_input(),
         cached_input_tokens: delta.cached_input,
+        cache_write_input_tokens: delta.cache_write_input,
         output_tokens: delta.output,
         total_tokens: delta.total(),
         cost: None,
@@ -402,6 +499,7 @@ fn token_event_delta(state: &mut FileParseState, info: &Value) -> Option<DeltaTo
         return Some(DeltaTokens {
             input: last.input,
             cached_input: last.cached_input,
+            cache_write_input: last.cache_write_input,
             output: last.output,
         });
     }
@@ -466,6 +564,17 @@ fn parse_cumulative_tokens(value: &Value) -> Option<CumulativeTokens> {
             ],
         )
         .unwrap_or(0),
+        cache_write_input: pick_u64(
+            value,
+            &[
+                &["cache_creation_input_tokens"],
+                &["cacheCreationInputTokens"],
+                &["cache_write_input_tokens"],
+                &["cacheWriteInputTokens"],
+                &["cached_write_input_tokens"],
+            ],
+        )
+        .unwrap_or(0),
         output: pick_u64(
             value,
             &[
@@ -484,11 +593,15 @@ fn compute_delta(prev: &Option<CumulativeTokens>, current: &CumulativeTokens) ->
         None => DeltaTokens {
             input: current.input,
             cached_input: current.cached_input,
+            cache_write_input: current.cache_write_input,
             output: current.output,
         },
         Some(prev) => DeltaTokens {
             input: current.input.saturating_sub(prev.input),
             cached_input: current.cached_input.saturating_sub(prev.cached_input),
+            cache_write_input: current
+                .cache_write_input
+                .saturating_sub(prev.cache_write_input),
             output: current.output.saturating_sub(prev.output),
         },
     }
@@ -537,6 +650,7 @@ fn add_to_bucket(
     accumulator.bucket.events += 1;
     accumulator.bucket.input_tokens += event.input_tokens;
     accumulator.bucket.cached_input_tokens += event.cached_input_tokens;
+    accumulator.bucket.cache_write_input_tokens += event.cache_write_input_tokens;
     accumulator.bucket.output_tokens += event.output_tokens;
     accumulator.bucket.total_tokens += event.total_tokens;
     if let Some(cost) = cost {
@@ -562,13 +676,14 @@ fn day_key(timestamp: Option<&str>) -> String {
 
 fn token_event_fingerprint(event: &TokenUsageEvent) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         event.session_id.as_deref().unwrap_or(""),
         event.timestamp.as_deref().unwrap_or(""),
         event.provider_id.as_deref().unwrap_or(""),
         event.model,
         event.input_tokens,
         event.cached_input_tokens,
+        event.cache_write_input_tokens,
         event.output_tokens
     )
 }
@@ -695,16 +810,19 @@ mod tests {
         let prev = Some(CumulativeTokens {
             input: 100,
             cached_input: 40,
+            cache_write_input: 10,
             output: 10,
         });
         let current = CumulativeTokens {
             input: 160,
             cached_input: 80,
+            cache_write_input: 15,
             output: 30,
         };
         let delta = compute_delta(&prev, &current);
         assert_eq!(delta.input, 60);
         assert_eq!(delta.cached_input, 40);
+        assert_eq!(delta.cache_write_input, 5);
         assert_eq!(delta.output, 20);
     }
 
@@ -749,6 +867,75 @@ mod tests {
         assert_eq!(summary.cost.cached_input_usd, "0.00000525");
         assert_eq!(summary.cost.output_usd, "0.00042");
         assert_eq!(summary.cost.total_usd, "0.00065275");
+    }
+
+    #[test]
+    fn subagent_history_replay_only_establishes_cumulative_baseline() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        fs::write(
+            day.join("child.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"child","session_id":"parent","source":{"subagent":{}}}}"#.to_string()
+                + "\n"
+                + r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":100}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1200,"cached_input_tokens":1000,"output_tokens":120}}}}"#
+                + "\n"
+                + r#"{"type":"event_msg","payload":{"type":"thread_settings_applied"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1300,"cached_input_tokens":1050,"output_tokens":150}}}}"#
+                + "\n",
+        )
+        .expect("write");
+
+        let summary = collect_token_usage(temp.path().to_path_buf()).expect("summary");
+        assert_eq!(summary.sessions, 1);
+        assert_eq!(summary.events, 1);
+        assert_eq!(
+            summary.recent_events[0].session_id.as_deref(),
+            Some("child")
+        );
+        assert_eq!(summary.input_tokens, 50);
+        assert_eq!(summary.cached_input_tokens, 50);
+        assert_eq!(summary.output_tokens, 30);
+        assert_eq!(summary.total_tokens, 130);
+    }
+
+    #[test]
+    fn separates_cache_write_tokens_from_fresh_input() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        fs::write(
+            day.join("cache-write.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"cache-write"}}"#.to_string()
+                + "\n"
+                + r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":10}}}}"#
+                + "\n",
+        )
+        .expect("write");
+
+        let summary = collect_token_usage(temp.path().to_path_buf()).expect("summary");
+        assert_eq!(summary.input_tokens, 50);
+        assert_eq!(summary.cached_input_tokens, 20);
+        assert_eq!(summary.cache_write_input_tokens, 30);
+        assert_eq!(summary.total_tokens, 110);
+        assert_eq!(summary.cost.cache_write_input_usd, "0.0000375");
     }
 
     #[test]

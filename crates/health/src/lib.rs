@@ -14,6 +14,9 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
     if matches!(status, Some(401 | 403)) {
         return class(HealthFailureKind::AuthFailed, false, true);
     }
+    if lower.contains("deactivated_workspace") {
+        return class(HealthFailureKind::AuthFailed, false, true);
+    }
     if lower.contains("insufficient_quota")
         || lower.contains("quota exceeded")
         || lower.contains("billing")
@@ -147,6 +150,10 @@ mod tests {
         assert_eq!(
             classify_failure(Some(429), "rate limit").kind,
             HealthFailureKind::RateLimited
+        );
+        assert_eq!(
+            classify_failure(Some(400), "deactivated_workspace").kind,
+            HealthFailureKind::AuthFailed
         );
         assert_eq!(
             classify_failure(Some(400), "insufficient_quota").kind,

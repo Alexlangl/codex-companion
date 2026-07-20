@@ -20,15 +20,15 @@ It provides:
 
 - Import official Codex account JSON, including Codex Companion, CPA, and sub2api formats.
 - Import API Key account JSON or manually add OpenAI-compatible providers.
-- Compose multiple accounts into a Provider Group and fallback by priority.
+- Compose multiple accounts into a Provider Group and fallback by priority; stable sessions keep account affinity when identifiable.
 - Expose the active account group as a local OpenAI-compatible API with `/v1/responses` and `/v1/models`.
 - Create independent API clients with one-time secrets, model allowlists, disable, rotate, and delete controls.
 - Single accounts default to direct mode, and you can switch them to local proxy mode from the account card.
 - Relay providers whose URL explicitly targets `/chat/completions` are forced through the local relay so Companion can translate Responses requests, tool calls, and multi-turn history.
 - Let Companion handle token refresh and request headers for official Codex accounts.
-- Refresh account health, subscription state, and recognizable quota information.
+- Refresh account health, subscription state, and recognizable 5-hour, weekly, 30-day, and model-specific quotas; transient failures retry while keeping the last successful value.
 - Repair Codex history and plugin state before launching Codex, reducing provider-switch continuity issues.
-- Scan local Codex session logs for token usage and estimate fresh-input, cached-input, and output cost by model.
+- Scan main and subagent Codex session logs and estimate fresh-input, cache-read, cache-write, and output costs by model.
 
 ## Screenshots
 
@@ -52,7 +52,7 @@ Add API Key accounts, paste Token / JSON, import local Codex accounts, or batch 
 
 ### Groups
 
-Put multiple accounts into one group and fallback in order.
+Put multiple accounts into one group and fallback in order. Requests with stable session identifiers keep account affinity and rebind after a provider failure.
 
 <img src="assets/readme/groups.jpg" alt="Provider groups" width="720">
 
@@ -115,6 +115,7 @@ Built-in prices are dated estimation snapshots, not upstream billing records. Cr
       "aliases": ["vendor/custom-latest"],
       "inputPerMillion": "1.00",
       "cachedInputPerMillion": "0.10",
+      "cacheWriteInputPerMillion": "1.25",
       "outputPerMillion": "2.00"
     }
   ],
@@ -124,7 +125,7 @@ Built-in prices are dated estimation snapshots, not upstream billing records. Cr
 }
 ```
 
-Prices are USD estimates per one million tokens. Use `providerMultipliers` to represent a gateway markup or discount.
+Prices are USD estimates per one million tokens. `cacheWriteInputPerMillion` is optional and falls back to the normal input price; use `providerMultipliers` to represent a gateway markup or discount.
 
 ## CLI Usage
 

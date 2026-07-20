@@ -698,6 +698,7 @@ fn request_affinity_key(headers: &HeaderMap, body: &[u8]) -> Option<String> {
 
     let value = serde_json::from_slice::<Value>(body).ok()?;
     for path in [
+        &["metadata", "session_id"][..],
         &["metadata", "user_id"][..],
         &["conversation_id"][..],
         &["thread_id"][..],
@@ -1039,6 +1040,26 @@ mod tests {
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("你好"));
         assert!(body.contains("response.completed"));
+    }
+
+    #[test]
+    fn affinity_key_accepts_metadata_session_id_but_not_previous_response_id() {
+        let session = request_affinity_key(
+            &HeaderMap::new(),
+            br#"{"metadata":{"session_id":"session-123"}}"#,
+        );
+        assert!(session.is_some());
+        assert_eq!(
+            session,
+            request_affinity_key(
+                &HeaderMap::new(),
+                br#"{"metadata":{"session_id":"session-123"},"previous_response_id":"resp-2"}"#,
+            )
+        );
+        assert!(
+            request_affinity_key(&HeaderMap::new(), br#"{"previous_response_id":"resp-1"}"#,)
+                .is_none()
+        );
     }
 
     #[tokio::test]

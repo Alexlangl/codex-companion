@@ -20,15 +20,15 @@
 
 - 导入官方 Codex 账号 JSON，例如 Codex Companion、CPA 或 sub2api 格式。
 - 导入 API Key 账号 JSON，或手动添加 OpenAI-compatible provider。
-- 把多个账号编排成 Provider Group，按优先级失败切换。
+- 把多个账号编排成 Provider Group，按优先级失败切换；能识别稳定会话时会保持账号粘性。
 - 把当前账号分组作为本地 OpenAI-compatible API，提供 `/v1/responses` 和 `/v1/models`。
 - 为不同调用方创建独立 API client，支持一次性密钥显示、模型白名单、停用、轮换和删除。
 - 单个账号默认直连，也可以在账号卡片里切换为本地代理。
 - 地址明确指向 `/chat/completions` 的中转站会强制使用本地代理，由 Companion 转换 Responses、工具调用和多轮历史，避免误选直连。
 - 官方 Codex 账号由 Companion 负责 token 刷新和请求头处理。
-- 自动刷新账号健康度、订阅状态和可识别的额度信息。
+- 自动刷新账号健康度、订阅状态和可识别的 5h、周、30 天及模型专属额度；瞬时失败会重试并保留上次成功值。
 - 启动 Codex 前修复历史会话和插件状态，减少切换 provider 后上下文丢失的问题。
-- 从本地 Codex 会话记录里统计 token 用量，并按模型估算新输入、缓存输入和输出成本。
+- 从本地 Codex 会话记录里统计主会话与子代理 token，用模型价格分别估算新输入、缓存读取、缓存写入和输出成本。
 
 ## 截图
 
@@ -52,7 +52,7 @@
 
 ### 分组
 
-把多个账号放进一个分组，按顺序执行失败切换。
+把多个账号放进一个分组，按顺序执行失败切换；有稳定会话标识时会保持账号粘性，绑定账号失败后切换并重新绑定。
 
 <img src="assets/readme/groups.jpg" alt="Provider groups" width="720">
 
@@ -115,6 +115,7 @@ curl http://127.0.0.1:17687/v1/responses \
       "aliases": ["vendor/custom-latest"],
       "inputPerMillion": "1.00",
       "cachedInputPerMillion": "0.10",
+      "cacheWriteInputPerMillion": "1.25",
       "outputPerMillion": "2.00"
     }
   ],
@@ -124,7 +125,7 @@ curl http://127.0.0.1:17687/v1/responses \
 }
 ```
 
-价格单位为每百万 Token 的美元估算值。`providerMultipliers` 可用于表达中转站加价或折扣。
+价格单位为每百万 Token 的美元估算值。`cacheWriteInputPerMillion` 可省略，省略时按普通输入价格计算；`providerMultipliers` 可用于表达中转站加价或折扣。
 
 ## CLI 用法
 

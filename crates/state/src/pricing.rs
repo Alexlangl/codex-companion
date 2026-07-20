@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-pub const PRICING_AS_OF: &str = "2026-07-10";
+pub const PRICING_AS_OF: &str = "2026-07-15";
 const TOKENS_PER_MILLION: u64 = 1_000_000;
 
 #[derive(Debug, Clone)]
@@ -14,6 +14,7 @@ pub struct ModelPricing {
     pub model: String,
     input_per_million: Decimal,
     cached_input_per_million: Decimal,
+    cache_write_input_per_million: Decimal,
     output_per_million: Decimal,
 }
 
@@ -21,17 +22,19 @@ pub struct ModelPricing {
 pub struct CostBreakdown {
     pub fresh_input_usd: Decimal,
     pub cached_input_usd: Decimal,
+    pub cache_write_input_usd: Decimal,
     pub output_usd: Decimal,
 }
 
 impl CostBreakdown {
     pub fn total_usd(&self) -> Decimal {
-        self.fresh_input_usd + self.cached_input_usd + self.output_usd
+        self.fresh_input_usd + self.cached_input_usd + self.cache_write_input_usd + self.output_usd
     }
 
     pub fn add_assign(&mut self, other: &Self) {
         self.fresh_input_usd += other.fresh_input_usd;
         self.cached_input_usd += other.cached_input_usd;
+        self.cache_write_input_usd += other.cache_write_input_usd;
         self.output_usd += other.output_usd;
     }
 
@@ -39,6 +42,7 @@ impl CostBreakdown {
         TokenCostBreakdown {
             fresh_input_usd: format_usd(self.fresh_input_usd),
             cached_input_usd: format_usd(self.cached_input_usd),
+            cache_write_input_usd: format_usd(self.cache_write_input_usd),
             output_usd: format_usd(self.output_usd),
             total_usd: format_usd(self.total_usd()),
         }
@@ -67,6 +71,8 @@ struct ModelPricingOverride {
     model: String,
     input_per_million: String,
     cached_input_per_million: String,
+    #[serde(default)]
+    cache_write_input_per_million: Option<String>,
     output_per_million: String,
     #[serde(default)]
     aliases: Vec<String>,
@@ -79,21 +85,24 @@ impl PricingCatalog {
             provider_multipliers: BTreeMap::new(),
             override_path: None,
         };
-        for (model, input, cached_input, output) in [
-            ("gpt-5.6-sol", "5.00", "0.50", "30.00"),
-            ("gpt-5.6-terra", "2.50", "0.25", "15.00"),
-            ("gpt-5.6-luna", "1.00", "0.10", "6.00"),
-            ("gpt-5.5", "5.00", "0.50", "30.00"),
-            ("gpt-5.4", "2.50", "0.25", "15.00"),
-            ("gpt-5.4-mini", "0.75", "0.075", "4.50"),
-            ("gpt-5.4-nano", "0.20", "0.02", "1.25"),
-            ("gpt-5.3-codex", "1.75", "0.175", "14.00"),
-            ("gpt-5.3-chat-latest", "5.00", "0.50", "30.00"),
+        for (model, input, cached_input, cache_write_input, output) in [
+            ("gpt-5.6-sol", "5.00", "0.50", "6.25", "30.00"),
+            ("gpt-5.6", "5.00", "0.50", "6.25", "30.00"),
+            ("gpt-5.6-terra", "2.50", "0.25", "3.125", "15.00"),
+            ("gpt-5.6-luna", "1.00", "0.10", "1.25", "6.00"),
+            ("gpt-5.5", "5.00", "0.50", "5.00", "30.00"),
+            ("gpt-5.4", "2.50", "0.25", "2.50", "15.00"),
+            ("gpt-5.4-mini", "0.75", "0.075", "0.75", "4.50"),
+            ("gpt-5.4-nano", "0.20", "0.02", "0.20", "1.25"),
+            ("gpt-5.3-codex", "1.75", "0.175", "1.75", "14.00"),
+            ("gpt-5.3-codex-spark", "1.75", "0.175", "1.75", "14.00"),
+            ("gpt-5.3-chat-latest", "5.00", "0.50", "5.00", "30.00"),
         ] {
             catalog.insert(
                 model,
                 decimal(input),
                 decimal(cached_input),
+                decimal(cache_write_input),
                 decimal(output),
                 &[],
             );
@@ -127,7 +136,22 @@ impl PricingCatalog {
                 "outputPerMillion",
                 &model.output_per_million,
             )?;
-            self.insert(&model.model, input, cached_input, output, &model.aliases);
+            let cache_write_input = model
+                .cache_write_input_per_million
+                .as_deref()
+                .map(|raw| {
+                    parse_nonnegative_decimal(path, &model.model, "cacheWriteInputPerMillion", raw)
+                })
+                .transpose()?
+                .unwrap_or(input);
+            self.insert(
+                &model.model,
+                input,
+                cached_input,
+                cache_write_input,
+                output,
+                &model.aliases,
+            );
         }
         for (provider_id, raw_multiplier) in value.provider_multipliers {
             let multiplier = Decimal::from_str(raw_multiplier.trim()).map_err(|source| {
@@ -161,6 +185,7 @@ impl PricingCatalog {
         provider_id: Option<&str>,
         fresh_input_tokens: u64,
         cached_input_tokens: u64,
+        cache_write_input_tokens: u64,
         output_tokens: u64,
     ) -> Option<(&ModelPricing, CostBreakdown)> {
         let pricing = self.find(raw_model)?;
@@ -177,6 +202,10 @@ impl PricingCatalog {
             cached_input_usd: Decimal::from(cached_input_tokens) * pricing.cached_input_per_million
                 / per_million
                 * multiplier,
+            cache_write_input_usd: Decimal::from(cache_write_input_tokens)
+                * pricing.cache_write_input_per_million
+                / per_million
+                * multiplier,
             output_usd: Decimal::from(output_tokens) * pricing.output_per_million / per_million
                 * multiplier,
         };
@@ -188,6 +217,7 @@ impl PricingCatalog {
         model: &str,
         input: Decimal,
         cached_input: Decimal,
+        cache_write_input: Decimal,
         output: Decimal,
         aliases: &[String],
     ) {
@@ -196,6 +226,7 @@ impl PricingCatalog {
             model: canonical.clone(),
             input_per_million: input,
             cached_input_per_million: cached_input,
+            cache_write_input_per_million: cache_write_input,
             output_per_million: output,
         };
         self.models.insert(canonical, pricing.clone());
@@ -247,7 +278,10 @@ fn normalize_model_key(raw: &str) -> String {
     if let Some((_, suffix)) = model.rsplit_once('/') {
         model = suffix.to_string();
     }
-    model
+    match model.as_str() {
+        "gpt-5.3-codexspark" | "gpt-5.3codexspark" => "gpt-5.3-codex-spark".to_string(),
+        _ => model,
+    }
 }
 
 fn strip_model_date_suffix(model: &str) -> String {
@@ -331,15 +365,16 @@ mod tests {
     }
 
     #[test]
-    fn splits_fresh_cached_and_output_cost() {
+    fn splits_fresh_cached_write_and_output_cost() {
         let catalog = PricingCatalog::builtin();
         let (_, cost) = catalog
-            .estimate("gpt-5.4", None, 1_000_000, 1_000_000, 1_000_000)
+            .estimate("gpt-5.4", None, 1_000_000, 1_000_000, 1_000_000, 1_000_000)
             .expect("pricing");
         assert_eq!(cost.fresh_input_usd, decimal("2.50"));
         assert_eq!(cost.cached_input_usd, decimal("0.25"));
+        assert_eq!(cost.cache_write_input_usd, decimal("2.50"));
         assert_eq!(cost.output_usd, decimal("15.00"));
-        assert_eq!(cost.total_usd(), decimal("17.75"));
+        assert_eq!(cost.total_usd(), decimal("20.25"));
     }
 
     #[test]
@@ -372,6 +407,7 @@ mod tests {
                 Some("paid-relay"),
                 1_000_000,
                 0,
+                0,
                 1_000_000,
             )
             .expect("custom pricing");
@@ -401,7 +437,7 @@ mod tests {
             .load_override(&path)
             .expect("override");
         let (pricing, cost) = catalog
-            .estimate("gpt-5.4-2026-03-05", None, 1_000_000, 0, 0)
+            .estimate("gpt-5.4-2026-03-05", None, 1_000_000, 0, 0, 0)
             .expect("snapshot pricing");
         assert_eq!(pricing.model, "gpt-5.4-2026-03-05");
         assert_eq!(cost.fresh_input_usd, decimal("9"));

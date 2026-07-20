@@ -168,7 +168,9 @@ export function shortId(value: string, visible = 8) {
 
 function primaryQuotaWindow(windows?: ProviderQuotaWindow[] | null) {
   if (!windows?.length) return null;
-  return windows.reduce((lowest, window) => (window.remainingPercent < lowest.remainingPercent ? window : lowest), windows[0]);
+  const accountWindows = windows.filter((window) => !window.label.includes(" "));
+  const candidates = accountWindows.length > 0 ? accountWindows : windows;
+  return candidates.reduce((lowest, window) => (window.remainingPercent < lowest.remainingPercent ? window : lowest), candidates[0]);
 }
 
 function formatApiUsage(available?: number | null, total?: number | null, used?: number | null, label?: string | null) {

@@ -28,6 +28,18 @@ struct UsageResponse {
     rate_limit: Option<RateLimitInfo>,
     #[serde(rename = "code_review_rate_limit")]
     _code_review_rate_limit: Option<RateLimitInfo>,
+    #[serde(rename = "additional_rate_limits", default)]
+    additional_rate_limits: Vec<AdditionalRateLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdditionalRateLimit {
+    #[serde(rename = "limit_name")]
+    limit_name: Option<String>,
+    #[serde(rename = "metered_feature")]
+    metered_feature: Option<String>,
+    #[serde(rename = "rate_limit")]
+    rate_limit: Option<RateLimitInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,23 +176,59 @@ async fn fetch_api_usage(
     usage_url: &str,
     token: &str,
 ) -> std::result::Result<serde_json::Value, String> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match fetch_api_usage_once(client, usage_url, token).await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let retryable = error.retryable;
+                last_error = Some(error.message);
+                if !retryable || attempt == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt + 1))).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "余量接口不可用".to_string()))
+}
+
+struct UsageFetchError {
+    message: String,
+    retryable: bool,
+}
+
+async fn fetch_api_usage_once(
+    client: &reqwest::Client,
+    usage_url: &str,
+    token: &str,
+) -> std::result::Result<serde_json::Value, UsageFetchError> {
     let response = client
         .get(usage_url)
         .bearer_auth(token)
         .header(ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|source| format!("请求失败: {source}"))?;
+        .map_err(|source| UsageFetchError {
+            message: format!("请求失败: {source}"),
+            retryable: true,
+        })?;
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|source| format!("读取响应失败: {source}"))?;
+    let body = response.text().await.map_err(|source| UsageFetchError {
+        message: format!("读取响应失败: {source}"),
+        retryable: true,
+    })?;
     if !status.is_success() {
-        return Err(format!("{status} [body_len:{}]", body.len()));
+        return Err(UsageFetchError {
+            message: format!("{status} [body_len:{}]", body.len()),
+            retryable: status.as_u16() == 429 || status.is_server_error(),
+        });
     }
-    let value = serde_json::from_str::<serde_json::Value>(&body)
-        .map_err(|source| format!("解析 JSON 失败: {source}"))?;
+    let value =
+        serde_json::from_str::<serde_json::Value>(&body).map_err(|source| UsageFetchError {
+            message: format!("解析 JSON 失败: {source}"),
+            retryable: false,
+        })?;
     if value
         .get("success")
         .and_then(serde_json::Value::as_bool)
@@ -194,7 +242,10 @@ async fn fetch_api_usage(
             .get("message")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("余量接口返回失败");
-        return Err(message.to_string());
+        return Err(UsageFetchError {
+            message: message.to_string(),
+            retryable: false,
+        });
     }
     Ok(value)
 }
@@ -231,30 +282,54 @@ async fn fetch_usage(
     access_token: &str,
     account_id: Option<&str>,
 ) -> Result<UsageResponse> {
+    let headers = codex_headers(access_token, account_id).map_err(CompanionError::InvalidConfig)?;
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match fetch_usage_once(client, headers.clone()).await {
+            Ok(usage) => return Ok(usage),
+            Err((message, retryable)) => {
+                last_error = Some(message);
+                if !retryable || attempt == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt + 1))).await;
+            }
+        }
+    }
+    Err(CompanionError::InvalidConfig(
+        last_error.unwrap_or_else(|| "Codex 额度接口不可用".to_string()),
+    ))
+}
+
+async fn fetch_usage_once(
+    client: &reqwest::Client,
+    headers: HeaderMap,
+) -> std::result::Result<UsageResponse, (String, bool)> {
     let response = client
         .get(USAGE_URL)
-        .headers(codex_headers(access_token, account_id).map_err(CompanionError::InvalidConfig)?)
+        .headers(headers)
         .send()
         .await
-        .map_err(|source| {
-            CompanionError::InvalidConfig(format!("请求 Codex 额度失败: {source}"))
-        })?;
+        .map_err(|source| (format!("请求 Codex 额度失败: {source}"), true))?;
     let status = response.status();
-    let body = response.text().await.map_err(|source| {
-        CompanionError::InvalidConfig(format!("读取 Codex 额度响应失败: {source}"))
-    })?;
+    let body = response
+        .text()
+        .await
+        .map_err(|source| (format!("读取 Codex 额度响应失败: {source}"), true))?;
     if !status.is_success() {
         let code = extract_error_code(&body)
             .map(|code| format!(" [error_code:{code}]"))
             .unwrap_or_default();
-        return Err(CompanionError::InvalidConfig(format!(
-            "Codex 额度接口返回 {status}{code} [body_len:{}]",
-            body.len()
-        )));
+        return Err((
+            format!(
+                "Codex 额度接口返回 {status}{code} [body_len:{}]",
+                body.len()
+            ),
+            status.as_u16() == 429 || status.is_server_error(),
+        ));
     }
-    serde_json::from_str::<UsageResponse>(&body).map_err(|source| {
-        CompanionError::InvalidConfig(format!("解析 Codex 额度 JSON 失败: {source}"))
-    })
+    serde_json::from_str::<UsageResponse>(&body)
+        .map_err(|source| (format!("解析 Codex 额度 JSON 失败: {source}"), false))
 }
 
 fn codex_headers(
@@ -409,7 +484,13 @@ fn apply_usage_to_account(account: &mut ProviderAccountInfo, usage: UsageRespons
 
     let windows = usage_windows(&usage);
     if !windows.is_empty() {
-        let lowest = windows
+        let primary_windows = primary_usage_windows(&usage);
+        let summary_windows = if primary_windows.is_empty() {
+            &windows
+        } else {
+            &primary_windows
+        };
+        let lowest = summary_windows
             .iter()
             .min_by(|left, right| {
                 left.remaining_percent
@@ -418,7 +499,7 @@ fn apply_usage_to_account(account: &mut ProviderAccountInfo, usage: UsageRespons
             })
             .cloned();
         account.quota_label = Some(
-            windows
+            summary_windows
                 .iter()
                 .map(|window| format!("{} {}%", window.label, window.remaining_percent.round()))
                 .collect::<Vec<_>>()
@@ -788,6 +869,34 @@ fn public_window_minutes(value: &str) -> Option<i64> {
 }
 
 fn usage_windows(usage: &UsageResponse) -> Vec<ProviderQuotaWindow> {
+    let mut windows = primary_usage_windows(usage);
+    for additional in &usage.additional_rate_limits {
+        let Some(rate_limit) = additional.rate_limit.as_ref() else {
+            continue;
+        };
+        let name = additional
+            .limit_name
+            .as_deref()
+            .or(additional.metered_feature.as_deref())
+            .map(additional_limit_label)
+            .unwrap_or_else(|| "Model".to_string());
+        for window in [
+            window_summary("5h", rate_limit.primary_window.as_ref()),
+            window_summary("Week", rate_limit.secondary_window.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            windows.push(ProviderQuotaWindow {
+                label: format!("{name} {}", window.label),
+                ..window
+            });
+        }
+    }
+    windows
+}
+
+fn primary_usage_windows(usage: &UsageResponse) -> Vec<ProviderQuotaWindow> {
     let Some(rate_limit) = usage.rate_limit.as_ref() else {
         return Vec::new();
     };
@@ -798,6 +907,20 @@ fn usage_windows(usage: &UsageResponse) -> Vec<ProviderQuotaWindow> {
     .into_iter()
     .flatten()
     .collect()
+}
+
+fn additional_limit_label(value: &str) -> String {
+    value
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .map(|word| match word.to_ascii_lowercase().as_str() {
+            "gpt" => "GPT".to_string(),
+            "codex" => "Codex".to_string(),
+            "spark" => "Spark".to_string(),
+            _ => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn window_summary(
@@ -825,7 +948,9 @@ fn window_label(window_minutes: Option<i64>, fallback: &str) -> String {
     let Some(minutes) = window_minutes else {
         return fallback.to_string();
     };
-    if minutes >= 10_080 {
+    if minutes >= 43_200 {
+        "30d".to_string()
+    } else if minutes >= 10_080 {
         "Week".to_string()
     } else if minutes >= 60 && minutes % 60 == 0 {
         format!("{}h", minutes / 60)
@@ -1064,6 +1189,46 @@ mod tests {
         assert_eq!(account.quota_windows[1].remaining_percent, 77.0);
         assert_eq!(account.quota_percent, Some(70.0));
         assert_eq!(account.quota_label.as_deref(), Some("5h 70% / Week 77%"));
+    }
+
+    #[test]
+    fn parses_free_plan_and_model_specific_windows() {
+        let usage = serde_json::from_value::<UsageResponse>(serde_json::json!({
+            "plan_type": "free",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25,
+                    "limit_window_seconds": 2592000,
+                    "reset_at": 1780800000
+                }
+            },
+            "additional_rate_limits": [{
+                "limit_name": "gpt-5.3-codex-spark",
+                "metered_feature": "codex_spark",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 40,
+                        "limit_window_seconds": 18000
+                    },
+                    "secondary_window": {
+                        "used_percent": 60,
+                        "limit_window_seconds": 604800
+                    }
+                }
+            }]
+        }))
+        .expect("usage");
+
+        let mut account = ProviderAccountInfo::default();
+        apply_usage_to_account(&mut account, usage);
+        let windows = account.quota_windows.clone();
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].label, "30d");
+        assert_eq!(windows[0].remaining_percent, 75.0);
+        assert_eq!(windows[1].label, "GPT 5.3 Codex Spark 5h");
+        assert_eq!(windows[2].label, "GPT 5.3 Codex Spark Week");
+        assert_eq!(account.quota_percent, Some(75.0));
+        assert_eq!(account.quota_label.as_deref(), Some("30d 75%"));
     }
 
     #[test]

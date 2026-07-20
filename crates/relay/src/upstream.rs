@@ -100,7 +100,9 @@ pub(crate) async fn send_upstream(
         {
             request = request.header("ChatGPT-Account-Id", account_id);
         }
-        request = request.header("originator", "codex-companion");
+        request = request
+            .header("originator", "codex_cli_rs")
+            .header("version", "0.144.1");
     } else if let Some(token) = resolve_auth_token(provider) {
         request = request.bearer_auth(token);
     }
@@ -121,7 +123,11 @@ pub(crate) async fn send_upstream(
     let body = rewrite_model(provider, body);
     let (body, tool_context, chat_messages) =
         if transform == ResponseTransform::ChatCompletionsToResponses {
-            responses_body_to_chat_completions(body, &provider.id)
+            responses_body_to_chat_completions(
+                body,
+                &provider.id,
+                provider_supports_chat_prompt_cache_key(provider),
+            )
         } else {
             (body, ChatToolContext::default(), Vec::new())
         };
@@ -838,6 +844,20 @@ fn chat_completions_url(provider: &ProviderConfig, upstream: &str) -> String {
     url
 }
 
+fn provider_supports_chat_prompt_cache_key(provider: &ProviderConfig) -> bool {
+    let Ok(url) = url::Url::parse(provider.base_url.trim()) else {
+        return false;
+    };
+    match url.host_str().map(str::to_ascii_lowercase).as_deref() {
+        Some("api.openai.com") => true,
+        Some("api.kimi.com") => {
+            let path = url.path().trim_end_matches('/');
+            path == "/coding" || path.starts_with("/coding/")
+        }
+        _ => false,
+    }
+}
+
 const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
 const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
@@ -1098,6 +1118,7 @@ fn store_chat_history(provider_id: &str, response_id: &str, entry: ChatHistoryEn
 fn responses_body_to_chat_completions(
     body: Bytes,
     provider_id: &str,
+    prompt_cache_enabled: bool,
 ) -> (Bytes, ChatToolContext, Vec<Value>) {
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
         return (body, ChatToolContext::default(), Vec::new());
@@ -1123,6 +1144,27 @@ fn responses_body_to_chat_completions(
     copy_json_field(object, &mut output, "parallel_tool_calls");
     copy_json_field(object, &mut output, "response_format");
     copy_json_field(object, &mut output, "metadata");
+    if prompt_cache_enabled {
+        let prompt_cache_key = object
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                object
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("session_id"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| object.get("conversation_id").and_then(Value::as_str))
+            .or_else(|| object.get("thread_id").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(prompt_cache_key) = prompt_cache_key {
+            output.insert(
+                "prompt_cache_key".to_string(),
+                Value::String(prompt_cache_key.to_string()),
+            );
+        }
+    }
     if let Some(max_output_tokens) = object.get("max_output_tokens") {
         output.insert("max_tokens".to_string(), max_output_tokens.clone());
     }
@@ -1398,6 +1440,7 @@ fn response_function_tool_to_chat_tool(tool: &Value, chat_name: &str) -> Option<
     if let Some(function) = tool.get("function").and_then(Value::as_object) {
         let mut function = function.clone();
         function.insert("name".to_string(), Value::String(chat_name.to_string()));
+        normalize_chat_function_parameters(&mut function);
         return Some(json!({ "type": "function", "function": function }));
     }
     let mut function = json!({
@@ -1412,7 +1455,23 @@ fn response_function_tool_to_chat_tool(tool: &Value, chat_name: &str) -> Option<
     if let Some(strict) = tool.get("strict") {
         function["strict"] = strict.clone();
     }
+    if let Some(function) = function.as_object_mut() {
+        normalize_chat_function_parameters(function);
+    }
     Some(json!({ "type": "function", "function": function }))
+}
+
+fn normalize_chat_function_parameters(function: &mut serde_json::Map<String, Value>) {
+    let parameters = function
+        .entry("parameters".to_string())
+        .or_insert_with(|| json!({ "type": "object", "properties": {} }));
+    let Some(parameters) = parameters.as_object_mut() else {
+        *parameters = json!({ "type": "object", "properties": {} });
+        return;
+    };
+    if parameters.get("type").and_then(Value::as_str) != Some("object") {
+        parameters.insert("type".to_string(), Value::String("object".to_string()));
+    }
 }
 
 fn response_tool_choice_to_chat(tool_choice: &Value, context: &ChatToolContext) -> Value {
@@ -2078,12 +2137,10 @@ impl ChatSseTransformState {
         let tools = self
             .tools
             .iter()
+            .filter(|(_, state)| !state.name.trim().is_empty())
             .map(|(index, state)| (*index, state.clone()))
             .collect::<Vec<_>>();
         for (position, (chat_index, state)) in tools.into_iter().enumerate() {
-            if state.name.trim().is_empty() {
-                continue;
-            }
             let output_index = position + 1;
             let call_id = if state.call_id.is_empty() {
                 format!("call_{chat_index}")
@@ -2660,6 +2717,7 @@ mod tests {
                 br#"{"model":"gpt-5-codex","instructions":"be brief","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"stream":true}"#,
             ),
             "p",
+            false,
         );
         let value: Value = serde_json::from_slice(&body).expect("json");
 
@@ -2669,6 +2727,34 @@ mod tests {
         assert_eq!(value["messages"][1]["role"], "user");
         assert_eq!(value["messages"][1]["content"], "hello");
         assert!(value.get("messages").and_then(Value::as_array).is_some());
+    }
+
+    #[test]
+    fn normalizes_chat_function_parameter_root_schema() {
+        let (body, _, _) = responses_body_to_chat_completions(
+            Bytes::from_static(
+                br#"{"tools":[{"type":"function","function":{"name":"lookup","parameters":{"properties":{"q":{"type":"string"}}}}}]}"#,
+            ),
+            "p",
+            false,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            value.pointer("/tools/0/function/parameters/type"),
+            Some(&Value::String("object".to_string()))
+        );
+    }
+
+    #[test]
+    fn injects_prompt_cache_key_only_for_supported_chat_upstreams() {
+        let request =
+            Bytes::from_static(br#"{"metadata":{"session_id":"session-123"},"input":"hello"}"#);
+        let (enabled, _, _) = responses_body_to_chat_completions(request.clone(), "p", true);
+        let (disabled, _, _) = responses_body_to_chat_completions(request, "p", false);
+        let enabled: Value = serde_json::from_slice(&enabled).expect("enabled json");
+        let disabled: Value = serde_json::from_slice(&disabled).expect("disabled json");
+        assert_eq!(enabled["prompt_cache_key"], "session-123");
+        assert!(disabled.get("prompt_cache_key").is_none());
     }
 
     #[test]
@@ -2696,6 +2782,7 @@ mod tests {
             }"#,
             ),
             "p",
+            false,
         );
         let value: Value = serde_json::from_slice(&body).expect("json");
         let tool_names = value["tools"]
@@ -2794,6 +2881,7 @@ mod tests {
                 }"#,
             ),
             provider_id,
+            false,
         );
         let first_request: Value = serde_json::from_slice(&first_body).expect("json");
         assert_eq!(first_request["messages"][0]["content"], "fix it");
@@ -2838,6 +2926,7 @@ mod tests {
                 }"#,
             ),
             provider_id,
+            false,
         );
         let follow_up: Value = serde_json::from_slice(&follow_up_body).expect("json");
 
@@ -3033,6 +3122,39 @@ mod tests {
         assert!(output.contains("\"query\":\"gmail\""));
         assert!(output.contains("\"input_tokens\":12"));
         assert!(output.contains("response.completed"));
+    }
+
+    #[test]
+    fn chat_sse_transform_preserves_late_tool_identity_and_sparse_order() {
+        let mut state = ChatSseTransformState::default();
+        state.push_chunk(
+            br#"data: {"id":"chatcmpl_sparse","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"tool_b","arguments":"{\"b\":"}},{"index":2,"id":"call_c","function":{"name":"tool_c","arguments":"{}"}}]}}]}
+
+"#,
+        );
+        state.push_chunk(
+            br#"data: {"id":"chatcmpl_sparse","choices":[{"delta":{"tool_calls":[{"index":1,"id":"","function":{"name":"","arguments":"1}"}},{"index":0,"function":{"name":"","arguments":"{}"}}]}}]}
+
+"#,
+        );
+        state.push_chunk(
+            br#"data: {"id":"chatcmpl_sparse","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"tool_a","arguments":""}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#,
+        );
+        let output = state
+            .pending
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect::<String>();
+        let tool_a = output.find("\"name\":\"tool_a\"").expect("tool a");
+        let tool_b = output.find("\"name\":\"tool_b\"").expect("tool b");
+        let tool_c = output.find("\"name\":\"tool_c\"").expect("tool c");
+        assert!(tool_a < tool_b && tool_b < tool_c);
+        assert!(output.contains("{\\\"b\\\":1}"));
+        assert!(!output.contains("\"output_index\":4"));
     }
 
     #[test]

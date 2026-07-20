@@ -210,6 +210,7 @@ export interface TokenUsageSummary {
   events: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheWriteInputTokens: number;
   outputTokens: number;
   totalTokens: number;
   cost: TokenCostBreakdown;
@@ -229,6 +230,7 @@ export interface TokenUsageBucket {
   events: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheWriteInputTokens: number;
   outputTokens: number;
   totalTokens: number;
   cost: TokenCostBreakdown;
@@ -239,6 +241,7 @@ export interface TokenUsageBucket {
 export interface TokenCostBreakdown {
   freshInputUsd: string;
   cachedInputUsd: string;
+  cacheWriteInputUsd: string;
   outputUsd: string;
   totalUsd: string;
 }
@@ -250,6 +253,7 @@ export interface TokenUsageEvent {
   providerId?: string | null;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheWriteInputTokens: number;
   outputTokens: number;
   totalTokens: number;
   cost?: TokenCostBreakdown | null;

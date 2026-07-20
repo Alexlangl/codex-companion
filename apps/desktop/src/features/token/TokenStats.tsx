@@ -100,6 +100,7 @@ export function TokenStats({
           <Metric label={totalCostLabel} value={formatUsd(stats?.cost.totalUsd)} />
           <Metric label="新输入" value={formatTokens(stats?.inputTokens ?? 0)} />
           <Metric label="缓存输入" value={formatTokens(stats?.cachedInputTokens ?? 0)} />
+          <Metric label="缓存写入" value={formatTokens(stats?.cacheWriteInputTokens ?? 0)} />
           <Metric label="输出" value={formatTokens(stats?.outputTokens ?? 0)} />
         </div>
       </Panel>
@@ -120,6 +121,8 @@ export function TokenStats({
           <dd>{formatUsd(stats?.cost.freshInputUsd)}</dd>
           <dt>缓存输入成本</dt>
           <dd>{formatUsd(stats?.cost.cachedInputUsd)}</dd>
+          <dt>缓存写入成本</dt>
+          <dd>{formatUsd(stats?.cost.cacheWriteInputUsd)}</dd>
           <dt>输出成本</dt>
           <dd>{formatUsd(stats?.cost.outputUsd)}</dd>
           <dt>价格快照</dt>
@@ -164,8 +167,8 @@ export function TokenStats({
   );
 }
 
-function tokenEventBreakdown(event: TokenUsageEvent) {
-  return `新输入 ${formatTokens(event.inputTokens)} · 缓存 ${formatTokens(event.cachedInputTokens)} · 输出 ${formatTokens(event.outputTokens)}`;
+function tokenEventBreakdown(event: TokenUsageEvent): string {
+  return `新输入 ${formatTokens(event.inputTokens)} · 缓存读 ${formatTokens(event.cachedInputTokens)} · 缓存写 ${formatTokens(event.cacheWriteInputTokens)} · 输出 ${formatTokens(event.outputTokens)}`;
 }
 
 function formatEventCost(event: TokenUsageEvent): string {
@@ -183,6 +186,7 @@ function tokenEventKey(event: TokenUsageEvent): string {
     event.model,
     event.inputTokens,
     event.cachedInputTokens,
+    event.cacheWriteInputTokens,
     event.outputTokens,
   ].join("|");
 }
@@ -239,7 +243,7 @@ function BucketList({ buckets, max }: { buckets: TokenUsageBucket[]; max: number
             <span style={{ width: `${Math.max(3, Math.round((bucket.totalTokens / max) * 100))}%` }} />
           </div>
           <small>
-            新输入 {formatTokens(bucket.inputTokens)} · 缓存 {formatTokens(bucket.cachedInputTokens)} · 输出 {formatTokens(bucket.outputTokens)} · {bucket.events} 次
+            新输入 {formatTokens(bucket.inputTokens)} · 缓存读 {formatTokens(bucket.cachedInputTokens)} · 缓存写 {formatTokens(bucket.cacheWriteInputTokens)} · 输出 {formatTokens(bucket.outputTokens)} · {bucket.events} 次
             {bucket.unpricedEvents ? ` · ${bucket.unpricedEvents} 次未定价` : ""}
           </small>
         </div>
