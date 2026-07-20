@@ -188,6 +188,12 @@ codex-companion-tui
 
 在 TUI 里按 `?` 查看快捷键。
 
+## 远端手动打包
+
+仓库提供 `Release` GitHub Actions 工作流。在 GitHub 的 `Actions` → `Release` 页面选择 `Run workflow`，输入 `0.1.1` 或 `v0.1.1` 形式的版本号即可开始打包。
+
+工作流会构建 macOS Universal / Intel / Apple Silicon、Windows x64、Linux x64 / ARM64 桌面安装包，以及包含 CLI 和 TUI 的命令行压缩包。全部平台成功后才会创建对应 GitHub Release，并附带 `SHA256SUMS`。
+
 ## 支持的账号
 
 - 官方 Codex 账号 JSON。

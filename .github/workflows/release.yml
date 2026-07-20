@@ -1,0 +1,261 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 0.1.1 or v0.1.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  PRODUCT_NAME: codex-companion
+  CLI_PACKAGE: codex-companion-cli
+  TUI_PACKAGE: codex-companion-tui
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        name: Validate version
+        shell: bash
+        env:
+          RELEASE_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_INPUT#v}"
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version: ${RELEASE_INPUT}. Use 0.1.1 or v0.1.1." >&2
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${VERSION}" >> "${GITHUB_OUTPUT}"
+          if [[ "${VERSION}" == *-* ]]; then
+            echo "prerelease=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "prerelease=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+  cli:
+    name: CLI and TUI ${{ matrix.suffix }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: macos-arm64
+            archive_ext: tar.gz
+            exe_ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: macos-x64
+            archive_ext: tar.gz
+            exe_ext: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x64
+            archive_ext: tar.gz
+            exe_ext: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-arm64
+            archive_ext: tar.gz
+            exe_ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x64
+            archive_ext: zip
+            exe_ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Apply release version
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: node scripts/set-release-version.mjs "${RELEASE_VERSION}"
+
+      - name: Build command-line archive
+        shell: bash
+        env:
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          ARTIFACT_SUFFIX: ${{ matrix.suffix }}
+          EXE_EXT: ${{ matrix.exe_ext }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="${PRODUCT_NAME}-${RELEASE_VERSION}-${ARTIFACT_SUFFIX}.${ARCHIVE_EXT}"
+          STAGING="dist-work/${PRODUCT_NAME}-${RELEASE_VERSION}-${ARTIFACT_SUFFIX}"
+          mkdir -p release-assets "${STAGING}"
+
+          cargo build \
+            -p "${CLI_PACKAGE}" \
+            -p "${TUI_PACKAGE}" \
+            --release \
+            --target "${RUST_TARGET}"
+
+          cp "target/${RUST_TARGET}/release/codex-companion${EXE_EXT}" "${STAGING}/"
+          cp "target/${RUST_TARGET}/release/codex-companion-tui${EXE_EXT}" "${STAGING}/"
+          cp README.md README.en.md LICENSE "${STAGING}/"
+
+          if [[ "${ARCHIVE_EXT}" == "zip" ]]; then
+            powershell -NoProfile -Command "Compress-Archive -Path '${STAGING}/*' -DestinationPath 'release-assets/${ARCHIVE}'"
+          else
+            tar -C "${STAGING}" -czf "release-assets/${ARCHIVE}" .
+          fi
+
+      - name: Upload command-line artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-cli-${{ matrix.suffix }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  app:
+    name: App ${{ matrix.suffix }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            args: --target universal-apple-darwin
+            suffix: macos-universal
+          - os: macos-latest
+            args: --target x86_64-apple-darwin
+            suffix: macos-x64
+          - os: macos-latest
+            args: --target aarch64-apple-darwin
+            suffix: macos-arm64
+          - os: windows-latest
+            args: ""
+            suffix: windows-x64
+          - os: ubuntu-latest
+            args: ""
+            suffix: linux-x64
+          - os: ubuntu-24.04-arm
+            args: ""
+            suffix: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.23.0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install macOS Rust targets
+        if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Apply release version
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: node scripts/set-release-version.mjs "${RELEASE_VERSION}"
+
+      - name: Build Tauri bundle
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if pnpm --filter @codex-companion/desktop tauri build ${{ matrix.args }}; then
+              exit 0
+            fi
+
+            if [[ "${attempt}" == "3" ]]; then
+              exit 1
+            fi
+
+            sleep $((attempt * 20))
+          done
+
+      - name: Normalize app artifact names
+        env:
+          CODEX_COMPANION_ARTIFACT_SUFFIX: ${{ matrix.suffix }}
+          CODEX_COMPANION_VERSION: ${{ needs.prepare.outputs.version }}
+        run: node scripts/rename-tauri-artifacts.mjs
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-app-${{ matrix.suffix }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - prepare
+      - cli
+      - app
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Codex Companion ${{ needs.prepare.outputs.tag }}
+          body: Desktop bundles and CLI/TUI archives built by the manual release workflow.
+          draft: false
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          fail_on_unmatched_files: true
+          files: release-assets/*

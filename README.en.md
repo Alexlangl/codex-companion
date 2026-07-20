@@ -188,6 +188,12 @@ codex-companion-tui
 
 Press `?` inside the TUI to view shortcuts.
 
+## Manual Remote Packaging
+
+The repository provides a `Release` GitHub Actions workflow. Open `Actions` → `Release` → `Run workflow` on GitHub and enter a version such as `0.1.1` or `v0.1.1`.
+
+The workflow builds desktop bundles for macOS Universal / Intel / Apple Silicon, Windows x64, and Linux x64 / ARM64, plus command-line archives containing both the CLI and TUI. It creates the GitHub Release only after every platform succeeds and includes `SHA256SUMS`.
+
 ## Supported Accounts
 
 - Official Codex account JSON.
