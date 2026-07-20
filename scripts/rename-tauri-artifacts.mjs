@@ -13,16 +13,17 @@ rmSync(output, { force: true, recursive: true });
 mkdirSync(output, { recursive: true });
 walk(root);
 
-const used = new Map();
-for (const file of candidates) {
+const used = new Set();
+for (const file of candidates.sort()) {
   const kind = artifactKind(file);
   const ext = artifactExtension(file);
   const stem = kind ? `${base}-${kind}` : base;
-  const collisionKey = `${stem}${ext}`;
-  const count = used.get(collisionKey) ?? 0;
-  used.set(collisionKey, count + 1);
-  const dedupe = count === 0 ? "" : `-${count + 1}`;
-  copyFileSync(file, path.join(output, `${stem}${dedupe}${ext}`));
+  const outputName = `${stem}${ext}`;
+  if (used.has(outputName)) {
+    throw new Error(`Multiple Tauri artifacts resolve to ${outputName}`);
+  }
+  used.add(outputName);
+  copyFileSync(file, path.join(output, outputName));
 }
 
 if (candidates.length === 0) {
@@ -51,7 +52,9 @@ function walk(dir) {
 }
 
 function isReleaseArtifact(file) {
-  return /\.(dmg|deb|rpm|msi|exe|AppImage|zip|tar\.gz)(\.sig)?$/i.test(file);
+  const name = path.basename(file);
+  if (/\.app\.tar\.gz(\.sig)?$/i.test(name)) return true;
+  return /\.(dmg|deb|rpm|msi|exe|AppImage|zip)(\.sig)?$/i.test(name);
 }
 
 function artifactExtension(file) {
