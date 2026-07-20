@@ -16,6 +16,140 @@ It provides:
 
 > Screenshots use sanitized demo data. They do not contain real account tokens or real Codex usage.
 
+## Download and Installation
+
+All official artifacts are published on [GitHub Releases](https://github.com/Alexlangl/codex-companion/releases). Each release includes desktop installers, CLI/TUI archives, desktop updater files, and `SHA256SUMS`.
+
+If the Releases page is empty, the project does not yet have a downloadable release and the Homebrew formula may not exist yet. Use the [build-from-source instructions](#build-from-source) in the meantime.
+
+> Current distribution status: the macOS desktop bundles use an ad-hoc signature, not an Apple Developer ID, and are not notarized by Apple. The Windows installers do not yet have an Authenticode certificate. Gatekeeper or SmartScreen may therefore warn on first launch. Verify the downloaded file as described below before deciding whether to allow it.
+
+### Desktop App
+
+Download the file that matches your machine. `<version>` represents the release version.
+
+| System | Architecture | Recommended file | Notes |
+| --- | --- | --- | --- |
+| macOS | Apple Silicon (M1/M2/M3/M4 and newer) | `Codex-Companion-<version>-macos-arm64-dmg.dmg` | `macos-universal` also works |
+| macOS | Intel | `Codex-Companion-<version>-macos-x64-dmg.dmg` | `macos-universal` also works |
+| Windows | x64 | `Codex-Companion-<version>-windows-x64-setup.exe` | NSIS installer; an `.msi` is also published |
+| Linux | x64 | `Codex-Companion-<version>-linux-x64-appimage.AppImage` | `.deb` and `.rpm` are also published |
+| Linux | ARM64 | `Codex-Companion-<version>-linux-arm64-appimage.AppImage` | `.deb` and `.rpm` are also published |
+
+Files ending in `.sig`, `latest.json`, and `*-updater.tar.gz` are used by desktop auto-update. They are not first-install packages and normally should not be opened manually.
+
+### CLI and TUI
+
+Homebrew is recommended on macOS and Linux. The tap updates after every successful stable release:
+
+```bash
+brew install Alexlangl/tap/codex-companion
+```
+
+You can also download a command-line archive directly:
+
+| System | File |
+| --- | --- |
+| macOS Apple Silicon | `codex-companion-<version>-macos-arm64.tar.gz` |
+| macOS Intel | `codex-companion-<version>-macos-x64.tar.gz` |
+| Linux x64 | `codex-companion-<version>-linux-x64.tar.gz` |
+| Linux ARM64 | `codex-companion-<version>-linux-arm64.tar.gz` |
+| Windows x64 | `codex-companion-<version>-windows-x64.zip` |
+
+On macOS or Linux, extract the archive and place both binaries on `PATH`:
+
+```bash
+VERSION="0.1.0" # Replace with the release version you are installing
+tar -xzf "codex-companion-${VERSION}-macos-arm64.tar.gz"
+sudo install -m 0755 codex-companion codex-companion-tui /usr/local/bin/
+```
+
+On Windows, extract the ZIP and run the binaries from PowerShell:
+
+```powershell
+.\codex-companion.exe status
+.\codex-companion-tui.exe
+```
+
+## First Launch and System Security Warnings
+
+### Verify the Download First
+
+Download only from this repository's GitHub Releases and download `SHA256SUMS` from the same release. If the calculated value does not match `SHA256SUMS`, delete the file and stop the installation.
+
+macOS:
+
+```bash
+VERSION="0.1.0" # Replace with the downloaded release version
+shasum -a 256 "Codex-Companion-${VERSION}-macos-arm64-dmg.dmg"
+```
+
+Windows PowerShell:
+
+```powershell
+$Version = "0.1.0" # Replace with the downloaded release version
+Get-FileHash ".\Codex-Companion-$Version-windows-x64-setup.exe" -Algorithm SHA256
+```
+
+Linux:
+
+```bash
+VERSION="0.1.0" # Replace with the downloaded release version
+sha256sum "Codex-Companion-${VERSION}-linux-x64-appimage.AppImage"
+```
+
+### macOS: Developer Cannot Be Verified
+
+The current macOS bundles do not have a Developer ID or Apple notarization, so Gatekeeper may block the first launch. After verifying the source and SHA-256:
+
+1. Try to open `Codex Companion` once so macOS records the block.
+2. Open `System Settings` → `Privacy & Security`.
+3. Scroll to `Security`, find the blocked Codex Companion entry, and click `Open Anyway`.
+4. Authenticate with your login password or Touch ID, then confirm `Open`.
+
+`Open Anyway` is normally available for about one hour after the failed launch. A company-managed Mac may prevent users from overriding the policy; contact your administrator in that case. Do not disable Gatekeeper globally, and do not bypass warnings for a file from an unknown source or with a mismatched SHA-256.
+
+Button labels can vary slightly between macOS versions. See Apple's official [Open a Mac app from an unknown developer](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac) guide for the current system instructions.
+
+If macOS explicitly says the app will damage your computer, reports malicious content, or says the file is damaged, do not treat it as a normal unidentified-developer warning. Download it again and verify the checksum; if it still happens, open an issue with the version and file hash.
+
+### Windows: Windows Protected Your PC
+
+The current Windows installers do not have an Authenticode publisher certificate. SmartScreen may show `Windows protected your PC`, and the publisher may be listed as unknown. After verifying the source and SHA-256:
+
+1. Select `More info` in the SmartScreen dialog.
+2. Confirm the application name, then select `Run anyway`.
+3. If UAC subsequently shows an unknown publisher, approve it only after the checksum has been verified.
+
+If `Run anyway` is unavailable, Smart App Control, enterprise policy, or an administrator restriction may be enforcing the block. Do not disable Microsoft Defender or SmartScreen globally just to install this project; contact the administrator or build from source in a trusted environment. If Defender reports a specific threat instead of an unknown/low-reputation app, do not blindly add an exclusion. Download again, verify the checksum, and open an issue.
+
+Microsoft documents the current unsigned-app behavior and publisher reputation model in [SmartScreen reputation for Windows app developers](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation).
+
+### Linux: AppImage, DEB, and RPM
+
+Make the AppImage executable before first launch:
+
+```bash
+VERSION="0.1.0" # Replace with the downloaded release version
+APPIMAGE="Codex-Companion-${VERSION}-linux-x64-appimage.AppImage"
+chmod +x "${APPIMAGE}"
+"./${APPIMAGE}"
+```
+
+If AppImage or FUSE support is unavailable, use the native package instead:
+
+```bash
+VERSION="0.1.0" # Replace with the downloaded release version
+
+# Debian / Ubuntu
+sudo apt install "./Codex-Companion-${VERSION}-linux-x64-deb.deb"
+
+# Fedora / RHEL
+sudo dnf install "./Codex-Companion-${VERSION}-linux-x64-rpm.rpm"
+```
+
+The current first-install Linux artifacts do not have a separate GPG release signature. Verify them against `SHA256SUMS` from the release.
+
 ## What It Does
 
 - Import official Codex account JSON, including Codex Companion, CPA, and sub2api formats.
@@ -129,11 +263,7 @@ Prices are USD estimates per one million tokens. `cacheWriteInputPerMillion` is 
 
 ## CLI Usage
 
-Install the CLI and TUI with Homebrew:
-
-```bash
-brew install Alexlangl/tap/codex-companion
-```
+See [Download and Installation](#download-and-installation) for installation options. The following are common operations; every command supports `--help` for its current arguments.
 
 Show status:
 
@@ -186,6 +316,23 @@ codex-companion relay clear-logs
 codex-companion relay settings --require-api-key true --retry-budget 2
 ```
 
+### Command Coverage
+
+| Command | Purpose |
+| --- | --- |
+| `install` / `uninstall` | Write or restore the Codex configuration |
+| `doctor` / `status` | Check integration health or print full status |
+| `daemon start` | Start the Companion daemon in the foreground |
+| `provider add` | Add a provider manually |
+| `provider import` / `import-local` | Import accounts from JSON or the local Codex installation |
+| `provider list` / `remove` / `test` / `refresh` / `refresh-all` | Inspect, remove, test, and refresh providers |
+| `group create` / `list` / `use` / `set` | Create, switch, and reorder groups |
+| `relay start` / `status` / `self-test` | Start and diagnose the local API service |
+| `relay client create/list/update/rotate/delete` | Manage local API clients and secrets |
+| `relay logs` / `clear-logs` / `settings` | Inspect audit records and change relay policies |
+| `repair` | Preview or repair history and plugin state |
+| `token-stats` | Scan local sessions and report token usage |
+
 ## TUI Usage
 
 ```bash
@@ -194,6 +341,31 @@ codex-companion-tui
 
 Press `?` inside the TUI to view shortcuts.
 
+## Build from Source
+
+You need Node.js 22, pnpm 10.23, a stable Rust toolchain, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform.
+
+```bash
+git clone https://github.com/Alexlangl/codex-companion.git
+cd codex-companion
+pnpm install --frozen-lockfile
+pnpm check
+cargo test --workspace
+pnpm dev:app
+```
+
+Build desktop packages for the current platform:
+
+```bash
+pnpm build:tauri
+```
+
+Build only the CLI and TUI:
+
+```bash
+cargo build --release -p codex-companion-cli -p codex-companion-tui
+```
+
 ## Manual Remote Packaging
 
 The repository provides a `Release` GitHub Actions workflow. Open `Actions` → `Release` → `Run workflow` on GitHub and enter a version such as `0.1.1` or `v0.1.1`.
@@ -201,6 +373,22 @@ The repository provides a `Release` GitHub Actions workflow. Open `Actions` → 
 The workflow builds desktop bundles for macOS Universal / Intel / Apple Silicon, Windows x64, and Linux x64 / ARM64, plus command-line archives containing both the CLI and TUI. It creates the GitHub Release only after every platform succeeds and includes `SHA256SUMS`.
 
 After a successful stable release, the workflow updates `Alexlangl/homebrew-tap`. The desktop app checks stable releases quietly at startup, lets the user choose `Update now` or `Later` when one is available, and also supports manual check, download, and restart installation from `Settings`; Tauri signatures protect update artifacts.
+
+## Update and Signing Boundaries
+
+These mechanisms protect different parts of the distribution process. The presence of a `.sig` file does not mean that the operating system trusts the publisher.
+
+| Mechanism | Current status | Scope |
+| --- | --- | --- |
+| Release `SHA256SUMS` | Available | Lets users compare a download with the file published in that release |
+| Tauri updater `.sig` | Enabled and mandatory | Verifies the source and integrity of updates downloaded by an installed desktop app |
+| macOS Developer ID + notarization | Not configured | Establishes an Apple-recognized publisher identity and reduces Gatekeeper blocks once configured |
+| Windows Authenticode | Not configured | Displays publisher identity once configured; SmartScreen reputation may still take time to build |
+| Linux GPG/AppImage release signing | Not configured | First installs currently rely on the GitHub Release source and SHA-256 verification |
+
+The Tauri updater private key exists only in the release environment; the repository contains only the public key. An updater signature does not replace macOS Developer ID signing, Apple notarization, or Windows Authenticode, and cannot remove the operating-system reputation warning shown for a first browser download.
+
+Removing those first-install warnings requires separate Apple Developer ID/notarization credentials and a Windows code-signing certificate in CI. Certificates and private keys must never be committed to the repository.
 
 ## Supported Accounts
 

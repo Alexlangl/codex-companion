@@ -16,6 +16,140 @@
 
 > 截图使用的是脱敏 demo 数据，不包含真实账号 token 或真实 Codex 用量。
 
+## 下载与安装
+
+所有正式产物都发布在 [GitHub Releases](https://github.com/Alexlangl/codex-companion/releases)。每个 Release 同时提供桌面安装包、CLI/TUI 压缩包、自动更新文件和 `SHA256SUMS`。
+
+如果 Releases 页面为空，表示项目尚未发布可供下载的版本，此时 Homebrew formula 也可能尚未生成；请先按[从源码运行](#从源码运行)操作。
+
+> 当前发行状态：macOS 桌面包使用 ad-hoc 签名，尚未使用 Apple Developer ID，也没有经过 Apple notarization；Windows 安装包尚未使用 Authenticode 证书。因此首次启动可能出现 Gatekeeper 或 SmartScreen 提示。请先按下文校验下载文件，再决定是否放行。
+
+### 桌面 App
+
+下载与机器架构匹配的文件；`<version>` 代表 Release 版本号。
+
+| 系统 | 架构 | 推荐文件 | 备注 |
+| --- | --- | --- | --- |
+| macOS | Apple Silicon（M1/M2/M3/M4 等） | `Codex-Companion-<version>-macos-arm64-dmg.dmg` | 也可使用 `macos-universal` |
+| macOS | Intel | `Codex-Companion-<version>-macos-x64-dmg.dmg` | 也可使用 `macos-universal` |
+| Windows | x64 | `Codex-Companion-<version>-windows-x64-setup.exe` | NSIS 安装器；也会提供 `.msi` |
+| Linux | x64 | `Codex-Companion-<version>-linux-x64-appimage.AppImage` | 同时提供 `.deb` 和 `.rpm` |
+| Linux | ARM64 | `Codex-Companion-<version>-linux-arm64-appimage.AppImage` | 同时提供 `.deb` 和 `.rpm` |
+
+Release 中的 `.sig`、`latest.json` 和 `*-updater.tar.gz` 是桌面自动更新使用的文件，普通用户首次安装时不需要手动打开。
+
+### CLI 和 TUI
+
+macOS 或 Linux 推荐使用 Homebrew；稳定版 Release 成功后 tap 会自动更新：
+
+```bash
+brew install Alexlangl/tap/codex-companion
+```
+
+也可以从 Release 直接下载：
+
+| 系统 | 文件 |
+| --- | --- |
+| macOS Apple Silicon | `codex-companion-<version>-macos-arm64.tar.gz` |
+| macOS Intel | `codex-companion-<version>-macos-x64.tar.gz` |
+| Linux x64 | `codex-companion-<version>-linux-x64.tar.gz` |
+| Linux ARM64 | `codex-companion-<version>-linux-arm64.tar.gz` |
+| Windows x64 | `codex-companion-<version>-windows-x64.zip` |
+
+macOS/Linux 解压后可把两个二进制放进 `PATH`：
+
+```bash
+VERSION="0.1.0" # 替换为要安装的 Release 版本
+tar -xzf "codex-companion-${VERSION}-macos-arm64.tar.gz"
+sudo install -m 0755 codex-companion codex-companion-tui /usr/local/bin/
+```
+
+Windows 解压 ZIP 后，可以直接在 PowerShell 中运行：
+
+```powershell
+.\codex-companion.exe status
+.\codex-companion-tui.exe
+```
+
+## 首次启动与系统安全提示
+
+### 先校验下载文件
+
+只从本仓库的 GitHub Release 下载文件，并同时下载同一版本的 `SHA256SUMS`。如果计算结果与 `SHA256SUMS` 不一致，请删除文件并停止安装。
+
+macOS：
+
+```bash
+VERSION="0.1.0" # 替换为下载的 Release 版本
+shasum -a 256 "Codex-Companion-${VERSION}-macos-arm64-dmg.dmg"
+```
+
+Windows PowerShell：
+
+```powershell
+$Version = "0.1.0" # 替换为下载的 Release 版本
+Get-FileHash ".\Codex-Companion-$Version-windows-x64-setup.exe" -Algorithm SHA256
+```
+
+Linux：
+
+```bash
+VERSION="0.1.0" # 替换为下载的 Release 版本
+sha256sum "Codex-Companion-${VERSION}-linux-x64-appimage.AppImage"
+```
+
+### macOS：无法验证开发者或无法检查恶意软件
+
+当前 macOS 包没有 Developer ID 和 Apple notarization，因此 Gatekeeper 可能阻止首次打开。确认下载来源和 SHA-256 后：
+
+1. 先尝试打开一次 `Codex Companion`，让系统记录拦截。
+2. 打开 `系统设置` → `隐私与安全性`。
+3. 滚动到 `安全性`，找到刚被拦截的 Codex Companion，点击 `仍要打开`。
+4. 使用登录密码或 Touch ID 确认，然后再次选择 `打开`。
+
+`仍要打开` 通常只会在首次尝试后的约一小时内出现。受公司 MDM 管理的 Mac 可能不允许用户放行，此时请联系管理员。不要全局关闭 Gatekeeper，也不要对来源不明或 SHA-256 不匹配的文件执行绕过命令。
+
+不同 macOS 版本的按钮文字可能略有差异，可同时参考 [Apple 官方的“打开来自未知开发者的 Mac App”说明](https://support.apple.com/zh-cn/guide/mac-help/mh40616/mac)。
+
+如果 macOS 明确提示“将损坏你的电脑”、文件已损坏或检测到恶意内容，不要按普通“未知开发者”处理：重新下载并校验；仍然出现时请保留版本号和文件哈希提交 Issue。
+
+### Windows：Windows 已保护你的电脑
+
+当前 Windows 安装包没有 Authenticode 发布者证书，SmartScreen 可能显示 `Windows protected your PC` / `Windows 已保护你的电脑`，发布者会显示为未知。确认下载来源和 SHA-256 后：
+
+1. 在 SmartScreen 窗口点击 `更多信息`（`More info`）。
+2. 核对应用名称后点击 `仍要运行`（`Run anyway`）。
+3. 如果随后出现 UAC 的“未知发布者”提示，只在哈希已经核对一致时确认安装。
+
+如果没有 `仍要运行`，设备可能启用了 Smart App Control、企业策略或管理员限制。不要为安装本软件而全局关闭 Microsoft Defender 或 SmartScreen；请联系管理员，或在可信环境中从源码构建。若 Defender 报告的是明确威胁而不是“未知/低信誉”，不要直接加入白名单，请先重新下载、核对哈希并提交 Issue。
+
+Microsoft 对未签名程序的当前行为和发布者信誉机制有单独说明，详见 [SmartScreen reputation for Windows app developers](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation)。
+
+### Linux：AppImage、DEB 和 RPM
+
+AppImage 首次运行前需要可执行权限：
+
+```bash
+VERSION="0.1.0" # 替换为下载的 Release 版本
+APPIMAGE="Codex-Companion-${VERSION}-linux-x64-appimage.AppImage"
+chmod +x "${APPIMAGE}"
+"./${APPIMAGE}"
+```
+
+如果系统缺少 AppImage/FUSE 支持，可以改用发行版安装包：
+
+```bash
+VERSION="0.1.0" # 替换为下载的 Release 版本
+
+# Debian / Ubuntu
+sudo apt install "./Codex-Companion-${VERSION}-linux-x64-deb.deb"
+
+# Fedora / RHEL
+sudo dnf install "./Codex-Companion-${VERSION}-linux-x64-rpm.rpm"
+```
+
+当前 Linux 首次安装包没有单独的 GPG 发布签名，请使用 Release 中的 `SHA256SUMS` 校验。
+
 ## 它做什么
 
 - 导入官方 Codex 账号 JSON，例如 Codex Companion、CPA 或 sub2api 格式。
@@ -129,11 +263,7 @@ curl http://127.0.0.1:17687/v1/responses \
 
 ## CLI 用法
 
-使用 Homebrew 安装 CLI 和 TUI：
-
-```bash
-brew install Alexlangl/tap/codex-companion
-```
+安装方式见[下载与安装](#下载与安装)。下面是常用操作；所有命令都支持 `--help` 查看当前参数。
 
 查看状态：
 
@@ -186,6 +316,23 @@ codex-companion relay clear-logs
 codex-companion relay settings --require-api-key true --retry-budget 2
 ```
 
+### 命令范围
+
+| 命令 | 用途 |
+| --- | --- |
+| `install` / `uninstall` | 写入或恢复 Codex 配置 |
+| `doctor` / `status` | 检查接入状态或输出完整状态 |
+| `daemon start` | 前台启动 Companion daemon |
+| `provider add` | 手动添加 provider |
+| `provider import` / `import-local` | 从 JSON 或本机 Codex 导入账号 |
+| `provider list` / `remove` / `test` / `refresh` / `refresh-all` | 查询、删除、测试和刷新 provider |
+| `group create` / `list` / `use` / `set` | 创建分组、切换分组和调整顺序 |
+| `relay start` / `status` / `self-test` | 启动和诊断本地 API 服务 |
+| `relay client create/list/update/rotate/delete` | 管理本地 API client 和密钥 |
+| `relay logs` / `clear-logs` / `settings` | 查看审计记录和修改转发策略 |
+| `repair` | dry-run 或修复历史会话与插件状态 |
+| `token-stats` | 扫描本地会话并输出 token 统计 |
+
 ## TUI 用法
 
 ```bash
@@ -194,6 +341,31 @@ codex-companion-tui
 
 在 TUI 里按 `?` 查看快捷键。
 
+## 从源码运行
+
+需要 Node.js 22、pnpm 10.23、稳定版 Rust 工具链，以及对应系统的 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)。
+
+```bash
+git clone https://github.com/Alexlangl/codex-companion.git
+cd codex-companion
+pnpm install --frozen-lockfile
+pnpm check
+cargo test --workspace
+pnpm dev:app
+```
+
+构建当前平台桌面安装包：
+
+```bash
+pnpm build:tauri
+```
+
+只构建 CLI 和 TUI：
+
+```bash
+cargo build --release -p codex-companion-cli -p codex-companion-tui
+```
+
 ## 远端手动打包
 
 仓库提供 `Release` GitHub Actions 工作流。在 GitHub 的 `Actions` → `Release` 页面选择 `Run workflow`，输入 `0.1.1` 或 `v0.1.1` 形式的版本号即可开始打包。
@@ -201,6 +373,22 @@ codex-companion-tui
 工作流会构建 macOS Universal / Intel / Apple Silicon、Windows x64、Linux x64 / ARM64 桌面安装包，以及包含 CLI 和 TUI 的命令行压缩包。全部平台成功后才会创建对应 GitHub Release，并附带 `SHA256SUMS`。
 
 稳定版 Release 成功后会自动更新 `Alexlangl/homebrew-tap`。桌面端启动时会静默检查稳定版本，发现更新后由用户选择“立即更新”或“稍后”，也可以在 `设置` 中手动检查、下载并重启安装；更新包使用 Tauri 签名校验。
+
+## 更新与签名边界
+
+这些机制保护的对象不同，不能把“有 `.sig`”理解成“操作系统已信任发布者”。
+
+| 机制 | 当前状态 | 保护范围 |
+| --- | --- | --- |
+| Release `SHA256SUMS` | 已提供 | 让用户核对下载内容是否与该 Release 发布的文件一致 |
+| Tauri updater `.sig` | 已启用且强制校验 | 已安装的桌面 App 下载更新时验证更新包来源和完整性 |
+| macOS Developer ID + notarization | 尚未配置 | 配置后可建立 Apple 认可的发布者身份并减少 Gatekeeper 拦截 |
+| Windows Authenticode | 尚未配置 | 配置后显示发布者身份；SmartScreen 信誉仍可能需要积累 |
+| Linux GPG/AppImage 发布签名 | 尚未配置 | 首次下载目前依赖 GitHub Release 来源和 SHA-256 校验 |
+
+Tauri updater 的私钥只存放在发布环境，仓库内只有公钥。自动更新签名不会替代 macOS Developer ID、Apple notarization 或 Windows Authenticode；它也不能消除首次从浏览器下载安装时的系统信誉提示。
+
+要消除这些首次安装提示，需要为 CI 另外配置 Apple Developer ID/公证凭据和 Windows 代码签名证书。证书和私钥不得提交到仓库。
 
 ## 支持的账号
 
