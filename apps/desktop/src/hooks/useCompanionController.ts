@@ -36,6 +36,7 @@ import type {
   ThemeMode,
 } from "../types/domain";
 import type { ApiKeyForm, JsonImportFile } from "../features/providers/provider-types";
+import { useAppUpdater } from "../features/settings/useAppUpdater";
 
 export function useCompanionController() {
   const [busy, setBusy] = useState<BusyState>("loading");
@@ -46,6 +47,7 @@ export function useCompanionController() {
   const [activeTab, setActiveTab] = useState("dashboard");
   const pollingRef = useRef(false);
   const hasLoadedStatusRef = useRef(false);
+  const appUpdater = useAppUpdater(setToast);
 
   const refresh = useCallback(async (options: { silent?: boolean } = {}) => {
     if (options.silent && pollingRef.current) return;
@@ -206,6 +208,7 @@ export function useCompanionController() {
 
   return {
     activeTab,
+    appUpdater,
     busy,
     error,
     progress,

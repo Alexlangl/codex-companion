@@ -1,10 +1,12 @@
 import * as Select from "@radix-ui/react-select";
-import { Cable, RotateCcw, ShieldCheck } from "lucide-react";
+import { Cable, Download, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
 import { Button, Field, Panel } from "../../components/ui";
 import { compactPath } from "../../lib/format";
 import type { BusyState, CompanionStatus, ThemeMode } from "../../types/domain";
+import type { AppUpdateState, AppUpdaterController } from "./useAppUpdater";
 
 export function Settings({
+  appUpdater,
   busy,
   status,
   onInstall,
@@ -13,6 +15,7 @@ export function Settings({
   onUninstall,
   onTheme,
 }: {
+  appUpdater: AppUpdaterController;
   busy: BusyState;
   status: CompanionStatus;
   onInstall: () => Promise<void>;
@@ -22,6 +25,17 @@ export function Settings({
   onResetPreferences: () => Promise<void>;
 }) {
   const disabled = busy !== "idle";
+  const update = appUpdater.state;
+  const updateBusy = update.status === "checking" || update.status === "downloading";
+  const updateStatus = appUpdateStatusLabel(update);
+
+  function handleCheckForUpdates(): void {
+    void appUpdater.checkForUpdates();
+  }
+
+  function handleInstallUpdate(): void {
+    void appUpdater.installUpdate();
+  }
 
   return (
     <div className="content-grid">
@@ -97,7 +111,47 @@ export function Settings({
           <dt>配置</dt>
           <dd>{compactPath(status.configPath)}</dd>
         </dl>
+        <div aria-busy={updateBusy} aria-live="polite" className="settings-update">
+          <dl className="details-grid details-top">
+            <dt>当前版本</dt>
+            <dd>{update.currentVersion || "读取中"}</dd>
+            <dt>软件更新</dt>
+            <dd>{updateStatus}</dd>
+          </dl>
+          {update.status === "available" ? <p className="field-hint">{update.notes}</p> : null}
+          <div className="actions">
+            <Button disabled={disabled || updateBusy} onClick={handleCheckForUpdates} variant="secondary">
+              <RefreshCw aria-hidden="true" size={15} /> 检查更新
+            </Button>
+            {update.status === "available" ? (
+              <Button disabled={disabled || updateBusy} onClick={handleInstallUpdate}>
+                <Download aria-hidden="true" size={15} /> 下载并安装 v{update.nextVersion}
+              </Button>
+            ) : null}
+          </div>
+        </div>
       </Panel>
     </div>
   );
+}
+
+function appUpdateStatusLabel(state: AppUpdateState): string {
+  switch (state.status) {
+    case "loading":
+      return "正在读取版本";
+    case "unsupported":
+      return "浏览器开发模式不执行更新";
+    case "checking":
+      return "正在检查更新";
+    case "latest":
+      return "当前已是最新版本";
+    case "available":
+      return `发现 v${state.nextVersion}`;
+    case "downloading":
+      return state.progress === null
+        ? `正在下载 v${state.nextVersion}`
+        : `正在下载 v${state.nextVersion}（${state.progress}%）`;
+    case "error":
+      return state.message;
+  }
 }

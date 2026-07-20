@@ -322,6 +322,8 @@ async fn get_token_usage(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|_app| {
             tauri::async_runtime::spawn(async {
                 let mut retry_delay = Duration::from_secs(1);

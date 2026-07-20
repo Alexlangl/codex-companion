@@ -129,6 +129,12 @@ curl http://127.0.0.1:17687/v1/responses \
 
 ## CLI 用法
 
+使用 Homebrew 安装 CLI 和 TUI：
+
+```bash
+brew install Alexlangl/tap/codex-companion
+```
+
 查看状态：
 
 ```bash
@@ -193,6 +199,8 @@ codex-companion-tui
 仓库提供 `Release` GitHub Actions 工作流。在 GitHub 的 `Actions` → `Release` 页面选择 `Run workflow`，输入 `0.1.1` 或 `v0.1.1` 形式的版本号即可开始打包。
 
 工作流会构建 macOS Universal / Intel / Apple Silicon、Windows x64、Linux x64 / ARM64 桌面安装包，以及包含 CLI 和 TUI 的命令行压缩包。全部平台成功后才会创建对应 GitHub Release，并附带 `SHA256SUMS`。
+
+稳定版 Release 成功后会自动更新 `Alexlangl/homebrew-tap`。桌面端启动时会静默检查稳定版本，也可以在 `设置` 中手动检查、下载并重启安装；更新包使用 Tauri 签名校验。
 
 ## 支持的账号
 

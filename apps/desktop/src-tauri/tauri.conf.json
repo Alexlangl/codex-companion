@@ -26,6 +26,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "macOS": {
       "signingIdentity": "-"
@@ -37,5 +38,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMxRUEzMTdEMDU5NDc4QjkKUldTNWVKUUZmVEhxTWV5eFNzSkd2SmxjUTZabzgvTzJiR1FZVGo2WjJWdDd3cmpyN204dDIyQTcK",
+      "endpoints": [
+        "https://github.com/Alexlangl/codex-companion/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

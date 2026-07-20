@@ -199,7 +199,15 @@ jobs:
 
       - name: Build Tauri bundle
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]]; then
+            echo "Missing TAURI_SIGNING_PRIVATE_KEY repository secret" >&2
+            exit 1
+          fi
+
           for attempt in 1 2 3; do
             if pnpm --filter @codex-companion/desktop tauri build ${{ matrix.args }}; then
               exit 0
@@ -234,12 +242,19 @@ jobs:
       - app
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: release-*
           path: release-assets
           merge-multiple: true
+
+      - name: Generate updater manifest
+        env:
+          CODEX_COMPANION_VERSION: ${{ needs.prepare.outputs.version }}
+        run: node scripts/generate-updater-manifest.mjs
 
       - name: Generate checksums
         shell: bash
@@ -259,3 +274,105 @@ jobs:
           prerelease: ${{ needs.prepare.outputs.prerelease }}
           fail_on_unmatched_files: true
           files: release-assets/*
+
+  homebrew:
+    name: Update Homebrew tap
+    if: needs.prepare.outputs.prerelease == 'false'
+    needs:
+      - prepare
+      - cli
+      - publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download command-line archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-cli-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Configure Homebrew tap deploy key
+        shell: bash
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${HOMEBREW_TAP_DEPLOY_KEY}" ]]; then
+            echo "Missing HOMEBREW_TAP_DEPLOY_KEY repository secret" >&2
+            exit 1
+          fi
+
+          KEY_PATH="${RUNNER_TEMP}/homebrew-tap-deploy-key"
+          KNOWN_HOSTS_PATH="${RUNNER_TEMP}/homebrew-tap-known-hosts"
+          printf '%s\n' "${HOMEBREW_TAP_DEPLOY_KEY}" > "${KEY_PATH}"
+          chmod 600 "${KEY_PATH}"
+          ssh-keyscan github.com > "${KNOWN_HOSTS_PATH}"
+          echo "GIT_SSH_COMMAND=ssh -i ${KEY_PATH} -o IdentitiesOnly=yes -o UserKnownHostsFile=${KNOWN_HOSTS_PATH}" >> "${GITHUB_ENV}"
+
+      - name: Update Formula
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ARM_MAC_ARCHIVE="${PRODUCT_NAME}-${RELEASE_VERSION}-macos-arm64.tar.gz"
+          X64_MAC_ARCHIVE="${PRODUCT_NAME}-${RELEASE_VERSION}-macos-x64.tar.gz"
+          ARM_LINUX_ARCHIVE="${PRODUCT_NAME}-${RELEASE_VERSION}-linux-arm64.tar.gz"
+          X64_LINUX_ARCHIVE="${PRODUCT_NAME}-${RELEASE_VERSION}-linux-x64.tar.gz"
+          ARM_MAC_SHA="$(sha256sum "release-assets/${ARM_MAC_ARCHIVE}" | awk '{print $1}')"
+          X64_MAC_SHA="$(sha256sum "release-assets/${X64_MAC_ARCHIVE}" | awk '{print $1}')"
+          ARM_LINUX_SHA="$(sha256sum "release-assets/${ARM_LINUX_ARCHIVE}" | awk '{print $1}')"
+          X64_LINUX_SHA="$(sha256sum "release-assets/${X64_LINUX_ARCHIVE}" | awk '{print $1}')"
+          BASE_URL="https://github.com/Alexlangl/${PRODUCT_NAME}/releases/download/v${RELEASE_VERSION}"
+
+          git clone git@github.com:Alexlangl/homebrew-tap.git tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/codex-companion.rb <<EOF
+          class CodexCompanion < Formula
+            desc "Local provider runtime, relay, and state continuity tool for Codex"
+            homepage "https://github.com/Alexlangl/codex-companion"
+            version "${RELEASE_VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${BASE_URL}/${ARM_MAC_ARCHIVE}"
+                sha256 "${ARM_MAC_SHA}"
+              else
+                url "${BASE_URL}/${X64_MAC_ARCHIVE}"
+                sha256 "${X64_MAC_SHA}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "${BASE_URL}/${ARM_LINUX_ARCHIVE}"
+                sha256 "${ARM_LINUX_SHA}"
+              else
+                url "${BASE_URL}/${X64_LINUX_ARCHIVE}"
+                sha256 "${X64_LINUX_SHA}"
+              end
+            end
+
+            def install
+              bin.install "codex-companion"
+              bin.install "codex-companion-tui"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/codex-companion --version")
+              assert_path_exists bin/"codex-companion-tui"
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/codex-companion.rb
+          if git diff --cached --quiet; then
+            echo "Homebrew Formula is already up to date"
+          else
+            git commit -m "Update codex-companion to ${RELEASE_VERSION}"
+            git push
+          fi

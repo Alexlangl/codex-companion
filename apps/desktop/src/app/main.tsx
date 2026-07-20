@@ -41,7 +41,7 @@ if (!root) {
 }
 
 function App() {
-  const { activeTab, actions, busy, error, progress, repairOutcome, status, toast } = useCompanionController();
+  const { activeTab, actions, appUpdater, busy, error, progress, repairOutcome, status, toast } = useCompanionController();
   const [pendingProviderLaunch, setPendingProviderLaunch] = React.useState<{
     mode: ProviderLaunchMode;
     provider: ProviderConfig;
@@ -165,6 +165,7 @@ function App() {
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="settings">
                   <Settings
+                    appUpdater={appUpdater}
                     busy={busy}
                     status={status}
                     onInstall={actions.install}

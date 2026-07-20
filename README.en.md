@@ -129,6 +129,12 @@ Prices are USD estimates per one million tokens. `cacheWriteInputPerMillion` is 
 
 ## CLI Usage
 
+Install the CLI and TUI with Homebrew:
+
+```bash
+brew install Alexlangl/tap/codex-companion
+```
+
 Show status:
 
 ```bash
@@ -193,6 +199,8 @@ Press `?` inside the TUI to view shortcuts.
 The repository provides a `Release` GitHub Actions workflow. Open `Actions` → `Release` → `Run workflow` on GitHub and enter a version such as `0.1.1` or `v0.1.1`.
 
 The workflow builds desktop bundles for macOS Universal / Intel / Apple Silicon, Windows x64, and Linux x64 / ARM64, plus command-line archives containing both the CLI and TUI. It creates the GitHub Release only after every platform succeeds and includes `SHA256SUMS`.
+
+After a successful stable release, the workflow updates `Alexlangl/homebrew-tap`. The desktop app checks stable releases quietly at startup and also supports manual check, download, and restart installation from `Settings`; Tauri signatures protect update artifacts.
 
 ## Supported Accounts
 

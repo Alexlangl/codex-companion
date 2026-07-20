@@ -18,8 +18,9 @@ for (const file of candidates) {
   const kind = artifactKind(file);
   const ext = artifactExtension(file);
   const stem = kind ? `${base}-${kind}` : base;
-  const count = used.get(stem) ?? 0;
-  used.set(stem, count + 1);
+  const collisionKey = `${stem}${ext}`;
+  const count = used.get(collisionKey) ?? 0;
+  used.set(collisionKey, count + 1);
   const dedupe = count === 0 ? "" : `-${count + 1}`;
   copyFileSync(file, path.join(output, `${stem}${dedupe}${ext}`));
 }
@@ -50,17 +51,23 @@ function walk(dir) {
 }
 
 function isReleaseArtifact(file) {
-  return /\.(dmg|deb|rpm|msi|exe|AppImage|zip)$/i.test(file);
+  return /\.(dmg|deb|rpm|msi|exe|AppImage|zip|tar\.gz)(\.sig)?$/i.test(file);
 }
 
 function artifactExtension(file) {
   const name = path.basename(file);
+  if (name.endsWith(".tar.gz.sig")) return ".tar.gz.sig";
+  if (name.endsWith(".tar.gz")) return ".tar.gz";
+  if (name.endsWith(".AppImage.sig")) return ".AppImage.sig";
   if (name.endsWith(".AppImage")) return ".AppImage";
+  if (name.endsWith(".exe.sig")) return ".exe.sig";
+  if (name.endsWith(".msi.sig")) return ".msi.sig";
   return path.extname(name);
 }
 
 function artifactKind(file) {
-  const lower = path.basename(file).toLowerCase();
+  const lower = path.basename(file).toLowerCase().replace(/\.sig$/, "");
+  if (lower.endsWith(".app.tar.gz")) return "updater";
   if (lower.endsWith(".dmg")) return "dmg";
   if (lower.endsWith(".deb")) return "deb";
   if (lower.endsWith(".rpm")) return "rpm";
