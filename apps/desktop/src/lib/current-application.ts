@@ -1,5 +1,5 @@
 import type { CompanionStatus, ProviderConfig, ProviderGroup, ProviderLaunchMode } from "../types/domain";
-import { providerAccountTitle } from "./provider-display";
+import { providerAccountTitle, providerTypeLabel } from "./provider-display";
 
 export const SINGLE_PROVIDER_GROUP_PREFIX = "single-";
 
@@ -98,11 +98,12 @@ export function currentProviderId(application: CurrentApplication) {
 }
 
 function providerApplication(provider: ProviderConfig, launchMode: ProviderLaunchMode, launchGroupId?: string): CurrentApplication {
+  const descriptionName = provider.kind === "official_codex" ? providerTypeLabel(provider) : provider.name;
   return {
     kind: "provider",
     id: provider.id,
     name: providerAccountTitle(provider),
-    description: `${provider.name} · ${launchMode === "direct" ? "直连账号" : "本地代理单账号"}`,
+    description: `${descriptionName} · ${launchMode === "direct" ? "直连账号" : "本地代理单账号"}`,
     providers: [provider],
     provider,
     launchMode,

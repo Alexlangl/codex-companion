@@ -114,13 +114,15 @@ function DashboardProviderCard({
   const showQuota = hasQuotaInfo(quota);
   const balanceText = showQuota && (quota.label.includes("余额") || quota.percentLabel.startsWith("$")) ? `${quota.label} ${quota.percentLabel}` : null;
   const showPlanBadge = provider.kind === "official_codex" && Boolean(provider.account?.subscriptionType);
+  const accountSubtitle = providerAccountSubtitle(provider);
+  const compactSubtitle = provider.kind === "official_codex" ? accountSubtitle : provider.name;
   if (compact) {
     return (
       <div className="dashboard-provider-mini dashboard-provider-simple">
         <div className="dashboard-provider-simple-main">
           <strong>{index + 1}. {providerAccountTitle(provider)}</strong>
           <div className="dashboard-provider-simple-meta">
-            <span>{provider.name}</span>
+            <span>{compactSubtitle}</span>
             <span className={`dashboard-provider-health dashboard-provider-health-${providerHealthTone(healthStatus)}`}>{providerHealthLabel(healthStatus)}</span>
             {balanceText ? <span className={`dashboard-provider-balance dashboard-provider-balance-${quota.tone}`}>{balanceText}</span> : null}
           </div>
@@ -136,7 +138,7 @@ function DashboardProviderCard({
         <Badge tone="info">{providerTypeLabel(provider)}</Badge>
         {showPlanBadge ? <Badge tone="accent">{provider.account?.subscriptionType}</Badge> : null}
       </div>
-      <span>{providerAccountSubtitle(provider)}</span>
+      <span>{accountSubtitle}</span>
       <div className="provider-mini-foot">
         <Badge tone={providerRunMode(provider).includes("直连") ? "info" : "accent"}>{providerRunMode(provider)}</Badge>
         <Badge tone={providerHealthTone(healthStatus)}>{providerHealthLabel(healthStatus)}</Badge>

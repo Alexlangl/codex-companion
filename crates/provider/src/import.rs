@@ -454,8 +454,7 @@ pub fn parse_provider_import_draft(
     let provider_name = explicit_provider_name
         .and_then(normalize_non_empty)
         .or_else(|| extract_oauth_account_name(&auth))
-        .or_else(|| extract_provider_name(value))
-        .unwrap_or_else(|| "Codex 官方账号".to_string());
+        .unwrap_or_else(|| account_id.clone());
     let provider_id = explicit_provider_id
         .and_then(sanitize_provider_id)
         .unwrap_or_else(|| derive_oauth_provider_id(&provider_name, &account_id));
@@ -944,25 +943,13 @@ fn extract_oauth_account_name(auth: &serde_json::Value) -> Option<String> {
     pick_first_string(
         &[auth, auth.get("tokens").unwrap_or(&serde_json::Value::Null)],
         &[
-            &["name"],
             &["email"],
-            &["tokens", "name"],
-            &["tokens", "email"],
-        ],
-    )
-}
-
-fn extract_provider_name(value: &serde_json::Value) -> Option<String> {
-    pick_string(
-        value,
-        &[
-            &["providerName"],
-            &["provider_name"],
             &["name"],
-            &["label"],
-            &["provider", "name"],
+            &["tokens", "email"],
+            &["tokens", "name"],
         ],
     )
+    .filter(|label| !is_generic_official_account_name(label))
 }
 
 fn extract_model(value: &serde_json::Value) -> Option<String> {
@@ -1181,6 +1168,13 @@ fn normalize_non_empty(value: &str) -> Option<String> {
     }
 }
 
+fn is_generic_official_account_name(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "codex 官方账号" | "官方账号" | "codex official account" | "official account"
+    )
+}
+
 fn derive_oauth_provider_id(provider_name: &str, account_id: &str) -> String {
     let name = sanitize_provider_id(provider_name).unwrap_or_else(|| "chatgpt".to_string());
     format!(
@@ -1274,6 +1268,33 @@ mod tests {
         let draft = parse_provider_import_draft(&value, None, None).expect("draft");
 
         assert_eq!(draft.model.as_deref(), Some("current-codex-model"));
+    }
+
+    #[test]
+    fn uses_account_id_as_official_name_when_profile_has_no_label() {
+        let value = serde_json::json!({
+            "access_token": "access-token",
+            "account_id": "account-id",
+            "name": "Codex 官方账号"
+        });
+
+        let draft = parse_provider_import_draft(&value, None, None).expect("draft");
+
+        assert_eq!(draft.provider_name, "account-id");
+    }
+
+    #[test]
+    fn prefers_official_account_email_over_generic_name() {
+        let value = serde_json::json!({
+            "access_token": "access-token",
+            "account_id": "account-id",
+            "email": "person@example.com",
+            "name": "Codex 官方账号"
+        });
+
+        let draft = parse_provider_import_draft(&value, None, None).expect("draft");
+
+        assert_eq!(draft.provider_name, "person@example.com");
     }
 
     #[test]

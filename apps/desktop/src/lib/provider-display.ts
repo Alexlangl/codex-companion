@@ -7,8 +7,26 @@ import type {
 import { daysUntil, formatPercent, formatTime } from "./format";
 import { providerEndpointIsChatCompletions } from "./provider-url";
 
+const GENERIC_OFFICIAL_ACCOUNT_NAMES = new Set([
+  "codex 官方账号",
+  "官方账号",
+  "codex official account",
+  "official account",
+]);
+
 export function providerAccountTitle(provider: ProviderConfig) {
   const account = provider.account;
+  if (provider.kind === "official_codex") {
+    return (
+      meaningfulAccountLabel(provider, account?.email) ||
+      meaningfulAccountLabel(provider, account?.displayName) ||
+      extractEmail(provider.name) ||
+      clean(account?.accountId) ||
+      clean(account?.userId) ||
+      meaningfulAccountLabel(provider, provider.name) ||
+      provider.id
+    );
+  }
   return (
     clean(account?.email) ||
     clean(account?.displayName) ||
@@ -24,12 +42,14 @@ export function providerAccountSubtitle(provider: ProviderConfig) {
   const title = providerAccountTitle(provider);
   if (provider.kind === "official_codex") {
     const userId = clean(account?.userId) || clean(account?.accountId);
+    const displayName = meaningfulAccountLabel(provider, account?.displayName);
+    const providerName = meaningfulAccountLabel(provider, provider.name);
     const parts = [
       clean(account?.teamName) ? `Team Name: ${account?.teamName}` : null,
       userId ? `使用 workos 登录 | 用户 ID: ${shortId(userId, 30)}` : null,
-      clean(account?.displayName) && clean(account?.displayName) !== title ? clean(account?.displayName) : null,
+      displayName && displayName !== title ? displayName : null,
     ].filter(Boolean);
-    return parts.length ? parts.join(" · ") : provider.name !== title ? provider.name : provider.id;
+    return parts.length ? parts.join(" · ") : providerName && providerName !== title ? providerName : provider.id;
   }
   const displayName = clean(account?.displayName);
   const parts = [
@@ -190,6 +210,17 @@ function compactNumber(value: number) {
 function clean(value?: string | null) {
   const trimmed = value?.trim();
   return trimmed || null;
+}
+
+function meaningfulAccountLabel(provider: ProviderConfig, value?: string | null) {
+  const label = clean(value);
+  if (!label || provider.kind !== "official_codex") return label;
+  if (isGenericOfficialAccountName(label)) return null;
+  return label;
+}
+
+export function isGenericOfficialAccountName(value: string) {
+  return GENERIC_OFFICIAL_ACCOUNT_NAMES.has(value.trim().toLowerCase());
 }
 
 function extractEmail(value?: string | null) {

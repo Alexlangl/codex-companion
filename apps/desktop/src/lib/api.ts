@@ -27,6 +27,7 @@ import type {
   RelaySettingsUpdate,
   ThemeMode,
 } from "../types/domain";
+import { isGenericOfficialAccountName } from "./provider-display";
 import { extractQuotaWindows, findNumber, findString, isApiKeyJson, lowestQuotaPercent, providerNameFromBaseUrl } from "./provider-json";
 import { getTokenUsage as getTokenUsageFromRuntime } from "./token-usage-api";
 
@@ -444,13 +445,13 @@ export function importProviderJson(jsonText: string, providerId?: string, provid
     if (isApiKeyJson(value)) {
       return importApiKeyJsonMock(value, providerId, providerName);
     }
-    const name =
-      emptyToNull(providerName) ||
-      findString(value, ["name", "email", "provider_name", "providerName"]) ||
-      "Codex 官方账号";
+    const explicitName = emptyToNull(providerName);
+    const detectedName = findString(value, ["email", "name"]);
+    const importedName = explicitName || (detectedName && !isGenericOfficialAccountName(detectedName) ? detectedName : null);
     const accountId =
       findString(value, ["chatgpt_account_id", "account_id", "workspace_id", "email"]) ||
       `mock_${Date.now()}`;
+    const name = importedName || accountId;
     const userId = findString(value, ["chatgpt_user_id", "user_id", "userId", "user"]);
     const email = findString(value, ["email", "name"]);
     const teamName = findString(value, ["team_name", "teamName", "workspace_name", "workspaceName"]);

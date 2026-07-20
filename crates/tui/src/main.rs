@@ -657,11 +657,30 @@ fn token_usage(daemon: &CompanionDaemon, app: &mut TuiState) {
 }
 
 fn provider_label(provider: &ProviderConfig) -> String {
-    provider
-        .account
-        .as_ref()
-        .and_then(|account| account.email.clone().or(account.display_name.clone()))
-        .unwrap_or_else(|| provider.name.clone())
+    let account_label = provider.account.as_ref().and_then(|account| {
+        account
+            .email
+            .clone()
+            .filter(|label| is_meaningful_account_label(label))
+            .or_else(|| {
+                account
+                    .display_name
+                    .clone()
+                    .filter(|label| is_meaningful_account_label(label))
+            })
+            .or_else(|| account.account_id.clone())
+            .or_else(|| account.user_id.clone())
+    });
+    account_label
+        .or_else(|| is_meaningful_account_label(&provider.name).then(|| provider.name.clone()))
+        .unwrap_or_else(|| provider.id.clone())
+}
+
+fn is_meaningful_account_label(label: &str) -> bool {
+    !matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "codex 官方账号" | "官方账号" | "codex official account" | "official account"
+    )
 }
 
 fn quota_label(provider: &ProviderConfig) -> String {
@@ -756,5 +775,20 @@ mod tests {
             &official_provider,
             true,
         ));
+    }
+
+    #[test]
+    fn official_account_label_uses_account_id_instead_of_placeholder() {
+        let mut official_provider = provider(Some("file:/tmp/official-auth.json"));
+        official_provider.name = "Codex 官方账号".to_string();
+        official_provider.kind = ProviderKind::OfficialCodex;
+        official_provider.account = Some(codex_companion_core::ProviderAccountInfo {
+            email: Some("Codex 官方账号".to_string()),
+            display_name: Some("Codex 官方账号".to_string()),
+            account_id: Some("account-id".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(provider_label(&official_provider), "account-id");
     }
 }
