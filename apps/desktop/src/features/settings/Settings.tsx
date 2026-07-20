@@ -151,7 +151,9 @@ function appUpdateStatusLabel(state: AppUpdateState): string {
       return state.progress === null
         ? `正在下载 v${state.nextVersion}`
         : `正在下载 v${state.nextVersion}（${state.progress}%）`;
-    case "error":
+    case "check-error":
+    case "install-error":
+    case "restart-error":
       return state.message;
   }
 }

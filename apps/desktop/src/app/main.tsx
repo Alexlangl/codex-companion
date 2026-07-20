@@ -13,6 +13,7 @@ import { Providers } from "../features/providers/Providers";
 import { canDirectLaunch, directLaunchWritesAuthJson } from "../features/providers/provider-launch";
 import { Relay } from "../features/relay/Relay";
 import { Repair } from "../features/repair/Repair";
+import { AppUpdatePrompt } from "../features/settings/AppUpdatePrompt";
 import { Settings } from "../features/settings/Settings";
 import { TokenStats } from "../features/token/TokenStats";
 import { useCompanionController } from "../hooks/useCompanionController";
@@ -188,6 +189,7 @@ function App() {
             </section>
           </main>
         )}
+        <AppUpdatePrompt isBlocked={Boolean(pendingProviderLaunch)} updater={appUpdater} />
         <Dialog.Root open={Boolean(pendingProviderLaunch)} onOpenChange={(open) => !open && setPendingProviderLaunch(null)}>
           <Dialog.Portal>
             <Dialog.Overlay className="dialog-overlay" />

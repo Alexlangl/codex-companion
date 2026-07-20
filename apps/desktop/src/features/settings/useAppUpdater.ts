@@ -11,12 +11,15 @@ export type AppUpdateState =
   | { status: "latest"; currentVersion: string }
   | { status: "available"; currentVersion: string; nextVersion: string; notes: string }
   | { status: "downloading"; currentVersion: string; nextVersion: string; progress: number | null }
-  | { status: "error"; currentVersion: string; message: string };
+  | { status: "check-error"; currentVersion: string; message: string }
+  | { status: "install-error"; currentVersion: string; nextVersion: string; message: string }
+  | { status: "restart-error"; currentVersion: string; nextVersion: string; message: string };
 
 export type AppUpdaterController = {
   state: AppUpdateState;
   checkForUpdates: () => Promise<void>;
   installUpdate: () => Promise<void>;
+  restartApp: () => Promise<void>;
 };
 
 export function useAppUpdater(notify: (message: string) => void): AppUpdaterController {
@@ -52,12 +55,14 @@ export function useAppUpdater(notify: (message: string) => void): AppUpdaterCont
         nextVersion: update.version,
         notes,
       });
-      notify(`发现新版本 v${update.version}`);
+      if (!automatic) {
+        notify(`发现新版本 v${update.version}`);
+      }
     } catch (unknownError) {
       setState({
-        status: "error",
+        status: "check-error",
         currentVersion,
-        message: normalizeUpdateError(unknownError),
+        message: normalizeUpdateError(unknownError, "检查更新"),
       });
     }
   }, [notify]);
@@ -90,16 +95,45 @@ export function useAppUpdater(notify: (message: string) => void): AppUpdaterCont
           progress: progress.percent,
         });
       });
-      notify(`v${nextVersion} 已安装，正在重启`);
+    } catch (unknownError) {
+      setState({
+        status: "install-error",
+        currentVersion,
+        nextVersion,
+        message: normalizeUpdateError(unknownError, "安装更新"),
+      });
+      return;
+    }
+
+    notify(`v${nextVersion} 已安装，正在重启`);
+    try {
       await relaunch();
     } catch (unknownError) {
       setState({
-        status: "error",
+        status: "restart-error",
         currentVersion,
-        message: normalizeUpdateError(unknownError),
+        nextVersion,
+        message: normalizeUpdateError(unknownError, "重启应用"),
       });
     }
   }, [checkForUpdates, notify]);
+
+  const restartApp = useCallback(async (): Promise<void> => {
+    const update = pendingUpdateRef.current;
+    if (!update) {
+      return;
+    }
+    try {
+      await relaunch();
+    } catch (unknownError) {
+      setState({
+        status: "restart-error",
+        currentVersion: update.currentVersion,
+        nextVersion: update.version,
+        message: normalizeUpdateError(unknownError, "重启应用"),
+      });
+    }
+  }, []);
 
   useEffect(() => {
     if (hasAutoCheckedRef.current) {
@@ -123,6 +157,7 @@ export function useAppUpdater(notify: (message: string) => void): AppUpdaterCont
     state,
     checkForUpdates: () => checkForUpdates(false),
     installUpdate,
+    restartApp,
   };
 }
 
@@ -158,10 +193,10 @@ function updateDownloadProgress(
   return { ...current, percent: 100 };
 }
 
-function normalizeUpdateError(error: unknown): string {
+function normalizeUpdateError(error: unknown, action: "检查更新" | "安装更新" | "重启应用"): string {
   const message = error instanceof Error ? error.message : String(error);
-  if (message.includes("404")) {
+  if (action === "检查更新" && message.includes("404")) {
     return "尚未发布可用于自动更新的稳定版本。";
   }
-  return `检查更新失败：${message}`;
+  return `${action}失败：${message}`;
 }

@@ -200,7 +200,7 @@ The repository provides a `Release` GitHub Actions workflow. Open `Actions` → 
 
 The workflow builds desktop bundles for macOS Universal / Intel / Apple Silicon, Windows x64, and Linux x64 / ARM64, plus command-line archives containing both the CLI and TUI. It creates the GitHub Release only after every platform succeeds and includes `SHA256SUMS`.
 
-After a successful stable release, the workflow updates `Alexlangl/homebrew-tap`. The desktop app checks stable releases quietly at startup and also supports manual check, download, and restart installation from `Settings`; Tauri signatures protect update artifacts.
+After a successful stable release, the workflow updates `Alexlangl/homebrew-tap`. The desktop app checks stable releases quietly at startup, lets the user choose `Update now` or `Later` when one is available, and also supports manual check, download, and restart installation from `Settings`; Tauri signatures protect update artifacts.
 
 ## Supported Accounts
 

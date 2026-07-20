@@ -200,7 +200,7 @@ codex-companion-tui
 
 工作流会构建 macOS Universal / Intel / Apple Silicon、Windows x64、Linux x64 / ARM64 桌面安装包，以及包含 CLI 和 TUI 的命令行压缩包。全部平台成功后才会创建对应 GitHub Release，并附带 `SHA256SUMS`。
 
-稳定版 Release 成功后会自动更新 `Alexlangl/homebrew-tap`。桌面端启动时会静默检查稳定版本，也可以在 `设置` 中手动检查、下载并重启安装；更新包使用 Tauri 签名校验。
+稳定版 Release 成功后会自动更新 `Alexlangl/homebrew-tap`。桌面端启动时会静默检查稳定版本，发现更新后由用户选择“立即更新”或“稍后”，也可以在 `设置` 中手动检查、下载并重启安装；更新包使用 Tauri 签名校验。
 
 ## 支持的账号
 
