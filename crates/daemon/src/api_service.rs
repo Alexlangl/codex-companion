@@ -1,7 +1,7 @@
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
     ApiClient, ApiClientCreate, ApiClientSecret, ApiClientUpdate, ApiServiceSelfTest,
-    ApiServiceSnapshot, CompanionError, RelayConfig, RelaySettingsUpdate, Result,
+    ApiServiceSnapshot, CompanionError, HealthStatusKind, RelayConfig, RelaySettingsUpdate, Result,
 };
 use codex_companion_relay::ApiServiceStore;
 use std::time::Instant;
@@ -9,7 +9,27 @@ use std::time::Instant;
 impl CompanionDaemon {
     pub fn api_service_snapshot(&self) -> Result<ApiServiceSnapshot> {
         let service = self.api_service_store()?;
-        service.snapshot(100)
+        let mut snapshot = service.snapshot(100)?;
+        let config = self.store.load()?;
+        snapshot.affinity_bindings =
+            service.affinity_binding_count(config.relay.session_affinity_ttl_seconds)?;
+        snapshot.pool_health.total = config.providers.len();
+        for provider in config
+            .providers
+            .values()
+            .filter(|provider| provider.enabled)
+        {
+            snapshot.pool_health.enabled += 1;
+            match config.health.get(&provider.id).map(|health| &health.status) {
+                Some(HealthStatusKind::Healthy) => snapshot.pool_health.healthy += 1,
+                Some(HealthStatusKind::Cooldown | HealthStatusKind::RateLimited) => {
+                    snapshot.pool_health.cooldown += 1;
+                }
+                Some(HealthStatusKind::Unknown) | None => {}
+                Some(_) => snapshot.pool_health.degraded += 1,
+            }
+        }
+        Ok(snapshot)
     }
 
     pub fn create_api_client(&self, input: ApiClientCreate) -> Result<ApiClientSecret> {

@@ -2,9 +2,13 @@ use crate::launch::direct_repair_target_provider_id;
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
     AppSettings, CodexLaunchMode, CompanionConfig, ProviderLaunchMode, ProviderViewMode,
-    RepairOptions, RepairOutcome, Result, ThemeMode, TokenUsageSummary, COMPANION_PROVIDER_ID,
+    RepairOptions, RepairOutcome, Result, ThemeMode, TokenUsageSummary, TokenUsageSyncStatus,
+    COMPANION_PROVIDER_ID,
 };
-use codex_companion_state::{collect_token_usage_cached, repair_state};
+use codex_companion_state::{
+    collect_token_usage_cached, collect_token_usage_cached_with_filters,
+    rebuild_token_usage_cached_with_filters, repair_state, TokenUsageDateRange, TokenUsageFilters,
+};
 use std::path::PathBuf;
 
 impl CompanionDaemon {
@@ -88,6 +92,43 @@ impl CompanionDaemon {
 
     pub fn token_usage(&self, codex_dir: PathBuf) -> Result<TokenUsageSummary> {
         collect_token_usage_cached(codex_dir, self.store.data_dir().join("cache"))
+    }
+
+    pub fn token_usage_in_range(
+        &self,
+        codex_dir: PathBuf,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<TokenUsageSummary> {
+        self.token_usage_filtered(codex_dir, start_date, end_date, None, None, false)
+    }
+
+    pub fn token_usage_filtered(
+        &self,
+        codex_dir: PathBuf,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        provider_id: Option<&str>,
+        model: Option<&str>,
+        rebuild: bool,
+    ) -> Result<TokenUsageSummary> {
+        let date_range = TokenUsageDateRange::parse(start_date, end_date)?;
+        let filters = TokenUsageFilters::parse(provider_id, model);
+        let collect = if rebuild {
+            rebuild_token_usage_cached_with_filters
+        } else {
+            collect_token_usage_cached_with_filters
+        };
+        collect(
+            codex_dir,
+            self.store.data_dir().join("cache"),
+            &date_range,
+            &filters,
+        )
+    }
+
+    pub fn token_usage_sync_status(&self) -> TokenUsageSyncStatus {
+        codex_companion_state::token_usage_sync_status()
     }
 
     fn repair_target_provider_id_from_state(&self) -> Result<Option<String>> {

@@ -1,11 +1,13 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, SecondsFormat, Utc};
 use codex_companion_core::{
-    ApiClient, ApiClientCreate, ApiClientSecret, ApiClientUpdate, ApiRequestLog,
-    ApiServiceSnapshot, CompanionError, ConfigStore, ModelCooldown, Result,
+    ApiClient, ApiClientCreate, ApiClientHealth, ApiClientPeriodUsage, ApiClientSecret,
+    ApiClientUpdate, ApiClientUsage, ApiRequestLog, ApiServiceSnapshot, CompanionError,
+    ConfigStore, ModelCooldown, Result,
 };
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -86,6 +88,23 @@ impl ApiServiceStore {
                     ON api_requests(started_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_api_requests_client_id
                     ON api_requests(client_id);
+                CREATE TABLE IF NOT EXISTS session_affinity (
+                    affinity_key TEXT PRIMARY KEY,
+                    provider_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_affinity_updated_at
+                    ON session_affinity(updated_at DESC);
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    provider_id TEXT NOT NULL,
+                    response_id TEXT NOT NULL,
+                    messages TEXT NOT NULL,
+                    tool_context TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(provider_id, response_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_history_updated_at
+                    ON chat_history(updated_at DESC);
                 CREATE TABLE IF NOT EXISTS model_cooldowns (
                     provider_id TEXT NOT NULL,
                     model TEXT NOT NULL,
@@ -203,8 +222,13 @@ impl ApiServiceStore {
         let rows = statement
             .query_map([], api_client_from_row)
             .map_err(database_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(database_error)
+        let clients = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        clients
+            .into_iter()
+            .map(|client| self.enrich_client(client))
+            .collect()
     }
 
     pub fn authenticate(&self, api_key: &str) -> Result<Option<ApiClient>> {
@@ -242,11 +266,141 @@ impl ApiServiceStore {
 
     pub fn snapshot(&self, request_limit: usize) -> Result<ApiServiceSnapshot> {
         self.remove_expired_model_cooldowns()?;
+        let clients = self.list_clients()?;
+        let model_cooldowns = self.list_model_cooldowns()?;
         Ok(ApiServiceSnapshot {
-            clients: self.list_clients()?,
+            clients,
             recent_requests: self.list_requests(request_limit)?,
-            model_cooldowns: self.list_model_cooldowns()?,
+            model_cooldowns,
+            affinity_bindings: self.affinity_binding_count(86_400)?,
+            pool_health: Default::default(),
         })
+    }
+
+    pub fn bind_affinity(&self, affinity_key: &str, provider_id: &str) -> Result<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO session_affinity (affinity_key, provider_id, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(affinity_key) DO UPDATE SET provider_id = excluded.provider_id, updated_at = excluded.updated_at",
+                params![affinity_key, provider_id, timestamp(Utc::now())],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn preferred_affinity(
+        &self,
+        affinity_key: &str,
+        ttl_seconds: u64,
+    ) -> Result<Option<String>> {
+        let cutoff = Utc::now()
+            - Duration::seconds(
+                i64::try_from(ttl_seconds)
+                    .unwrap_or(i64::MAX)
+                    .clamp(60, 86_400),
+            );
+        let connection = self.connection()?;
+        let provider = connection
+            .query_row(
+                "SELECT provider_id FROM session_affinity WHERE affinity_key = ?1 AND updated_at >= ?2",
+                params![affinity_key, timestamp(cutoff)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        if provider.is_some() {
+            connection
+                .execute(
+                    "UPDATE session_affinity SET updated_at = ?2 WHERE affinity_key = ?1",
+                    params![affinity_key, timestamp(Utc::now())],
+                )
+                .map_err(database_error)?;
+        }
+        Ok(provider)
+    }
+
+    pub fn affinity_binding_count(&self, ttl_seconds: u64) -> Result<u64> {
+        let cutoff = Utc::now()
+            - Duration::seconds(
+                i64::try_from(ttl_seconds)
+                    .unwrap_or(i64::MAX)
+                    .clamp(60, 86_400),
+            );
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "DELETE FROM session_affinity WHERE updated_at < ?1",
+                params![timestamp(cutoff)],
+            )
+            .map_err(database_error)?;
+        connection
+            .query_row("SELECT COUNT(*) FROM session_affinity", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .map_err(database_error)
+    }
+
+    pub fn load_chat_history(
+        &self,
+        provider_id: &str,
+        response_id: &str,
+    ) -> Result<Option<(Value, Value)>> {
+        let connection = self.connection()?;
+        let stored = connection
+            .query_row(
+                "SELECT messages, tool_context FROM chat_history WHERE provider_id = ?1 AND response_id = ?2",
+                params![provider_id, response_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(database_error)?;
+        stored
+            .map(|(messages, tool_context)| {
+                let messages = serde_json::from_str(&messages).map_err(|error| {
+                    CompanionError::InvalidConfig(format!("chat history messages invalid: {error}"))
+                })?;
+                let tool_context = serde_json::from_str(&tool_context).map_err(|error| {
+                    CompanionError::InvalidConfig(format!(
+                        "chat history tool context invalid: {error}"
+                    ))
+                })?;
+                Ok((messages, tool_context))
+            })
+            .transpose()
+    }
+
+    pub fn store_chat_history(
+        &self,
+        provider_id: &str,
+        response_id: &str,
+        messages: &Value,
+        tool_context: &Value,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO chat_history (provider_id, response_id, messages, tool_context, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(provider_id, response_id) DO UPDATE SET \
+                 messages = excluded.messages, tool_context = excluded.tool_context, updated_at = excluded.updated_at",
+                params![
+                    provider_id,
+                    response_id,
+                    messages.to_string(),
+                    tool_context.to_string(),
+                    timestamp(Utc::now())
+                ],
+            )
+            .map_err(database_error)?;
+        connection
+            .execute(
+                "DELETE FROM chat_history WHERE (provider_id, response_id) IN (\
+                    SELECT provider_id, response_id FROM chat_history ORDER BY updated_at DESC LIMIT -1 OFFSET 512\
+                 )",
+                [],
+            )
+            .map_err(database_error)?;
+        Ok(())
     }
 
     pub fn record_request_start(&self, input: RequestLogStart<'_>) -> Result<()> {
@@ -440,7 +594,7 @@ impl ApiServiceStore {
 
     fn client_by_id(&self, id: &str) -> Result<Option<ApiClient>> {
         let connection = self.connection()?;
-        connection
+        let client = connection
             .query_row(
                 "SELECT id, name, key_prefix, allowed_models, enabled, created_at, \
                  last_used_at, request_count FROM api_clients WHERE id = ?1",
@@ -448,7 +602,106 @@ impl ApiServiceStore {
                 api_client_from_row,
             )
             .optional()
-            .map_err(database_error)
+            .map_err(database_error)?;
+        match client {
+            Some(client) => self.enrich_client(client).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn enrich_client(&self, client: ApiClient) -> Result<ApiClient> {
+        let usage = ApiClientUsage {
+            today: self.client_period_usage(&client.id, period_start(Period::Today))?,
+            week: self.client_period_usage(&client.id, period_start(Period::Week))?,
+            month: self.client_period_usage(&client.id, period_start(Period::Month))?,
+        };
+        let health = self.client_health(&client.id, client.enabled)?;
+        Ok(ApiClient {
+            usage,
+            health,
+            ..client
+        })
+    }
+
+    fn client_period_usage(&self, client_id: &str, start: String) -> Result<ApiClientPeriodUsage> {
+        let connection = self.connection()?;
+        let (requests, succeeded, failed, average_latency_ms) = connection
+            .query_row(
+                "SELECT COUNT(*), \
+                    COALESCE(SUM(CASE WHEN outcome IN ('succeeded', 'local') THEN 1 ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN outcome NOT IN ('succeeded', 'local', 'processing') THEN 1 ELSE 0 END), 0), \
+                    AVG(latency_ms) FROM api_requests WHERE client_id = ?1 AND started_at >= ?2",
+                params![client_id, start],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, Option<f64>>(3)?,
+                    ))
+                },
+            )
+            .map_err(database_error)?;
+        Ok(ApiClientPeriodUsage {
+            requests,
+            succeeded,
+            failed,
+            success_rate: percentage(succeeded, requests),
+            average_latency_ms: average_latency_ms.map(|value| value.max(0.0).round() as u64),
+        })
+    }
+
+    fn client_health(&self, client_id: &str, enabled: bool) -> Result<ApiClientHealth> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT started_at, outcome FROM api_requests WHERE client_id = ?1 ORDER BY started_at DESC LIMIT 50",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map(params![client_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(database_error)?;
+        let mut last_request_at = None;
+        let mut last_success_at = None;
+        let mut last_failure_at = None;
+        let mut consecutive_failures = 0;
+        for row in rows {
+            let (started_at, outcome) = row.map_err(database_error)?;
+            let parsed = parse_timestamp(&started_at)?;
+            if last_request_at.is_none() {
+                last_request_at = Some(parsed);
+            }
+            if outcome == "succeeded" || outcome == "local" {
+                if last_success_at.is_none() {
+                    last_success_at = Some(parsed);
+                }
+                break;
+            }
+            if outcome != "processing" {
+                if last_failure_at.is_none() {
+                    last_failure_at = Some(parsed);
+                }
+                consecutive_failures += 1;
+            }
+        }
+        let status = if !enabled {
+            "disabled"
+        } else if consecutive_failures >= 3 {
+            "degraded"
+        } else if last_request_at.is_some() {
+            "healthy"
+        } else {
+            "idle"
+        };
+        Ok(ApiClientHealth {
+            status: status.to_string(),
+            last_request_at,
+            last_success_at,
+            last_failure_at,
+            consecutive_failures,
+        })
     }
 
     fn connection(&self) -> Result<Connection> {
@@ -479,7 +732,38 @@ fn api_client_from_row(row: &Row<'_>) -> rusqlite::Result<ApiClient> {
             .map(|value| parse_timestamp_sql(6, value))
             .transpose()?,
         request_count: row.get(7)?,
+        usage: ApiClientUsage::default(),
+        health: ApiClientHealth::default(),
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Period {
+    Today,
+    Week,
+    Month,
+}
+
+fn period_start(period: Period) -> String {
+    let today = Local::now().date_naive();
+    let date = match period {
+        Period::Today => today,
+        Period::Week => today - Duration::days(i64::from(today.weekday().num_days_from_monday())),
+        Period::Month => today.with_day(1).unwrap_or(today),
+    };
+    let local = date
+        .and_time(NaiveTime::MIN)
+        .and_local_timezone(Local)
+        .single()
+        .unwrap_or_else(|| Local::now());
+    timestamp(local.with_timezone(&Utc))
+}
+
+fn percentage(successful: u64, total: u64) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    ((successful.saturating_mul(100) / total).min(100)) as u8
 }
 
 fn api_request_from_row(row: &Row<'_>) -> rusqlite::Result<ApiRequestLog> {
@@ -680,5 +964,79 @@ mod tests {
         assert!(store
             .model_cooldown_active("provider-a", "gpt-test")
             .expect("active"));
+    }
+
+    #[test]
+    fn client_calendar_usage_and_affinity_survive_store_reopen() {
+        let (_temp, store) = test_store();
+        let created = store
+            .create_client(ApiClientCreate {
+                name: "Automation".into(),
+                allowed_models: Vec::new(),
+            })
+            .expect("client");
+        for (index, outcome) in ["succeeded", "failed", "local"].iter().enumerate() {
+            let request_id = format!("period-{index}");
+            store
+                .record_request_start(RequestLogStart {
+                    request_id: &request_id,
+                    method: "POST",
+                    path: "/v1/responses",
+                    model: Some("gpt-test"),
+                    client_id: Some(&created.client.id),
+                })
+                .expect("start");
+            store
+                .record_request_finish(RequestLogFinish {
+                    request_id: &request_id,
+                    provider_id: Some("provider-a"),
+                    status_code: Some(if *outcome == "failed" { 500 } else { 200 }),
+                    outcome,
+                    attempts: 1,
+                    latency_ms: 30,
+                    error: None,
+                })
+                .expect("finish");
+        }
+        store
+            .bind_affinity("session-hash", "provider-a")
+            .expect("affinity");
+
+        let reopened = ApiServiceStore {
+            path: store.path.clone(),
+        };
+        let snapshot = reopened.snapshot(10).expect("snapshot");
+        let client = &snapshot.clients[0];
+        assert_eq!(client.usage.today.requests, 3);
+        assert_eq!(client.usage.today.succeeded, 2);
+        assert_eq!(client.usage.today.failed, 1);
+        assert_eq!(client.usage.today.success_rate, 66);
+        assert_eq!(snapshot.affinity_bindings, 1);
+        assert_eq!(
+            reopened
+                .preferred_affinity("session-hash", 3600)
+                .expect("preferred")
+                .as_deref(),
+            Some("provider-a")
+        );
+    }
+
+    #[test]
+    fn chat_history_survives_store_reopen() {
+        let (_temp, store) = test_store();
+        let messages = serde_json::json!([{"role":"user","content":"hello"}]);
+        let tools = serde_json::json!({"chatTools":[],"specs":[]});
+        store
+            .store_chat_history("provider-a", "resp-a", &messages, &tools)
+            .expect("store");
+        let reopened = ApiServiceStore {
+            path: store.path.clone(),
+        };
+        let (stored_messages, stored_tools) = reopened
+            .load_chat_history("provider-a", "resp-a")
+            .expect("load")
+            .expect("entry");
+        assert_eq!(stored_messages, messages);
+        assert_eq!(stored_tools, tools);
     }
 }

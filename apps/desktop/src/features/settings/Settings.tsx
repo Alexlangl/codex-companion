@@ -1,6 +1,6 @@
 import * as Select from "@radix-ui/react-select";
 import { Cable, Download, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
-import { Button, Field, Panel } from "../../components/ui";
+import { Badge, Button, Field, Panel } from "../../components/ui";
 import { compactPath } from "../../lib/format";
 import type { BusyState, CompanionStatus, ThemeMode } from "../../types/domain";
 import type { AppUpdateState, AppUpdaterController } from "./useAppUpdater";
@@ -107,7 +107,13 @@ export function Settings({
         </div>
         <dl className="details-grid details-top">
           <dt>数据目录</dt>
-          <dd>{compactPath(status.dataDir)}</dd>
+          <dd>
+            {compactPath(status.dataDir)} {status.dataRoots.companionIsolated ? <Badge tone="info">隔离</Badge> : null}
+          </dd>
+          <dt>会话目录</dt>
+          <dd>
+            {compactPath(status.codex.codexDir)} {status.dataRoots.codexIsolated ? <Badge tone="info">隔离</Badge> : null}
+          </dd>
           <dt>配置</dt>
           <dd>{compactPath(status.configPath)}</dd>
         </dl>

@@ -36,6 +36,13 @@ Download the file that matches your machine. `<version>` represents the release 
 | Linux | x64 | `Codex-Companion-<version>-linux-x64-appimage.AppImage` | `.deb` and `.rpm` are also published |
 | Linux | ARM64 | `Codex-Companion-<version>-linux-arm64-appimage.AppImage` | `.deb` and `.rpm` are also published |
 
+On macOS, the desktop app can also be installed or upgraded with Homebrew Cask:
+
+```bash
+brew install --cask Alexlangl/tap/codex-companion
+brew upgrade --cask Alexlangl/tap/codex-companion
+```
+
 Files ending in `.sig`, `latest.json`, and `*-updater.tar.gz` are used by desktop auto-update. They are not first-install packages and normally should not be opened manually.
 
 ### CLI and TUI
@@ -100,18 +107,12 @@ sha256sum "Codex-Companion-${VERSION}-linux-x64-appimage.AppImage"
 
 ### macOS: Developer Cannot Be Verified
 
-The current macOS bundles do not have a Developer ID or Apple notarization, so Gatekeeper may block the first launch. After verifying the source and SHA-256:
+The current macOS bundle is not notarized by Apple. After moving the app to `/Applications`, run:
 
-1. Try to open `Codex Companion` once so macOS records the block.
-2. Open `System Settings` → `Privacy & Security`.
-3. Scroll to `Security`, find the blocked Codex Companion entry, and click `Open Anyway`.
-4. Authenticate with your login password or Touch ID, then confirm `Open`.
-
-`Open Anyway` is normally available for about one hour after the failed launch. A company-managed Mac may prevent users from overriding the policy; contact your administrator in that case. Do not disable Gatekeeper globally, and do not bypass warnings for a file from an unknown source or with a mismatched SHA-256.
-
-Button labels can vary slightly between macOS versions. See Apple's official [Open a Mac app from an unknown developer](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac) guide for the current system instructions.
-
-If macOS explicitly says the app will damage your computer, reports malicious content, or says the file is damaged, do not treat it as a normal unidentified-developer warning. Download it again and verify the checksum; if it still happens, open an issue with the version and file hash.
+```bash
+xattr -dr com.apple.quarantine "/Applications/Codex Companion.app"
+open "/Applications/Codex Companion.app"
+```
 
 ### Windows: Windows Protected Your PC
 
@@ -372,7 +373,7 @@ The repository provides a `Release` GitHub Actions workflow. Open `Actions` → 
 
 The workflow builds desktop bundles for macOS Universal / Intel / Apple Silicon, Windows x64, and Linux x64 / ARM64, plus command-line archives containing both the CLI and TUI. It creates the GitHub Release only after every platform succeeds and includes `SHA256SUMS`.
 
-After a successful stable release, the workflow updates `Alexlangl/homebrew-tap`. The desktop app checks stable releases quietly at startup, lets the user choose `Update now` or `Later` when one is available, and also supports manual check, download, and restart installation from `Settings`; Tauri signatures protect update artifacts.
+After a successful stable release, the workflow updates both the CLI/TUI Formula and desktop Cask in `Alexlangl/homebrew-tap`. The desktop app checks stable releases quietly at startup, lets the user choose `Update now` or `Later` when one is available, and also supports manual check, download, and restart installation from `Settings`; Tauri signatures protect update artifacts.
 
 ## Update and Signing Boundaries
 

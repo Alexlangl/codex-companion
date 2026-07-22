@@ -1,6 +1,7 @@
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
-    default_codex_dir, CompanionStatus, ProviderConfig, ProviderGroup, RelayEvent, Result,
+    default_codex_dir, CompanionStatus, DataRootStatus, ProviderConfig, ProviderGroup, RelayEvent,
+    Result,
 };
 use codex_companion_provider::{active_group, selected_providers};
 use codex_companion_state::{doctor, install_companion_provider, uninstall_companion_provider};
@@ -20,6 +21,10 @@ impl CompanionDaemon {
             config,
             codex,
             recent_events: recent_events(self.store.data_dir()),
+            data_roots: DataRootStatus {
+                companion_isolated: non_empty_env("CODEX_COMPANION_HOME"),
+                codex_isolated: non_empty_env("CODEX_COMPANION_CODEX_DIR"),
+            },
         })
     }
 
@@ -45,6 +50,10 @@ impl CompanionDaemon {
         let config = self.store.load()?;
         doctor(codex_dir.unwrap_or(default_codex_dir()?), &config.relay)
     }
+}
+
+fn non_empty_env(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
 }
 
 fn recent_events(data_dir: PathBuf) -> Vec<RelayEvent> {

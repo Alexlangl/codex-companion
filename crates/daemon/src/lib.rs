@@ -5,6 +5,7 @@ mod launch;
 mod providers;
 mod repair;
 mod runtime;
+mod sessions;
 mod status;
 
 pub use launch::provider_can_direct_connect;

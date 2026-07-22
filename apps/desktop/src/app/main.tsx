@@ -3,7 +3,7 @@ import * as Progress from "@radix-ui/react-progress";
 import * as Tabs from "@radix-ui/react-tabs";
 import * as Toast from "@radix-ui/react-toast";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { Boxes, Command, Gauge, GitBranch, Hammer, LayoutDashboard, Moon, RadioTower, Settings as SettingsIcon, Sun, X } from "lucide-react";
+import { Boxes, Command, Gauge, GitBranch, Hammer, History, LayoutDashboard, Moon, RadioTower, Settings as SettingsIcon, Sun, X } from "lucide-react";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { Button, IconButton } from "../components/ui";
@@ -13,6 +13,7 @@ import { Providers } from "../features/providers/Providers";
 import { canDirectLaunch, directLaunchWritesAuthJson } from "../features/providers/provider-launch";
 import { Relay } from "../features/relay/Relay";
 import { Repair } from "../features/repair/Repair";
+import { Sessions } from "../features/sessions/Sessions";
 import { AppUpdatePrompt } from "../features/settings/AppUpdatePrompt";
 import { Settings } from "../features/settings/Settings";
 import { TokenStats } from "../features/token/TokenStats";
@@ -33,6 +34,7 @@ const pageTitles: Record<string, string> = {
   groups: "分组",
   relay: "转发",
   token: "用量",
+  sessions: "会话",
   repair: "修复",
   settings: "设置",
 };
@@ -93,6 +95,7 @@ function App() {
                   <Tab value="groups" icon={<GitBranch size={16} />} label="分组" />
                   <Tab value="relay" icon={<RadioTower size={16} />} label="转发" />
                   <Tab value="token" icon={<Gauge size={16} />} label="用量" />
+                  <Tab value="sessions" icon={<History size={16} />} label="会话" />
                   <Tab value="repair" icon={<Hammer size={16} />} label="修复" />
                   <Tab value="settings" icon={<SettingsIcon size={16} />} label="设置" />
                 </Tabs.List>
@@ -160,6 +163,9 @@ function App() {
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="token">
                   <TokenStats active={activeTab === "token"} status={status} onLoad={actions.loadTokenUsage} />
+                </Tabs.Content>
+                <Tabs.Content className="tabs-content" value="sessions">
+                  <Sessions active={activeTab === "sessions"} status={status} />
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="repair">
                   <Repair outcome={repairOutcome} status={status} onRepair={actions.repair} />

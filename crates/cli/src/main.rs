@@ -43,7 +43,8 @@ enum Command {
         command: GroupCommand,
     },
     Repair(RepairArgs),
-    TokenStats(PathOpt),
+    TokenStats(TokenStatsArgs),
+    Sessions(SessionsArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -135,6 +136,34 @@ enum GroupCommand {
 struct PathOpt {
     #[arg(long)]
     codex_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct TokenStatsArgs {
+    #[arg(long)]
+    codex_dir: Option<PathBuf>,
+    #[arg(long)]
+    start_date: Option<String>,
+    #[arg(long)]
+    end_date: Option<String>,
+    #[arg(long)]
+    provider: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    rebuild: bool,
+}
+
+#[derive(Debug, Args)]
+struct SessionsArgs {
+    #[arg(long)]
+    codex_dir: Option<PathBuf>,
+    #[arg(long)]
+    query: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: usize,
+    #[arg(long)]
+    rebuild: bool,
 }
 
 #[derive(Debug, Args)]
@@ -392,7 +421,26 @@ async fn main() -> anyhow::Result<()> {
                 Some(path) => path,
                 None => default_codex_dir()?,
             };
-            print_json(daemon.token_usage(codex_dir)?)?;
+            print_json(daemon.token_usage_filtered(
+                codex_dir,
+                args.start_date.as_deref(),
+                args.end_date.as_deref(),
+                args.provider.as_deref(),
+                args.model.as_deref(),
+                args.rebuild,
+            )?)?;
+        }
+        Command::Sessions(args) => {
+            let codex_dir = match args.codex_dir {
+                Some(path) => path,
+                None => default_codex_dir()?,
+            };
+            print_json(daemon.session_page(
+                codex_dir,
+                args.query.as_deref(),
+                args.limit,
+                args.rebuild,
+            )?)?;
         }
     }
 

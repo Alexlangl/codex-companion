@@ -250,6 +250,38 @@ pub struct ApiClient {
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub request_count: u64,
+    #[serde(default)]
+    pub usage: ApiClientUsage,
+    #[serde(default)]
+    pub health: ApiClientHealth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiClientUsage {
+    pub today: ApiClientPeriodUsage,
+    pub week: ApiClientPeriodUsage,
+    pub month: ApiClientPeriodUsage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiClientPeriodUsage {
+    pub requests: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub success_rate: u8,
+    pub average_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiClientHealth {
+    pub status: String,
+    pub last_request_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_failure_at: Option<DateTime<Utc>>,
+    pub consecutive_failures: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +342,20 @@ pub struct ApiServiceSnapshot {
     pub clients: Vec<ApiClient>,
     pub recent_requests: Vec<ApiRequestLog>,
     pub model_cooldowns: Vec<ModelCooldown>,
+    #[serde(default)]
+    pub affinity_bindings: u64,
+    #[serde(default)]
+    pub pool_health: ApiPoolHealth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPoolHealth {
+    pub total: usize,
+    pub enabled: usize,
+    pub healthy: usize,
+    pub degraded: usize,
+    pub cooldown: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +367,54 @@ pub struct ApiServiceSelfTest {
     pub database_ok: bool,
     pub listener_ok: bool,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRefreshProgress {
+    pub active: bool,
+    pub completed: usize,
+    pub total: usize,
+    pub current_provider_id: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageSyncStatus {
+    pub active: bool,
+    pub scanned_files: usize,
+    pub total_files: usize,
+    pub phase: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    pub model: String,
+    pub provider_id: Option<String>,
+    pub path: PathBuf,
+    pub modified_at: DateTime<Utc>,
+    pub bytes: u64,
+    pub is_subagent: bool,
+    pub parent_id: Option<String>,
+    pub is_running: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPage {
+    pub sessions: Vec<SessionSummary>,
+    pub total: usize,
+    pub query: String,
+    pub from_cache: bool,
+    pub data_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,6 +485,14 @@ pub struct CompanionStatus {
     pub active_providers: Vec<ProviderConfig>,
     pub codex: CodexInstallStatus,
     pub recent_events: Vec<RelayEvent>,
+    pub data_roots: DataRootStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DataRootStatus {
+    pub companion_isolated: bool,
+    pub codex_isolated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +554,8 @@ pub struct TokenUsageSummary {
     pub unpriced_models: Vec<String>,
     pub pricing_as_of: String,
     pub pricing_override_path: Option<PathBuf>,
+    pub available_providers: Vec<String>,
+    pub available_models: Vec<String>,
     pub by_day: Vec<TokenUsageBucket>,
     pub by_model: Vec<TokenUsageBucket>,
     pub by_provider: Vec<TokenUsageBucket>,
@@ -498,6 +602,7 @@ impl Default for TokenCostBreakdown {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsageEvent {
+    pub event_id: Option<String>,
     pub timestamp: Option<String>,
     pub session_id: Option<String>,
     pub model: String,

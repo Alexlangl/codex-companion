@@ -1,4 +1,5 @@
 mod pricing;
+mod session_index;
 mod token_usage;
 
 use chrono::Local;
@@ -25,7 +26,12 @@ const COMPANION_MARKER_TABLE: &str = "codex_companion";
 const COMPANION_MARKER_VERSION: i64 = 1;
 const REPAIR_BACKUP_RETENTION: usize = 10;
 
-pub use token_usage::{collect_token_usage, collect_token_usage_cached};
+pub use session_index::list_sessions_cached;
+pub use token_usage::{
+    collect_token_usage, collect_token_usage_cached, collect_token_usage_cached_in_range,
+    collect_token_usage_cached_with_filters, rebuild_token_usage_cached_with_filters,
+    token_usage_sync_status, TokenUsageDateRange, TokenUsageFilters,
+};
 
 #[derive(Debug, Clone, Default)]
 struct SessionMetadata {

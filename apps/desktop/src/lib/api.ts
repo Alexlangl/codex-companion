@@ -6,6 +6,7 @@ import type {
   ApiClientUpdate,
   ApiServiceSelfTest,
   ApiServiceSnapshot,
+  ProviderRefreshProgress,
   ApiKeyProviderUpdate,
   AppSettings,
   CodexLaunchOutcome,
@@ -25,7 +26,9 @@ import type {
   RepairOutcome,
   RelayConfig,
   RelaySettingsUpdate,
+  SessionPage,
   ThemeMode,
+  TokenUsageQuery,
 } from "../types/domain";
 import { isGenericOfficialAccountName } from "./provider-display";
 import { extractQuotaWindows, findNumber, findString, isApiKeyJson, lowestQuotaPercent, providerNameFromBaseUrl } from "./provider-json";
@@ -49,6 +52,62 @@ export function getApiServiceSnapshot() {
   return invoke<ApiServiceSnapshot>("get_api_service_snapshot");
 }
 
+export function getProviderRefreshProgress() {
+  if (!isTauri()) {
+    return Promise.resolve<ProviderRefreshProgress>({
+      active: false,
+      completed: 0,
+      total: 0,
+      currentProviderId: null,
+      startedAt: null,
+      finishedAt: null,
+      lastError: null,
+    });
+  }
+  return invoke<ProviderRefreshProgress>("get_provider_refresh_progress");
+}
+
+export function getSessionPage(
+  codexDir?: string,
+  options: { query?: string; limit?: number; rebuild?: boolean } = {},
+) {
+  if (!isTauri()) {
+    const sessions = [
+      {
+        id: "019f7dcb-642d-70c2-a12d-19d7e603a8c0",
+        title: "完善 Codex Companion 发布和用量能力",
+        model: "gpt-5.6-codex",
+        providerId: "official-team",
+        path: `${MOCK_CODEX_DIR}/sessions/2026/07/22/rollout-demo.jsonl`,
+        modifiedAt: new Date().toISOString(),
+        bytes: 182_400,
+        isSubagent: false,
+        parentId: null,
+        isRunning: true,
+      },
+    ];
+    const query = options.query?.trim().toLowerCase() ?? "";
+    const filtered = sessions.filter((session) => {
+      if (!query) return true;
+      return [session.id, session.title, session.model, session.providerId]
+        .some((value) => value.toLowerCase().includes(query));
+    });
+    return Promise.resolve<SessionPage>({
+      sessions: filtered.slice(0, options.limit ?? 50),
+      total: filtered.length,
+      query: options.query?.trim() ?? "",
+      fromCache: !options.rebuild,
+      dataRoot: codexDir?.trim() || MOCK_CODEX_DIR,
+    });
+  }
+  return invoke<SessionPage>("get_session_page", {
+    codexDir: emptyToNull(codexDir),
+    query: emptyToNull(options.query),
+    limit: options.limit ?? 50,
+    rebuild: options.rebuild ?? false,
+  });
+}
+
 export function createApiClient(input: ApiClientCreate) {
   if (!isTauri()) {
     const now = new Date().toISOString();
@@ -62,6 +121,8 @@ export function createApiClient(input: ApiClientCreate) {
       createdAt: now,
       lastUsedAt: null,
       requestCount: 0,
+      usage: emptyApiClientUsage(),
+      health: { status: "idle", lastRequestAt: null, lastSuccessAt: null, lastFailureAt: null, consecutiveFailures: 0 },
     };
     mockApiService = { ...mockApiService, clients: [client, ...mockApiService.clients] };
     return Promise.resolve<ApiClientSecret>({ client, apiKey });
@@ -1050,8 +1111,8 @@ export function resetAppSettings() {
   return invoke<AppSettings>("reset_app_settings");
 }
 
-export function getTokenUsage(codexDir?: string) {
-  return getTokenUsageFromRuntime(codexDir);
+export function getTokenUsage(codexDir?: string, query?: TokenUsageQuery) {
+  return getTokenUsageFromRuntime(codexDir, query);
 }
 
 function emptyToNull(value?: string) {
@@ -1219,6 +1280,52 @@ function recordMockCodexLaunch(mode: CodexLaunchOutcome["mode"], targetProviderI
 
 function createMockStatus(): CompanionStatus {
   const app = readStoredAppSettings();
+  const providers: Record<string, ProviderConfig> = {
+    "official-team": {
+      id: "official-team",
+      name: "Official Codex",
+      kind: "official_codex",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      authRef: `file:${MOCK_DATA_DIR}/auth/official-team.json`,
+      directAuthRef: null,
+      modelMap: {},
+      priority: 100,
+      enabled: true,
+      refreshIntervalSeconds: 300,
+      account: {
+        displayName: "alex@example.com",
+        email: "alex@example.com",
+        subscriptionType: "Plus",
+        subscriptionStatus: "可用",
+      },
+    },
+    "backup-api": {
+      id: "backup-api",
+      name: "Backup API",
+      kind: "openai_compatible",
+      baseUrl: "https://api.openai.com/v1",
+      authRef: "env:OPENAI_API_KEY",
+      directAuthRef: "env:OPENAI_API_KEY",
+      modelMap: {},
+      priority: 90,
+      enabled: true,
+      refreshIntervalSeconds: 300,
+      account: {
+        displayName: "Backup API",
+        subscriptionType: "API Key",
+        subscriptionStatus: "可用",
+      },
+    },
+  };
+  const healthy = {
+    status: "healthy",
+    lastChecked: new Date().toISOString(),
+    lastSuccess: new Date().toISOString(),
+    lastError: null,
+    lastFailureKind: null,
+    cooldownUntil: null,
+    failureCount: 0,
+  };
   return syncMockDerived({
     config: {
       relay: {
@@ -1231,17 +1338,20 @@ function createMockStatus(): CompanionStatus {
         sessionAffinityTtlSeconds: 3600,
         requestLogRetentionDays: 30,
       },
-      providers: {},
+      providers,
       groups: {
         default: {
           id: "default",
           name: "Default",
           policy: "priority_fallback",
-          providerOrder: [],
+          providerOrder: ["official-team", "backup-api"],
           fallbackEnabled: true,
         },
       },
-      health: {},
+      health: {
+        "official-team": healthy,
+        "backup-api": healthy,
+      },
       app,
     },
     dataDir: MOCK_DATA_DIR,
@@ -1258,6 +1368,10 @@ function createMockStatus(): CompanionStatus {
       message: "Codex 配置存在，但尚未设置 model_provider",
     },
     recentEvents: [],
+    dataRoots: {
+      companionIsolated: false,
+      codexIsolated: false,
+    },
   });
 }
 
@@ -1274,6 +1388,12 @@ function createMockApiServiceSnapshot(): ApiServiceSnapshot {
         createdAt: new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString(),
         lastUsedAt: new Date(now - 90 * 1000).toISOString(),
         requestCount: 128,
+        usage: {
+          today: { requests: 12, succeeded: 11, failed: 1, successRate: 91, averageLatencyMs: 842 },
+          week: { requests: 48, succeeded: 46, failed: 2, successRate: 95, averageLatencyMs: 910 },
+          month: { requests: 128, succeeded: 123, failed: 5, successRate: 96, averageLatencyMs: 980 },
+        },
+        health: { status: "healthy", lastRequestAt: new Date(now - 90 * 1000).toISOString(), lastSuccessAt: new Date(now - 90 * 1000).toISOString(), lastFailureAt: null, consecutiveFailures: 0 },
       },
     ],
     recentRequests: [
@@ -1309,6 +1429,16 @@ function createMockApiServiceSnapshot(): ApiServiceSnapshot {
       },
     ],
     modelCooldowns: [],
+    affinityBindings: 2,
+    poolHealth: { total: 2, enabled: 2, healthy: 2, degraded: 0, cooldown: 0 },
+  };
+}
+
+function emptyApiClientUsage() {
+  return {
+    today: { requests: 0, succeeded: 0, failed: 0, successRate: 0, averageLatencyMs: null },
+    week: { requests: 0, succeeded: 0, failed: 0, successRate: 0, averageLatencyMs: null },
+    month: { requests: 0, succeeded: 0, failed: 0, successRate: 0, averageLatencyMs: null },
   };
 }
 

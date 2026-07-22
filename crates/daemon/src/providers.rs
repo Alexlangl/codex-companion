@@ -1,3 +1,6 @@
+use crate::health_loop::{
+    begin_refresh, finish_refresh, mark_refresh_provider, refresh_coordinator,
+};
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{ProviderConfig, ProviderHealth, ProviderKind, Result};
 use codex_companion_provider::{
@@ -94,10 +97,16 @@ impl CompanionDaemon {
     }
 
     pub async fn refresh_provider(&self, id: &str) -> Result<ProviderHealth> {
-        refresh_provider_status(&self.store, id).await
+        let _guard = refresh_coordinator().lock().await;
+        begin_refresh(&self.store, &[id.to_string()]);
+        mark_refresh_provider(&self.store, id, 0);
+        let result = refresh_provider_status(&self.store, id).await;
+        finish_refresh(&self.store, result.as_ref().err().map(ToString::to_string));
+        result
     }
 
     pub async fn refresh_all_providers(&self) -> Result<Vec<ProviderHealth>> {
+        let _guard = refresh_coordinator().lock().await;
         let ids = self
             .store
             .load()?
@@ -105,10 +114,20 @@ impl CompanionDaemon {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        begin_refresh(&self.store, &ids);
         let mut output = Vec::new();
-        for id in ids {
-            output.push(refresh_provider_status(&self.store, &id).await?);
+        let mut first_error = None;
+        for (index, id) in ids.iter().enumerate() {
+            mark_refresh_provider(&self.store, id, index);
+            match refresh_provider_status(&self.store, id).await {
+                Ok(health) => output.push(health),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+            mark_refresh_provider(&self.store, id, index + 1);
         }
-        Ok(output)
+        finish_refresh(&self.store, first_error.as_ref().map(ToString::to_string));
+        first_error.map_or(Ok(output), Err)
     }
 }

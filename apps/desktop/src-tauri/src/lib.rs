@@ -26,6 +26,12 @@ fn get_api_service_snapshot() -> Result<codex_companion_core::ApiServiceSnapshot
 }
 
 #[tauri::command]
+fn get_provider_refresh_progress() -> Result<codex_companion_core::ProviderRefreshProgress, String>
+{
+    Ok(daemon()?.provider_refresh_progress())
+}
+
+#[tauri::command]
 fn create_api_client(
     input: ApiClientCreate,
 ) -> Result<codex_companion_core::ApiClientSecret, String> {
@@ -306,6 +312,11 @@ fn reset_app_settings() -> Result<codex_companion_core::AppSettings, String> {
 #[tauri::command]
 async fn get_token_usage(
     codex_dir: Option<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    provider_id: Option<String>,
+    model: Option<String>,
+    rebuild: Option<bool>,
 ) -> Result<codex_companion_core::TokenUsageSummary, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let codex_dir = match codex_dir.filter(|value| !value.trim().is_empty()) {
@@ -313,7 +324,44 @@ async fn get_token_usage(
             None => default_codex_dir().map_err(|error| error.to_string())?,
         };
         daemon()?
-            .token_usage(codex_dir)
+            .token_usage_filtered(
+                codex_dir,
+                start_date.as_deref(),
+                end_date.as_deref(),
+                provider_id.as_deref(),
+                model.as_deref(),
+                rebuild.unwrap_or(false),
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn get_token_usage_sync_status() -> Result<codex_companion_core::TokenUsageSyncStatus, String> {
+    Ok(daemon()?.token_usage_sync_status())
+}
+
+#[tauri::command]
+async fn get_session_page(
+    codex_dir: Option<String>,
+    query: Option<String>,
+    limit: Option<usize>,
+    rebuild: Option<bool>,
+) -> Result<codex_companion_core::SessionPage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let codex_dir = match codex_dir.filter(|value| !value.trim().is_empty()) {
+            Some(value) => PathBuf::from(value),
+            None => default_codex_dir().map_err(|error| error.to_string())?,
+        };
+        daemon()?
+            .session_page(
+                codex_dir,
+                query.as_deref(),
+                limit.unwrap_or(50),
+                rebuild.unwrap_or(false),
+            )
             .map_err(|error| error.to_string())
     })
     .await
@@ -356,6 +404,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_api_service_snapshot,
+            get_provider_refresh_progress,
             create_api_client,
             update_api_client,
             rotate_api_client_key,
@@ -386,7 +435,9 @@ pub fn run() {
             set_preserve_official_codex_auth,
             set_provider_launch_mode,
             reset_app_settings,
-            get_token_usage
+            get_token_usage,
+            get_token_usage_sync_status,
+            get_session_page
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex Companion");

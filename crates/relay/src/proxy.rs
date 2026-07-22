@@ -140,6 +140,8 @@ async fn proxy_dispatch(
             return Ok(api_error_response(status, "invalid_api_key", &message));
         }
     };
+    let affinity_key = affinity_key
+        .map(|key| scoped_affinity_key(&key, client.as_ref().map(|client| client.id.as_str())));
     record_request_start(
         &state,
         request_id,
@@ -294,6 +296,7 @@ async fn proxy_dispatch(
         let upstream = upstream_url(&provider, &uri);
         match send_upstream(
             &state.client,
+            &state.api_service,
             &provider,
             &method,
             &uri,
@@ -732,6 +735,10 @@ fn hash_affinity_key(value: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+fn scoped_affinity_key(key: &str, client_id: Option<&str>) -> String {
+    hash_affinity_key(&format!("client:{}:{key}", client_id.unwrap_or("local")))
+}
+
 fn normalize_health(config: &mut CompanionConfig) {
     for health in config.health.values_mut() {
         normalize_expired_cooldown(health);
@@ -1059,6 +1066,19 @@ mod tests {
         assert!(
             request_affinity_key(&HeaderMap::new(), br#"{"previous_response_id":"resp-1"}"#,)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn affinity_key_is_isolated_per_api_client() {
+        let raw = hash_affinity_key("session:shared");
+        assert_ne!(
+            scoped_affinity_key(&raw, Some("client-a")),
+            scoped_affinity_key(&raw, Some("client-b"))
+        );
+        assert_eq!(
+            scoped_affinity_key(&raw, Some("client-a")),
+            scoped_affinity_key(&raw, Some("client-a"))
         );
     }
 

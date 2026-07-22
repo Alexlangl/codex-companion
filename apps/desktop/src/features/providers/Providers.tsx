@@ -17,8 +17,9 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import { Button, Field, Panel } from "../../components/ui";
+import { getProviderRefreshProgress } from "../../lib/api";
 import { providerKindLabel } from "../../lib/format";
 import { providerAccountTitle } from "../../lib/provider-display";
 import type {
@@ -29,6 +30,7 @@ import type {
   ProviderExportFormat,
   ProviderExportOutput,
   ProviderLaunchMode,
+  ProviderRefreshProgress,
   ProviderViewMode,
 } from "../../types/domain";
 import { ProviderCard, ProviderCompactItem } from "./ProviderCards";
@@ -82,6 +84,7 @@ export function Providers({
   const [pastedJson, setPastedJson] = useState("");
   const [addOpen, setAddOpen] = useState(false);
   const [apiKeyError, setApiKeyError] = useState("");
+  const [refreshProgress, setRefreshProgress] = useState<ProviderRefreshProgress | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const exportRequestRef = useRef(0);
   const disabled = busy !== "idle";
@@ -93,6 +96,28 @@ export function Providers({
     ...jsonFiles,
     ...(pastedJson.trim() ? [{ name: "粘贴的 JSON", text: pastedJson.trim() }] : []),
   ];
+
+  useEffect(() => {
+    if (busy !== "testing") {
+      setRefreshProgress(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = async (): Promise<void> => {
+      try {
+        const progress = await getProviderRefreshProgress();
+        if (!cancelled) setRefreshProgress(progress);
+      } catch {
+        if (!cancelled) setRefreshProgress(null);
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 300);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [busy]);
 
   async function submitApiKey(event: FormEvent) {
     event.preventDefault();
@@ -262,6 +287,15 @@ export function Providers({
             </button>
           </div>
         </div>
+        {refreshProgress?.active ? (
+          <div className="provider-refresh-progress" aria-live="polite">
+            <progress max={Math.max(1, refreshProgress.total)} value={refreshProgress.completed} />
+            <span>
+              {refreshProgress.completed}/{refreshProgress.total}
+              {refreshProgress.currentProviderId ? ` · ${refreshProgress.currentProviderId}` : ""}
+            </span>
+          </div>
+        ) : null}
 
         {providers.length === 0 ? (
           <p className="empty">添加账号后，可以直接启动单个账号，也可以把多个账号编排成分组。</p>

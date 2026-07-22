@@ -36,6 +36,13 @@
 | Linux | x64 | `Codex-Companion-<version>-linux-x64-appimage.AppImage` | 同时提供 `.deb` 和 `.rpm` |
 | Linux | ARM64 | `Codex-Companion-<version>-linux-arm64-appimage.AppImage` | 同时提供 `.deb` 和 `.rpm` |
 
+macOS 也可以通过 Homebrew Cask 安装或升级桌面 App：
+
+```bash
+brew install --cask Alexlangl/tap/codex-companion
+brew upgrade --cask Alexlangl/tap/codex-companion
+```
+
 Release 中的 `.sig`、`latest.json` 和 `*-updater.tar.gz` 是桌面自动更新使用的文件，普通用户首次安装时不需要手动打开。
 
 ### CLI 和 TUI
@@ -100,18 +107,12 @@ sha256sum "Codex-Companion-${VERSION}-linux-x64-appimage.AppImage"
 
 ### macOS：无法验证开发者或无法检查恶意软件
 
-当前 macOS 包没有 Developer ID 和 Apple notarization，因此 Gatekeeper 可能阻止首次打开。确认下载来源和 SHA-256 后：
+当前 macOS 包尚未经过 Apple 公证。将 App 拖入 `/Applications` 后运行：
 
-1. 先尝试打开一次 `Codex Companion`，让系统记录拦截。
-2. 打开 `系统设置` → `隐私与安全性`。
-3. 滚动到 `安全性`，找到刚被拦截的 Codex Companion，点击 `仍要打开`。
-4. 使用登录密码或 Touch ID 确认，然后再次选择 `打开`。
-
-`仍要打开` 通常只会在首次尝试后的约一小时内出现。受公司 MDM 管理的 Mac 可能不允许用户放行，此时请联系管理员。不要全局关闭 Gatekeeper，也不要对来源不明或 SHA-256 不匹配的文件执行绕过命令。
-
-不同 macOS 版本的按钮文字可能略有差异，可同时参考 [Apple 官方的“打开来自未知开发者的 Mac App”说明](https://support.apple.com/zh-cn/guide/mac-help/mh40616/mac)。
-
-如果 macOS 明确提示“将损坏你的电脑”、文件已损坏或检测到恶意内容，不要按普通“未知开发者”处理：重新下载并校验；仍然出现时请保留版本号和文件哈希提交 Issue。
+```bash
+xattr -dr com.apple.quarantine "/Applications/Codex Companion.app"
+open "/Applications/Codex Companion.app"
+```
 
 ### Windows：Windows 已保护你的电脑
 
@@ -372,7 +373,7 @@ cargo build --release -p codex-companion-cli -p codex-companion-tui
 
 工作流会构建 macOS Universal / Intel / Apple Silicon、Windows x64、Linux x64 / ARM64 桌面安装包，以及包含 CLI 和 TUI 的命令行压缩包。全部平台成功后才会创建对应 GitHub Release，并附带 `SHA256SUMS`。
 
-稳定版 Release 成功后会自动更新 `Alexlangl/homebrew-tap`。桌面端启动时会静默检查稳定版本，发现更新后由用户选择“立即更新”或“稍后”，也可以在 `设置` 中手动检查、下载并重启安装；更新包使用 Tauri 签名校验。
+稳定版 Release 成功后会自动更新 `Alexlangl/homebrew-tap` 中的 CLI/TUI Formula 和桌面 Cask。桌面端启动时会静默检查稳定版本，发现更新后由用户选择“立即更新”或“稍后”，也可以在 `设置` 中手动检查、下载并重启安装；更新包使用 Tauri 签名校验。
 
 ## 更新与签名边界
 

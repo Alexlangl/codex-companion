@@ -13,6 +13,7 @@ use codex_companion_health::{classify_failure, mark_failure};
 use codex_companion_provider::{ensure_codex_auth_snapshot, resolve_auth_token};
 use futures_util::{stream, Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::pin::Pin;
@@ -55,6 +56,7 @@ enum ResponseTransform {
 
 pub(crate) async fn send_upstream(
     client: &reqwest::Client,
+    api_service: &ApiServiceStore,
     provider: &ProviderConfig,
     method: &Method,
     uri: &Uri,
@@ -123,10 +125,11 @@ pub(crate) async fn send_upstream(
     let body = rewrite_model(provider, body);
     let (body, tool_context, chat_messages) =
         if transform == ResponseTransform::ChatCompletionsToResponses {
-            responses_body_to_chat_completions(
+            responses_body_to_chat_completions_with_store(
                 body,
                 &provider.id,
                 provider_supports_chat_prompt_cache_key(provider),
+                Some(api_service),
             )
         } else {
             (body, ChatToolContext::default(), Vec::new())
@@ -414,12 +417,14 @@ pub(crate) async fn stream_response(
             })
         });
         let converted = chat_json_to_responses_json(value.clone(), &tool_context);
+        let api_service = ApiServiceStore::from_config_store(&store);
         store_non_stream_chat_history(
             &provider_id,
             &converted,
             &value,
             &tool_context,
             &chat_messages,
+            Some(&api_service),
         );
         let body = converted.to_string();
         return Response::builder()
@@ -900,6 +905,80 @@ impl ChatToolContext {
         context
     }
 
+    fn to_persisted(&self) -> Value {
+        let specs = self
+            .chat_name_to_spec
+            .iter()
+            .map(|(chat_name, spec)| {
+                json!({
+                    "chatName": chat_name,
+                    "kind": match spec.kind {
+                        ChatToolKind::Function => "function",
+                        ChatToolKind::Namespace => "namespace",
+                        ChatToolKind::Custom => "custom",
+                        ChatToolKind::ToolSearch => "tool_search",
+                    },
+                    "name": spec.name,
+                    "namespace": spec.namespace,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({ "chatTools": self.chat_tools, "specs": specs })
+    }
+
+    fn from_persisted(value: &Value) -> Self {
+        let mut context = Self::default();
+        let tools = value
+            .get("chatTools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let specs = value
+            .get("specs")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for spec in specs {
+            let Some(chat_name) = spec.get("chatName").and_then(Value::as_str) else {
+                continue;
+            };
+            let kind = match spec.get("kind").and_then(Value::as_str) {
+                Some("custom") => ChatToolKind::Custom,
+                Some("namespace") => ChatToolKind::Namespace,
+                Some("tool_search") => ChatToolKind::ToolSearch,
+                _ => ChatToolKind::Function,
+            };
+            let name = spec
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(chat_name)
+                .to_string();
+            let namespace = spec
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let chat_tool = tools
+                .iter()
+                .find(|tool| {
+                    tool.pointer("/function/name").and_then(Value::as_str) == Some(chat_name)
+                })
+                .cloned()
+                .unwrap_or_else(
+                    || json!({ "type": "function", "function": { "name": chat_name } }),
+                );
+            context.add_chat_tool(
+                chat_name.to_string(),
+                ChatToolSpec {
+                    kind,
+                    name,
+                    namespace,
+                },
+                chat_tool,
+            );
+        }
+        context
+    }
+
     fn merge_missing_from(&mut self, previous: &Self) {
         for chat_tool in &previous.chat_tools {
             let Some(chat_name) = chat_tool.pointer("/function/name").and_then(Value::as_str)
@@ -1072,6 +1151,15 @@ struct ChatHistoryEntry {
     tool_context: ChatToolContext,
 }
 
+impl ChatHistoryEntry {
+    fn from_persisted(messages: Value, tool_context: Value) -> Option<Self> {
+        Some(Self {
+            messages: messages.as_array()?.clone(),
+            tool_context: ChatToolContext::from_persisted(&tool_context),
+        })
+    }
+}
+
 #[derive(Debug, Default)]
 struct ChatHistoryStore {
     entries: HashMap<String, ChatHistoryEntry>,
@@ -1084,20 +1172,51 @@ fn chat_history_key(provider_id: &str, response_id: &str) -> String {
     format!("{provider_id}:{response_id}")
 }
 
-fn load_chat_history(provider_id: &str, response_id: &str) -> Option<ChatHistoryEntry> {
+fn load_chat_history(
+    provider_id: &str,
+    response_id: &str,
+    persistent: Option<&ApiServiceStore>,
+) -> Option<ChatHistoryEntry> {
     let store = CHAT_HISTORY.get_or_init(|| Mutex::new(ChatHistoryStore::default()));
-    store
+    let cached = store
         .lock()
         .ok()?
         .entries
         .get(&chat_history_key(provider_id, response_id))
-        .cloned()
+        .cloned();
+    if cached.is_some() {
+        return cached;
+    }
+    let (messages, tool_context) = persistent?
+        .load_chat_history(provider_id, response_id)
+        .ok()
+        .flatten()?;
+    let entry = ChatHistoryEntry::from_persisted(messages, tool_context)?;
+    cache_chat_history(provider_id, response_id, entry.clone());
+    Some(entry)
 }
 
-fn store_chat_history(provider_id: &str, response_id: &str, entry: ChatHistoryEntry) {
+fn store_chat_history(
+    provider_id: &str,
+    response_id: &str,
+    entry: ChatHistoryEntry,
+    persistent: Option<&ApiServiceStore>,
+) {
     if response_id.trim().is_empty() {
         return;
     }
+    if let Some(persistent) = persistent {
+        let _ = persistent.store_chat_history(
+            provider_id,
+            response_id,
+            &Value::Array(entry.messages.clone()),
+            &entry.tool_context.to_persisted(),
+        );
+    }
+    cache_chat_history(provider_id, response_id, entry);
+}
+
+fn cache_chat_history(provider_id: &str, response_id: &str, entry: ChatHistoryEntry) {
     let store = CHAT_HISTORY.get_or_init(|| Mutex::new(ChatHistoryStore::default()));
     let Ok(mut store) = store.lock() else {
         return;
@@ -1115,10 +1234,20 @@ fn store_chat_history(provider_id: &str, response_id: &str, entry: ChatHistoryEn
     }
 }
 
+#[cfg(test)]
 fn responses_body_to_chat_completions(
     body: Bytes,
     provider_id: &str,
     prompt_cache_enabled: bool,
+) -> (Bytes, ChatToolContext, Vec<Value>) {
+    responses_body_to_chat_completions_with_store(body, provider_id, prompt_cache_enabled, None)
+}
+
+fn responses_body_to_chat_completions_with_store(
+    body: Bytes,
+    provider_id: &str,
+    prompt_cache_enabled: bool,
+    persistent: Option<&ApiServiceStore>,
 ) -> (Bytes, ChatToolContext, Vec<Value>) {
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
         return (body, ChatToolContext::default(), Vec::new());
@@ -1130,7 +1259,7 @@ fn responses_body_to_chat_completions(
     let previous = object
         .get("previous_response_id")
         .and_then(Value::as_str)
-        .and_then(|response_id| load_chat_history(provider_id, response_id));
+        .and_then(|response_id| load_chat_history(provider_id, response_id, persistent));
     if let Some(previous) = previous.as_ref() {
         tool_context.merge_missing_from(&previous.tool_context);
     }
@@ -1570,7 +1699,7 @@ fn chat_json_to_responses_json(value: Value, tool_context: &ChatToolContext) -> 
         .get("id")
         .and_then(Value::as_str)
         .map(response_id_from_chat_id)
-        .unwrap_or_else(|| "resp_codex_companion".to_string());
+        .unwrap_or_else(|| stable_chat_response_id(&value));
     let model = value
         .get("model")
         .and_then(Value::as_str)
@@ -1625,6 +1754,7 @@ fn store_non_stream_chat_history(
     chat_response: &Value,
     tool_context: &ChatToolContext,
     request_messages: &[Value],
+    persistent: Option<&ApiServiceStore>,
 ) {
     let Some(response_id) = converted.get("id").and_then(Value::as_str) else {
         return;
@@ -1644,6 +1774,7 @@ fn store_non_stream_chat_history(
             messages,
             tool_context: tool_context.clone(),
         },
+        persistent,
     );
 }
 
@@ -2031,6 +2162,13 @@ impl ChatSseTransformState {
         if self.started {
             return;
         }
+        if self.response_id == "resp_codex_companion" {
+            self.response_id = stable_response_id(&json!({
+                "provider": self.provider_id,
+                "model": self.model,
+                "messages": self.chat_messages,
+            }));
+        }
         self.started = true;
         self.emit(json!({
             "type": "response.created",
@@ -2130,6 +2268,9 @@ impl ChatSseTransformState {
                 messages,
                 tool_context: self.tool_context.clone(),
             },
+            self.observer
+                .as_ref()
+                .map(|(_, api_service, _)| api_service),
         );
     }
 
@@ -2287,6 +2428,19 @@ fn response_id_from_chat_id(id: &str) -> String {
     } else {
         format!("resp_{id}")
     }
+}
+
+fn stable_response_id(value: &Value) -> String {
+    let serialized = serde_json::to_vec(value).unwrap_or_default();
+    let digest = format!("{:x}", Sha256::digest(serialized));
+    format!("resp_cc_{}", &digest[..24])
+}
+
+fn stable_chat_response_id(value: &Value) -> String {
+    stable_response_id(&json!({
+        "model": value.get("model"),
+        "choices": value.get("choices"),
+    }))
 }
 
 fn unix_now() -> i64 {
@@ -2911,6 +3065,7 @@ mod tests {
             &chat_response,
             &first_context,
             &first_messages,
+            None,
         );
 
         let (follow_up_body, follow_up_context, _) = responses_body_to_chat_completions(
@@ -2931,6 +3086,99 @@ mod tests {
         let follow_up: Value = serde_json::from_slice(&follow_up_body).expect("json");
 
         assert_eq!(follow_up["messages"][0]["content"], "fix it");
+        assert_eq!(
+            follow_up.pointer("/messages/1/tool_calls/0/function/name"),
+            Some(&Value::String("apply_patch".to_string()))
+        );
+        assert_eq!(follow_up["messages"][2]["role"], "tool");
+        assert_eq!(
+            follow_up_context
+                .lookup("apply_patch")
+                .map(|spec| &spec.kind),
+            Some(&ChatToolKind::Custom)
+        );
+    }
+
+    #[test]
+    fn restores_previous_response_history_from_sqlite_after_memory_cache_is_cleared() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config_store = ConfigStore::new(temp.path().join("config.json"));
+        let api_service = ApiServiceStore::from_config_store(&config_store);
+        api_service.initialize().expect("initialize api service");
+        let provider_id = "persistent-history-provider";
+        let (first_body, first_context, first_messages) =
+            responses_body_to_chat_completions_with_store(
+                Bytes::from_static(
+                    br#"{
+                        "model":"gpt-5.4",
+                        "tools":[{"type":"custom","name":"apply_patch"}],
+                        "input":"persist this context"
+                    }"#,
+                ),
+                provider_id,
+                false,
+                Some(&api_service),
+            );
+        let first_request: Value = serde_json::from_slice(&first_body).expect("first request");
+        assert_eq!(
+            first_request["messages"][0]["content"],
+            "persist this context"
+        );
+
+        let chat_response = json!({
+            "id": "chatcmpl_persisted",
+            "model": "gpt-5.4",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_persisted",
+                        "type": "function",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": "{\"input\":\"patch\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let converted = chat_json_to_responses_json(chat_response.clone(), &first_context);
+        store_non_stream_chat_history(
+            provider_id,
+            &converted,
+            &chat_response,
+            &first_context,
+            &first_messages,
+            Some(&api_service),
+        );
+
+        let cache = CHAT_HISTORY.get_or_init(|| Mutex::new(ChatHistoryStore::default()));
+        cache
+            .lock()
+            .expect("chat history cache")
+            .entries
+            .remove(&chat_history_key(provider_id, "resp_chatcmpl_persisted"));
+
+        let (follow_up_body, follow_up_context, _) = responses_body_to_chat_completions_with_store(
+            Bytes::from_static(
+                br#"{
+                        "model":"gpt-5.4",
+                        "previous_response_id":"resp_chatcmpl_persisted",
+                        "input":[{
+                            "type":"custom_tool_call_output",
+                            "call_id":"call_persisted",
+                            "output":"ok"
+                        }]
+                    }"#,
+            ),
+            provider_id,
+            false,
+            Some(&api_service),
+        );
+        let follow_up: Value = serde_json::from_slice(&follow_up_body).expect("follow-up");
+
+        assert_eq!(follow_up["messages"][0]["content"], "persist this context");
         assert_eq!(
             follow_up.pointer("/messages/1/tool_calls/0/function/name"),
             Some(&Value::String("apply_patch".to_string()))
@@ -3180,5 +3428,18 @@ data: [DONE]
                 env!("CARGO_PKG_VERSION")
             )
         );
+    }
+
+    #[test]
+    fn missing_chat_response_id_uses_stable_semantic_hash() {
+        let response = json!({
+            "model": "gpt-test",
+            "choices": [{"message": {"role": "assistant", "content": "same"}}]
+        });
+        let first = chat_json_to_responses_json(response.clone(), &ChatToolContext::default());
+        let second = chat_json_to_responses_json(response, &ChatToolContext::default());
+        let first_id = first.get("id").and_then(Value::as_str).expect("first id");
+        assert_eq!(second.get("id").and_then(Value::as_str), Some(first_id));
+        assert!(first_id.starts_with("resp_cc_"));
     }
 }

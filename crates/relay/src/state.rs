@@ -35,9 +35,15 @@ impl RelayState {
     pub(crate) fn preferred_provider(&self, key: &str, ttl_seconds: u64) -> Option<String> {
         let mut bindings = self.session_affinity.lock().ok()?;
         prune_bindings(&mut bindings, ttl_seconds);
-        let binding = bindings.get_mut(key)?;
-        binding.updated_at = Instant::now();
-        Some(binding.provider_id.clone())
+        if let Some(binding) = bindings.get_mut(key) {
+            binding.updated_at = Instant::now();
+            return Some(binding.provider_id.clone());
+        }
+        drop(bindings);
+        self.api_service
+            .preferred_affinity(key, ttl_seconds)
+            .ok()
+            .flatten()
     }
 
     pub(crate) fn bind_provider(&self, key: &str, provider_id: &str, ttl_seconds: u64) {
@@ -52,6 +58,7 @@ impl RelayState {
                 updated_at: Instant::now(),
             },
         );
+        let _ = self.api_service.bind_affinity(key, provider_id);
         if bindings.len() > MAX_SESSION_AFFINITY_BINDINGS {
             if let Some(oldest) = bindings
                 .iter()

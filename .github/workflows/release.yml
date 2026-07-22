@@ -282,13 +282,14 @@ jobs:
     needs:
       - prepare
       - cli
+      - app
       - publish
     runs-on: ubuntu-latest
     steps:
-      - name: Download command-line archives
+      - name: Download release archives
         uses: actions/download-artifact@v8
         with:
-          pattern: release-cli-*
+          pattern: release-*
           path: release-assets
           merge-multiple: true
 
@@ -310,7 +311,7 @@ jobs:
           ssh-keyscan github.com > "${KNOWN_HOSTS_PATH}"
           echo "GIT_SSH_COMMAND=ssh -i ${KEY_PATH} -o IdentitiesOnly=yes -o UserKnownHostsFile=${KNOWN_HOSTS_PATH}" >> "${GITHUB_ENV}"
 
-      - name: Update Formula
+      - name: Update Formula and Cask
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
@@ -320,10 +321,12 @@ jobs:
           X64_MAC_ARCHIVE="${PRODUCT_NAME}-${RELEASE_VERSION}-macos-x64.tar.gz"
           ARM_LINUX_ARCHIVE="${PRODUCT_NAME}-${RELEASE_VERSION}-linux-arm64.tar.gz"
           X64_LINUX_ARCHIVE="${PRODUCT_NAME}-${RELEASE_VERSION}-linux-x64.tar.gz"
+          MAC_APP_DMG="Codex-Companion-${RELEASE_VERSION}-macos-universal-dmg.dmg"
           ARM_MAC_SHA="$(sha256sum "release-assets/${ARM_MAC_ARCHIVE}" | awk '{print $1}')"
           X64_MAC_SHA="$(sha256sum "release-assets/${X64_MAC_ARCHIVE}" | awk '{print $1}')"
           ARM_LINUX_SHA="$(sha256sum "release-assets/${ARM_LINUX_ARCHIVE}" | awk '{print $1}')"
           X64_LINUX_SHA="$(sha256sum "release-assets/${X64_LINUX_ARCHIVE}" | awk '{print $1}')"
+          MAC_APP_SHA="$(sha256sum "release-assets/${MAC_APP_DMG}" | awk '{print $1}')"
           BASE_URL="https://github.com/Alexlangl/${PRODUCT_NAME}/releases/download/v${RELEASE_VERSION}"
 
           git clone git@github.com:Alexlangl/homebrew-tap.git tap
@@ -367,10 +370,32 @@ jobs:
           end
           EOF
 
+          mkdir -p tap/Casks
+          cat > tap/Casks/codex-companion.rb <<EOF
+          cask "codex-companion" do
+            version "${RELEASE_VERSION}"
+            sha256 "${MAC_APP_SHA}"
+
+            url "${BASE_URL}/${MAC_APP_DMG}"
+            name "Codex Companion"
+            desc "Local provider runtime, relay, and state continuity tool for Codex"
+            homepage "https://github.com/Alexlangl/codex-companion"
+
+            app "Codex Companion.app"
+
+            postflight do
+              system_command "/usr/bin/xattr",
+                             args: ["-dr", "com.apple.quarantine", "#{appdir}/Codex Companion.app"]
+            end
+
+            zap trash: "~/.codex-companion"
+          end
+          EOF
+
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/codex-companion.rb
+          git add Formula/codex-companion.rb Casks/codex-companion.rb
           if git diff --cached --quiet; then
             echo "Homebrew Formula is already up to date"
           else

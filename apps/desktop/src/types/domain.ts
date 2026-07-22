@@ -32,6 +32,30 @@ export interface ApiClient {
   createdAt: string;
   lastUsedAt?: string | null;
   requestCount: number;
+  usage: ApiClientUsage;
+  health: ApiClientHealth;
+}
+
+export interface ApiClientUsage {
+  today: ApiClientPeriodUsage;
+  week: ApiClientPeriodUsage;
+  month: ApiClientPeriodUsage;
+}
+
+export interface ApiClientPeriodUsage {
+  requests: number;
+  succeeded: number;
+  failed: number;
+  successRate: number;
+  averageLatencyMs?: number | null;
+}
+
+export interface ApiClientHealth {
+  status: string;
+  lastRequestAt?: string | null;
+  lastSuccessAt?: string | null;
+  lastFailureAt?: string | null;
+  consecutiveFailures: number;
 }
 
 export interface ApiClientCreate {
@@ -76,6 +100,56 @@ export interface ApiServiceSnapshot {
   clients: ApiClient[];
   recentRequests: ApiRequestLog[];
   modelCooldowns: ModelCooldown[];
+  affinityBindings: number;
+  poolHealth: ApiPoolHealth;
+}
+
+export interface ApiPoolHealth {
+  total: number;
+  enabled: number;
+  healthy: number;
+  degraded: number;
+  cooldown: number;
+}
+
+export interface ProviderRefreshProgress {
+  active: boolean;
+  completed: number;
+  total: number;
+  currentProviderId?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  lastError?: string | null;
+}
+
+export interface TokenUsageSyncStatus {
+  active: boolean;
+  scannedFiles: number;
+  totalFiles: number;
+  phase: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+}
+
+export interface SessionSummary {
+  id: string;
+  title: string;
+  model: string;
+  providerId?: string | null;
+  path: string;
+  modifiedAt: string;
+  bytes: number;
+  isSubagent: boolean;
+  parentId?: string | null;
+  isRunning: boolean;
+}
+
+export interface SessionPage {
+  sessions: SessionSummary[];
+  total: number;
+  query: string;
+  fromCache: boolean;
+  dataRoot: string;
 }
 
 export interface ApiServiceSelfTest {
@@ -194,6 +268,12 @@ export interface CompanionStatus {
   activeProviders: ProviderConfig[];
   codex: CodexInstallStatus;
   recentEvents: RelayEvent[];
+  dataRoots: DataRootStatus;
+}
+
+export interface DataRootStatus {
+  companionIsolated: boolean;
+  codexIsolated: boolean;
 }
 
 export interface RelayEvent {
@@ -219,10 +299,23 @@ export interface TokenUsageSummary {
   unpricedModels: string[];
   pricingAsOf: string;
   pricingOverridePath?: string | null;
+  availableProviders: string[];
+  availableModels: string[];
   byDay: TokenUsageBucket[];
   byModel: TokenUsageBucket[];
   byProvider: TokenUsageBucket[];
   recentEvents: TokenUsageEvent[];
+}
+
+export interface TokenUsageDateRange {
+  startDate?: string;
+  endDate?: string;
+}
+
+export interface TokenUsageQuery extends TokenUsageDateRange {
+  providerId?: string;
+  model?: string;
+  rebuild?: boolean;
 }
 
 export interface TokenUsageBucket {
@@ -247,6 +340,7 @@ export interface TokenCostBreakdown {
 }
 
 export interface TokenUsageEvent {
+  eventId?: string | null;
   timestamp?: string | null;
   sessionId?: string | null;
   model: string;

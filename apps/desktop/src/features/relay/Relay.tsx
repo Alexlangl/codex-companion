@@ -212,6 +212,16 @@ export function Relay({ active, status }: RelayProps) {
             state="ok"
             value={settings.requireApiKey ? "强制密钥" : "本机兼容"}
           />
+          <StatusItem
+            label="账号池"
+            state={poolHealthState(snapshot)}
+            value={snapshot ? `${snapshot.poolHealth.healthy}/${snapshot.poolHealth.enabled} 健康` : "读取中"}
+          />
+          <StatusItem
+            label="会话亲和"
+            state="ok"
+            value={snapshot ? `${snapshot.affinityBindings} 个绑定` : "读取中"}
+          />
         </div>
         <div className="api-service-toolbar">
           <Button disabled={action !== null} onClick={handleSelfTest} variant="secondary">
@@ -291,6 +301,12 @@ export function Relay({ active, status }: RelayProps) {
                       {client.allowedModels.length === 0 ? "全部模型" : client.allowedModels.join(" · ")}
                       {` · ${client.requestCount} 次请求`}
                       {client.lastUsedAt ? ` · 最近 ${formatTime(client.lastUsedAt)}` : " · 尚未使用"}
+                    </span>
+                    <span className="api-client-usage-line">
+                      <Badge tone={client.health.status === "degraded" ? "danger" : client.health.status === "healthy" ? "ok" : "neutral"}>
+                        {client.health.status === "degraded" ? "连接降级" : client.health.status === "healthy" ? "连接正常" : client.health.status === "idle" ? "待使用" : "已停用"}
+                      </Badge>
+                      {`今日 ${client.usage.today.requests} · 本周 ${client.usage.week.requests} · 本月 ${client.usage.month.requests} · 成功率 ${client.usage.month.successRate}%`}
                     </span>
                   </div>
                   <div className="api-client-actions">
@@ -487,6 +503,13 @@ function StatusItem({
       </strong>
     </div>
   );
+}
+
+function poolHealthState(snapshot: ApiServiceSnapshot | null): "error" | "ok" | "pending" {
+  if (!snapshot) return "pending";
+  if (snapshot.poolHealth.degraded > 0) return "error";
+  if (snapshot.poolHealth.healthy < snapshot.poolHealth.enabled) return "pending";
+  return "ok";
 }
 
 function NumberSetting(props: {

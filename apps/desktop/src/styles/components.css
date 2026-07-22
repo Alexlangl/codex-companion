@@ -191,6 +191,7 @@
 
 input,
 textarea,
+.field select,
 .select-trigger {
   width: 100%;
   border: 1px solid var(--border);
@@ -206,6 +207,7 @@ textarea,
 }
 
 input,
+.field select,
 .select-trigger {
   min-height: 34px;
   padding: 0 11px;
@@ -220,6 +222,7 @@ textarea {
 
 input:focus,
 textarea:focus,
+.field select:focus,
 .select-trigger:focus {
   border-color: var(--link);
   box-shadow: 0 0 0 3px var(--ring);
@@ -744,6 +747,97 @@ textarea:focus,
   display: grid;
   gap: 0;
   border-top: 1px solid var(--border);
+}
+
+.usage-range-fieldset {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 16px 0 0;
+  border: 0;
+  padding: 0;
+}
+
+.usage-range-fieldset legend {
+  margin-bottom: 8px;
+  padding: 0;
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.usage-range-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(68px, 1fr));
+  gap: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 3px;
+  background: var(--muted-bg);
+}
+
+.usage-range-options label {
+  position: relative;
+  min-width: 0;
+}
+
+.usage-range-options input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.usage-range-options span {
+  display: grid;
+  min-height: 32px;
+  place-items: center;
+  border-radius: 4px;
+  padding: 0 9px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.usage-range-options input:checked + span {
+  color: var(--foreground);
+  background: var(--surface-solid);
+  box-shadow: 0 1px 3px var(--shadow);
+}
+
+.usage-range-options input:focus-visible + span {
+  outline: 2px solid var(--link);
+  outline-offset: 1px;
+}
+
+.usage-range-options input:disabled + span {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.usage-custom-dates {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.usage-dimension-filters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+@media (max-width: 860px) {
+  .usage-custom-dates,
+  .usage-dimension-filters {
+    grid-template-columns: 1fr;
+  }
 }
 
 .usage-row {
@@ -1746,9 +1840,17 @@ dd {
 
 .api-service-health-row {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
+}
+
+.api-status-item:nth-child(-n + 3) {
+  border-bottom: 1px solid var(--border);
+}
+
+.api-status-item:nth-child(3n) {
+  border-right: 0;
 }
 
 .api-status-item {
@@ -1931,6 +2033,164 @@ dd {
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.api-client-main > .api-client-usage-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  overflow: visible;
+  white-space: normal;
+}
+
+.api-client-usage-line .badge {
+  flex: 0 0 auto;
+}
+
+.usage-sync-progress,
+.provider-refresh-progress {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.usage-sync-progress progress,
+.provider-refresh-progress progress {
+  width: min(280px, 60%);
+  height: 6px;
+  accent-color: var(--primary);
+}
+
+.sessions-stack {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.session-toolbar {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(260px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.session-toolbar .field {
+  margin-top: 0;
+}
+
+.session-search-control {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding-left: 9px;
+  background: var(--surface-solid);
+}
+
+.session-search-control:focus-within {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 16%, transparent);
+}
+
+.session-search-control svg {
+  color: var(--muted);
+}
+
+.session-search-control input {
+  border: 0;
+  box-shadow: none;
+  padding-left: 2px;
+}
+
+.session-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.session-index-status {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 7px 14px;
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.session-index-status code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-list {
+  display: grid;
+  border-top: 1px solid var(--border);
+}
+
+.session-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  padding: 13px 2px;
+}
+
+.session-row-main {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.session-row-title {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.session-row-title strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-row-main > span,
+.session-row-main > code,
+.session-row-meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.session-row-main > code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.session-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 160px;
 }
 
 .api-client-actions {
@@ -2260,6 +2520,30 @@ dd {
 
   .api-status-item:nth-child(2) {
     border-right: 0;
+  }
+
+  .api-status-item:nth-child(3n) {
+    border-right: 1px solid var(--border);
+  }
+
+  .api-status-item:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .api-status-item:nth-child(-n + 4) {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .session-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .session-row {
+    grid-template-columns: 1fr;
+  }
+
+  .session-row-meta {
+    justify-content: flex-start;
   }
 
   .api-status-item:nth-child(-n + 2) {

@@ -1,5 +1,5 @@
 use crate::health_loop::start_health_refresh_loop;
-use codex_companion_core::{ConfigStore, Result};
+use codex_companion_core::{ConfigStore, ProviderRefreshProgress, Result};
 
 #[derive(Debug, Clone)]
 pub struct CompanionDaemon {
@@ -41,5 +41,9 @@ impl CompanionDaemon {
 
     pub fn start_health_refresh_loop(&self) -> bool {
         start_health_refresh_loop(self.store.clone())
+    }
+
+    pub fn provider_refresh_progress(&self) -> ProviderRefreshProgress {
+        crate::health_loop::refresh_progress(&self.store)
     }
 }

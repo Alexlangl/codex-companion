@@ -31,7 +31,14 @@ function tokenUsageDevEndpoint() {
       server.middlewares.use("/__codex_companion__/token-usage", (request, response) => {
         const url = new URL(request.url ?? "/", "http://127.0.0.1");
         const codexDir = expandHome(url.searchParams.get("codexDir") || "~/.codex");
-        const command = tokenStatsCommand(codexDir);
+        const command = tokenStatsCommand(
+          codexDir,
+          url.searchParams.get("startDate"),
+          url.searchParams.get("endDate"),
+          url.searchParams.get("providerId"),
+          url.searchParams.get("model"),
+          url.searchParams.get("rebuild") === "true",
+        );
         execFile(
           command.bin,
           command.args,
@@ -51,17 +58,30 @@ function tokenUsageDevEndpoint() {
   };
 }
 
-function tokenStatsCommand(codexDir: string) {
+function tokenStatsCommand(
+  codexDir: string,
+  startDate: string | null,
+  endDate: string | null,
+  providerId: string | null,
+  model: string | null,
+  rebuild: boolean,
+) {
+  const args = ["token-stats", "--codex-dir", codexDir];
+  if (startDate) args.push("--start-date", startDate);
+  if (endDate) args.push("--end-date", endDate);
+  if (providerId) args.push("--provider", providerId);
+  if (model) args.push("--model", model);
+  if (rebuild) args.push("--rebuild");
   const debugBinary = resolve(workspaceRoot, "target/debug/codex-companion");
   if (existsSync(debugBinary)) {
     return {
       bin: debugBinary,
-      args: ["token-stats", "--codex-dir", codexDir],
+      args,
     };
   }
   return {
     bin: "cargo",
-    args: ["run", "-p", "codex-companion-cli", "--", "token-stats", "--codex-dir", codexDir],
+    args: ["run", "-p", "codex-companion-cli", "--", ...args],
   };
 }
 

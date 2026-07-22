@@ -1,19 +1,99 @@
 use crate::pricing::{default_pricing_override_path, CostBreakdown, PricingCatalog, PRICING_AS_OF};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use codex_companion_core::{
     CompanionError, Result, TokenUsageBucket, TokenUsageEvent, TokenUsageSummary,
+    TokenUsageSyncStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-const TOKEN_USAGE_CACHE_VERSION: u32 = 3;
+const TOKEN_USAGE_CACHE_VERSION: u32 = 4;
 
-#[derive(Debug, Clone, Default)]
+static TOKEN_USAGE_SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TOKEN_USAGE_STATUS: OnceLock<Mutex<TokenUsageSyncStatus>> = OnceLock::new();
+
+pub fn token_usage_sync_status() -> TokenUsageSyncStatus {
+    TOKEN_USAGE_STATUS
+        .get_or_init(|| Mutex::new(TokenUsageSyncStatus::default()))
+        .lock()
+        .map(|status| status.clone())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsageDateRange {
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+}
+
+impl TokenUsageDateRange {
+    pub fn parse(start_date: Option<&str>, end_date: Option<&str>) -> Result<Self> {
+        let start_date = parse_date_boundary("开始日期", start_date)?;
+        let end_date = parse_date_boundary("结束日期", end_date)?;
+        if start_date
+            .zip(end_date)
+            .is_some_and(|(start, end)| start > end)
+        {
+            return Err(CompanionError::InvalidConfig(
+                "开始日期不能晚于结束日期".into(),
+            ));
+        }
+        Ok(Self {
+            start_date,
+            end_date,
+        })
+    }
+
+    fn includes(&self, timestamp: Option<&str>) -> bool {
+        if self.start_date.is_none() && self.end_date.is_none() {
+            return true;
+        }
+        let Some(date) = timestamp.and_then(event_local_date) else {
+            return false;
+        };
+        self.start_date.is_none_or(|start| date >= start)
+            && self.end_date.is_none_or(|end| date <= end)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsageFilters {
+    provider_id: Option<String>,
+    model: Option<String>,
+}
+
+impl TokenUsageFilters {
+    pub fn parse(provider_id: Option<&str>, model: Option<&str>) -> Self {
+        Self {
+            provider_id: normalize_filter_value(provider_id),
+            model: normalize_filter_value(model),
+        }
+    }
+
+    fn includes(&self, event: &TokenUsageEvent) -> bool {
+        self.matches_provider(event)
+            && self
+                .model
+                .as_deref()
+                .is_none_or(|model| event.model == model)
+    }
+
+    fn matches_provider(&self, event: &TokenUsageEvent) -> bool {
+        let provider_id = event.provider_id.as_deref().unwrap_or("unknown");
+        self.provider_id
+            .as_deref()
+            .is_none_or(|selected| provider_id == selected)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CumulativeTokens {
     input: u64,
     cached_input: u64,
@@ -56,7 +136,16 @@ struct FileParseState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CodexSessionIdentity {
     thread_id: String,
+    parent_thread_id: Option<String>,
+    forked_at: Option<DateTime<Utc>>,
     carries_history_snapshot: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTokenUsageEvent {
+    event: TokenUsageEvent,
+    signature: CumulativeTokens,
+    line_index: usize,
 }
 
 impl Default for FileParseState {
@@ -95,6 +184,8 @@ pub fn collect_token_usage(codex_dir: PathBuf) -> Result<TokenUsageSummary> {
         files.len(),
         all_events,
         &PricingCatalog::builtin(),
+        &TokenUsageDateRange::default(),
+        &TokenUsageFilters::default(),
     ))
 }
 
@@ -102,13 +193,62 @@ pub fn collect_token_usage_cached(
     codex_dir: PathBuf,
     cache_dir: PathBuf,
 ) -> Result<TokenUsageSummary> {
+    collect_token_usage_cached_in_range(codex_dir, cache_dir, &TokenUsageDateRange::default())
+}
+
+pub fn collect_token_usage_cached_in_range(
+    codex_dir: PathBuf,
+    cache_dir: PathBuf,
+    date_range: &TokenUsageDateRange,
+) -> Result<TokenUsageSummary> {
+    collect_token_usage_cached_with_filters(
+        codex_dir,
+        cache_dir,
+        date_range,
+        &TokenUsageFilters::default(),
+    )
+}
+
+pub fn collect_token_usage_cached_with_filters(
+    codex_dir: PathBuf,
+    cache_dir: PathBuf,
+    date_range: &TokenUsageDateRange,
+    filters: &TokenUsageFilters,
+) -> Result<TokenUsageSummary> {
+    let scan_lock = TOKEN_USAGE_SCAN_LOCK.get_or_init(|| Mutex::new(()));
+    let _scan_guard = scan_lock
+        .lock()
+        .map_err(|_| CompanionError::InvalidConfig("token usage scan lock poisoned".into()))?;
     let files = collect_codex_session_files(&codex_dir);
+    set_token_usage_status(TokenUsageSyncStatus {
+        active: true,
+        total_files: files.len(),
+        phase: "scanning".to_string(),
+        started_at: Some(chrono::Utc::now()),
+        ..TokenUsageSyncStatus::default()
+    });
+    let result = collect_token_usage_cached_inner(codex_dir, cache_dir, date_range, filters, files);
+    let mut status = token_usage_sync_status();
+    status.active = false;
+    status.phase = if result.is_ok() { "complete" } else { "failed" }.to_string();
+    status.finished_at = Some(chrono::Utc::now());
+    set_token_usage_status(status);
+    result
+}
+
+fn collect_token_usage_cached_inner(
+    codex_dir: PathBuf,
+    cache_dir: PathBuf,
+    date_range: &TokenUsageDateRange,
+    filters: &TokenUsageFilters,
+    files: Vec<PathBuf>,
+) -> Result<TokenUsageSummary> {
     let cache_path = cache_dir.join("token-usage-cache.json");
     let mut cache = read_token_usage_cache(&cache_path);
     let mut next_files = BTreeMap::new();
     let mut all_events = Vec::new();
 
-    for file in &files {
+    for (file_index, file) in files.iter().enumerate() {
         let cache_key = file.to_string_lossy().to_string();
         let signature = file_signature(file);
         let cached = signature.as_ref().and_then(|signature| {
@@ -139,6 +279,7 @@ pub fn collect_token_usage_cached(
         };
         all_events.extend(cached_file.events.clone());
         next_files.insert(cache_key, cached_file);
+        update_token_usage_progress(file_index + 1);
     }
 
     cache.version = TOKEN_USAGE_CACHE_VERSION;
@@ -152,7 +293,42 @@ pub fn collect_token_usage_cached(
         files.len(),
         all_events,
         &catalog,
+        date_range,
+        filters,
     ))
+}
+
+fn set_token_usage_status(status: TokenUsageSyncStatus) {
+    if let Ok(mut current) = TOKEN_USAGE_STATUS
+        .get_or_init(|| Mutex::new(TokenUsageSyncStatus::default()))
+        .lock()
+    {
+        *current = status;
+    }
+}
+
+fn update_token_usage_progress(scanned_files: usize) {
+    if let Ok(mut status) = TOKEN_USAGE_STATUS
+        .get_or_init(|| Mutex::new(TokenUsageSyncStatus::default()))
+        .lock()
+    {
+        status.scanned_files = scanned_files;
+    }
+}
+
+pub fn rebuild_token_usage_cached_with_filters(
+    codex_dir: PathBuf,
+    cache_dir: PathBuf,
+    date_range: &TokenUsageDateRange,
+    filters: &TokenUsageFilters,
+) -> Result<TokenUsageSummary> {
+    let cache_path = cache_dir.join("token-usage-cache.json");
+    if let Err(error) = fs::remove_file(&cache_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(CompanionError::io(&cache_path, error));
+        }
+    }
+    collect_token_usage_cached_with_filters(codex_dir, cache_dir, date_range, filters)
 }
 
 fn summarize_token_events(
@@ -160,6 +336,8 @@ fn summarize_token_events(
     files_scanned: usize,
     events: Vec<TokenUsageEvent>,
     pricing: &PricingCatalog,
+    date_range: &TokenUsageDateRange,
+    filters: &TokenUsageFilters,
 ) -> TokenUsageSummary {
     let mut summary = TokenUsageSummary {
         codex_dir,
@@ -175,9 +353,22 @@ fn summarize_token_events(
     let mut by_model = BTreeMap::<String, TokenUsageBucketAccumulator>::new();
     let mut by_provider = BTreeMap::<String, TokenUsageBucketAccumulator>::new();
     let mut seen_events = BTreeSet::<String>::new();
+    let mut available_providers = BTreeSet::new();
+    let mut available_models = BTreeSet::new();
 
     for mut event in events {
-        if !seen_events.insert(token_event_fingerprint(&event)) {
+        if !seen_events.insert(token_event_key(&event)) {
+            continue;
+        }
+        if !date_range.includes(event.timestamp.as_deref()) {
+            continue;
+        }
+        let provider_id = event.provider_id.as_deref().unwrap_or("unknown");
+        available_providers.insert(provider_id.to_string());
+        if filters.matches_provider(&event) {
+            available_models.insert(event.model.clone());
+        }
+        if !filters.includes(&event) {
             continue;
         }
         if let Some(session_id) = event.session_id.as_ref() {
@@ -224,7 +415,6 @@ fn summarize_token_events(
             &event,
             event_cost.as_ref(),
         );
-        let provider_id = event.provider_id.as_deref().unwrap_or("unknown");
         add_to_bucket(
             by_provider
                 .entry(provider_id.to_string())
@@ -238,6 +428,8 @@ fn summarize_token_events(
     summary.sessions = sessions.len();
     summary.cost = summary_cost.to_api();
     summary.unpriced_models = unpriced_models.into_iter().collect();
+    summary.available_providers = available_providers.into_iter().collect();
+    summary.available_models = available_models.into_iter().collect();
     summary.by_day = buckets_desc(by_day, false);
     summary.by_model = buckets_desc(by_model, true);
     summary.by_provider = buckets_desc(by_provider, true);
@@ -255,6 +447,28 @@ fn summarize_token_events(
     summary
 }
 
+fn parse_date_boundary(label: &str, value: Option<&str>) -> Result<Option<NaiveDate>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map(Some)
+        .map_err(|_| CompanionError::InvalidConfig(format!("{label}必须使用 YYYY-MM-DD 格式")))
+}
+
+fn normalize_filter_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn event_local_date(timestamp: &str) -> Option<NaiveDate> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|value| value.with_timezone(&Local).date_naive())
+}
+
 fn parse_session_file(path: &Path) -> Result<Vec<TokenUsageEvent>> {
     let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
     let reader = BufReader::new(file);
@@ -263,12 +477,12 @@ fn parse_session_file(path: &Path) -> Result<Vec<TokenUsageEvent>> {
         .map_while(std::result::Result::ok)
         .collect::<Vec<_>>();
     let identity = session_identity_from_lines(&lines);
-    let history_boundary = history_replay_boundary(&lines, identity.as_ref());
+    let fallback_boundary = history_replay_boundary(&lines, identity.as_ref());
     let mut state = FileParseState {
-        session_id: identity.map(|identity| identity.thread_id),
+        session_id: identity.as_ref().map(|identity| identity.thread_id.clone()),
         ..FileParseState::default()
     };
-    let mut events = Vec::new();
+    let mut parsed_events = Vec::new();
 
     for (line_index, line) in lines.into_iter().enumerate() {
         if !line.contains("token_count")
@@ -287,9 +501,14 @@ fn parse_session_file(path: &Path) -> Result<Vec<TokenUsageEvent>> {
             "session_meta" => apply_session_meta(&mut state, &value),
             "turn_context" => apply_turn_context(&mut state, &value),
             "event_msg" => {
-                if let Some(event) = parse_token_event(&mut state, &value) {
-                    if history_boundary.is_none_or(|boundary| line_index + 1 >= boundary) {
-                        events.push(event);
+                if let Some(mut event) = parse_token_event(&mut state, &value) {
+                    event.event_id = Some(stable_event_id(&event, line_index));
+                    if let Some(signature) = token_usage_signature(&value) {
+                        parsed_events.push(ParsedTokenUsageEvent {
+                            event,
+                            signature,
+                            line_index,
+                        });
                     }
                 }
             }
@@ -297,7 +516,18 @@ fn parse_session_file(path: &Path) -> Result<Vec<TokenUsageEvent>> {
         }
     }
 
-    Ok(events)
+    let replay_prefix = identity
+        .as_ref()
+        .and_then(|identity| replay_prefix_from_parent(path, identity, &parsed_events));
+    Ok(parsed_events
+        .into_iter()
+        .enumerate()
+        .filter(|(event_index, parsed)| match replay_prefix {
+            Some(prefix) => *event_index >= prefix,
+            None => fallback_boundary.is_none_or(|boundary| parsed.line_index + 1 >= boundary),
+        })
+        .map(|(_, parsed)| parsed.event)
+        .collect())
 }
 
 fn session_identity_from_lines(lines: &[String]) -> Option<CodexSessionIdentity> {
@@ -309,11 +539,16 @@ fn session_identity_from_lines(lines: &[String]) -> Option<CodexSessionIdentity>
         if value.get("type").and_then(Value::as_str) != Some("session_meta") {
             return None;
         }
-        value.get("payload").and_then(parse_codex_session_identity)
+        value.get("payload").and_then(|payload| {
+            parse_codex_session_identity(payload, value.get("timestamp").and_then(Value::as_str))
+        })
     })
 }
 
-fn parse_codex_session_identity(payload: &Value) -> Option<CodexSessionIdentity> {
+fn parse_codex_session_identity(
+    payload: &Value,
+    timestamp: Option<&str>,
+) -> Option<CodexSessionIdentity> {
     let thread_id = pick_string(
         payload,
         &[
@@ -324,22 +559,134 @@ fn parse_codex_session_identity(payload: &Value) -> Option<CodexSessionIdentity>
             &["sessionId"],
         ],
     )?;
-    let parent_session_id = pick_string(payload, &[&["session_id"], &["sessionId"]]);
-    let carries_history_snapshot = payload
-        .get("forked_from_id")
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty())
+    let forked_from_id = pick_string(payload, &[&["forked_from_id"]]);
+    let spawned_from_id = pick_string(
+        payload,
+        &[&["source", "subagent", "thread_spawn", "parent_thread_id"]],
+    );
+    let parent_thread_id = match (forked_from_id, spawned_from_id) {
+        (Some(forked), Some(spawned)) if forked == spawned => Some(forked),
+        (Some(parent), None) | (None, Some(parent)) => Some(parent),
+        _ => None,
+    };
+    let legacy_parent = pick_string(payload, &[&["session_id"], &["sessionId"]])
+        .filter(|parent| parent != &thread_id);
+    let parent_thread_id = parent_thread_id.or(legacy_parent);
+    let carries_history_snapshot = parent_thread_id.is_some()
+        || payload
+            .get("forked_from_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
         || payload
             .get("source")
             .and_then(|source| source.get("subagent"))
-            .is_some()
-        || parent_session_id
-            .as_deref()
-            .is_some_and(|parent| parent != thread_id);
+            .is_some();
     Some(CodexSessionIdentity {
         thread_id,
+        parent_thread_id,
+        forked_at: timestamp
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc)),
         carries_history_snapshot,
     })
+}
+
+fn token_usage_signature(value: &Value) -> Option<CumulativeTokens> {
+    let info = value.pointer("/payload/info")?.as_object()?;
+    info.get("total_token_usage")
+        .or_else(|| info.get("last_token_usage"))
+        .and_then(parse_cumulative_tokens)
+}
+
+fn replay_prefix_from_parent(
+    child_path: &Path,
+    identity: &CodexSessionIdentity,
+    child_events: &[ParsedTokenUsageEvent],
+) -> Option<usize> {
+    let parent_id = identity.parent_thread_id.as_deref()?;
+    let cutoff = identity.forked_at?;
+    let codex_dir = child_path.ancestors().find_map(|ancestor| {
+        let name = ancestor.file_name()?.to_str()?;
+        (name == "sessions" || name == "archived_sessions")
+            .then(|| ancestor.parent().map(Path::to_path_buf))
+            .flatten()
+    })?;
+    let mut matching_parents = Vec::new();
+    for candidate in collect_codex_session_files(&codex_dir) {
+        if candidate == child_path {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        let lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+        if session_identity_from_lines(&lines)
+            .as_ref()
+            .is_none_or(|parent| parent.thread_id != parent_id)
+        {
+            continue;
+        }
+        if let Some(signatures) = parent_signatures_before(&lines, cutoff) {
+            matching_parents.push(signatures);
+        }
+    }
+    let first = matching_parents.first()?;
+    if matching_parents
+        .iter()
+        .skip(1)
+        .any(|candidate| candidate != first)
+    {
+        return None;
+    }
+    Some(matching_replay_prefix(child_events, first))
+}
+
+fn parent_signatures_before(
+    lines: &[String],
+    cutoff: DateTime<Utc>,
+) -> Option<Vec<CumulativeTokens>> {
+    let mut signatures = Vec::new();
+    let mut max_timestamp = None;
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        if let Some(timestamp) = timestamp {
+            max_timestamp = Some(
+                max_timestamp.map_or(timestamp, |current: DateTime<Utc>| current.max(timestamp)),
+            );
+        }
+        let Some(signature) = token_usage_signature(&value) else {
+            continue;
+        };
+        if timestamp.is_some_and(|timestamp| timestamp <= cutoff) {
+            signatures.push(signature);
+        }
+    }
+    max_timestamp
+        .is_some_and(|timestamp| timestamp >= cutoff)
+        .then_some(signatures)
+}
+
+fn matching_replay_prefix(child: &[ParsedTokenUsageEvent], parent: &[CumulativeTokens]) -> usize {
+    let mut parent_offset = 0;
+    let mut matched = 0;
+    for event in child {
+        let Some(relative_match) = parent[parent_offset..]
+            .iter()
+            .position(|signature| signature == &event.signature)
+        else {
+            break;
+        };
+        parent_offset += relative_match + 1;
+        matched += 1;
+    }
+    matched
 }
 
 fn history_replay_boundary(
@@ -470,6 +817,7 @@ fn parse_token_event(state: &mut FileParseState, value: &Value) -> Option<TokenU
     }
 
     Some(TokenUsageEvent {
+        event_id: None,
         timestamp: pick_string(value, &[&["timestamp"]]),
         session_id: state.session_id.clone(),
         model: state.current_model.clone(),
@@ -607,7 +955,7 @@ fn compute_delta(prev: &Option<CumulativeTokens>, current: &CumulativeTokens) ->
     }
 }
 
-fn collect_codex_session_files(codex_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn collect_codex_session_files(codex_dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_jsonl_recursive(&codex_dir.join("sessions"), &mut files, 0, 4);
     collect_jsonl_recursive(&codex_dir.join("archived_sessions"), &mut files, 0, 1);
@@ -672,6 +1020,29 @@ fn day_key(timestamp: Option<&str>) -> String {
                 .map(ToString::to_string)
         })
         .unwrap_or_else(|| "未知日期".to_string())
+}
+
+fn token_event_key(event: &TokenUsageEvent) -> String {
+    event
+        .event_id
+        .clone()
+        .unwrap_or_else(|| token_event_fingerprint(event))
+}
+
+fn stable_event_id(event: &TokenUsageEvent, line_index: usize) -> String {
+    let source = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        event.session_id.as_deref().unwrap_or(""),
+        event.timestamp.as_deref().unwrap_or(""),
+        event.provider_id.as_deref().unwrap_or(""),
+        event.model,
+        event.input_tokens,
+        event.cached_input_tokens,
+        event.cache_write_input_tokens,
+        event.output_tokens,
+        line_index,
+    );
+    format!("{:x}", Sha256::digest(source.as_bytes()))
 }
 
 fn token_event_fingerprint(event: &TokenUsageEvent) -> String {
@@ -804,6 +1175,132 @@ fn pick_u64(value: &Value, paths: &[&[&str]]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn validates_and_applies_inclusive_date_ranges() {
+        let range = TokenUsageDateRange::parse(Some("2026-07-10"), Some("2026-07-12"))
+            .expect("valid range");
+        assert!(range.includes(Some(&local_timestamp(2026, 7, 10))));
+        assert!(range.includes(Some(&local_timestamp(2026, 7, 12))));
+        assert!(!range.includes(Some(&local_timestamp(2026, 7, 9))));
+        assert!(!range.includes(Some(&local_timestamp(2026, 7, 13))));
+        assert!(!range.includes(None));
+        assert!(TokenUsageDateRange::parse(Some("2026-07-12"), Some("2026-07-10")).is_err());
+        assert!(TokenUsageDateRange::parse(Some("07/10/2026"), None).is_err());
+    }
+
+    #[test]
+    fn date_range_filters_every_summary_dimension() {
+        let range = TokenUsageDateRange::parse(Some("2026-07-10"), Some("2026-07-12"))
+            .expect("valid range");
+        let events = vec![
+            usage_event("before", "provider-before", 2026, 7, 9, 100),
+            usage_event("inside-a", "provider-a", 2026, 7, 10, 200),
+            usage_event("inside-b", "provider-b", 2026, 7, 12, 300),
+            usage_event("after", "provider-after", 2026, 7, 13, 400),
+        ];
+        let summary = summarize_token_events(
+            PathBuf::from("/tmp/codex"),
+            4,
+            events,
+            &PricingCatalog::builtin(),
+            &range,
+            &TokenUsageFilters::default(),
+        );
+
+        assert_eq!(summary.files_scanned, 4);
+        assert_eq!(summary.sessions, 2);
+        assert_eq!(summary.events, 2);
+        assert_eq!(summary.total_tokens, 500);
+        assert_eq!(summary.by_day.len(), 2);
+        assert_eq!(summary.by_model.len(), 2);
+        assert_eq!(summary.by_provider.len(), 2);
+        assert_eq!(summary.recent_events.len(), 2);
+        assert!(summary
+            .by_provider
+            .iter()
+            .all(|bucket| bucket.key == "provider-a" || bucket.key == "provider-b"));
+    }
+
+    #[test]
+    fn provider_and_model_filters_apply_to_every_summary_dimension() {
+        let events = vec![
+            usage_event("model-a", "provider-a", 2026, 7, 10, 100),
+            usage_event("model-b", "provider-a", 2026, 7, 11, 200),
+            usage_event("model-a", "provider-b", 2026, 7, 12, 300),
+        ];
+        let filters = TokenUsageFilters::parse(Some("provider-a"), Some("model-b"));
+        let summary = summarize_token_events(
+            PathBuf::from("/tmp/codex"),
+            3,
+            events,
+            &PricingCatalog::builtin(),
+            &TokenUsageDateRange::default(),
+            &filters,
+        );
+
+        assert_eq!(summary.sessions, 1);
+        assert_eq!(summary.events, 1);
+        assert_eq!(summary.total_tokens, 200);
+        assert_eq!(summary.by_day.len(), 1);
+        assert_eq!(summary.by_model.len(), 1);
+        assert_eq!(summary.by_model[0].key, "model-b");
+        assert_eq!(summary.by_provider.len(), 1);
+        assert_eq!(summary.by_provider[0].key, "provider-a");
+        assert_eq!(summary.recent_events.len(), 1);
+        assert_eq!(
+            summary.available_providers,
+            vec!["provider-a", "provider-b"]
+        );
+        assert_eq!(summary.available_models, vec!["model-a", "model-b"]);
+    }
+
+    #[test]
+    fn stable_event_ids_keep_distinct_same_second_usage() {
+        let mut first = usage_event("session", "provider", 2026, 7, 10, 100);
+        let mut second = first.clone();
+        first.event_id = Some(stable_event_id(&first, 10));
+        second.event_id = Some(stable_event_id(&second, 11));
+        let summary = summarize_token_events(
+            PathBuf::from("/tmp/codex"),
+            1,
+            vec![first, second],
+            &PricingCatalog::builtin(),
+            &TokenUsageDateRange::default(),
+            &TokenUsageFilters::default(),
+        );
+
+        assert_eq!(summary.events, 2);
+        assert_eq!(summary.total_tokens, 200);
+    }
+
+    fn local_timestamp(year: i32, month: u32, day: u32) -> String {
+        Local
+            .with_ymd_and_hms(year, month, day, 12, 0, 0)
+            .single()
+            .expect("local timestamp")
+            .to_rfc3339()
+    }
+
+    fn usage_event(
+        session_id: &str,
+        provider_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+        total_tokens: u64,
+    ) -> TokenUsageEvent {
+        TokenUsageEvent {
+            timestamp: Some(local_timestamp(year, month, day)),
+            session_id: Some(session_id.to_string()),
+            model: session_id.to_string(),
+            provider_id: Some(provider_id.to_string()),
+            input_tokens: total_tokens,
+            total_tokens,
+            ..TokenUsageEvent::default()
+        }
+    }
 
     #[test]
     fn computes_delta_from_cumulative_token_count() {
@@ -910,6 +1407,55 @@ mod tests {
     }
 
     #[test]
+    fn fork_replay_uses_parent_token_prefix_alignment() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        fs::write(
+            day.join("parent.jsonl"),
+            r#"{"timestamp":"2026-07-10T03:00:00Z","type":"session_meta","payload":{"id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"output_tokens":20}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:05Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("parent");
+        fs::write(
+            day.join("child.jsonl"),
+            r#"{"timestamp":"2026-07-10T03:00:04Z","type":"session_meta","payload":{"id":"child","forked_from_id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"output_tokens":20}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":250,"output_tokens":25}}}}"#
+                + "\n",
+        )
+        .expect("child");
+
+        let summary = collect_token_usage(temp.path().to_path_buf()).expect("summary");
+        assert_eq!(summary.events, 3);
+        assert_eq!(summary.sessions, 2);
+        assert_eq!(summary.total_tokens, 275);
+        assert_eq!(
+            summary
+                .recent_events
+                .iter()
+                .filter(|event| event.session_id.as_deref() == Some("child"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn separates_cache_write_tokens_from_fresh_input() {
         let temp = tempfile::tempdir().expect("temp");
         let day = temp
@@ -976,6 +1522,54 @@ mod tests {
             collect_token_usage_cached(temp.path().to_path_buf(), cache_dir).expect("third");
         assert_eq!(third.events, 2);
         assert_eq!(third.total_tokens, 135);
+    }
+
+    #[test]
+    fn rebuild_discards_cached_events_and_rescans_session_files() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        fs::write(
+            day.join("session.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"s1"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n",
+        )
+        .expect("write");
+        let cache_dir = temp.path().join("cache");
+        let range = TokenUsageDateRange::default();
+        let filters = TokenUsageFilters::default();
+        let first = collect_token_usage_cached_with_filters(
+            temp.path().to_path_buf(),
+            cache_dir.clone(),
+            &range,
+            &filters,
+        )
+        .expect("initial scan");
+        assert_eq!(first.total_tokens, 110);
+
+        let cache_path = cache_dir.join("token-usage-cache.json");
+        let mut cache = read_token_usage_cache(&cache_path);
+        for cached_file in cache.files.values_mut() {
+            cached_file.events.clear();
+        }
+        write_token_usage_cache(&cache_path, &cache).expect("poison cache");
+
+        let rebuilt = rebuild_token_usage_cached_with_filters(
+            temp.path().to_path_buf(),
+            cache_dir,
+            &range,
+            &filters,
+        )
+        .expect("rebuild");
+        assert_eq!(rebuilt.events, 1);
+        assert_eq!(rebuilt.total_tokens, 110);
     }
 
     #[test]
