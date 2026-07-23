@@ -1,5 +1,6 @@
 use crate::types::{ApiKeyProviderUpdate, ProviderUpsert};
 use crate::validate::{validate_base_url, validate_id};
+use crate::write_private_auth_file;
 use codex_companion_core::{
     CompanionError, ConfigStore, ProviderAccountInfo, ProviderConfig, ProviderGroup,
     ProviderHealth, ProviderKind, Result, DEFAULT_GROUP_ID,
@@ -15,6 +16,10 @@ pub fn add_provider(store: &ConfigStore, input: ProviderUpsert) -> Result<Provid
             name: input.name.trim().to_string(),
             kind: input.kind,
             base_url: input.base_url.trim().trim_end_matches('/').to_string(),
+            websocket_url: input
+                .websocket_url
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.trim().trim_end_matches('/').to_string()),
             auth_ref: input.auth_ref.filter(|value| !value.trim().is_empty()),
             direct_auth_ref: input
                 .direct_auth_ref
@@ -95,8 +100,7 @@ pub fn update_api_key_provider(
         let text = serde_json::to_string_pretty(&auth).map_err(|source| {
             CompanionError::InvalidConfig(format!("provider API key serialize failed: {source}"))
         })?;
-        fs::write(&auth_path, format!("{text}\n"))
-            .map_err(|source| CompanionError::io(&auth_path, source))?;
+        write_private_auth_file(&auth_path, &format!("{text}\n"))?;
         auth_ref = Some(format!("file:{}", auth_path.display()));
         direct_auth_ref = None;
     } else if let Some(env_var) = new_env_var {
@@ -126,6 +130,7 @@ pub fn update_api_key_provider(
             name: provider_name,
             kind: input.kind,
             base_url,
+            websocket_url: input.websocket_url,
             auth_ref,
             direct_auth_ref,
             model_map: existing.model_map,
@@ -143,6 +148,7 @@ pub fn remove_provider(store: &ConfigStore, id: &str) -> Result<bool> {
         config.health.remove(id);
         for group in config.groups.values_mut() {
             group.provider_order.retain(|provider_id| provider_id != id);
+            group.provider_weights.remove(id);
         }
         Ok(removed)
     })
@@ -175,6 +181,7 @@ mod tests {
             name: id.to_string(),
             kind: ProviderKind::OpenAiCompatible,
             base_url: format!("https://{id}.example.com/v1"),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: BTreeMap::new(),
@@ -211,6 +218,7 @@ mod tests {
                         name: "Work".to_string(),
                         policy: GroupPolicy::PriorityFallback,
                         provider_order: vec!["a".to_string(), "b".to_string()],
+                        provider_weights: Default::default(),
                         fallback_enabled: true,
                     },
                 );
@@ -238,6 +246,7 @@ mod tests {
                 provider_name: "PPTOKEN".to_string(),
                 kind: ProviderKind::RelayProvider,
                 base_url: "https://cn.pptoken.cc/v1".to_string(),
+                websocket_url: None,
                 api_key: Some("sk-secret".to_string()),
                 env_var: None,
                 refresh_interval_seconds: 30,

@@ -9,6 +9,8 @@ import {
   providerHealthLabel,
   providerHealthTone,
   providerTypeLabel,
+  providerUsesAgentIdentity,
+  providerUsesWebSocket,
   quotaInfo,
   validityLabel,
   validityTone,
@@ -51,6 +53,8 @@ export function ProviderCompactItem({
   const canEdit = provider.kind !== "official_codex";
   const showPlanBadge = provider.kind === "official_codex" && Boolean(provider.account?.subscriptionType);
   const showQuota = hasQuotaInfo(quota);
+  const usesAgentIdentity = providerUsesAgentIdentity(provider);
+  const usesWebSocket = providerUsesWebSocket(provider);
   return (
     <div className={`provider-compact-item ${active ? "provider-compact-active" : ""}`}>
       <span className="compact-check" aria-label={active ? "当前账号" : "可用账号"}>
@@ -63,6 +67,8 @@ export function ProviderCompactItem({
       <span className="compact-status">{providerHealthLabel(health?.status)}</span>
       {provider.account?.validUntil ? <Badge tone={validityTone(provider.account.validUntil)}>{validityLabel(provider.account.validUntil)?.split(" · ")[0]}</Badge> : null}
       {showPlanBadge ? <Badge tone="neutral">{provider.account?.subscriptionType}</Badge> : null}
+      {usesAgentIdentity ? <Badge tone="accent">Agent Identity</Badge> : null}
+      {usesWebSocket ? <Badge tone="info">WebSocket</Badge> : null}
       <LaunchModeControl
         compact
         disabled={disabled}
@@ -127,6 +133,8 @@ export function ProviderCard({
   const showPlanBadge = provider.kind === "official_codex" && Boolean(account?.subscriptionType);
   const canEdit = provider.kind !== "official_codex";
   const lastRefreshAt = account?.lastRefreshAt ? formatTime(account.lastRefreshAt) : null;
+  const usesAgentIdentity = providerUsesAgentIdentity(provider);
+  const usesWebSocket = providerUsesWebSocket(provider);
   const balanceTitle = quotaIsBalance ? "账户余额" : showQuota ? quota.label : "无法刷新余额";
   const balanceValue = showQuota ? quota.percentLabel : null;
   const balanceDetail = quotaIsBalance
@@ -147,6 +155,8 @@ export function ProviderCard({
             {active ? <Badge tone="ok">当前</Badge> : null}
             <Badge tone="info">{providerTypeLabel(provider)}</Badge>
             {showPlanBadge ? <Badge tone="accent">{account?.subscriptionType}</Badge> : null}
+            {usesAgentIdentity ? <Badge tone="accent">Agent Identity</Badge> : null}
+            {usesWebSocket ? <Badge tone="info">WebSocket</Badge> : null}
           </div>
           <span>{providerAccountSubtitle(provider)}</span>
         </div>

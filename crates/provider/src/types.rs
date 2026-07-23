@@ -15,6 +15,8 @@ pub struct ProviderUpsert {
     pub name: String,
     pub kind: ProviderKind,
     pub base_url: String,
+    #[serde(default)]
+    pub websocket_url: Option<String>,
     pub auth_ref: Option<String>,
     #[serde(default)]
     pub direct_auth_ref: Option<String>,
@@ -36,6 +38,8 @@ pub struct ApiKeyProviderUpdate {
     pub provider_name: String,
     pub kind: ProviderKind,
     pub base_url: String,
+    #[serde(default)]
+    pub websocket_url: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
@@ -66,6 +70,8 @@ pub struct GroupUpsert {
     pub name: String,
     pub policy: GroupPolicy,
     pub provider_order: Vec<String>,
+    #[serde(default)]
+    pub provider_weights: BTreeMap<String, u16>,
     pub fallback_enabled: bool,
 }
 
@@ -78,6 +84,7 @@ pub struct ProviderImportDraft {
     pub base_url: String,
     pub auth_ref: String,
     pub account_id: String,
+    pub user_id: Option<String>,
     pub model: Option<String>,
 }
 
@@ -90,4 +97,21 @@ pub struct ProviderImportOutcome {
     pub auth_path: PathBuf,
     pub created: bool,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImportFailure {
+    pub index: usize,
+    pub label: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImportBatchReport {
+    pub total: usize,
+    pub succeeded: Vec<ProviderImportOutcome>,
+    pub failed: Vec<ProviderImportFailure>,
+    pub added_to_group: Vec<String>,
 }

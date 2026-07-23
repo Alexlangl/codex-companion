@@ -1,20 +1,37 @@
 import * as Select from "@radix-ui/react-select";
-import { Cable, Download, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
+import {
+  Cable,
+  Clipboard,
+  Download,
+  FileText,
+  FolderOpen,
+  Play,
+  RefreshCw,
+  RotateCcw,
+  ShieldCheck,
+  SquareTerminal,
+  Trash2,
+} from "lucide-react";
+import { useEffect, useState, type ChangeEvent } from "react";
 import { Badge, Button, Field, Panel } from "../../components/ui";
+import {
+  clearDiagnosticLogs,
+  getDiagnosticInfo,
+  launchCli,
+  openDiagnosticDirectory,
+  previewCliCommand,
+} from "../../lib/api";
 import { compactPath } from "../../lib/format";
-import type { BusyState, CompanionStatus, ThemeMode } from "../../types/domain";
+import type {
+  BusyState,
+  CompanionStatus,
+  DiagnosticInfo,
+  TerminalKind,
+  ThemeMode,
+} from "../../types/domain";
 import type { AppUpdateState, AppUpdaterController } from "./useAppUpdater";
 
-export function Settings({
-  appUpdater,
-  busy,
-  status,
-  onInstall,
-  onResetPreferences,
-  onPreserveOfficialCodexAuth,
-  onUninstall,
-  onTheme,
-}: {
+type SettingsProps = {
   appUpdater: AppUpdaterController;
   busy: BusyState;
   status: CompanionStatus;
@@ -22,12 +39,99 @@ export function Settings({
   onUninstall: () => Promise<void>;
   onPreserveOfficialCodexAuth: (preserve: boolean) => Promise<void>;
   onTheme: (theme: ThemeMode) => Promise<void>;
+  onTokenUsageRefreshInterval: (seconds: number) => Promise<void>;
   onResetPreferences: () => Promise<void>;
-}) {
+};
+
+const TERMINAL_OPTIONS = [
+  { value: "auto", label: "自动选择" },
+  { value: "terminal", label: "Terminal (macOS)" },
+  { value: "i_term2", label: "iTerm2 (macOS)" },
+  { value: "windows_terminal", label: "Windows Terminal" },
+  { value: "power_shell", label: "Windows PowerShell" },
+  { value: "pwsh", label: "PowerShell 7" },
+  { value: "cmd", label: "Command Prompt" },
+  { value: "shell", label: "Linux 终端" },
+] as const satisfies ReadonlyArray<{ value: TerminalKind; label: string }>;
+
+const TOKEN_REFRESH_OPTIONS = [
+  { value: 0, label: "关闭自动刷新" },
+  { value: 15, label: "每 15 秒" },
+  { value: 30, label: "每 30 秒" },
+  { value: 60, label: "每 1 分钟" },
+  { value: 300, label: "每 5 分钟" },
+] as const;
+
+export function Settings(props: SettingsProps) {
+  const {
+    appUpdater,
+    busy,
+    status,
+    onInstall,
+    onPreserveOfficialCodexAuth,
+    onResetPreferences,
+    onTheme,
+    onTokenUsageRefreshInterval,
+    onUninstall,
+  } = props;
+  const [diagnosticInfo, setDiagnosticInfo] = useState<DiagnosticInfo | null>(null);
+  const [diagnosticBusy, setDiagnosticBusy] = useState(false);
+  const [diagnosticMessage, setDiagnosticMessage] = useState("");
+  const [workingDirectory, setWorkingDirectory] = useState(
+    () => status.config.app.recentWorkingDirectories[0] ?? status.codex.codexDir,
+  );
+  const [terminal, setTerminal] = useState<TerminalKind>(status.config.app.preferredTerminal);
+  const [cliPreview, setCliPreview] = useState("");
+  const [cliMessage, setCliMessage] = useState("");
+  const [cliBusy, setCliBusy] = useState(false);
   const disabled = busy !== "idle";
   const update = appUpdater.state;
   const updateBusy = update.status === "checking" || update.status === "downloading";
   const updateStatus = appUpdateStatusLabel(update);
+
+  useEffect(() => {
+    void loadDiagnostics();
+  }, []);
+
+  useEffect(() => {
+    const directory = workingDirectory.trim();
+    if (!directory) {
+      setCliPreview("");
+      setCliMessage("");
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const command = await previewCliCommand({ workingDirectory: directory, terminal });
+        if (!cancelled) {
+          setCliPreview(command);
+          setCliMessage("");
+        }
+      } catch (unknownError) {
+        if (!cancelled) {
+          setCliPreview("");
+          setCliMessage(String(unknownError));
+        }
+      }
+    }, 220);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [terminal, workingDirectory]);
+
+  async function loadDiagnostics(): Promise<void> {
+    setDiagnosticBusy(true);
+    try {
+      setDiagnosticInfo(await getDiagnosticInfo());
+      setDiagnosticMessage("");
+    } catch (unknownError) {
+      setDiagnosticMessage(String(unknownError));
+    } finally {
+      setDiagnosticBusy(false);
+    }
+  }
 
   function handleCheckForUpdates(): void {
     void appUpdater.checkForUpdates();
@@ -37,8 +141,74 @@ export function Settings({
     void appUpdater.installUpdate();
   }
 
+  function handleWorkingDirectoryChange(event: ChangeEvent<HTMLInputElement>): void {
+    setWorkingDirectory(event.target.value);
+  }
+
+  function handleTerminalChange(event: ChangeEvent<HTMLSelectElement>): void {
+    setTerminal(event.target.value as TerminalKind);
+  }
+
+  function handleTokenRefreshChange(event: ChangeEvent<HTMLSelectElement>): void {
+    void onTokenUsageRefreshInterval(Number(event.target.value));
+  }
+
+  async function handleLaunchCli(): Promise<void> {
+    setCliBusy(true);
+    setCliMessage("");
+    try {
+      const outcome = await launchCli({
+        workingDirectory: workingDirectory.trim(),
+        terminal,
+      });
+      setCliPreview(outcome.command);
+      setCliMessage(outcome.message);
+    } catch (unknownError) {
+      setCliMessage(String(unknownError));
+    } finally {
+      setCliBusy(false);
+    }
+  }
+
+  async function handleCopyCliCommand(): Promise<void> {
+    if (!cliPreview) return;
+    try {
+      await navigator.clipboard.writeText(cliPreview);
+      setCliMessage("命令已复制");
+    } catch (unknownError) {
+      setCliMessage(String(unknownError));
+    }
+  }
+
+  async function handleOpenDiagnosticDirectory(): Promise<void> {
+    setDiagnosticBusy(true);
+    try {
+      const opened = await openDiagnosticDirectory();
+      setDiagnosticMessage(opened ? "已打开诊断日志目录" : "当前环境无法自动打开目录");
+    } catch (unknownError) {
+      setDiagnosticMessage(String(unknownError));
+    } finally {
+      setDiagnosticBusy(false);
+    }
+  }
+
+  async function handleClearDiagnosticLogs(): Promise<void> {
+    const confirmed = window.confirm("确定清空 Companion 诊断日志吗？账号、配置和会话不会被删除。");
+    if (!confirmed) return;
+    setDiagnosticBusy(true);
+    try {
+      const removed = await clearDiagnosticLogs();
+      setDiagnosticMessage(`已清理 ${removed} 个日志文件`);
+      setDiagnosticInfo(await getDiagnosticInfo());
+    } catch (unknownError) {
+      setDiagnosticMessage(String(unknownError));
+    } finally {
+      setDiagnosticBusy(false);
+    }
+  }
+
   return (
-    <div className="content-grid">
+    <div className="content-grid settings-grid">
       <Panel eyebrow="Codex" title="启动配置">
         <dl className="details-grid">
           <dt>Codex 目录</dt>
@@ -63,26 +233,26 @@ export function Settings({
           </span>
         </label>
         <p className="field-hint" id="preserve-official-codex-auth-hint">
-          开启后，第三方 API key 直连会写入对应 provider 的 experimental_bearer_token，官方 ChatGPT OAuth 继续保留在 auth.json；本地代理仍由 Companion 注入密钥。
+          第三方 API Key 直连写入 provider 配置，官方 ChatGPT OAuth 继续保留在 auth.json；本地代理由 Companion 注入账号材料。
         </p>
         <div className="actions">
           <Button disabled={disabled} onClick={() => void onInstall()}>
-            <Cable size={15} /> 写入 Codex 配置
+            <Cable aria-hidden="true" size={15} /> 写入 Codex 配置
           </Button>
           <Button disabled={disabled} onClick={() => void onUninstall()} variant="secondary">
-            <RotateCcw size={15} /> 恢复原配置
+            <RotateCcw aria-hidden="true" size={15} /> 恢复原配置
           </Button>
         </div>
       </Panel>
 
-      <Panel eyebrow="应用" title="偏好设置">
+      <Panel eyebrow="应用" title="偏好与更新">
         <Field label="主题">
           <Select.Root value={status.config.app.theme} onValueChange={(theme) => void onTheme(theme as ThemeMode)}>
             <Select.Trigger className="select-trigger">
               <Select.Value />
             </Select.Trigger>
             <Select.Portal>
-              <Select.Content className="select-content">
+              <Select.Content className="select-content" position="popper" sideOffset={4}>
                 <Select.Item className="select-item" value="system">
                   <Select.ItemText>跟随系统</Select.ItemText>
                 </Select.Item>
@@ -96,16 +266,20 @@ export function Settings({
             </Select.Portal>
           </Select.Root>
         </Field>
+        <Field label="Token 自动刷新">
+          <select
+            disabled={disabled}
+            onChange={handleTokenRefreshChange}
+            value={status.config.app.tokenUsageRefreshIntervalSeconds}
+          >
+            {TOKEN_REFRESH_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </Field>
         <dl className="details-grid details-top">
           <dt>账号展示</dt>
           <dd>{status.config.app.providerViewMode === "cards" ? "卡片" : "紧凑"}</dd>
-        </dl>
-        <div className="actions">
-          <Button disabled={disabled} onClick={() => void onResetPreferences()} variant="secondary">
-            <RotateCcw size={15} /> 恢复界面默认
-          </Button>
-        </div>
-        <dl className="details-grid details-top">
           <dt>数据目录</dt>
           <dd>
             {compactPath(status.dataDir)} {status.dataRoots.companionIsolated ? <Badge tone="info">隔离</Badge> : null}
@@ -114,9 +288,12 @@ export function Settings({
           <dd>
             {compactPath(status.codex.codexDir)} {status.dataRoots.codexIsolated ? <Badge tone="info">隔离</Badge> : null}
           </dd>
-          <dt>配置</dt>
-          <dd>{compactPath(status.configPath)}</dd>
         </dl>
+        <div className="actions">
+          <Button disabled={disabled} onClick={() => void onResetPreferences()} variant="secondary">
+            <RotateCcw aria-hidden="true" size={15} /> 恢复界面默认
+          </Button>
+        </div>
         <div aria-busy={updateBusy} aria-live="polite" className="settings-update">
           <dl className="details-grid details-top">
             <dt>当前版本</dt>
@@ -135,6 +312,69 @@ export function Settings({
               </Button>
             ) : null}
           </div>
+        </div>
+      </Panel>
+
+      <Panel eyebrow="CLI" title="在终端启动 Codex">
+        <Field label="工作目录">
+          <input
+            list="recent-working-directories"
+            onChange={handleWorkingDirectoryChange}
+            placeholder="/path/to/project"
+            value={workingDirectory}
+          />
+        </Field>
+        <datalist id="recent-working-directories">
+          {status.config.app.recentWorkingDirectories.map((directory) => (
+            <option key={directory} value={directory} />
+          ))}
+        </datalist>
+        <Field label="终端">
+          <select onChange={handleTerminalChange} value={terminal}>
+            {TERMINAL_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </Field>
+        <div className="cli-command-preview" aria-live="polite">
+          <SquareTerminal aria-hidden="true" size={16} />
+          <code>{cliPreview || "输入有效工作目录后生成启动命令"}</code>
+        </div>
+        {cliMessage ? <p className="field-hint" role="status">{cliMessage}</p> : null}
+        <div className="actions">
+          <Button disabled={cliBusy || !cliPreview} onClick={() => void handleLaunchCli()}>
+            <Play aria-hidden="true" size={15} /> {cliBusy ? "启动中" : "打开终端"}
+          </Button>
+          <Button disabled={!cliPreview} onClick={() => void handleCopyCliCommand()} variant="secondary">
+            <Clipboard aria-hidden="true" size={15} /> 复制命令
+          </Button>
+        </div>
+      </Panel>
+
+      <Panel eyebrow="诊断" title="本地日志">
+        <dl className="details-grid diagnostic-details">
+          <dt>当前日志</dt>
+          <dd>{diagnosticInfo ? compactPath(diagnosticInfo.currentLogPath) : "读取中"}</dd>
+          <dt>保留文件</dt>
+          <dd>{diagnosticInfo?.retainedFiles ?? 0}</dd>
+          <dt>总大小</dt>
+          <dd>{formatBytes(diagnosticInfo?.totalBytes ?? 0)}</dd>
+        </dl>
+        <div className="diagnostic-note">
+          <FileText aria-hidden="true" size={16} />
+          <span>日志采用 JSONL，写入前会脱敏，并按大小轮转保留。</span>
+        </div>
+        {diagnosticMessage ? <p className="field-hint" role="status">{diagnosticMessage}</p> : null}
+        <div className="actions">
+          <Button disabled={diagnosticBusy} onClick={() => void handleOpenDiagnosticDirectory()} variant="secondary">
+            <FolderOpen aria-hidden="true" size={15} /> 打开日志目录
+          </Button>
+          <Button disabled={diagnosticBusy} onClick={() => void loadDiagnostics()} variant="ghost">
+            <RefreshCw aria-hidden="true" size={15} /> 刷新信息
+          </Button>
+          <Button disabled={diagnosticBusy} onClick={() => void handleClearDiagnosticLogs()} variant="danger">
+            <Trash2 aria-hidden="true" size={15} /> 清空日志
+          </Button>
         </div>
       </Panel>
     </div>
@@ -162,4 +402,10 @@ function appUpdateStatusLabel(state: AppUpdateState): string {
     case "restart-error":
       return state.message;
   }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }

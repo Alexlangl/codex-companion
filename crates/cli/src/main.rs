@@ -242,6 +242,10 @@ enum ProviderKindArg {
 #[derive(Debug, Clone, ValueEnum)]
 enum GroupPolicyArg {
     PriorityFallback,
+    RoundRobin,
+    Random,
+    Weighted,
+    LeastLoaded,
     Manual,
 }
 
@@ -356,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
                     name: args.name,
                     kind: args.kind.into(),
                     base_url: args.base_url,
+                    websocket_url: None,
                     auth_ref: args.auth_ref,
                     direct_auth_ref: None,
                     model_map: BTreeMap::new(),
@@ -372,6 +377,7 @@ async fn main() -> anyhow::Result<()> {
                     &json_text,
                     args.provider_id,
                     args.provider_name,
+                    None,
                 )?)?;
             }
             ProviderCommand::ImportLocal(args) => {
@@ -393,6 +399,7 @@ async fn main() -> anyhow::Result<()> {
                     name: args.name,
                     policy: args.policy.into(),
                     provider_order: args.providers,
+                    provider_weights: BTreeMap::new(),
                     fallback_enabled: args.fallback,
                 })?;
                 print_json(group)?;
@@ -479,6 +486,10 @@ impl From<GroupPolicyArg> for GroupPolicy {
     fn from(value: GroupPolicyArg) -> Self {
         match value {
             GroupPolicyArg::PriorityFallback => Self::PriorityFallback,
+            GroupPolicyArg::RoundRobin => Self::RoundRobin,
+            GroupPolicyArg::Random => Self::Random,
+            GroupPolicyArg::Weighted => Self::Weighted,
+            GroupPolicyArg::LeastLoaded => Self::LeastLoaded,
             GroupPolicyArg::Manual => Self::Manual,
         }
     }

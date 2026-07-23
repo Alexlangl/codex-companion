@@ -22,7 +22,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bytes = "1.11"
 chrono = { version = "0.4", features = ["serde"] }
@@ -34,7 +34,9 @@ codex-companion-provider = { path = "crates/provider" }
 codex-companion-relay = { path = "crates/relay" }
 codex-companion-state = { path = "crates/state" }
 crossterm = "0.29"
+crypto_box = { version = "0.9.1", features = ["seal", "std"] }
 dirs = "6.0"
+ed25519-dalek = { version = "2.2", features = ["pkcs8", "rand_core"] }
 futures-util = "0.3"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -51,7 +53,8 @@ tauri-plugin-process = "2.3.1"
 tauri-plugin-updater = "2.10.1"
 tempfile = "3.23"
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 toml_edit = "0.23"
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2.5"

@@ -21,6 +21,7 @@ pub fn upsert_group(store: &ConfigStore, input: GroupUpsert) -> Result<ProviderG
             name: input.name.trim().to_string(),
             policy: input.policy,
             provider_order: input.provider_order,
+            provider_weights: input.provider_weights,
             fallback_enabled: input.fallback_enabled,
         };
         config.groups.insert(group.id.clone(), group.clone());
@@ -118,6 +119,7 @@ mod tests {
             name: id.to_string(),
             kind: ProviderKind::OpenAiCompatible,
             base_url: format!("https://{id}.example.com/v1"),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: BTreeMap::new(),
@@ -146,6 +148,7 @@ mod tests {
                 name: "Main".to_string(),
                 policy: GroupPolicy::PriorityFallback,
                 provider_order: vec!["b".to_string(), "a".to_string()],
+                provider_weights: BTreeMap::new(),
                 fallback_enabled: true,
             },
         );
@@ -183,6 +186,7 @@ mod tests {
                 name: "Manual".to_string(),
                 policy: GroupPolicy::Manual,
                 provider_order: vec!["b".to_string(), "a".to_string()],
+                provider_weights: BTreeMap::new(),
                 fallback_enabled: false,
             },
         );

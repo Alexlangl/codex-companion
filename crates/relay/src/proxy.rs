@@ -1,5 +1,5 @@
 use crate::events::{append_event, update_health};
-use crate::state::RelayState;
+use crate::state::{apply_group_policy, RelayState};
 use crate::upstream::{send_upstream, stream_response, text_response, upstream_url};
 use crate::{RequestLogFinish, RequestLogStart};
 use axum::{
@@ -247,6 +247,8 @@ async fn proxy_dispatch(
         selected
     };
 
+    apply_group_policy(&state, &group, &mut candidates);
+
     if !group.fallback_enabled {
         candidates.truncate(1);
     }
@@ -293,6 +295,7 @@ async fn proxy_dispatch(
     let mut last_error = None;
     let candidate_count = candidates.len();
     for (index, provider) in candidates.into_iter().enumerate() {
+        let _request_guard = state.begin_provider_request(&provider.id);
         let upstream = upstream_url(&provider, &uri);
         match send_upstream(
             &state.client,
@@ -306,8 +309,48 @@ async fn proxy_dispatch(
         )
         .await
         {
-            Ok(response) if response.status().is_success() => {
+            Ok(mut response) if response.status().is_success() => {
                 let upstream_status = response.status();
+                if let Err(error) = response.preflight_stream_failure().await {
+                    let failure = classify_failure(None, &error);
+                    let message = format!("stream 输出前语义失败: {}", compact_error_body(&error));
+                    record_provider_failure(
+                        &state,
+                        &config,
+                        &provider.id,
+                        requested_model.as_deref(),
+                        &failure,
+                        &message,
+                    );
+                    last_error = Some(message.clone());
+                    let can_retry = fallback_eligible(&failure)
+                        && index + 1 < candidate_count
+                        && group.fallback_enabled;
+                    if can_retry {
+                        append_event(
+                            &state.store,
+                            "fallback",
+                            Some(provider.id),
+                            format!("[{request_id}] {message}"),
+                        );
+                        continue;
+                    }
+                    record_request_finish(
+                        &state,
+                        request_id,
+                        Some(&provider.id),
+                        Some(StatusCode::BAD_GATEWAY),
+                        "failed",
+                        (index + 1) as u16,
+                        started_at,
+                        Some(&message),
+                    );
+                    return Ok(api_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        failure_error_code(&failure.kind),
+                        &message,
+                    ));
+                }
                 let downstream = stream_response(
                     state.store.clone(),
                     request_id.to_string(),
@@ -1007,6 +1050,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn falls_back_when_sse_fails_before_any_output() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let provider_a_url = spawn_sse_mock_server(
+            concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
+                "\"error\":{\"message\":\"overloaded before output\"}}}\n\n"
+            ),
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_sse_mock_server(
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok from b\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_b\",",
+                "\"status\":\"completed\"}}\n\n"
+            ),
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("b")
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        assert!(String::from_utf8_lossy(&body).contains("ok from b"));
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn does_not_fallback_after_sse_output_has_started() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let provider_a_url = spawn_sse_mock_server(
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial from a\"}\n\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
+                "\"error\":{\"message\":\"failed after output\"}}}\n\n"
+            ),
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_sse_mock_server(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("a")
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("partial from a"));
+        assert!(body.contains("response.failed"));
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn transforms_sse_even_when_upstream_content_type_is_wrong() {
         let provider_url = spawn_mock_server(
             StatusCode::OK,
@@ -1441,6 +1587,29 @@ mod tests {
         format!("http://{addr}/v1")
     }
 
+    async fn spawn_sse_mock_server(body: &'static str, hits: Option<Arc<AtomicUsize>>) -> String {
+        let app = Router::new().route(
+            "/{*path}",
+            any(move || {
+                let hits = hits.clone();
+                async move {
+                    if let Some(hits) = hits {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/v1")
+    }
+
     fn store_with_group(providers: Vec<ProviderConfig>) -> ConfigStore {
         let temp = tempfile::tempdir().expect("temp");
         let store = ConfigStore::new(temp.keep().join("config.json"));
@@ -1462,6 +1631,7 @@ mod tests {
                         name: "Test".to_string(),
                         policy: GroupPolicy::PriorityFallback,
                         provider_order,
+                        provider_weights: Default::default(),
                         fallback_enabled: true,
                     },
                 );
@@ -1477,6 +1647,7 @@ mod tests {
             name: id.to_string(),
             kind: ProviderKind::OpenAiCompatible,
             base_url: base_url.to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: BTreeMap::new(),

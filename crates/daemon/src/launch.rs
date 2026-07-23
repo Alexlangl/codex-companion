@@ -1,10 +1,13 @@
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
-    default_codex_dir, provider_endpoint_is_chat_completions, CodexLaunchMode, CodexLaunchOutcome,
-    CompanionError, GroupPolicy, ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode,
-    RepairOptions, RepairOutcome, RepairPlan, Result, COMPANION_PROVIDER_ID,
+    default_codex_dir, provider_endpoint_is_chat_completions, CliLaunchOutcome, CliLaunchRequest,
+    CodexLaunchMode, CodexLaunchOutcome, CompanionError, GroupPolicy, ProviderConfig,
+    ProviderGroup, ProviderKind, ProviderLaunchMode, RepairOptions, RepairOutcome, RepairPlan,
+    Result, TerminalKind, COMPANION_PROVIDER_ID,
 };
-use codex_companion_provider::{selected_providers_for_group, use_group};
+use codex_companion_provider::{
+    provider_uses_agent_identity, selected_providers_for_group, use_group,
+};
 use codex_companion_state::{
     doctor, install_companion_provider_with_token_source, install_direct_provider_with_options,
     repair_state, DirectInstallOptions,
@@ -22,6 +25,42 @@ const LEGACY_CODEX_APP_NAME: &str = "Codex";
 const CODEX_CLIENT_DISPLAY_NAME: &str = "ChatGPT / Codex";
 
 impl CompanionDaemon {
+    pub fn preview_cli_command(&self, request: &CliLaunchRequest) -> Result<String> {
+        validate_working_directory(&request.working_directory)?;
+        Ok(cli_shell_command(request))
+    }
+
+    pub fn launch_cli(&self, request: CliLaunchRequest) -> Result<CliLaunchOutcome> {
+        validate_working_directory(&request.working_directory)?;
+        let terminal = resolve_terminal(request.terminal.clone());
+        let command = cli_shell_command(&request);
+        let launched = launch_cli_terminal(&terminal, &request.working_directory, &command);
+        self.store.update(|config| {
+            config.app.preferred_terminal = terminal.clone();
+            config
+                .app
+                .recent_working_directories
+                .retain(|path| path != &request.working_directory);
+            config
+                .app
+                .recent_working_directories
+                .insert(0, request.working_directory.clone());
+            config.app.recent_working_directories.truncate(8);
+            Ok(())
+        })?;
+        Ok(CliLaunchOutcome {
+            command,
+            terminal,
+            working_directory: request.working_directory,
+            launched,
+            message: if launched {
+                "已在所选终端启动 Codex CLI".to_string()
+            } else {
+                "终端启动失败，命令已生成，可复制后手动执行".to_string()
+            },
+        })
+    }
+
     pub fn launch_group(
         &self,
         group_id: &str,
@@ -195,6 +234,7 @@ impl CompanionDaemon {
                 name: format!("{} 单 Provider", provider.name),
                 policy: GroupPolicy::Manual,
                 provider_order: vec![provider.id.clone()],
+                provider_weights: Default::default(),
                 fallback_enabled: false,
             };
             config.groups.insert(group_id.clone(), group.clone());
@@ -214,8 +254,160 @@ impl CompanionDaemon {
     }
 }
 
+fn validate_working_directory(path: &std::path::Path) -> Result<()> {
+    if !path.is_dir() {
+        return Err(CompanionError::InvalidConfig(format!(
+            "CLI 工作目录不存在或不是目录: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cli_shell_command(request: &CliLaunchRequest) -> String {
+    let codex_command = request
+        .resume_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|session_id| format!("codex resume {}", shell_quote(session_id)))
+        .unwrap_or_else(|| "codex".to_string());
+    format!(
+        "cd {} && {codex_command}",
+        shell_quote(&request.working_directory.to_string_lossy())
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn cli_shell_command(request: &CliLaunchRequest) -> String {
+    let terminal = resolve_terminal(request.terminal.clone());
+    let resume_session_id = request
+        .resume_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if matches!(terminal, TerminalKind::PowerShell | TerminalKind::Pwsh) {
+        let working_directory =
+            powershell_single_quote(&request.working_directory.to_string_lossy());
+        let codex_command = resume_session_id
+            .map(|session_id| format!("codex resume '{}'", powershell_single_quote(session_id)))
+            .unwrap_or_else(|| "codex".to_string());
+        return format!("Set-Location -LiteralPath '{working_directory}'; {codex_command}");
+    }
+    let working_directory = cmd_quote(&request.working_directory.to_string_lossy());
+    let codex_command = resume_session_id
+        .map(|session_id| format!("codex resume {}", cmd_quote(session_id)))
+        .unwrap_or_else(|| "codex".to_string());
+    format!("cd /d {working_directory} && {codex_command}")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "windows")]
+fn cmd_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn resolve_terminal(terminal: TerminalKind) -> TerminalKind {
+    if !matches!(terminal, TerminalKind::Auto) {
+        return terminal;
+    }
+    #[cfg(target_os = "macos")]
+    return TerminalKind::Terminal;
+    #[cfg(target_os = "windows")]
+    return TerminalKind::WindowsTerminal;
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    TerminalKind::Shell
+}
+
+#[cfg(target_os = "macos")]
+fn launch_cli_terminal(
+    terminal: &TerminalKind,
+    _working_directory: &std::path::Path,
+    command: &str,
+) -> bool {
+    let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = match terminal {
+        TerminalKind::ITerm2 => format!(
+            r#"tell application "iTerm2"
+activate
+create window with default profile
+tell current session of current window to write text "{escaped}"
+end tell"#
+        ),
+        _ => format!(
+            r#"tell application "Terminal"
+activate
+do script "{escaped}"
+end tell"#
+        ),
+    };
+    Command::new("osascript")
+        .args(["-e", script.as_str()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(target_os = "windows")]
+fn launch_cli_terminal(
+    terminal: &TerminalKind,
+    working_directory: &std::path::Path,
+    command: &str,
+) -> bool {
+    let working_directory = working_directory.to_string_lossy();
+    match terminal {
+        TerminalKind::PowerShell => Command::new("powershell")
+            .args(["-NoExit", "-Command", command])
+            .current_dir(working_directory.as_ref())
+            .spawn()
+            .is_ok(),
+        TerminalKind::Pwsh => Command::new("pwsh")
+            .args(["-NoExit", "-Command", command])
+            .current_dir(working_directory.as_ref())
+            .spawn()
+            .is_ok(),
+        TerminalKind::Cmd => Command::new("cmd")
+            .args(["/K", command])
+            .current_dir(working_directory.as_ref())
+            .spawn()
+            .is_ok(),
+        _ => Command::new("wt")
+            .args(["-d", working_directory.as_ref(), "cmd", "/K", command])
+            .spawn()
+            .is_ok(),
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn launch_cli_terminal(
+    _terminal: &TerminalKind,
+    working_directory: &std::path::Path,
+    command: &str,
+) -> bool {
+    for (program, args) in [
+        ("x-terminal-emulator", vec!["-e", "sh", "-lc", command]),
+        ("gnome-terminal", vec!["--", "sh", "-lc", command]),
+        ("konsole", vec!["-e", "sh", "-lc", command]),
+    ] {
+        if Command::new(program)
+            .args(args)
+            .current_dir(working_directory)
+            .spawn()
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn provider_can_direct_connect(provider: &ProviderConfig) -> bool {
-    !provider_endpoint_is_chat_completions(&provider.base_url)
+    !provider_uses_agent_identity(provider)
+        && !provider_endpoint_is_chat_completions(&provider.base_url)
         && provider
             .direct_auth_ref
             .as_deref()
@@ -228,6 +420,9 @@ pub fn provider_can_direct_connect(provider: &ProviderConfig) -> bool {
 
 pub fn provider_relay_reason(provider: &ProviderConfig) -> &'static str {
     if matches!(provider.kind, ProviderKind::OfficialCodex) {
+        if provider_uses_agent_identity(provider) {
+            return "Agent Identity 仅通过 Companion API 服务动态签名，不写入 Codex auth.json";
+        }
         "本地代理由 Companion 续期 OAuth token 并注入 Codex headers"
     } else if provider
         .auth_ref
@@ -785,6 +980,7 @@ mod tests {
             name: "Provider".to_string(),
             kind,
             base_url: "https://example.com/v1".to_string(),
+            websocket_url: None,
             auth_ref: auth_ref.map(ToOwned::to_owned),
             direct_auth_ref: auth_ref
                 .filter(|auth_ref| auth_ref.starts_with("env:"))
@@ -923,5 +1119,35 @@ mod tests {
 
         assert!(source.contains("environment variable OPENROUTER_API_KEY"));
         assert!(source.contains("Provider"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn cli_command_quotes_working_directory_and_resume_session_id() {
+        let request = CliLaunchRequest {
+            working_directory: PathBuf::from("/tmp/Client's project"),
+            terminal: TerminalKind::Shell,
+            resume_session_id: Some("session'; touch /tmp/unexpected #".to_string()),
+        };
+
+        assert_eq!(
+            cli_shell_command(&request),
+            "cd '/tmp/Client'\\''s project' && codex resume 'session'\\''; touch /tmp/unexpected #'"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn cli_command_ignores_an_empty_resume_session_id() {
+        let request = CliLaunchRequest {
+            working_directory: PathBuf::from("/tmp/project with spaces"),
+            terminal: TerminalKind::Shell,
+            resume_session_id: Some("   ".to_string()),
+        };
+
+        assert_eq!(
+            cli_shell_command(&request),
+            "cd '/tmp/project with spaces' && codex"
+        );
     }
 }

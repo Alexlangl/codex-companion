@@ -20,7 +20,10 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
     if lower.contains("insufficient_quota")
         || lower.contains("quota exceeded")
         || lower.contains("billing")
-        || lower.contains("额度")
+        || lower.contains("额度耗尽")
+        || lower.contains("额度不足")
+        || lower.contains("余额不足")
+        || lower.contains("超出额度")
     {
         return class(HealthFailureKind::QuotaExhausted, true, true);
     }
@@ -39,6 +42,8 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
     if lower.contains("upstream semantic failure")
         || lower.contains("response.failed")
         || lower.contains("upstream_stream_incomplete")
+        || (lower.contains("json")
+            && (lower.contains("解析") || lower.contains("parse") || lower.contains("decode")))
     {
         return class(HealthFailureKind::UpstreamFailed, true, true);
     }
@@ -158,6 +163,18 @@ mod tests {
         assert_eq!(
             classify_failure(Some(400), "insufficient_quota").kind,
             HealthFailureKind::QuotaExhausted
+        );
+        assert_eq!(
+            classify_failure(None, "额度不足").kind,
+            HealthFailureKind::QuotaExhausted
+        );
+        assert_eq!(
+            classify_failure(
+                None,
+                "解析 Codex 额度 JSON 失败: invalid type: null, expected a sequence"
+            )
+            .kind,
+            HealthFailureKind::UpstreamFailed
         );
         assert_eq!(
             classify_failure(Some(404), "model_not_found").kind,

@@ -36,6 +36,8 @@ export function getTokenUsageSyncStatus() {
       active: false,
       scannedFiles: 0,
       totalFiles: 0,
+      deferredFiles: 0,
+      suspectedDuplicates: 0,
       phase: "complete",
       startedAt: null,
       finishedAt: null,

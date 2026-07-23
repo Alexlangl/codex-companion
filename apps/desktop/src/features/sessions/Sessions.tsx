@@ -1,7 +1,7 @@
-import { Copy, History, RefreshCw, RotateCcw, Search } from "lucide-react";
+import { Copy, History, Play, RefreshCw, RotateCcw, Search } from "lucide-react";
 import { useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
 import { Badge, Button, Field, IconButton, Panel } from "../../components/ui";
-import { getSessionPage } from "../../lib/api";
+import { getSessionPage, launchCli } from "../../lib/api";
 import { compactPath, formatTime } from "../../lib/format";
 import type { CompanionStatus, SessionPage, SessionSummary } from "../../types/domain";
 
@@ -17,6 +17,8 @@ export function Sessions({ active, status }: SessionsProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [launchingId, setLaunchingId] = useState<string | null>(null);
+  const [launchMessage, setLaunchMessage] = useState("");
   const loadRequestRef = useRef(0);
   const deferredQuery = useDeferredValue(query);
 
@@ -58,6 +60,24 @@ export function Sessions({ active, status }: SessionsProps) {
     window.setTimeout(() => setCopiedId((current) => current === session.id ? null : current), 1600);
   }
 
+  async function handleLaunchResume(session: SessionSummary): Promise<void> {
+    const workingDirectory = status.config.app.recentWorkingDirectories[0] ?? status.codex.codexDir;
+    setLaunchingId(session.id);
+    setLaunchMessage("");
+    try {
+      const outcome = await launchCli({
+        workingDirectory,
+        terminal: status.config.app.preferredTerminal,
+        resumeSessionId: session.id,
+      });
+      setLaunchMessage(outcome.message);
+    } catch (unknownError) {
+      setLaunchMessage(String(unknownError));
+    } finally {
+      setLaunchingId(null);
+    }
+  }
+
   const rootIsIsolated = status.dataRoots.companionIsolated || status.dataRoots.codexIsolated;
   const sessions = page?.sessions ?? [];
 
@@ -95,6 +115,7 @@ export function Sessions({ active, status }: SessionsProps) {
           <code>{compactPath(page?.dataRoot ?? codexDir)}</code>
         </div>
         {error ? <div className="error-banner">{error}</div> : null}
+        {launchMessage ? <p className="field-hint" role="status">{launchMessage}</p> : null}
       </Panel>
 
       <section className="session-list" aria-label="会话列表" aria-busy={loading}>
@@ -122,6 +143,13 @@ export function Sessions({ active, status }: SessionsProps) {
                 onClick={() => void handleCopyResume(session)}
               >
                 <Copy size={14} />
+              </IconButton>
+              <IconButton
+                disabled={launchingId !== null}
+                label={`在终端恢复 ${session.title}`}
+                onClick={() => void handleLaunchResume(session)}
+              >
+                <Play size={14} />
               </IconButton>
             </div>
           </article>

@@ -33,7 +33,11 @@ export function Groups({
   }
 
   function openEditor(group: GroupUpsert) {
-    setForm({ ...group, providerOrder: existingProviderIds(group.providerOrder, providers) });
+    setForm({
+      ...group,
+      providerOrder: existingProviderIds(group.providerOrder, providers),
+      providerWeights: group.providerWeights ?? {},
+    });
     setOpen(true);
   }
 
@@ -44,6 +48,9 @@ export function Groups({
       id: form.id.trim(),
       name: form.name.trim(),
       providerOrder: existingProviderIds(form.providerOrder, providers),
+      providerWeights: Object.fromEntries(
+        form.providerOrder.map((providerId) => [providerId, form.providerWeights[providerId] ?? 1]),
+      ),
     });
     setOpen(false);
   }
@@ -52,7 +59,13 @@ export function Groups({
     const providerOrder = checked
       ? [...form.providerOrder, provider.id].filter(unique)
       : form.providerOrder.filter((id) => id !== provider.id);
-    setForm({ ...form, providerOrder });
+    const providerWeights = { ...form.providerWeights };
+    if (checked) {
+      providerWeights[provider.id] = providerWeights[provider.id] ?? 1;
+    } else {
+      delete providerWeights[provider.id];
+    }
+    setForm({ ...form, providerOrder, providerWeights });
   }
 
   function moveProvider(providerId: string, direction: -1 | 1) {
@@ -161,16 +174,28 @@ export function Groups({
                   setForm({
                     ...form,
                     policy: nextPolicy,
-                    fallbackEnabled: nextPolicy === "priority_fallback" ? true : false,
+                    fallbackEnabled: nextPolicy !== "manual",
                   });
                 }}>
                   <Select.Trigger className="select-trigger">
                     <Select.Value />
                   </Select.Trigger>
                   <Select.Portal>
-                    <Select.Content className="select-content">
+                    <Select.Content className="select-content" position="popper" sideOffset={4}>
                       <Select.Item className="select-item" value="priority_fallback">
                         <Select.ItemText>按优先级自动切换</Select.ItemText>
+                      </Select.Item>
+                      <Select.Item className="select-item" value="round_robin">
+                        <Select.ItemText>轮询分配</Select.ItemText>
+                      </Select.Item>
+                      <Select.Item className="select-item" value="random">
+                        <Select.ItemText>随机分配</Select.ItemText>
+                      </Select.Item>
+                      <Select.Item className="select-item" value="weighted">
+                        <Select.ItemText>按权重分配</Select.ItemText>
+                      </Select.Item>
+                      <Select.Item className="select-item" value="least_loaded">
+                        <Select.ItemText>优先最低负载</Select.ItemText>
                       </Select.Item>
                       <Select.Item className="select-item" value="manual">
                         <Select.ItemText>只使用第一个账号</Select.ItemText>
@@ -179,7 +204,7 @@ export function Groups({
                   </Select.Portal>
                 </Select.Root>
                 <p className="field-hint">
-                  自动切换会按下方账号顺序 fallback；固定首个只使用列表第一位，不做静默切换。
+                  会话亲和始终优先；新会话按所选策略决定首选账号，失败后可继续使用后备账号。
                 </p>
               </Field>
 
@@ -221,6 +246,24 @@ export function Groups({
                             <small>{id}</small>
                           </div>
                           <div className="order-actions">
+                            {form.policy === "weighted" ? (
+                              <label className="weight-control">
+                                <span>权重</span>
+                                <input
+                                  aria-label={`${provider ? providerAccountTitle(provider) : id} 的权重`}
+                                  min={1}
+                                  onChange={(event) => setForm({
+                                    ...form,
+                                    providerWeights: {
+                                      ...form.providerWeights,
+                                      [id]: Math.max(1, Number(event.target.value) || 1),
+                                    },
+                                  })}
+                                  type="number"
+                                  value={form.providerWeights[id] ?? 1}
+                                />
+                              </label>
+                            ) : null}
                             <Button disabled={disabled || index === 0} onClick={() => moveProvider(id, -1)} type="button" variant="secondary">
                               <ArrowUp size={14} /> 上移
                             </Button>
@@ -258,12 +301,21 @@ function newGroupDraft(): GroupUpsert {
     name: "",
     policy: "priority_fallback",
     providerOrder: [],
+    providerWeights: {},
     fallbackEnabled: true,
   };
 }
 
 function policyLabel(policy: GroupPolicy) {
-  return policy === "priority_fallback" ? "按优先级自动切换" : "只使用第一个账号";
+  const labels: Record<GroupPolicy, string> = {
+    priority_fallback: "按优先级自动切换",
+    round_robin: "轮询分配",
+    random: "随机分配",
+    weighted: "按权重分配",
+    least_loaded: "优先最低负载",
+    manual: "只使用第一个账号",
+  };
+  return labels[policy];
 }
 
 function unique(value: string, index: number, array: string[]) {

@@ -43,7 +43,25 @@ pub enum ProviderKind {
 #[serde(rename_all = "snake_case")]
 pub enum GroupPolicy {
     PriorityFallback,
+    RoundRobin,
+    Random,
+    Weighted,
+    LeastLoaded,
     Manual,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalKind {
+    #[default]
+    Auto,
+    Terminal,
+    ITerm2,
+    PowerShell,
+    Pwsh,
+    WindowsTerminal,
+    Cmd,
+    Shell,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +140,8 @@ pub struct ProviderConfig {
     pub name: String,
     pub kind: ProviderKind,
     pub base_url: String,
+    #[serde(default)]
+    pub websocket_url: Option<String>,
     pub auth_ref: Option<String>,
     #[serde(default)]
     pub direct_auth_ref: Option<String>,
@@ -137,6 +157,8 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAccountInfo {
+    #[serde(default)]
+    pub auth_mode: Option<String>,
     pub display_name: Option<String>,
     pub email: Option<String>,
     pub team_name: Option<String>,
@@ -172,6 +194,8 @@ pub struct ProviderGroup {
     pub name: String,
     pub policy: GroupPolicy,
     pub provider_order: Vec<String>,
+    #[serde(default)]
+    pub provider_weights: BTreeMap<String, u16>,
     pub fallback_enabled: bool,
 }
 
@@ -182,6 +206,7 @@ impl ProviderGroup {
             name: "Default".to_string(),
             policy: GroupPolicy::PriorityFallback,
             provider_order: Vec::new(),
+            provider_weights: BTreeMap::new(),
             fallback_enabled: true,
         }
     }
@@ -383,10 +408,27 @@ pub struct ProviderRefreshProgress {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct ProviderImportProgress {
+    pub active: bool,
+    pub completed: usize,
+    pub total: usize,
+    pub current_label: Option<String>,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct TokenUsageSyncStatus {
     pub active: bool,
     pub scanned_files: usize,
     pub total_files: usize,
+    #[serde(default)]
+    pub deferred_files: usize,
+    #[serde(default)]
+    pub suspected_duplicates: usize,
     pub phase: String,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -434,6 +476,12 @@ pub struct AppSettings {
     pub codex_restart_required_on_next_relay: bool,
     #[serde(default)]
     pub preserve_official_codex_auth: bool,
+    #[serde(default = "default_token_usage_refresh_interval_seconds")]
+    pub token_usage_refresh_interval_seconds: u64,
+    #[serde(default)]
+    pub preferred_terminal: TerminalKind,
+    #[serde(default)]
+    pub recent_working_directories: Vec<PathBuf>,
 }
 
 impl Default for AppSettings {
@@ -446,6 +494,9 @@ impl Default for AppSettings {
             last_codex_target_provider_id: None,
             codex_restart_required_on_next_relay: false,
             preserve_official_codex_auth: false,
+            token_usage_refresh_interval_seconds: default_token_usage_refresh_interval_seconds(),
+            preferred_terminal: TerminalKind::Auto,
+            recent_working_directories: Vec::new(),
         }
     }
 }
@@ -541,6 +592,12 @@ pub struct RelayEvent {
 pub struct TokenUsageSummary {
     pub codex_dir: PathBuf,
     pub files_scanned: usize,
+    #[serde(default)]
+    pub deferred_files: usize,
+    #[serde(default)]
+    pub suspected_duplicates: usize,
+    #[serde(default)]
+    pub cache_version: u32,
     pub sessions: usize,
     pub events: usize,
     pub input_tokens: u64,
@@ -560,6 +617,39 @@ pub struct TokenUsageSummary {
     pub by_model: Vec<TokenUsageBucket>,
     pub by_provider: Vec<TokenUsageBucket>,
     pub recent_events: Vec<TokenUsageEvent>,
+}
+
+pub fn default_token_usage_refresh_interval_seconds() -> u64 {
+    30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliLaunchRequest {
+    pub working_directory: PathBuf,
+    #[serde(default)]
+    pub terminal: TerminalKind,
+    #[serde(default)]
+    pub resume_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliLaunchOutcome {
+    pub command: String,
+    pub terminal: TerminalKind,
+    pub working_directory: PathBuf,
+    pub launched: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticInfo {
+    pub log_directory: PathBuf,
+    pub current_log_path: PathBuf,
+    pub retained_files: usize,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

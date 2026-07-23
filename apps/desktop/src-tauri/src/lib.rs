@@ -32,6 +32,41 @@ fn get_provider_refresh_progress() -> Result<codex_companion_core::ProviderRefre
 }
 
 #[tauri::command]
+fn get_provider_import_progress() -> Result<codex_companion_core::ProviderImportProgress, String> {
+    Ok(daemon()?.provider_import_progress())
+}
+
+#[tauri::command]
+fn get_diagnostic_info() -> Result<codex_companion_core::DiagnosticInfo, String> {
+    Ok(daemon()?.diagnostic_info())
+}
+
+#[tauri::command]
+fn clear_diagnostic_logs() -> Result<usize, String> {
+    daemon()?
+        .clear_diagnostic_logs()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_diagnostic_directory() -> Result<bool, String> {
+    daemon()?
+        .open_diagnostic_directory()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn report_frontend_error(
+    message: String,
+    stack: Option<String>,
+    component_stack: Option<String>,
+) -> Result<(), String> {
+    daemon()?
+        .report_frontend_error(&message, stack.as_deref(), component_stack.as_deref())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn create_api_client(
     input: ApiClientCreate,
 ) -> Result<codex_companion_core::ApiClientSecret, String> {
@@ -140,9 +175,10 @@ fn import_provider_json_many(
     json_text: String,
     provider_id: Option<String>,
     provider_name: Option<String>,
-) -> Result<Vec<codex_companion_provider::ProviderImportOutcome>, String> {
+    add_to_group_id: Option<String>,
+) -> Result<codex_companion_provider::ProviderImportBatchReport, String> {
     daemon()?
-        .import_provider_json_many(&json_text, provider_id, provider_name)
+        .import_provider_json_many(&json_text, provider_id, provider_name, add_to_group_id)
         .map_err(|error| error.to_string())
 }
 
@@ -151,6 +187,7 @@ fn import_api_key_provider(
     provider_name: String,
     kind: ProviderKind,
     base_url: String,
+    websocket_url: Option<String>,
     api_key: String,
     env_var: Option<String>,
     model: Option<String>,
@@ -161,6 +198,7 @@ fn import_api_key_provider(
             provider_name,
             kind,
             base_url,
+            websocket_url,
             api_key,
             env_var,
             model,
@@ -244,6 +282,22 @@ fn launch_provider(
 }
 
 #[tauri::command]
+fn preview_cli_command(input: codex_companion_core::CliLaunchRequest) -> Result<String, String> {
+    daemon()?
+        .preview_cli_command(&input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn launch_cli(
+    input: codex_companion_core::CliLaunchRequest,
+) -> Result<codex_companion_core::CliLaunchOutcome, String> {
+    daemon()?
+        .launch_cli(input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn repair(
     history: bool,
     plugins: bool,
@@ -289,6 +343,13 @@ fn set_provider_view_mode(mode: ProviderViewMode) -> Result<ProviderViewMode, St
 fn set_preserve_official_codex_auth(preserve: bool) -> Result<bool, String> {
     daemon()?
         .set_preserve_official_codex_auth(preserve)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_token_usage_refresh_interval(seconds: u64) -> Result<u64, String> {
+    daemon()?
+        .set_token_usage_refresh_interval(seconds)
         .map_err(|error| error.to_string())
 }
 
@@ -405,6 +466,11 @@ pub fn run() {
             get_status,
             get_api_service_snapshot,
             get_provider_refresh_progress,
+            get_provider_import_progress,
+            get_diagnostic_info,
+            clear_diagnostic_logs,
+            open_diagnostic_directory,
+            report_frontend_error,
             create_api_client,
             update_api_client,
             rotate_api_client_key,
@@ -429,10 +495,13 @@ pub fn run() {
             use_group,
             launch_group,
             launch_provider,
+            preview_cli_command,
+            launch_cli,
             repair,
             set_theme,
             set_provider_view_mode,
             set_preserve_official_codex_auth,
+            set_token_usage_refresh_interval,
             set_provider_launch_mode,
             reset_app_settings,
             get_token_usage,

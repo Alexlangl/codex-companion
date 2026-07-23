@@ -25,6 +25,7 @@ import "../styles/layout.css";
 import "../styles/components.css";
 import "../styles/radix.css";
 import type { ProviderConfig, ProviderLaunchMode } from "../types/domain";
+import { AppErrorBoundary } from "./AppErrorBoundary";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 
@@ -178,6 +179,7 @@ function App() {
                     onInstall={actions.install}
                     onUninstall={actions.uninstall}
                     onPreserveOfficialCodexAuth={actions.changePreserveOfficialCodexAuth}
+                    onTokenUsageRefreshInterval={actions.changeTokenUsageRefreshInterval}
                     onTheme={actions.changeTheme}
                     onResetPreferences={actions.resetPreferences}
                   />
@@ -272,6 +274,8 @@ function Tab({ value, icon, label }: { value: string; icon: React.ReactNode; lab
 
 createRoot(root).render(
   <React.StrictMode>
-    <App />
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>
   </React.StrictMode>,
 );

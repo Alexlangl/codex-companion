@@ -6,6 +6,9 @@ import type {
   ApiClientUpdate,
   ApiServiceSelfTest,
   ApiServiceSnapshot,
+  CliLaunchOutcome,
+  CliLaunchRequest,
+  DiagnosticInfo,
   ProviderRefreshProgress,
   ApiKeyProviderUpdate,
   AppSettings,
@@ -18,6 +21,8 @@ import type {
   ProviderExportOutput,
   ProviderHealth,
   ProviderImportOutcome,
+  ProviderImportBatchReport,
+  ProviderImportProgress,
   ProviderGroup,
   ProviderKind,
   ProviderLaunchMode,
@@ -65,6 +70,75 @@ export function getProviderRefreshProgress() {
     });
   }
   return invoke<ProviderRefreshProgress>("get_provider_refresh_progress");
+}
+
+export function getProviderImportProgress() {
+  if (!isTauri()) {
+    return Promise.resolve<ProviderImportProgress>({
+      active: false,
+      completed: 0,
+      total: 0,
+      currentLabel: null,
+      succeeded: 0,
+      failed: 0,
+      startedAt: null,
+      finishedAt: null,
+    });
+  }
+  return invoke<ProviderImportProgress>("get_provider_import_progress");
+}
+
+export function getDiagnosticInfo() {
+  if (!isTauri()) {
+    return Promise.resolve<DiagnosticInfo>({
+      logDirectory: `${MOCK_DATA_DIR}/logs`,
+      currentLogPath: `${MOCK_DATA_DIR}/logs/companion.log.jsonl`,
+      retainedFiles: 1,
+      totalBytes: 12_480,
+    });
+  }
+  return invoke<DiagnosticInfo>("get_diagnostic_info");
+}
+
+export function clearDiagnosticLogs() {
+  if (!isTauri()) return Promise.resolve(1);
+  return invoke<number>("clear_diagnostic_logs");
+}
+
+export function openDiagnosticDirectory() {
+  if (!isTauri()) return Promise.resolve(false);
+  return invoke<boolean>("open_diagnostic_directory");
+}
+
+export function reportFrontendError(
+  message: string,
+  stack?: string | null,
+  componentStack?: string | null,
+) {
+  if (!isTauri()) return Promise.resolve();
+  return invoke<void>("report_frontend_error", {
+    message,
+    stack: stack ?? null,
+    componentStack: componentStack ?? null,
+  });
+}
+
+export function previewCliCommand(input: CliLaunchRequest) {
+  if (!isTauri()) return Promise.resolve(mockCliCommand(input));
+  return invoke<string>("preview_cli_command", { input });
+}
+
+export function launchCli(input: CliLaunchRequest) {
+  if (!isTauri()) {
+    return Promise.resolve<CliLaunchOutcome>({
+      command: mockCliCommand(input),
+      terminal: input.terminal === "auto" ? "terminal" : input.terminal,
+      workingDirectory: input.workingDirectory,
+      launched: true,
+      message: "已在所选终端启动 Codex CLI",
+    });
+  }
+  return invoke<CliLaunchOutcome>("launch_cli", { input });
 }
 
 export function getSessionPage(
@@ -298,6 +372,7 @@ export function updateApiKeyProvider(input: ApiKeyProviderUpdate) {
       name: input.providerName.trim(),
       kind: input.kind,
       baseUrl: input.baseUrl.trim().replace(/\/+$/, ""),
+      websocketUrl: input.websocketUrl?.trim() || null,
       authRef,
       directAuthRef,
       refreshIntervalSeconds: input.refreshIntervalSeconds || existing.refreshIntervalSeconds,
@@ -402,6 +477,7 @@ export function importApiKeyProvider(input: {
   providerName: string;
   kind: "openai_compatible" | "relay_provider";
   baseUrl: string;
+  websocketUrl?: string;
   apiKey: string;
   envVar?: string;
   model?: string;
@@ -414,6 +490,7 @@ export function importApiKeyProvider(input: {
       name: input.providerName,
       kind: input.kind,
       baseUrl: input.baseUrl.replace(/\/+$/, ""),
+      websocketUrl: input.websocketUrl?.trim() || null,
       authRef: input.apiKey ? `file:${mockStatus.dataDir}/auth/api-keys/${id}.json` : input.envVar ? `env:${input.envVar}` : null,
       directAuthRef: input.envVar ? `env:${input.envVar}` : null,
       modelMap: input.model ? { [input.model]: input.model } : {},
@@ -462,6 +539,7 @@ export function importApiKeyProvider(input: {
     providerName: input.providerName,
     kind: input.kind,
     baseUrl: input.baseUrl,
+    websocketUrl: emptyToNull(input.websocketUrl),
     apiKey: input.apiKey,
     envVar: emptyToNull(input.envVar),
     model: emptyToNull(input.model),
@@ -609,33 +687,66 @@ export function importProviderJson(jsonText: string, providerId?: string, provid
   });
 }
 
-export function importProviderJsonMany(jsonText: string, providerId?: string, providerName?: string) {
+export async function importProviderJsonMany(
+  jsonText: string,
+  providerId?: string,
+  providerName?: string,
+  addToGroupId?: string | null,
+): Promise<ProviderImportBatchReport> {
   if (!isTauri()) {
     const value = JSON.parse(jsonText) as unknown;
+    let items: unknown[] = [value];
     if (Array.isArray(value) && value.length > 0) {
-      return Promise.all(value.map((item) => importProviderJson(JSON.stringify(item), undefined, providerName)));
+      items = value;
+    } else {
+      const accounts =
+        value && typeof value === "object" && !Array.isArray(value)
+          ? (value as { accounts?: unknown }).accounts
+          : null;
+      if (Array.isArray(accounts) && accounts.length > 1) {
+        items = accounts.map((account) => ({
+          ...(value as Record<string, unknown>),
+          accounts: [account],
+        }));
+      }
     }
-    const accounts =
-      value && typeof value === "object" && !Array.isArray(value)
-        ? (value as { accounts?: unknown }).accounts
-        : null;
-    if (Array.isArray(accounts) && accounts.length > 1) {
-      return Promise.all(
-        accounts.map((account) => {
-          const item = {
-            ...(value as Record<string, unknown>),
-            accounts: [account],
-          };
-          return importProviderJson(JSON.stringify(item), undefined, providerName);
-        }),
-      );
+    const report: ProviderImportBatchReport = {
+      total: items.length,
+      succeeded: [],
+      failed: [],
+      addedToGroup: [],
+    };
+    for (const [index, item] of items.entries()) {
+      try {
+        const outcome = await importProviderJson(
+          JSON.stringify(item),
+          items.length === 1 ? providerId : undefined,
+          providerName,
+        );
+        report.succeeded.push(outcome);
+      } catch (unknownError) {
+        report.failed.push({
+          index,
+          label: `账号 ${index + 1}`,
+          message: String(unknownError),
+        });
+      }
     }
-    return importProviderJson(jsonText, providerId, providerName).then((outcome) => [outcome]);
+    if (addToGroupId) {
+      const group = mockStatus.config.groups[addToGroupId];
+      if (group) {
+        const providerIds = report.succeeded.map((outcome) => outcome.provider.id);
+        report.addedToGroup = providerIds.filter((id) => !group.providerOrder.includes(id));
+        group.providerOrder = [...group.providerOrder, ...report.addedToGroup];
+      }
+    }
+    return report;
   }
-  return invoke<ProviderImportOutcome[]>("import_provider_json_many", {
+  return invoke<ProviderImportBatchReport>("import_provider_json_many", {
     jsonText,
     providerId: emptyToNull(providerId),
     providerName: emptyToNull(providerName),
+    addToGroupId: emptyToNull(addToGroupId ?? undefined),
   });
 }
 
@@ -951,6 +1062,7 @@ export function launchProvider(id: string, mode: ProviderLaunchMode = "auto", co
       name: `${provider.name} 单 Provider`,
       policy: "manual",
       providerOrder: [provider.id],
+      providerWeights: {},
       fallbackEnabled: false,
     };
     mockStatus = {
@@ -1092,6 +1204,19 @@ export function setPreserveOfficialCodexAuth(preserve: boolean) {
   return invoke<boolean>("set_preserve_official_codex_auth", { preserve });
 }
 
+export function setTokenUsageRefreshInterval(seconds: number) {
+  if (!isTauri()) {
+    const app = { ...mockStatus.config.app, tokenUsageRefreshIntervalSeconds: seconds };
+    writeStoredAppSettings(app);
+    mockStatus = {
+      ...mockStatus,
+      config: { ...mockStatus.config, app },
+    };
+    return Promise.resolve(seconds);
+  }
+  return invoke<number>("set_token_usage_refresh_interval", { seconds });
+}
+
 export function resetAppSettings() {
   if (!isTauri()) {
     const app = {
@@ -1207,6 +1332,7 @@ function isTauri() {
 }
 
 function providerCanDirectConnect(provider: ProviderConfig) {
+  if (provider.account?.authMode === "agentIdentity") return false;
   const authRef = provider.directAuthRef?.trim() || provider.authRef?.trim();
   return !authRef || authRef.startsWith("env:") || authRef.startsWith("file:");
 }
@@ -1286,6 +1412,7 @@ function createMockStatus(): CompanionStatus {
       name: "Official Codex",
       kind: "official_codex",
       baseUrl: "https://chatgpt.com/backend-api/codex",
+      websocketUrl: "wss://chatgpt.com/backend-api/codex/responses",
       authRef: `file:${MOCK_DATA_DIR}/auth/official-team.json`,
       directAuthRef: null,
       modelMap: {},
@@ -1293,6 +1420,7 @@ function createMockStatus(): CompanionStatus {
       enabled: true,
       refreshIntervalSeconds: 300,
       account: {
+        authMode: "oauth",
         displayName: "alex@example.com",
         email: "alex@example.com",
         subscriptionType: "Plus",
@@ -1304,6 +1432,7 @@ function createMockStatus(): CompanionStatus {
       name: "Backup API",
       kind: "openai_compatible",
       baseUrl: "https://api.openai.com/v1",
+      websocketUrl: "wss://api.openai.com/v1/responses",
       authRef: "env:OPENAI_API_KEY",
       directAuthRef: "env:OPENAI_API_KEY",
       modelMap: {},
@@ -1311,6 +1440,7 @@ function createMockStatus(): CompanionStatus {
       enabled: true,
       refreshIntervalSeconds: 300,
       account: {
+        authMode: "apikey",
         displayName: "Backup API",
         subscriptionType: "API Key",
         subscriptionStatus: "可用",
@@ -1345,6 +1475,7 @@ function createMockStatus(): CompanionStatus {
           name: "Default",
           policy: "priority_fallback",
           providerOrder: ["official-team", "backup-api"],
+          providerWeights: { "official-team": 3, "backup-api": 1 },
           fallbackEnabled: true,
         },
       },
@@ -1451,6 +1582,9 @@ function defaultAppSettings(): AppSettings {
     lastCodexTargetProviderId: null,
     codexRestartRequiredOnNextRelay: false,
     preserveOfficialCodexAuth: false,
+    tokenUsageRefreshIntervalSeconds: 30,
+    preferredTerminal: "auto",
+    recentWorkingDirectories: [],
   };
 }
 
@@ -1472,10 +1606,26 @@ function readStoredAppSettings(): AppSettings {
         typeof parsed.codexRestartRequiredOnNextRelay === "boolean" ? parsed.codexRestartRequiredOnNextRelay : fallback.codexRestartRequiredOnNextRelay,
       preserveOfficialCodexAuth:
         typeof parsed.preserveOfficialCodexAuth === "boolean" ? parsed.preserveOfficialCodexAuth : fallback.preserveOfficialCodexAuth,
+      tokenUsageRefreshIntervalSeconds:
+        typeof parsed.tokenUsageRefreshIntervalSeconds === "number"
+          ? parsed.tokenUsageRefreshIntervalSeconds
+          : fallback.tokenUsageRefreshIntervalSeconds,
+      preferredTerminal: parsed.preferredTerminal ?? fallback.preferredTerminal,
+      recentWorkingDirectories: Array.isArray(parsed.recentWorkingDirectories)
+        ? parsed.recentWorkingDirectories.filter((path): path is string => typeof path === "string")
+        : fallback.recentWorkingDirectories,
     };
   } catch {
     return fallback;
   }
+}
+
+function mockCliCommand(input: CliLaunchRequest): string {
+  const directory = `'${input.workingDirectory.replaceAll("'", `'\\''`)}'`;
+  const command = input.resumeSessionId
+    ? `codex resume '${input.resumeSessionId.replaceAll("'", `'\\''`)}'`
+    : "codex";
+  return `cd ${directory} && ${command}`;
 }
 
 function writeStoredAppSettings(settings: AppSettings) {

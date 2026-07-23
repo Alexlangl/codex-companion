@@ -116,15 +116,13 @@ open "/Applications/Codex Companion.app"
 
 ### Windows: Windows Protected Your PC
 
-The current Windows installers do not have an Authenticode publisher certificate. SmartScreen may show `Windows protected your PC`, and the publisher may be listed as unknown. After verifying the source and SHA-256:
+The current Windows installers do not have an Authenticode publisher certificate. After verifying the source and SHA-256:
 
 1. Select `More info` in the SmartScreen dialog.
-2. Confirm the application name, then select `Run anyway`.
-3. If UAC subsequently shows an unknown publisher, approve it only after the checksum has been verified.
+2. Select `Run anyway`.
+3. Continue through an unknown-publisher UAC prompt only when the checksum matches.
 
-If `Run anyway` is unavailable, Smart App Control, enterprise policy, or an administrator restriction may be enforcing the block. Do not disable Microsoft Defender or SmartScreen globally just to install this project; contact the administrator or build from source in a trusted environment. If Defender reports a specific threat instead of an unknown/low-reputation app, do not blindly add an exclusion. Download again, verify the checksum, and open an issue.
-
-Microsoft documents the current unsigned-app behavior and publisher reputation model in [SmartScreen reputation for Windows app developers](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation).
+If `Run anyway` is unavailable, Smart App Control, enterprise policy, or an administrator restriction is usually enforcing the block. Do not disable Defender or SmartScreen globally; build from source in a trusted environment or contact the administrator.
 
 ### Linux: AppImage, DEB, and RPM
 
@@ -154,16 +152,20 @@ The current first-install Linux artifacts do not have a separate GPG release sig
 ## What It Does
 
 - Import official Codex account JSON, including Codex Companion, CPA, and sub2api formats.
+- Import Agent Identity credentials and let Companion sign requests and register or recover tasks locally; private keys and tasks are never written to Codex `auth.json`.
 - Import API Key account JSON or manually add OpenAI-compatible providers.
-- Compose multiple accounts into a Provider Group and fallback by priority; stable sessions keep account affinity when identifiable.
-- Expose the active account group as a local OpenAI-compatible API with `/v1/responses` and `/v1/models`.
+- Batch imports report each success and failure and can add successful entries directly to a group.
+- Compose multiple accounts into a Provider Group with priority, round-robin, random, weighted, least-loaded, or manual scheduling; stable sessions keep account affinity when identifiable.
+- Expose the active account group through HTTP and WebSocket `/v1/responses` plus `/v1/models`.
 - Create independent API clients with one-time secrets, model allowlists, disable, rotate, and delete controls.
 - Single accounts default to direct mode, and you can switch them to local proxy mode from the account card.
 - Relay providers whose URL explicitly targets `/chat/completions` are forced through the local relay so Companion can translate Responses requests, tool calls, and multi-turn history.
 - Let Companion handle token refresh and request headers for official Codex accounts.
 - Refresh account health, subscription state, and recognizable 5-hour, weekly, 30-day, and model-specific quotas; transient failures retry while keeping the last successful value.
 - Repair Codex history and plugin state before launching Codex, reducing provider-switch continuity issues.
-- Scan main and subagent Codex session logs and estimate fresh-input, cache-read, cache-write, and output costs by model.
+- Scan main and subagent Codex session logs, filter by date, provider, and model, and estimate fresh-input, cache-read, cache-write, and output costs.
+- Preview and launch Codex CLI from Settings or run `codex resume` directly from Sessions.
+- Write redacted local diagnostics and provide recovery, open-folder, and clear-log actions for frontend failures.
 
 ## Screenshots
 
@@ -181,13 +183,13 @@ Manage official accounts, API Key accounts, and gateway providers in one place. 
 
 ### Add Account
 
-Add API Key accounts, paste Token / JSON, import local Codex accounts, or batch import multiple JSON files.
+Add API Key accounts, paste Token / JSON, import local Codex accounts, or import Agent Identity. Batch import continues after individual failures, reports each reason, and can add successful entries to a selected group.
 
 <img src="assets/readme/provider-add-dialog.jpg" alt="Add provider dialog" width="720">
 
 ### Groups
 
-Put multiple accounts into one group and fallback in order. Requests with stable session identifiers keep account affinity and rebind after a provider failure.
+Put multiple accounts into one group and choose priority, round-robin, random, weighted, least-loaded, or manual scheduling. Requests with stable session identifiers keep account affinity and rebind after a provider failure.
 
 <img src="assets/readme/groups.jpg" alt="Provider groups" width="720">
 
@@ -205,7 +207,7 @@ Preview or repair Codex history and plugin state. Real repair uses an isolated t
 
 ### Usage
 
-Read token usage and estimated cost from local Codex session logs. Models without a matching price are shown as unpriced instead of being reported as a real `$0`.
+Read token usage and estimated cost from local Codex session logs with date, provider, and model filters. Models without a matching price are shown as unpriced instead of being reported as a real `$0`.
 
 <img src="assets/readme/token-usage.jpg" alt="Token usage page" width="720">
 
@@ -218,7 +220,27 @@ After opening the desktop app:
 - Use `Relay` to inspect local proxy status and request logs.
 - Use `Repair` to preview or repair Codex history and plugin state.
 - Use `Usage` to view local token stats.
-- Use `Settings` to install or restore Codex configuration.
+- Use `Sessions` to copy a resume command or run `codex resume` in a terminal.
+- Use `Settings` to install or restore Codex configuration, launch CLI, check for updates, and manage diagnostics.
+
+### Agent Identity
+
+Agent Identity accounts are served only through Companion's local API and cannot be installed into Codex `auth.json` for direct mode. Import copies the credential into Companion's data directory. Each request receives a dynamic `AgentAssertion`; if the task is missing or rejected as invalid, Companion registers a replacement and atomically persists it with `0600` permissions on Unix.
+
+Different users under the same ChatGPT account remain separate providers. Provider cards show an explicit `Agent Identity` status.
+
+### Group Scheduling Policies
+
+| Policy | Behavior |
+| --- | --- |
+| Priority fallback | Use list order and try the next provider after a failure |
+| Round robin | Rotate the first provider for each new request |
+| Random | Randomize the first provider for each new request |
+| Weighted | Select the first provider by configured weights, then preserve fallback |
+| Least loaded | Prefer the provider with the fewest in-flight requests |
+| Manual | Use only the first provider in the list |
+
+A stable session ID overrides the initial ordering to preserve affinity. SSE failures may switch providers only before valid output begins. After any output has reached the client, Companion never replays the request, avoiding duplicate text or tool calls.
 
 ### Local API Service
 
@@ -231,12 +253,38 @@ curl http://127.0.0.1:17687/v1/responses \
   -d '{"model":"your-model","input":"hello","stream":false}'
 ```
 
-- Supports `POST /v1/responses` and `GET /v1/models`.
+- Supports `POST /v1/responses`, WebSocket `GET /v1/responses`, and `GET /v1/models`.
 - API client secrets are shown once; SQLite stores only a SHA-256 hash and short prefix.
 - Each client can have its own model allowlist and can be disabled, rotated, or deleted independently.
 - Cross-origin browser requests always require a valid client key. Local non-browser requests can use compatibility mode or enforce keys.
 - Request logs store routing metadata only, never prompts, response bodies, or complete keys.
 - If an upstream stream ends without a terminal event, Companion emits `response.failed` and updates provider health and request audit state.
+- Providers may define a separate `websocket_url`. WebSocket connections use the same API client authentication and group fallback; official accounts receive the required Codex headers, and Agent Identity retries after task recovery.
+- Responses-to-Chat-Completions translation supports function, custom, tool-search, and namespace tools, including top-level or nested `additional_tools` and namespace `tool_choice`.
+
+### Token Stats and Cache
+
+The `Usage` page filters by start date, end date, provider, and model. Its refresh interval is configurable, and `0` disables automatic refresh. The cache has an explicit format version and rebuilds automatically after a version change; it can also be rebuilt manually.
+
+When a child task references a parent session that has not appeared yet, the child is shown as deferred and excluded until a later scan can resolve it. Conflicting copies of the same parent history are marked as suspected duplicates and excluded instead of silently double-counting usage.
+
+### CLI Launch and Session Resume
+
+`Settings` lets you choose a working directory and terminal, preview the command, copy it, or launch it directly. macOS supports Terminal and iTerm2; Windows supports Windows Terminal, Windows PowerShell, PowerShell 7, and CMD; Linux tries common terminal applications.
+
+`Sessions` can copy or run:
+
+```bash
+codex resume SESSION_ID
+```
+
+The working directory and session ID are shell-escaped for the current platform.
+
+### Diagnostic Logs
+
+Diagnostic logs are stored under `~/.codex-companion/logs/` as JSONL. Each file rotates at 2 MB, with at most five files including the current file. Tokens, Authorization headers, cookies, API keys, private keys, and `AgentAssertion` values are redacted; prompts and response bodies are not logged.
+
+The desktop `Settings` page shows log size and can open or clear the directory. A React crash recovery screen also provides reload and open-log actions.
 
 ### Custom Model Pricing
 
@@ -394,6 +442,7 @@ Removing those first-install warnings requires separate Apple Developer ID/notar
 ## Supported Accounts
 
 - Official Codex account JSON.
+- Agent Identity JSON.
 - sub2api `accounts[]` OpenAI OAuth accounts.
 - Codex Companion / CPA style Codex OAuth accounts.
 - API Key account JSON.
@@ -408,6 +457,7 @@ API Key JSON example:
   "OPENAI_API_KEY": "sk-...",
   "email": "api-key-demo",
   "api_base_url": "https://api.example.com/v1",
+  "websocket_url": "wss://api.example.com/v1/responses",
   "api_provider_id": "example",
   "api_provider_name": "Example API"
 }
@@ -418,6 +468,8 @@ API Key JSON example:
 - You can run dry-run before writing repair changes.
 - Real repair uses transactional backups under `~/.codex/backups/codex-companion/repair/`; failures roll back automatically and a successful run keeps the 10 newest repair backups.
 - Imported account material stays on your machine.
+- Agent Identity private keys stay in Companion's private account directory, are used only for local signing, and are never written to Codex `auth.json`.
 - Local API client secrets are shown once and stored only as hashes; request audit records do not store request or response bodies.
 - Token usage stats only read local Codex session logs.
+- Diagnostic logs rotate and redact sensitive values. Review them before sharing and include only issue-relevant excerpts.
 - Cost is an estimate based on the model price snapshot and local overrides, not an OpenAI or gateway invoice.

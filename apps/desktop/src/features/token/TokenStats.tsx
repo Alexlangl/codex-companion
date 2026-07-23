@@ -61,6 +61,7 @@ export function TokenStats({
   }), [dateRange, model, providerId]);
   const queryKey = `${codexDir.trim()}|${query.startDate ?? ""}|${query.endDate ?? ""}|${providerId}|${model}`;
   const rangeLabel = usageRangeLabel(rangePreset, customStartDate, customEndDate);
+  const refreshIntervalSeconds = status.config.app.tokenUsageRefreshIntervalSeconds;
 
   const load = useCallback(async (mode: "manual" | "silent" | "rebuild" = "manual") => {
     if (inFlightRef.current) return;
@@ -100,12 +101,12 @@ export function TokenStats({
   }, [active, load, loading, queryKey]);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active || refreshIntervalSeconds <= 0) return;
     const timer = window.setInterval(() => {
       void load("silent");
-    }, 30_000);
+    }, refreshIntervalSeconds * 1000);
     return () => window.clearInterval(timer);
-  }, [active, load]);
+  }, [active, load, refreshIntervalSeconds]);
 
   useEffect(() => {
     if (!active || (!loading && !refreshing)) return;
@@ -256,7 +257,11 @@ export function TokenStats({
         {syncStatus?.active ? (
           <div className="usage-sync-progress" aria-live="polite">
             <progress max={Math.max(1, syncStatus.totalFiles)} value={syncStatus.scannedFiles} />
-            <span>{syncStatus.scannedFiles}/{syncStatus.totalFiles} 个文件</span>
+            <span>
+              {syncStatus.scannedFiles}/{syncStatus.totalFiles} 个文件
+              {syncStatus.deferredFiles ? ` · ${syncStatus.deferredFiles} 个等待父会话` : ""}
+              {syncStatus.suspectedDuplicates ? ` · ${syncStatus.suspectedDuplicates} 个疑似重复` : ""}
+            </span>
           </div>
         ) : null}
         {error ? <div className="error-banner">{error}</div> : null}
@@ -266,6 +271,14 @@ export function TokenStats({
             <strong>{stats.unpricedEvents} 条 Token 事件尚未定价</strong>
             <p>
               当前成本只汇总已匹配价格的事件。未定价模型：{unpricedModelText}。可在 Companion 数据目录创建 model-pricing.json 补充价格。
+            </p>
+          </div>
+        ) : null}
+        {stats && (stats.deferredFiles > 0 || stats.suspectedDuplicates > 0) ? (
+          <div className="warning-box usage-integrity-warning">
+            <strong>有 {stats.deferredFiles + stats.suspectedDuplicates} 个文件需要确认归属</strong>
+            <p>
+              {stats.deferredFiles} 个子任务文件正在等待父会话出现，暂不计入统计；{stats.suspectedDuplicates} 个文件存在父记录冲突，已标记为疑似重复。
             </p>
           </div>
         ) : null}
@@ -291,6 +304,12 @@ export function TokenStats({
           <dd>{model || "全部"}</dd>
           <dt>文件</dt>
           <dd>{stats?.filesScanned ?? 0} 个 JSONL</dd>
+          <dt>等待父会话</dt>
+          <dd>{stats?.deferredFiles ?? 0}</dd>
+          <dt>疑似重复</dt>
+          <dd>{stats?.suspectedDuplicates ?? 0}</dd>
+          <dt>缓存版本</dt>
+          <dd>{stats?.cacheVersion ?? "—"}</dd>
           <dt>Session</dt>
           <dd>{stats?.sessions ?? 0}</dd>
           <dt>Token 事件</dt>

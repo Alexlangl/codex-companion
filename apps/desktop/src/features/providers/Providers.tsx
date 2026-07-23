@@ -19,9 +19,9 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import { Button, Field, Panel } from "../../components/ui";
-import { getProviderRefreshProgress } from "../../lib/api";
+import { getProviderImportProgress, getProviderRefreshProgress } from "../../lib/api";
 import { providerKindLabel } from "../../lib/format";
-import { providerAccountTitle } from "../../lib/provider-display";
+import { providerAccountTitle, providerUsesAgentIdentity } from "../../lib/provider-display";
 import type {
   ApiKeyProviderUpdate,
   BusyState,
@@ -30,6 +30,8 @@ import type {
   ProviderExportFormat,
   ProviderExportOutput,
   ProviderLaunchMode,
+  ProviderImportBatchReport,
+  ProviderImportProgress,
   ProviderRefreshProgress,
   ProviderViewMode,
 } from "../../types/domain";
@@ -57,7 +59,10 @@ export function Providers({
   status: CompanionStatus;
   launchModes: Record<string, ProviderLaunchMode>;
   onImportApiKey: (input: ApiKeyForm) => Promise<void>;
-  onImportJsonBatch: (jsonFiles: JsonImportFile[]) => Promise<void>;
+  onImportJsonBatch: (
+    jsonFiles: JsonImportFile[],
+    addToGroupId?: string | null,
+  ) => Promise<ProviderImportBatchReport>;
   onImportLocal: () => Promise<void>;
   onExport: (id: string, format?: ProviderExportFormat | null) => Promise<ProviderExportOutput>;
   onLaunch: (id: string, mode?: ProviderLaunchMode) => Promise<void>;
@@ -85,6 +90,9 @@ export function Providers({
   const [addOpen, setAddOpen] = useState(false);
   const [apiKeyError, setApiKeyError] = useState("");
   const [refreshProgress, setRefreshProgress] = useState<ProviderRefreshProgress | null>(null);
+  const [importProgress, setImportProgress] = useState<ProviderImportProgress | null>(null);
+  const [importReport, setImportReport] = useState<ProviderImportBatchReport | null>(null);
+  const [addToCurrentGroup, setAddToCurrentGroup] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const exportRequestRef = useRef(0);
   const disabled = busy !== "idle";
@@ -119,12 +127,35 @@ export function Providers({
     };
   }, [busy]);
 
+  useEffect(() => {
+    if (busy !== "saving" || !addOpen) {
+      setImportProgress(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = async (): Promise<void> => {
+      try {
+        const progress = await getProviderImportProgress();
+        if (!cancelled) setImportProgress(progress);
+      } catch {
+        if (!cancelled) setImportProgress(null);
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [addOpen, busy]);
+
   async function submitApiKey(event: FormEvent) {
     event.preventDefault();
     const input = {
       ...apiKeyForm,
       providerName: apiKeyForm.providerName.trim(),
       baseUrl: apiKeyForm.baseUrl.trim(),
+      websocketUrl: apiKeyForm.websocketUrl.trim(),
       apiKey: apiKeyForm.apiKey.trim(),
       envVar: apiKeyForm.envVar.trim(),
       refreshIntervalSeconds: Number(apiKeyForm.refreshIntervalSeconds) || 60,
@@ -141,13 +172,19 @@ export function Providers({
 
   async function submitJsonBatch(event: FormEvent) {
     event.preventDefault();
-    await onImportJsonBatch(jsonImportSources);
-    setJsonFiles([]);
-    setPastedJson("");
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
+    const report = await onImportJsonBatch(
+      jsonImportSources,
+      addToCurrentGroup ? status.config.relay.activeGroupId : null,
+    );
+    setImportReport(report);
+    if (report.failed.length === 0) {
+      setJsonFiles([]);
+      setPastedJson("");
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      setAddOpen(false);
     }
-    setAddOpen(false);
   }
 
   async function importLocalAccount() {
@@ -169,6 +206,7 @@ export function Providers({
       providerDisplayName: editForm.providerDisplayName.trim(),
       providerName: editForm.providerName.trim(),
       baseUrl: editForm.baseUrl.trim(),
+      websocketUrl: editForm.websocketUrl.trim(),
       apiKey: editForm.apiKey.trim(),
       envVar: editForm.envVar.trim(),
       refreshIntervalSeconds: Number(editForm.refreshIntervalSeconds) || 60,
@@ -183,6 +221,7 @@ export function Providers({
       providerName: input.providerName,
       kind: input.kind,
       baseUrl: input.baseUrl,
+      websocketUrl: input.websocketUrl || null,
       apiKey: input.apiKey || null,
       envVar: input.envVar || null,
       refreshIntervalSeconds: input.refreshIntervalSeconds,
@@ -338,7 +377,10 @@ export function Providers({
         )}
       </Panel>
 
-      <Dialog.Root open={addOpen} onOpenChange={setAddOpen}>
+      <Dialog.Root open={addOpen} onOpenChange={(open) => {
+        setAddOpen(open);
+        if (!open) setImportReport(null);
+      }}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
           <Dialog.Content className="dialog-content add-provider-dialog">
@@ -358,13 +400,18 @@ export function Providers({
               disabled={disabled}
               fileInputRef={fileInputRef}
               jsonImportSources={jsonImportSources}
+              importProgress={importProgress}
+              importReport={importReport}
               loadJsonFiles={loadJsonFiles}
               onImportLocal={importLocalAccount}
               apiKeyError={apiKeyError}
               pastedJson={pastedJson}
+              addToCurrentGroup={addToCurrentGroup}
+              activeGroupName={status.activeGroup?.name ?? status.config.relay.activeGroupId}
               setApiKeyForm={setApiKeyForm}
               setApiKeyError={setApiKeyError}
               setPastedJson={setPastedJson}
+              setAddToCurrentGroup={setAddToCurrentGroup}
               submitApiKey={submitApiKey}
               submitJsonBatch={submitJsonBatch}
             />
@@ -493,6 +540,13 @@ function ApiKeyEditForm({
           required
         />
       </Field>
+      <Field label="Responses WebSocket（可选）">
+        <input
+          value={form.websocketUrl}
+          onChange={(event) => update({ ...form, websocketUrl: event.target.value })}
+          placeholder="wss://api.example.com/v1/responses"
+        />
+      </Field>
       <p className="field-hint">
         这里不决定直连或代理；启动方式以账号卡片上的选择为准。本地代理下填 /v1 会按 Codex 请求路径拼接，填完整 endpoint 则按原地址发送。
       </p>
@@ -533,6 +587,7 @@ const EXPORT_FORMAT_LABELS: Record<ProviderExportFormat, string> = {
 
 function exportFormatOptionsForProvider(provider: ProviderConfig): ProviderExportFormat[] {
   if (isApiKeyProvider(provider)) return ["codex_companion"];
+  if (providerUsesAgentIdentity(provider)) return ["codex_companion", "sub2api"];
   return ["codex_companion", "sub2api", "cpa"];
 }
 
@@ -543,6 +598,7 @@ function apiKeyFormFromProvider(provider: ProviderConfig): ApiKeyForm {
     providerName: provider.name,
     kind: isApiKeyProvider(provider) ? provider.kind : "openai_compatible",
     baseUrl: provider.baseUrl,
+    websocketUrl: provider.websocketUrl ?? "",
     apiKey: "",
     envVar: authRef.startsWith("env:") ? authRef.slice("env:".length) : "",
     refreshIntervalSeconds: provider.refreshIntervalSeconds || 60,
@@ -611,13 +667,18 @@ function ProviderAddTabs({
   disabled,
   fileInputRef,
   jsonImportSources,
+  importProgress,
+  importReport,
   loadJsonFiles,
   onImportLocal,
   apiKeyError,
   pastedJson,
+  addToCurrentGroup,
+  activeGroupName,
   setApiKeyForm,
   setApiKeyError,
   setPastedJson,
+  setAddToCurrentGroup,
   submitApiKey,
   submitJsonBatch,
 }: {
@@ -625,13 +686,18 @@ function ProviderAddTabs({
   disabled: boolean;
   fileInputRef: RefObject<HTMLInputElement | null>;
   jsonImportSources: JsonImportFile[];
+  importProgress: ProviderImportProgress | null;
+  importReport: ProviderImportBatchReport | null;
   loadJsonFiles: (fileList: FileList | null) => Promise<void>;
   onImportLocal: () => Promise<void>;
   apiKeyError: string;
   pastedJson: string;
+  addToCurrentGroup: boolean;
+  activeGroupName: string;
   setApiKeyForm: (form: ApiKeyForm) => void;
   setApiKeyError: (value: string) => void;
   setPastedJson: (value: string) => void;
+  setAddToCurrentGroup: (value: boolean) => void;
   submitApiKey: (event: FormEvent) => Promise<void>;
   submitJsonBatch: (event: FormEvent) => Promise<void>;
 }) {
@@ -663,7 +729,7 @@ function ProviderAddTabs({
                   <Select.Value />
                 </Select.Trigger>
                 <Select.Portal>
-                  <Select.Content className="select-content">
+                  <Select.Content className="select-content" position="popper" sideOffset={4}>
                     {(["openai_compatible", "relay_provider"] as ApiKeyKind[]).map((kind) => (
                       <Select.Item className="select-item" key={kind} value={kind}>
                         <Select.ItemText>{providerKindLabel(kind)}</Select.ItemText>
@@ -680,6 +746,13 @@ function ProviderAddTabs({
               onChange={(event) => updateApiKeyForm({ ...apiKeyForm, baseUrl: event.target.value })}
               placeholder="https://api.example.com/v1 或 https://api.example.com/v1/responses"
               required
+            />
+          </Field>
+          <Field label="Responses WebSocket（可选）">
+            <input
+              value={apiKeyForm.websocketUrl}
+              onChange={(event) => updateApiKeyForm({ ...apiKeyForm, websocketUrl: event.target.value })}
+              placeholder="wss://api.example.com/v1/responses"
             />
           </Field>
           <Field label="API Key（可选）">
@@ -717,6 +790,32 @@ function ProviderAddTabs({
           <button className="button button-default import-submit" disabled={disabled || jsonImportSources.length === 0} type="submit">
             <Upload size={15} /> 导入
           </button>
+          <label className="check-row import-group-option">
+            <input
+              checked={addToCurrentGroup}
+              disabled={disabled}
+              onChange={(event) => setAddToCurrentGroup(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>导入成功后加入当前分组“{activeGroupName}”</span>
+          </label>
+          {importProgress?.active ? (
+            <div className="provider-refresh-progress" aria-live="polite">
+              <progress max={Math.max(1, importProgress.total)} value={importProgress.completed} />
+              <span>
+                {importProgress.completed}/{importProgress.total}
+                {importProgress.currentLabel ? ` · ${importProgress.currentLabel}` : ""}
+              </span>
+            </div>
+          ) : null}
+          {importReport ? (
+            <div className={importReport.failed.length ? "warning-box import-report" : "success-box import-report"}>
+              <strong>{importReport.succeeded.length} 成功 · {importReport.failed.length} 失败</strong>
+              {importReport.failed.map((failure) => (
+                <p key={`${failure.index}-${failure.label}`}>{failure.label}：{failure.message}</p>
+              ))}
+            </div>
+          ) : null}
           <div className="file-import-panel">
             <span>文件批量导入</span>
             <input

@@ -36,14 +36,27 @@ pub fn export_provider_json(
 fn export_api_key_provider(provider: &ProviderConfig) -> Result<Value> {
     let api_key = resolve_api_key(provider)?;
     let account = provider.account.as_ref();
-    Ok(Value::Array(vec![json!({
-        "auth_mode": "apikey",
-        "OPENAI_API_KEY": api_key,
-        "email": account_email_or_name(account, provider),
-        "api_base_url": provider.base_url,
-        "api_provider_id": provider.id,
-        "api_provider_name": provider.name,
-    })]))
+    let mut item = Map::new();
+    item.insert("auth_mode".to_string(), Value::String("apikey".to_string()));
+    item.insert("OPENAI_API_KEY".to_string(), Value::String(api_key));
+    item.insert(
+        "email".to_string(),
+        Value::String(account_email_or_name(account, provider)),
+    );
+    item.insert(
+        "api_base_url".to_string(),
+        Value::String(provider.base_url.clone()),
+    );
+    item.insert(
+        "api_provider_id".to_string(),
+        Value::String(provider.id.clone()),
+    );
+    item.insert(
+        "api_provider_name".to_string(),
+        Value::String(provider.name.clone()),
+    );
+    insert_optional(&mut item, "websocket_url", provider.websocket_url.clone());
+    Ok(Value::Array(vec![Value::Object(item)]))
 }
 
 fn export_official_provider(
@@ -51,6 +64,9 @@ fn export_official_provider(
     format: ProviderExportFormat,
 ) -> Result<Value> {
     let auth = read_auth_value(provider.auth_ref.as_deref())?;
+    if is_agent_identity_auth(&auth) {
+        return export_agent_identity_provider(provider, &auth, format);
+    }
     let access_token = pick_json_string(
         &auth,
         &[
@@ -207,6 +223,86 @@ fn export_official_provider(
             email,
             expired,
         )),
+    }
+}
+
+fn is_agent_identity_auth(auth: &Value) -> bool {
+    pick_json_string(
+        auth,
+        &[&["auth_mode"], &["authMode"], &["openai_auth_mode"]],
+    )
+    .is_some_and(|mode| mode.eq_ignore_ascii_case("agentIdentity"))
+}
+
+fn export_agent_identity_provider(
+    provider: &ProviderConfig,
+    auth: &Value,
+    format: ProviderExportFormat,
+) -> Result<Value> {
+    if matches!(format, ProviderExportFormat::Cpa) {
+        return Err(CompanionError::InvalidConfig(
+            "CPA 格式不支持 Agent Identity，请使用 Codex Companion 或 Sub2API".to_string(),
+        ));
+    }
+    let runtime_id = pick_json_string(auth, &[&["agent_runtime_id"], &["agentRuntimeId"]])
+        .ok_or_else(|| {
+            CompanionError::InvalidConfig("Agent Identity 缺少 agent_runtime_id".to_string())
+        })?;
+    let private_key = pick_json_string(auth, &[&["agent_private_key"], &["agentPrivateKey"]])
+        .ok_or_else(|| {
+            CompanionError::InvalidConfig("Agent Identity 缺少 agent_private_key".to_string())
+        })?;
+    let task_id = pick_json_string(auth, &[&["task_id"], &["taskId"]]);
+    let account = provider.account.as_ref();
+    let account_id = account
+        .and_then(|info| info.account_id.clone())
+        .or_else(|| pick_json_string(auth, &[&["chatgpt_account_id"], &["account_id"]]))
+        .unwrap_or_default();
+    let user_id = account
+        .and_then(|info| info.user_id.clone())
+        .or_else(|| pick_json_string(auth, &[&["chatgpt_user_id"], &["user_id"]]));
+    let email = account_email_or_name(account, provider);
+    let plan_type = account
+        .and_then(|info| info.subscription_type.clone())
+        .or_else(|| pick_json_string(auth, &[&["plan_type"], &["chatgpt_plan_type"]]));
+
+    let mut credentials = Map::new();
+    credentials.insert(
+        "auth_mode".to_string(),
+        Value::String("agentIdentity".to_string()),
+    );
+    credentials.insert("agent_runtime_id".to_string(), Value::String(runtime_id));
+    credentials.insert("agent_private_key".to_string(), Value::String(private_key));
+    insert_optional(&mut credentials, "task_id", task_id);
+    if !account_id.is_empty() {
+        credentials.insert("chatgpt_account_id".to_string(), Value::String(account_id));
+    }
+    insert_optional(&mut credentials, "chatgpt_user_id", user_id);
+    if !email.is_empty() {
+        credentials.insert("email".to_string(), Value::String(email));
+    }
+    insert_optional(&mut credentials, "plan_type", plan_type);
+
+    match format {
+        ProviderExportFormat::CodexCompanion => Ok(Value::Array(vec![json!({
+            "auth_mode": "agentIdentity",
+            "agent_identity": Value::Object(credentials),
+        })])),
+        ProviderExportFormat::Sub2api => Ok(json!({
+            "exported_at": now_iso(),
+            "proxies": [],
+            "accounts": [{
+                "name": provider.name,
+                "platform": "openai",
+                "type": "agent_identity",
+                "credentials": Value::Object(credentials),
+                "concurrency": 0,
+                "priority": 0
+            }],
+            "type": "sub2api-data",
+            "version": 1
+        })),
+        ProviderExportFormat::Cpa => unreachable!(),
     }
 }
 
@@ -384,6 +480,7 @@ mod tests {
             name: id.to_string(),
             kind,
             base_url: "https://api.example.com/v1".to_string(),
+            websocket_url: Some("wss://api.example.com/v1/responses".to_string()),
             auth_ref: Some(auth_ref),
             direct_auth_ref: None,
             model_map: BTreeMap::new(),
@@ -434,6 +531,7 @@ mod tests {
         assert_eq!(item["OPENAI_API_KEY"], "sk-secret");
         assert_eq!(item["api_provider_id"], "api-key-provider");
         assert_eq!(item["api_base_url"], "https://api.example.com/v1");
+        assert_eq!(item["websocket_url"], "wss://api.example.com/v1/responses");
     }
 
     #[test]

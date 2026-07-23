@@ -409,10 +409,16 @@ fn import_json(daemon: &CompanionDaemon, app: &mut TuiState) {
         .map_err(|error| error.to_string())
         .and_then(|text| {
             daemon
-                .import_provider_json_many(&text, None, None)
+                .import_provider_json_many(&text, None, None, None)
                 .map_err(|error| error.to_string())
         }) {
-        Ok(outcomes) => app.message = format!("已导入 {} 个账号。", outcomes.len()),
+        Ok(outcomes) => {
+            app.message = format!(
+                "已导入 {} 个账号，{} 个失败。",
+                outcomes.succeeded.len(),
+                outcomes.failed.len()
+            )
+        }
         Err(error) => app.message = format!("导入失败：{error}"),
     }
 }
@@ -431,6 +437,7 @@ fn add_api_key(daemon: &CompanionDaemon, app: &mut TuiState) {
         name,
         ProviderKind::OpenAiCompatible,
         base_url,
+        None,
         api_key,
         None,
         None,
@@ -585,6 +592,7 @@ fn save_group(
             GroupPolicy::Manual
         },
         provider_order,
+        provider_weights: Default::default(),
         fallback_enabled,
     }) {
         Ok(group) => app.message = format!("已保存分组：{}", group.name),
@@ -727,6 +735,7 @@ mod tests {
             name: "Provider".to_string(),
             kind: ProviderKind::OpenAiCompatible,
             base_url: "https://example.com/v1".to_string(),
+            websocket_url: None,
             auth_ref: auth_ref.map(ToOwned::to_owned),
             direct_auth_ref: None,
             model_map: Default::default(),

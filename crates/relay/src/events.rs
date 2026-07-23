@@ -1,4 +1,4 @@
-use codex_companion_core::{now_event, ConfigStore};
+use codex_companion_core::{append_diagnostic_log, now_event, ConfigStore};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -21,6 +21,8 @@ pub(crate) fn append_event(
     provider_id: Option<String>,
     message: String,
 ) {
+    let diagnostic_level = if kind == "error" { "error" } else { "info" };
+    let _ = append_diagnostic_log(&store.data_dir(), diagnostic_level, "relay", &message);
     let event = now_event(kind, provider_id, message);
     let events_dir = store.data_dir().join("relay");
     if fs::create_dir_all(&events_dir).is_err() {

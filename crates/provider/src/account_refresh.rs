@@ -1,15 +1,18 @@
 use crate::auth::resolve_auth_token;
 use crate::codex_oauth::ensure_codex_auth_snapshot;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use codex_companion_core::{
     CompanionError, ProviderAccountInfo, ProviderConfig, ProviderKind, ProviderQuotaWindow, Result,
 };
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
-use serde::Deserialize;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, REFERER, USER_AGENT};
+use serde::{Deserialize, Deserializer};
 use url::Url;
 
-const ACCOUNT_CHECK_URL: &str = "https://chatgpt.com/backend-api/wham/accounts/check";
+const ACCOUNT_CHECK_URL: &str = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
+const LEGACY_ACCOUNT_CHECK_URL: &str = "https://chatgpt.com/backend-api/wham/accounts/check";
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CHATGPT_WEB_REFERER: &str = "https://chatgpt.com/";
+const CHATGPT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone, Default)]
 struct AccountProfile {
@@ -28,8 +31,20 @@ struct UsageResponse {
     rate_limit: Option<RateLimitInfo>,
     #[serde(rename = "code_review_rate_limit")]
     _code_review_rate_limit: Option<RateLimitInfo>,
-    #[serde(rename = "additional_rate_limits", default)]
+    #[serde(
+        rename = "additional_rate_limits",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     additional_rate_limits: Vec<AdditionalRateLimit>,
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +176,9 @@ pub fn provider_supports_api_key_usage(provider: &ProviderConfig) -> bool {
     if provider.kind == ProviderKind::RelayProvider {
         return true;
     }
+    if provider.kind != ProviderKind::OpenAiCompatible {
+        return false;
+    }
     let Ok(url) = Url::parse(provider.base_url.trim()) else {
         return false;
     };
@@ -168,7 +186,7 @@ pub fn provider_supports_api_key_usage(provider: &ProviderConfig) -> bool {
         .host_str()
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    host.contains("openrouter.ai") || host.contains("newapi") || host.contains("new-api")
+    !host.is_empty() && host != "api.openai.com"
 }
 
 async fn fetch_api_usage(
@@ -255,9 +273,54 @@ async fn fetch_account_profile(
     access_token: &str,
     account_id: Option<&str>,
 ) -> std::result::Result<AccountProfile, String> {
-    let response = client
-        .get(ACCOUNT_CHECK_URL)
-        .headers(codex_headers(access_token, account_id)?)
+    let mut last_error = None;
+    for (url, target_path, include_timezone) in [
+        (
+            ACCOUNT_CHECK_URL,
+            "/backend-api/accounts/check/v4-2023-04-27",
+            true,
+        ),
+        (
+            LEGACY_ACCOUNT_CHECK_URL,
+            "/backend-api/wham/accounts/check",
+            false,
+        ),
+    ] {
+        match fetch_account_profile_once(
+            client,
+            access_token,
+            account_id,
+            url,
+            target_path,
+            include_timezone,
+        )
+        .await
+        {
+            Ok(profile) => return Ok(profile),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "账号信息接口不可用".to_string()))
+}
+
+async fn fetch_account_profile_once(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    url: &str,
+    target_path: &str,
+    include_timezone: bool,
+) -> std::result::Result<AccountProfile, String> {
+    let mut request =
+        client
+            .get(url)
+            .headers(chatgpt_web_headers(access_token, account_id, target_path)?);
+    if include_timezone {
+        let timezone_offset_min = -(Local::now().offset().local_minus_utc() / 60);
+        request = request.query(&[("timezone_offset_min", timezone_offset_min)]);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| format!("请求账号信息失败: {error}"))?;
@@ -353,6 +416,27 @@ fn codex_headers(
     Ok(headers)
 }
 
+fn chatgpt_web_headers(
+    access_token: &str,
+    account_id: Option<&str>,
+    target_path: &str,
+) -> std::result::Result<HeaderMap, String> {
+    let mut headers = codex_headers(access_token, account_id)?;
+    headers.insert(REFERER, HeaderValue::from_static(CHATGPT_WEB_REFERER));
+    headers.insert(USER_AGENT, HeaderValue::from_static(CHATGPT_WEB_USER_AGENT));
+    headers.insert(
+        "x-openai-target-path",
+        HeaderValue::from_str(target_path)
+            .map_err(|error| format!("构建 x-openai-target-path 头失败: {error}"))?,
+    );
+    headers.insert(
+        "x-openai-target-route",
+        HeaderValue::from_str(target_path)
+            .map_err(|error| format!("构建 x-openai-target-route 头失败: {error}"))?,
+    );
+    Ok(headers)
+}
+
 fn parse_account_profile(value: &serde_json::Value, expected_id: Option<&str>) -> AccountProfile {
     let records = collect_account_records(value);
     if records.is_empty() {
@@ -360,7 +444,7 @@ fn parse_account_profile(value: &serde_json::Value, expected_id: Option<&str>) -
     }
     let selected = expected_id
         .and_then(|expected| {
-            records.iter().find(|record| {
+            records.iter().copied().find(|record| {
                 pick_first_string(
                     &[*record],
                     &[
@@ -369,14 +453,27 @@ fn parse_account_profile(value: &serde_json::Value, expected_id: Option<&str>) -
                         &["accountId"],
                         &["chatgpt_account_id"],
                         &["workspace_id"],
+                        &["account", "id"],
+                        &["account", "account_id"],
+                        &["account", "accountId"],
+                        &["account", "chatgpt_account_id"],
+                        &["account", "workspace_id"],
                     ],
                 )
                 .as_deref()
                     == Some(expected)
             })
         })
-        .or_else(|| records.first())
-        .copied()
+        .or_else(|| {
+            value
+                .get("account_ordering")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(serde_json::Value::as_str)
+                .and_then(|key| value.get("accounts").and_then(|accounts| accounts.get(key)))
+                .filter(|record| record.is_object())
+        })
+        .or_else(|| records.first().copied())
         .unwrap_or(value);
 
     AccountProfile {
@@ -390,6 +487,13 @@ fn parse_account_profile(value: &serde_json::Value, expected_id: Option<&str>) -
                 &["organization_name"],
                 &["workspace_name"],
                 &["title"],
+                &["account", "name"],
+                &["account", "display_name"],
+                &["account", "displayName"],
+                &["account", "account_name"],
+                &["account", "organization_name"],
+                &["account", "workspace_name"],
+                &["account", "title"],
             ],
         ),
         structure: pick_first_string(
@@ -401,6 +505,12 @@ fn parse_account_profile(value: &serde_json::Value, expected_id: Option<&str>) -
                 &["kind"],
                 &["type"],
                 &["account_type"],
+                &["account", "structure"],
+                &["account", "account_structure"],
+                &["account", "accountStructure"],
+                &["account", "kind"],
+                &["account", "type"],
+                &["account", "account_type"],
             ],
         ),
         account_id: pick_first_string(
@@ -411,6 +521,11 @@ fn parse_account_profile(value: &serde_json::Value, expected_id: Option<&str>) -
                 &["accountId"],
                 &["chatgpt_account_id"],
                 &["workspace_id"],
+                &["account", "id"],
+                &["account", "account_id"],
+                &["account", "accountId"],
+                &["account", "chatgpt_account_id"],
+                &["account", "workspace_id"],
             ],
         ),
         plan_type: pick_first_string(
@@ -422,6 +537,9 @@ fn parse_account_profile(value: &serde_json::Value, expected_id: Option<&str>) -
                 &["chatgpt_plan_type"],
                 &["subscription", "plan_type"],
                 &["entitlement", "plan_type"],
+                &["entitlement", "subscription_plan"],
+                &["account", "plan_type"],
+                &["account", "planType"],
             ],
         ),
         subscription_active_until: pick_first_string(
@@ -434,6 +552,9 @@ fn parse_account_profile(value: &serde_json::Value, expected_id: Option<&str>) -
                 &["subscription", "activeUntil"],
                 &["entitlement", "subscription_active_until"],
                 &["entitlement", "expires_at"],
+                &["account", "subscription_active_until"],
+                &["account", "subscriptionActiveUntil"],
+                &["account", "expires_at"],
             ],
         ),
     }
@@ -1232,6 +1353,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_official_plan_variants_with_nullable_additional_limits() {
+        for plan_type in ["team", "k12team", "plus", "pro", "free"] {
+            let usage = serde_json::from_value::<UsageResponse>(serde_json::json!({
+                "plan_type": plan_type,
+                "rate_limit": null,
+                "code_review_rate_limit": null,
+                "additional_rate_limits": null
+            }))
+            .expect("usage");
+
+            let mut account = ProviderAccountInfo::default();
+            apply_usage_to_account(&mut account, usage);
+
+            assert_eq!(
+                account.subscription_type.as_deref(),
+                Some(plan_type.to_ascii_uppercase().as_str())
+            );
+            assert_eq!(account.subscription_status.as_deref(), Some("可用"));
+            assert!(account.quota_windows.is_empty());
+        }
+    }
+
+    #[test]
     fn parses_account_check_profile() {
         let value = serde_json::json!({
             "accounts": [{
@@ -1251,6 +1395,51 @@ mod tests {
             profile.subscription_active_until.as_deref(),
             Some("2026-07-06T13:27:00Z")
         );
+    }
+
+    #[test]
+    fn parses_cockpit_account_and_entitlement_profile() {
+        let value = serde_json::json!({
+            "account_ordering": ["personal", "school"],
+            "accounts": {
+                "personal": {
+                    "account": {
+                        "account_id": "acct-free",
+                        "name": "person@example.test",
+                        "structure": "personal"
+                    },
+                    "entitlement": {
+                        "subscription_plan": "free",
+                        "expires_at": "2026-08-01T00:00:00Z"
+                    }
+                },
+                "school": {
+                    "account": {
+                        "account_id": "acct-school",
+                        "name": "K12 Workspace",
+                        "structure": "workspace"
+                    },
+                    "entitlement": {
+                        "subscription_plan": "k12team",
+                        "expires_at": "2027-07-01T00:00:00Z"
+                    }
+                }
+            }
+        });
+
+        let selected = parse_account_profile(&value, Some("acct-school"));
+        assert_eq!(selected.account_id.as_deref(), Some("acct-school"));
+        assert_eq!(selected.name.as_deref(), Some("K12 Workspace"));
+        assert_eq!(selected.structure.as_deref(), Some("workspace"));
+        assert_eq!(selected.plan_type.as_deref(), Some("k12team"));
+        assert_eq!(
+            selected.subscription_active_until.as_deref(),
+            Some("2027-07-01T00:00:00Z")
+        );
+
+        let ordered = parse_account_profile(&value, None);
+        assert_eq!(ordered.account_id.as_deref(), Some("acct-free"));
+        assert_eq!(ordered.plan_type.as_deref(), Some("free"));
     }
 
     #[test]
@@ -1366,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn only_known_api_key_providers_probe_usage() {
+    fn non_openai_api_key_providers_probe_usage() {
         let mut provider =
             provider_config("https://api.openai.com/v1", ProviderKind::OpenAiCompatible);
         assert!(!provider_supports_api_key_usage(&provider));
@@ -1375,6 +1564,8 @@ mod tests {
         assert!(provider_supports_api_key_usage(&provider));
 
         provider.base_url = "https://relay.example.com/v1".to_string();
+        assert!(provider_supports_api_key_usage(&provider));
+
         provider.kind = ProviderKind::RelayProvider;
         assert!(provider_supports_api_key_usage(&provider));
     }
@@ -1385,6 +1576,7 @@ mod tests {
             name: "Provider".to_string(),
             kind,
             base_url: base_url.to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: std::collections::BTreeMap::new(),

@@ -157,17 +157,31 @@
   background: color-mix(in srgb, var(--warn) 9%, var(--surface-solid));
 }
 
-.warning-box strong {
+.success-box {
+  border: 1px solid color-mix(in srgb, var(--ok) 38%, var(--border));
+  border-radius: var(--radius);
+  padding: 12px;
+  background: color-mix(in srgb, var(--ok) 8%, var(--surface-solid));
+}
+
+.warning-box strong,
+.success-box strong {
   display: block;
   margin-bottom: 5px;
   font-size: 13px;
 }
 
-.warning-box p {
+.warning-box p,
+.success-box p {
   margin: 0;
   color: var(--muted);
   font-size: 12px;
   line-height: 1.6;
+}
+
+.success-box p + p,
+.warning-box p + p {
+  margin-top: 5px;
 }
 
 .advanced-details {
@@ -398,6 +412,18 @@ textarea:focus,
 .import-submit {
   width: 100%;
   margin-top: 14px;
+}
+
+.import-group-option {
+  align-items: flex-start;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.import-report {
+  max-height: 180px;
+  margin-top: 12px;
+  overflow-y: auto;
 }
 
 .file-import-panel {
@@ -1107,7 +1133,25 @@ dd {
 
 .order-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.weight-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.weight-control input {
+  width: 64px;
+  min-height: 30px;
+  padding-inline: 8px;
 }
 
 .import-file-list {
@@ -2062,6 +2106,89 @@ dd {
   width: min(280px, 60%);
   height: 6px;
   accent-color: var(--primary);
+}
+
+.usage-integrity-warning {
+  margin-top: 12px;
+}
+
+.settings-grid .panel {
+  min-width: 0;
+}
+
+.cli-command-preview,
+.diagnostic-note {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 11px;
+  color: var(--muted);
+  background: var(--muted-bg);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.cli-command-preview code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.diagnostic-details dd {
+  white-space: normal;
+}
+
+.fatal-error-shell {
+  display: grid;
+  min-height: 100%;
+  place-items: center;
+  padding: 24px;
+  background: var(--background);
+}
+
+.fatal-error-panel {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 14px;
+  width: min(620px, 100%);
+  border: 1px solid color-mix(in srgb, var(--danger) 34%, var(--border));
+  border-radius: var(--radius);
+  padding: 20px;
+  background: var(--surface-solid);
+  box-shadow: 0 12px 34px var(--shadow);
+}
+
+.fatal-error-panel > svg {
+  color: var(--danger);
+}
+
+.fatal-error-panel h1 {
+  margin: 0 0 7px;
+  font-size: 18px;
+}
+
+.fatal-error-panel p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.fatal-error-panel code {
+  display: block;
+  margin-top: 12px;
+  overflow-wrap: anywhere;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.fatal-error-panel .actions {
+  grid-column: 2;
 }
 
 .sessions-stack {

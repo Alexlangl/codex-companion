@@ -10,7 +10,11 @@ use codex_companion_core::{
     ProviderConfig, ProviderKind,
 };
 use codex_companion_health::{classify_failure, mark_failure};
-use codex_companion_provider::{ensure_codex_auth_snapshot, resolve_auth_token};
+use codex_companion_provider::{
+    ensure_agent_identity_authorization, ensure_codex_auth_snapshot,
+    is_agent_identity_task_invalid, provider_uses_agent_identity, redact_agent_identity_body,
+    resolve_auth_token,
+};
 use futures_util::{stream, Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -22,6 +26,7 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) struct UpstreamResponse {
     response: Option<reqwest::Response>,
     buffered_body: Option<Bytes>,
+    prefetched_body: VecDeque<Bytes>,
     status: StatusCode,
     headers: HeaderMap,
     transform: ResponseTransform,
@@ -35,16 +40,107 @@ impl UpstreamResponse {
     }
 
     pub(crate) async fn text(mut self) -> Result<String, String> {
-        if let Some(body) = self.buffered_body.take() {
-            return Ok(String::from_utf8_lossy(&body).into_owned());
+        let mut bytes = Vec::new();
+        while let Some(chunk) = self.prefetched_body.pop_front() {
+            bytes.extend_from_slice(&chunk);
         }
-        self.response
+        if let Some(body) = self.buffered_body.take() {
+            bytes.extend_from_slice(&body);
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        let tail = self
+            .response
             .take()
             .ok_or_else(|| "upstream response body is unavailable".to_string())?
             .text()
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        bytes.extend_from_slice(tail.as_bytes());
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+
+    pub(crate) async fn preflight_stream_failure(&mut self) -> Result<(), String> {
+        if !self.status.is_success() || !is_event_stream(&self.headers) || self.response.is_none() {
+            return Ok(());
+        }
+        let mut inspection = Vec::new();
+        loop {
+            let chunk = self
+                .response
+                .as_mut()
+                .expect("response checked above")
+                .chunk()
+                .await
+                .map_err(|error| format!("读取上游 SSE 首帧失败: {error}"))?;
+            let Some(chunk) = chunk else {
+                return Err("上游 SSE 在输出内容前结束".to_string());
+            };
+            inspection.extend_from_slice(&chunk);
+            self.prefetched_body.push_back(chunk);
+            let mut parsed_any = false;
+            while let Some(index) = next_sse_block_index(&inspection) {
+                parsed_any = true;
+                let block = String::from_utf8_lossy(&inspection[..index]).into_owned();
+                let drain_to = if inspection[index..].starts_with(b"\r\n\r\n") {
+                    index + 4
+                } else {
+                    index + 2
+                };
+                inspection.drain(..drain_to);
+                match preflight_sse_block(&block) {
+                    StreamPreflight::Continue => {}
+                    StreamPreflight::OutputStarted | StreamPreflight::Terminal => return Ok(()),
+                    StreamPreflight::Failure(message) => return Err(message),
+                }
+            }
+            if inspection.len() >= 64 * 1024 || (!parsed_any && inspection.len() >= 16 * 1024) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+enum StreamPreflight {
+    Continue,
+    OutputStarted,
+    Terminal,
+    Failure(String),
+}
+
+fn preflight_sse_block(block: &str) -> StreamPreflight {
+    let data = block
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() {
+        return StreamPreflight::Continue;
+    }
+    if data == "[DONE]" {
+        return StreamPreflight::Terminal;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&data) else {
+        return StreamPreflight::Continue;
+    };
+    if let Some(message) = semantic_failure_message(&value) {
+        return StreamPreflight::Failure(message);
+    }
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(event_type, "response.completed" | "response.incomplete") {
+        return StreamPreflight::Terminal;
+    }
+    if event_type.contains("output_item")
+        || event_type.ends_with(".delta")
+        || event_type.contains("content_part")
+        || value.pointer("/choices/0/delta/content").is_some()
+        || value.pointer("/choices/0/delta/tool_calls").is_some()
+    {
+        return StreamPreflight::OutputStarted;
+    }
+    StreamPreflight::Continue
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,42 +175,32 @@ pub(crate) async fn send_upstream(
     } else {
         upstream.to_string()
     };
-    let mut request = client.request(reqwest_method, &upstream);
-    for (name, value) in headers {
-        if matches!(
-            *name,
-            header::HOST | header::AUTHORIZATION | header::CONTENT_LENGTH
-        ) {
-            continue;
-        }
-        request = request.header(name, value);
-    }
+    let mut authorization = None;
+    let mut agent_identity_task_id = None;
+    let mut chatgpt_account_id = None;
     if provider.kind == ProviderKind::OfficialCodex {
-        let auth = ensure_codex_auth_snapshot(provider)
-            .await
-            .map_err(|error| error.to_string())?;
-        request = request.bearer_auth(auth.access_token);
-        if let Some(account_id) = provider
+        chatgpt_account_id = provider
             .account
             .as_ref()
             .and_then(|account| account.account_id.clone())
-            .or(auth.account_id)
-        {
-            request = request.header("ChatGPT-Account-Id", account_id);
+            .filter(|account_id| !account_id.trim().is_empty());
+        if provider_uses_agent_identity(provider) {
+            let auth = ensure_agent_identity_authorization(client, provider, None)
+                .await
+                .map_err(|error| error.to_string())?;
+            agent_identity_task_id = Some(auth.task_id);
+            authorization = Some(auth.header);
+        } else {
+            let auth = ensure_codex_auth_snapshot(provider)
+                .await
+                .map_err(|error| error.to_string())?;
+            chatgpt_account_id = chatgpt_account_id.or(auth.account_id);
+            authorization = Some(format!("Bearer {}", auth.access_token));
         }
-        request = request
-            .header("originator", "codex_cli_rs")
-            .header("version", "0.144.1");
     } else if let Some(token) = resolve_auth_token(provider) {
-        request = request.bearer_auth(token);
+        authorization = Some(format!("Bearer {token}"));
     }
     let session_identity = official_codex_session_identity(provider, method, uri, headers, &body);
-    if let Some(value) = session_identity
-        .as_deref()
-        .and_then(|value| HeaderValue::from_str(value).ok())
-    {
-        request = request.header("session_id", value);
-    }
     let body = normalize_official_responses_input(
         provider,
         method,
@@ -134,11 +220,65 @@ pub(crate) async fn send_upstream(
         } else {
             (body, ChatToolContext::default(), Vec::new())
         };
-    let response = request
-        .body(body)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut response = build_upstream_request(
+        client,
+        &reqwest_method,
+        &upstream,
+        headers,
+        provider.kind == ProviderKind::OfficialCodex,
+        authorization.as_deref(),
+        chatgpt_account_id.as_deref(),
+        session_identity.as_deref(),
+    )
+    .body(body.clone())
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+    let mut buffered_error = None;
+    if agent_identity_task_id.is_some() && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let task_id = agent_identity_task_id
+            .as_deref()
+            .expect("agent identity task checked above");
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let error_body = response
+            .bytes()
+            .await
+            .map_err(|error| format!("读取 Agent Identity 失败响应失败: {error}"))?;
+        let error_text = String::from_utf8_lossy(&error_body).into_owned();
+        if is_agent_identity_task_invalid(status, &error_text) {
+            let auth = ensure_agent_identity_authorization(client, provider, Some(task_id))
+                .await
+                .map_err(|error| error.to_string())?;
+            response = build_upstream_request(
+                client,
+                &reqwest_method,
+                &upstream,
+                headers,
+                true,
+                Some(&auth.header),
+                chatgpt_account_id.as_deref(),
+                session_identity.as_deref(),
+            )
+            .body(body.clone())
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        } else {
+            let redacted = redact_agent_identity_body(provider, &error_text);
+            buffered_error = Some(Bytes::from(redacted));
+            return Ok(UpstreamResponse {
+                response: None,
+                buffered_body: buffered_error,
+                prefetched_body: VecDeque::new(),
+                status,
+                headers: response_headers,
+                transform,
+                tool_context,
+                chat_messages,
+            });
+        }
+    }
     let status = response.status();
     let headers = response.headers().clone();
     let inspect_body = status.is_success()
@@ -161,17 +301,55 @@ pub(crate) async fn send_upstream(
         }
         (None, Some(body))
     } else {
-        (Some(response), None)
+        (Some(response), buffered_error)
     };
     Ok(UpstreamResponse {
         response,
         buffered_body,
+        prefetched_body: VecDeque::new(),
         status,
         headers,
         transform,
         tool_context,
         chat_messages,
     })
+}
+
+fn build_upstream_request(
+    client: &reqwest::Client,
+    method: &reqwest::Method,
+    upstream: &str,
+    headers: &HeaderMap,
+    official_codex: bool,
+    authorization: Option<&str>,
+    chatgpt_account_id: Option<&str>,
+    session_identity: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut request = client.request(method.clone(), upstream);
+    for (name, value) in headers {
+        if matches!(
+            *name,
+            header::HOST | header::AUTHORIZATION | header::CONTENT_LENGTH
+        ) {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    if let Some(authorization) = authorization {
+        request = request.header(header::AUTHORIZATION, authorization);
+    }
+    if let Some(account_id) = chatgpt_account_id {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+    if let Some(session_identity) = session_identity {
+        request = request.header("session_id", session_identity);
+    }
+    if official_codex {
+        request = request
+            .header("originator", "codex_cli_rs")
+            .header("version", "0.144.1");
+    }
+    request
 }
 
 fn normalize_official_responses_input(
@@ -356,6 +534,7 @@ pub(crate) async fn stream_response(
     let UpstreamResponse {
         response,
         buffered_body,
+        prefetched_body,
         status,
         headers,
         transform,
@@ -363,10 +542,7 @@ pub(crate) async fn stream_response(
         chat_messages,
     } = upstream;
     if transform == ResponseTransform::OfficialCodexStreamToResponse && status.is_success() {
-        let body = match response {
-            Some(response) => response.bytes().await.map_err(|error| error.to_string()),
-            None => Ok(buffered_body.unwrap_or_default()),
-        };
+        let body = collect_response_bytes(response, buffered_body, prefetched_body).await;
         return match body.and_then(|body| terminal_response_from_sse(&body)) {
             Ok(value) => Response::builder()
                 .status(status)
@@ -397,7 +573,7 @@ pub(crate) async fn stream_response(
             return chat_sse_response(
                 provider_id,
                 status,
-                response_byte_stream(response, buffered_body),
+                response_byte_stream(response, buffered_body, prefetched_body),
                 tool_context,
                 chat_messages,
                 store,
@@ -447,7 +623,7 @@ pub(crate) async fn stream_response(
         || buffered_body
             .as_ref()
             .is_some_and(|body| looks_like_sse(body));
-    let stream = response_byte_stream(response, buffered_body);
+    let stream = response_byte_stream(response, buffered_body, prefetched_body);
     let stream = if observe_responses_stream {
         responses_sse_observer_stream(
             stream,
@@ -472,6 +648,24 @@ pub(crate) async fn stream_response(
                 format!("response build failed: {error}"),
             )
         })
+}
+
+async fn collect_response_bytes(
+    response: Option<reqwest::Response>,
+    buffered_body: Option<Bytes>,
+    prefetched_body: VecDeque<Bytes>,
+) -> Result<Bytes, String> {
+    let mut bytes = Vec::new();
+    for chunk in prefetched_body {
+        bytes.extend_from_slice(&chunk);
+    }
+    if let Some(body) = buffered_body {
+        bytes.extend_from_slice(&body);
+    } else if let Some(response) = response {
+        let tail = response.bytes().await.map_err(|error| error.to_string())?;
+        bytes.extend_from_slice(&tail);
+    }
+    Ok(Bytes::from(bytes))
 }
 
 fn chat_sse_response(
@@ -506,14 +700,20 @@ fn chat_sse_response(
 fn response_byte_stream(
     response: Option<reqwest::Response>,
     buffered_body: Option<Bytes>,
+    prefetched_body: VecDeque<Bytes>,
 ) -> ResponseByteStream {
     if let Some(body) = buffered_body {
-        return Box::pin(stream::once(async move { Ok(body) }));
+        return Box::pin(
+            stream::iter(prefetched_body.into_iter().map(Ok))
+                .chain(stream::once(async move { Ok(body) })),
+        );
     }
-    match response {
+    let prefetched = stream::iter(prefetched_body.into_iter().map(Ok));
+    let tail: ResponseByteStream = match response {
         Some(response) => Box::pin(response.bytes_stream().map_err(io::Error::other)),
         None => Box::pin(stream::empty()),
-    }
+    };
+    Box::pin(prefetched.chain(tail))
 }
 
 fn responses_sse_observer_stream(
@@ -899,6 +1099,7 @@ impl ChatToolContext {
                 context.add_response_tool(tool);
             }
         }
+        collect_additional_tools(value, &mut context);
         if let Some(input) = value.get("input") {
             collect_tool_search_output_tools(input, &mut context);
         }
@@ -1142,6 +1343,29 @@ impl ChatToolContext {
             },
             _ => {}
         }
+    }
+}
+
+fn collect_additional_tools(value: &Value, context: &mut ChatToolContext) {
+    match value {
+        Value::Object(object) => {
+            if let Some(tools) = object.get("additional_tools").and_then(Value::as_array) {
+                for tool in tools {
+                    context.add_response_tool(tool);
+                }
+            }
+            for key in ["input", "override", "overrides"] {
+                if let Some(child) = object.get(key) {
+                    collect_additional_tools(child, context);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_additional_tools(item, context);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2523,6 +2747,7 @@ mod tests {
             name: "Official".to_string(),
             kind: ProviderKind::OfficialCodex,
             base_url: base_url.to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: BTreeMap::new(),
@@ -2540,6 +2765,7 @@ mod tests {
             name: "Provider".to_string(),
             kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.example.com/v1".to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: BTreeMap::new(),
@@ -2579,6 +2805,7 @@ mod tests {
             name: "Provider".to_string(),
             kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.example.com/v1".to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map,
@@ -2739,6 +2966,7 @@ mod tests {
             name: "Provider".to_string(),
             kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.example.com/v1".to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map,
@@ -2764,6 +2992,7 @@ mod tests {
             name: "Provider".to_string(),
             kind: ProviderKind::OpenAiCompatible,
             base_url: "https://api.example.com/v1".to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map,
@@ -2787,6 +3016,7 @@ mod tests {
             name: "Provider".to_string(),
             kind: ProviderKind::RelayProvider,
             base_url: "https://api.example.com/v1".to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: BTreeMap::new(),
@@ -2814,6 +3044,7 @@ mod tests {
             name: "Provider".to_string(),
             kind: ProviderKind::RelayProvider,
             base_url: "https://api.example.com/v1/chat/completions".to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: BTreeMap::new(),
@@ -2843,6 +3074,7 @@ mod tests {
             name: "Provider".to_string(),
             kind: ProviderKind::RelayProvider,
             base_url: "https://api.example.com/v1/responses?api-version=2026-06-09".to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: BTreeMap::new(),
@@ -2962,6 +3194,72 @@ mod tests {
         assert_eq!(
             value.pointer("/messages/2/tool_calls/0/function/name"),
             Some(&Value::String("apply_patch".to_string()))
+        );
+        assert_eq!(
+            context
+                .lookup("github__search_issues")
+                .map(|spec| &spec.kind),
+            Some(&ChatToolKind::Namespace)
+        );
+    }
+
+    #[test]
+    fn collects_additional_tools_from_top_level_input_and_overrides() {
+        let (body, context, _) = responses_body_to_chat_completions(
+            Bytes::from_static(
+                br#"{
+                    "model":"gpt-5.4",
+                    "additional_tools":[
+                        {"type":"custom","name":"top_level_tool"}
+                    ],
+                    "input":{
+                        "type":"message",
+                        "role":"user",
+                        "content":"use tools",
+                        "additional_tools":[
+                            {"type":"namespace","name":"github","tools":[
+                                {"type":"function","name":"search_issues","parameters":{"type":"object"}}
+                            ]}
+                        ]
+                    },
+                    "override":{
+                        "additional_tools":[
+                            {"type":"function","name":"override_tool","parameters":{"type":"object"}}
+                        ]
+                    },
+                    "overrides":[{
+                        "additional_tools":[{"type":"tool_search"}]
+                    }],
+                    "tool_choice":{"type":"function","name":"search_issues","namespace":"github"}
+                }"#,
+            ),
+            "p",
+            false,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        let tool_names = value["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            tool_names,
+            vec![
+                "top_level_tool",
+                "github__search_issues",
+                "override_tool",
+                "tool_search"
+            ]
+        );
+        assert_eq!(
+            value.pointer("/tool_choice/function/name"),
+            Some(&Value::String("github__search_issues".to_string()))
+        );
+        assert_eq!(
+            value.pointer("/messages/0/content"),
+            Some(&json!("use tools"))
         );
         assert_eq!(
             context
@@ -3412,6 +3710,7 @@ data: [DONE]
             name: "Provider".to_string(),
             kind: ProviderKind::OfficialCodex,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: BTreeMap::new(),

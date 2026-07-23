@@ -7,6 +7,7 @@ export interface ApiKeyForm {
   providerName: string;
   kind: ApiKeyKind;
   baseUrl: string;
+  websocketUrl: string;
   apiKey: string;
   envVar: string;
   refreshIntervalSeconds: number;
@@ -22,6 +23,7 @@ export const emptyApiKeyForm: ApiKeyForm = {
   providerName: "",
   kind: "openai_compatible",
   baseUrl: "",
+  websocketUrl: "",
   apiKey: "",
   envVar: "",
   refreshIntervalSeconds: 60,

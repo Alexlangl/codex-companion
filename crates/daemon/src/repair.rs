@@ -50,6 +50,18 @@ impl CompanionDaemon {
         })
     }
 
+    pub fn set_token_usage_refresh_interval(&self, seconds: u64) -> Result<u64> {
+        if seconds != 0 && !(15..=3600).contains(&seconds) {
+            return Err(codex_companion_core::CompanionError::InvalidConfig(
+                "Token 自动刷新间隔必须为 0（关闭）或 15-3600 秒".to_string(),
+            ));
+        }
+        self.store.update(|config| {
+            config.app.token_usage_refresh_interval_seconds = seconds;
+            Ok(seconds)
+        })
+    }
+
     pub fn set_provider_launch_mode(
         &self,
         provider_id: String,
@@ -172,6 +184,7 @@ mod tests {
             name: "Official".to_string(),
             kind,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            websocket_url: None,
             auth_ref: None,
             direct_auth_ref: None,
             model_map: BTreeMap::new(),

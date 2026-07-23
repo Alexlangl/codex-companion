@@ -87,6 +87,14 @@ export function providerTypeLabel(provider: ProviderConfig) {
   return "API Key";
 }
 
+export function providerUsesAgentIdentity(provider: ProviderConfig): boolean {
+  return provider.account?.authMode?.trim().toLowerCase() === "agentidentity";
+}
+
+export function providerUsesWebSocket(provider: ProviderConfig): boolean {
+  return Boolean(provider.websocketUrl?.trim());
+}
+
 export function providerHealthLabel(status?: string) {
   switch (status) {
     case "healthy":

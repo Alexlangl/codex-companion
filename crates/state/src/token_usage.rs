@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-const TOKEN_USAGE_CACHE_VERSION: u32 = 4;
+const TOKEN_USAGE_CACHE_VERSION: u32 = 5;
 
 static TOKEN_USAGE_SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TOKEN_USAGE_STATUS: OnceLock<Mutex<TokenUsageSyncStatus>> = OnceLock::new();
@@ -171,17 +171,43 @@ struct CachedTokenUsageFile {
     modified_secs: u64,
     modified_nanos: u32,
     events: Vec<TokenUsageEvent>,
+    #[serde(default)]
+    deferred: bool,
+    #[serde(default)]
+    suspected_duplicate: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParsedTokenUsageFile {
+    events: Vec<TokenUsageEvent>,
+    deferred: bool,
+    suspected_duplicate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayResolution {
+    NotApplicable,
+    Matched(usize),
+    Deferred,
+    SuspectedDuplicate,
 }
 
 pub fn collect_token_usage(codex_dir: PathBuf) -> Result<TokenUsageSummary> {
     let files = collect_codex_session_files(&codex_dir);
     let mut all_events = Vec::new();
+    let mut deferred_files = 0;
+    let mut suspected_duplicates = 0;
     for file in &files {
-        all_events.extend(parse_session_file(file)?);
+        let parsed = parse_session_file(file)?;
+        deferred_files += usize::from(parsed.deferred);
+        suspected_duplicates += usize::from(parsed.suspected_duplicate);
+        all_events.extend(parsed.events);
     }
     Ok(summarize_token_events(
         codex_dir,
         files.len(),
+        deferred_files,
+        suspected_duplicates,
         all_events,
         &PricingCatalog::builtin(),
         &TokenUsageDateRange::default(),
@@ -247,6 +273,8 @@ fn collect_token_usage_cached_inner(
     let mut cache = read_token_usage_cache(&cache_path);
     let mut next_files = BTreeMap::new();
     let mut all_events = Vec::new();
+    let mut deferred_files = 0;
+    let mut suspected_duplicates = 0;
 
     for (file_index, file) in files.iter().enumerate() {
         let cache_key = file.to_string_lossy().to_string();
@@ -255,31 +283,39 @@ fn collect_token_usage_cached_inner(
             cache
                 .files
                 .get(&cache_key)
-                .filter(|cached| cached.matches(signature))
+                .filter(|cached| {
+                    cached.matches(signature) && !cached.deferred && !cached.suspected_duplicate
+                })
                 .cloned()
         });
         let cached_file = match (cached, signature) {
             (Some(cached), _) => cached,
             (_, Some(signature)) => {
-                let events = parse_session_file(file)?;
+                let parsed = parse_session_file(file)?;
                 CachedTokenUsageFile {
                     len: signature.len,
                     modified_secs: signature.modified_secs,
                     modified_nanos: signature.modified_nanos,
-                    events,
+                    events: parsed.events,
+                    deferred: parsed.deferred,
+                    suspected_duplicate: parsed.suspected_duplicate,
                 }
             }
             (None, None) => {
-                let events = parse_session_file(file)?;
+                let parsed = parse_session_file(file)?;
                 CachedTokenUsageFile {
-                    events,
+                    events: parsed.events,
+                    deferred: parsed.deferred,
+                    suspected_duplicate: parsed.suspected_duplicate,
                     ..CachedTokenUsageFile::default()
                 }
             }
         };
+        deferred_files += usize::from(cached_file.deferred);
+        suspected_duplicates += usize::from(cached_file.suspected_duplicate);
         all_events.extend(cached_file.events.clone());
         next_files.insert(cache_key, cached_file);
-        update_token_usage_progress(file_index + 1);
+        update_token_usage_progress(file_index + 1, deferred_files, suspected_duplicates);
     }
 
     cache.version = TOKEN_USAGE_CACHE_VERSION;
@@ -291,6 +327,8 @@ fn collect_token_usage_cached_inner(
     Ok(summarize_token_events(
         codex_dir,
         files.len(),
+        deferred_files,
+        suspected_duplicates,
         all_events,
         &catalog,
         date_range,
@@ -307,12 +345,18 @@ fn set_token_usage_status(status: TokenUsageSyncStatus) {
     }
 }
 
-fn update_token_usage_progress(scanned_files: usize) {
+fn update_token_usage_progress(
+    scanned_files: usize,
+    deferred_files: usize,
+    suspected_duplicates: usize,
+) {
     if let Ok(mut status) = TOKEN_USAGE_STATUS
         .get_or_init(|| Mutex::new(TokenUsageSyncStatus::default()))
         .lock()
     {
         status.scanned_files = scanned_files;
+        status.deferred_files = deferred_files;
+        status.suspected_duplicates = suspected_duplicates;
     }
 }
 
@@ -334,6 +378,8 @@ pub fn rebuild_token_usage_cached_with_filters(
 fn summarize_token_events(
     codex_dir: PathBuf,
     files_scanned: usize,
+    deferred_files: usize,
+    suspected_duplicates: usize,
     events: Vec<TokenUsageEvent>,
     pricing: &PricingCatalog,
     date_range: &TokenUsageDateRange,
@@ -342,6 +388,9 @@ fn summarize_token_events(
     let mut summary = TokenUsageSummary {
         codex_dir,
         files_scanned,
+        deferred_files,
+        suspected_duplicates,
+        cache_version: TOKEN_USAGE_CACHE_VERSION,
         pricing_as_of: PRICING_AS_OF.to_string(),
         pricing_override_path: pricing.override_path.clone(),
         ..TokenUsageSummary::default()
@@ -469,7 +518,7 @@ fn event_local_date(timestamp: &str) -> Option<NaiveDate> {
         .map(|value| value.with_timezone(&Local).date_naive())
 }
 
-fn parse_session_file(path: &Path) -> Result<Vec<TokenUsageEvent>> {
+fn parse_session_file(path: &Path) -> Result<ParsedTokenUsageFile> {
     let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
     let reader = BufReader::new(file);
     let lines = reader
@@ -516,18 +565,40 @@ fn parse_session_file(path: &Path) -> Result<Vec<TokenUsageEvent>> {
         }
     }
 
-    let replay_prefix = identity
+    let replay_resolution = identity
         .as_ref()
-        .and_then(|identity| replay_prefix_from_parent(path, identity, &parsed_events));
-    Ok(parsed_events
+        .map_or(ReplayResolution::NotApplicable, |identity| {
+            replay_prefix_from_parent(path, identity, &parsed_events)
+        });
+    if matches!(replay_resolution, ReplayResolution::Deferred) {
+        return Ok(ParsedTokenUsageFile {
+            deferred: true,
+            ..ParsedTokenUsageFile::default()
+        });
+    }
+    if matches!(replay_resolution, ReplayResolution::SuspectedDuplicate) {
+        return Ok(ParsedTokenUsageFile {
+            deferred: true,
+            suspected_duplicate: true,
+            ..ParsedTokenUsageFile::default()
+        });
+    }
+    let events = parsed_events
         .into_iter()
         .enumerate()
-        .filter(|(event_index, parsed)| match replay_prefix {
-            Some(prefix) => *event_index >= prefix,
-            None => fallback_boundary.is_none_or(|boundary| parsed.line_index + 1 >= boundary),
+        .filter(|(event_index, parsed)| match replay_resolution {
+            ReplayResolution::Matched(prefix) => *event_index >= prefix,
+            ReplayResolution::NotApplicable => {
+                fallback_boundary.is_none_or(|boundary| parsed.line_index + 1 >= boundary)
+            }
+            ReplayResolution::Deferred | ReplayResolution::SuspectedDuplicate => false,
         })
         .map(|(_, parsed)| parsed.event)
-        .collect())
+        .collect();
+    Ok(ParsedTokenUsageFile {
+        events,
+        ..ParsedTokenUsageFile::default()
+    })
 }
 
 fn session_identity_from_lines(lines: &[String]) -> Option<CodexSessionIdentity> {
@@ -602,16 +673,23 @@ fn replay_prefix_from_parent(
     child_path: &Path,
     identity: &CodexSessionIdentity,
     child_events: &[ParsedTokenUsageEvent],
-) -> Option<usize> {
-    let parent_id = identity.parent_thread_id.as_deref()?;
-    let cutoff = identity.forked_at?;
-    let codex_dir = child_path.ancestors().find_map(|ancestor| {
+) -> ReplayResolution {
+    let Some(parent_id) = identity.parent_thread_id.as_deref() else {
+        return ReplayResolution::NotApplicable;
+    };
+    let Some(cutoff) = identity.forked_at else {
+        return ReplayResolution::NotApplicable;
+    };
+    let Some(codex_dir) = child_path.ancestors().find_map(|ancestor| {
         let name = ancestor.file_name()?.to_str()?;
         (name == "sessions" || name == "archived_sessions")
             .then(|| ancestor.parent().map(Path::to_path_buf))
             .flatten()
-    })?;
+    }) else {
+        return ReplayResolution::Deferred;
+    };
     let mut matching_parents = Vec::new();
+    let mut found_parent = false;
     for candidate in collect_codex_session_files(&codex_dir) {
         if candidate == child_path {
             continue;
@@ -626,19 +704,23 @@ fn replay_prefix_from_parent(
         {
             continue;
         }
+        found_parent = true;
         if let Some(signatures) = parent_signatures_before(&lines, cutoff) {
             matching_parents.push(signatures);
         }
     }
-    let first = matching_parents.first()?;
+    if !found_parent || matching_parents.is_empty() {
+        return ReplayResolution::Deferred;
+    }
+    let first = &matching_parents[0];
     if matching_parents
         .iter()
         .skip(1)
         .any(|candidate| candidate != first)
     {
-        return None;
+        return ReplayResolution::SuspectedDuplicate;
     }
-    Some(matching_replay_prefix(child_events, first))
+    ReplayResolution::Matched(matching_replay_prefix(child_events, first))
 }
 
 fn parent_signatures_before(
@@ -1203,6 +1285,8 @@ mod tests {
         let summary = summarize_token_events(
             PathBuf::from("/tmp/codex"),
             4,
+            0,
+            0,
             events,
             &PricingCatalog::builtin(),
             &range,
@@ -1234,6 +1318,8 @@ mod tests {
         let summary = summarize_token_events(
             PathBuf::from("/tmp/codex"),
             3,
+            0,
+            0,
             events,
             &PricingCatalog::builtin(),
             &TokenUsageDateRange::default(),
@@ -1265,6 +1351,8 @@ mod tests {
         let summary = summarize_token_events(
             PathBuf::from("/tmp/codex"),
             1,
+            0,
+            0,
             vec![first, second],
             &PricingCatalog::builtin(),
             &TokenUsageDateRange::default(),
@@ -1456,6 +1544,105 @@ mod tests {
     }
 
     #[test]
+    fn missing_parent_defers_child_until_a_later_cached_scan_can_resolve_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        fs::write(
+            day.join("child.jsonl"),
+            r#"{"timestamp":"2026-07-10T03:00:04Z","type":"session_meta","payload":{"id":"child","forked_from_id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"output_tokens":15}}}}"#
+                + "\n",
+        )
+        .expect("child");
+        let cache_dir = temp.path().join("cache");
+
+        let deferred = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir.clone())
+            .expect("deferred scan");
+        assert_eq!(deferred.deferred_files, 1);
+        assert_eq!(deferred.events, 0);
+
+        fs::write(
+            day.join("parent.jsonl"),
+            r#"{"timestamp":"2026-07-10T03:00:00Z","type":"session_meta","payload":{"id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:05Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("parent");
+
+        let resolved = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir)
+            .expect("resolved scan");
+        assert_eq!(resolved.deferred_files, 0);
+        assert_eq!(resolved.suspected_duplicates, 0);
+        assert_eq!(
+            resolved
+                .recent_events
+                .iter()
+                .filter(|event| event.session_id.as_deref() == Some("child"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn conflicting_parent_histories_mark_the_child_as_a_suspected_duplicate() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        for (name, input_tokens) in [("parent-a.jsonl", 100), ("parent-b.jsonl", 120)] {
+            fs::write(
+                day.join(name),
+                format!(
+                    concat!(
+                        "{{\"timestamp\":\"2026-07-10T03:00:00Z\",\"type\":\"session_meta\",",
+                        "\"payload\":{{\"id\":\"parent\"}}}}\n",
+                        "{{\"timestamp\":\"2026-07-10T03:00:01Z\",\"type\":\"event_msg\",",
+                        "\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":",
+                        "{{\"input_tokens\":{},\"output_tokens\":10}}}}}}}}\n",
+                        "{{\"timestamp\":\"2026-07-10T03:00:05Z\",\"type\":\"event_msg\",",
+                        "\"payload\":{{\"type\":\"task_complete\"}}}}\n"
+                    ),
+                    input_tokens
+                ),
+            )
+            .expect("parent");
+        }
+        fs::write(
+            day.join("child.jsonl"),
+            r#"{"timestamp":"2026-07-10T03:00:04Z","type":"session_meta","payload":{"id":"child","forked_from_id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"output_tokens":15}}}}"#
+                + "\n",
+        )
+        .expect("child");
+
+        let summary = collect_token_usage(temp.path().to_path_buf()).expect("summary");
+
+        assert_eq!(summary.deferred_files, 1);
+        assert_eq!(summary.suspected_duplicates, 1);
+        assert!(summary
+            .recent_events
+            .iter()
+            .all(|event| event.session_id.as_deref() != Some("child")));
+    }
+
+    #[test]
     fn separates_cache_write_tokens_from_fresh_input() {
         let temp = tempfile::tempdir().expect("temp");
         let day = temp
@@ -1522,6 +1709,44 @@ mod tests {
             collect_token_usage_cached(temp.path().to_path_buf(), cache_dir).expect("third");
         assert_eq!(third.events, 2);
         assert_eq!(third.total_tokens, 135);
+    }
+
+    #[test]
+    fn old_cache_version_is_discarded_and_rebuilt() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        fs::write(
+            day.join("session.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"s1"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n",
+        )
+        .expect("session");
+        let cache_dir = temp.path().join("cache");
+        let first = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir.clone())
+            .expect("first scan");
+        assert_eq!(first.total_tokens, 110);
+
+        let cache_path = cache_dir.join("token-usage-cache.json");
+        let mut cache = read_token_usage_cache(&cache_path);
+        cache.version = TOKEN_USAGE_CACHE_VERSION - 1;
+        for cached_file in cache.files.values_mut() {
+            cached_file.events.clear();
+        }
+        write_token_usage_cache(&cache_path, &cache).expect("old cache");
+
+        let rebuilt =
+            collect_token_usage_cached(temp.path().to_path_buf(), cache_dir).expect("rebuilt scan");
+        assert_eq!(rebuilt.total_tokens, 110);
+        assert_eq!(rebuilt.events, 1);
+        assert_eq!(rebuilt.cache_version, TOKEN_USAGE_CACHE_VERSION);
     }
 
     #[test]

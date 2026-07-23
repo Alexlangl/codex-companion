@@ -2,12 +2,14 @@ use crate::health_loop::{
     begin_refresh, finish_refresh, mark_refresh_provider, refresh_coordinator,
 };
 use crate::runtime::CompanionDaemon;
-use codex_companion_core::{ProviderConfig, ProviderHealth, ProviderKind, Result};
+use codex_companion_core::{
+    ProviderConfig, ProviderHealth, ProviderImportProgress, ProviderKind, Result,
+};
 use codex_companion_provider::{
     add_provider, export_provider_json, import_api_key_provider, import_local_codex_provider,
     import_provider_json, import_provider_json_many, list_providers, refresh_provider_status,
     remove_provider, test_provider, ApiKeyProviderUpdate, ProviderExportFormat,
-    ProviderExportOutput, ProviderImportOutcome, ProviderUpsert,
+    ProviderExportOutput, ProviderImportBatchReport, ProviderImportOutcome, ProviderUpsert,
 };
 use std::path::PathBuf;
 
@@ -42,8 +44,19 @@ impl CompanionDaemon {
         json_text: &str,
         provider_id: Option<String>,
         provider_name: Option<String>,
-    ) -> Result<Vec<ProviderImportOutcome>> {
-        import_provider_json_many(&self.store, json_text, provider_id, provider_name)
+        add_to_group_id: Option<String>,
+    ) -> Result<ProviderImportBatchReport> {
+        import_provider_json_many(
+            &self.store,
+            json_text,
+            provider_id,
+            provider_name,
+            add_to_group_id,
+        )
+    }
+
+    pub fn provider_import_progress(&self) -> ProviderImportProgress {
+        codex_companion_provider::provider_import_progress()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -52,6 +65,7 @@ impl CompanionDaemon {
         provider_name: String,
         kind: ProviderKind,
         base_url: String,
+        websocket_url: Option<String>,
         api_key: String,
         env_var: Option<String>,
         model: Option<String>,
@@ -62,6 +76,7 @@ impl CompanionDaemon {
             provider_name,
             kind,
             base_url,
+            websocket_url,
             api_key,
             env_var,
             model,

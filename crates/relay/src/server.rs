@@ -1,6 +1,10 @@
 use crate::proxy::proxy;
 use crate::state::RelayState;
-use axum::{routing::any, Router};
+use crate::websocket::responses_websocket;
+use axum::{
+    routing::{any, get},
+    Router,
+};
 use codex_companion_core::ConfigStore;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -30,6 +34,7 @@ pub async fn serve(store: ConfigStore) -> anyhow::Result<RelayStartOutcome> {
 
 fn relay_router(state: RelayState) -> Router {
     Router::new()
+        .route("/v1/responses", get(responses_websocket).post(proxy))
         .route("/{*path}", any(proxy))
         .layer(
             CorsLayer::new()
@@ -75,6 +80,7 @@ mod tests {
                         name: "Account A".to_string(),
                         kind: ProviderKind::OpenAiCompatible,
                         base_url: format!("http://{upstream_addr}/v1"),
+                        websocket_url: None,
                         auth_ref: None,
                         direct_auth_ref: None,
                         model_map: BTreeMap::new(),

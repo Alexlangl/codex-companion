@@ -1,4 +1,5 @@
 mod constants;
+mod diagnostics;
 mod error;
 mod events;
 mod paths;
@@ -7,6 +8,7 @@ mod store;
 mod types;
 
 pub use constants::*;
+pub use diagnostics::*;
 pub use error::{CompanionError, Result};
 pub use events::now_event;
 pub use paths::{default_codex_dir, default_config_path, default_data_dir};

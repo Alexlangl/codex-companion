@@ -18,6 +18,7 @@ import {
   setProviderLaunchMode,
   setProviderViewMode,
   setTheme,
+  setTokenUsageRefreshInterval,
   uninstall,
   updateApiKeyProvider,
   upsertGroup,
@@ -31,6 +32,7 @@ import type {
   ProviderExportFormat,
   ProviderExportOutput,
   ProviderLaunchMode,
+  ProviderImportBatchReport,
   ProviderViewMode,
   RepairOutcome,
   ThemeMode,
@@ -179,6 +181,70 @@ export function useCompanionController() {
     }
   }
 
+  async function changeTokenUsageRefreshInterval(seconds: number) {
+    setStatus((current) =>
+      current
+        ? {
+            ...current,
+            config: {
+              ...current.config,
+              app: {
+                ...current.config.app,
+                tokenUsageRefreshIntervalSeconds: seconds,
+              },
+            },
+          }
+        : current,
+    );
+    try {
+      await setTokenUsageRefreshInterval(seconds);
+    } catch (unknownError) {
+      setError(String(unknownError));
+      await refresh();
+    }
+  }
+
+  async function importJsonBatch(
+    jsonFiles: JsonImportFile[],
+    addToGroupId?: string | null,
+  ): Promise<ProviderImportBatchReport> {
+    setBusy("saving");
+    setError(null);
+    const combined: ProviderImportBatchReport = {
+      total: 0,
+      succeeded: [],
+      failed: [],
+      addedToGroup: [],
+    };
+    try {
+      for (const file of jsonFiles) {
+        const report = await importProviderJsonMany(file.text, undefined, undefined, addToGroupId);
+        const offset = combined.total;
+        combined.total += report.total;
+        combined.succeeded.push(...report.succeeded);
+        combined.failed.push(
+          ...report.failed.map((failure) => ({
+            ...failure,
+            index: failure.index + offset,
+            label: `${file.name} · ${failure.label}`,
+          })),
+        );
+        combined.addedToGroup.push(...report.addedToGroup);
+      }
+      const message = combined.failed.length
+        ? `导入完成：${combined.succeeded.length} 成功，${combined.failed.length} 失败`
+        : `已导入 ${combined.succeeded.length} 个账号`;
+      setToast(message);
+      await refresh();
+      return combined;
+    } catch (unknownError) {
+      setError(String(unknownError));
+      throw unknownError;
+    } finally {
+      setBusy("idle");
+    }
+  }
+
   async function resetPreferences() {
     await run("界面偏好已恢复默认", "saving", async () => {
       const appSettings = await resetAppSettings();
@@ -219,6 +285,7 @@ export function useCompanionController() {
       changeProviderLaunchMode,
       changeProviderViewMode,
       changePreserveOfficialCodexAuth,
+      changeTokenUsageRefreshInterval,
       changeTheme,
       importApiKey: (input: ApiKeyForm) =>
         run("API Key Provider 已添加", "saving", async () => {
@@ -229,12 +296,7 @@ export function useCompanionController() {
           await updateApiKeyProvider(input);
         }),
       exportProvider,
-      importJsonBatch: (jsonFiles: JsonImportFile[]) =>
-        run(`已导入 ${jsonFiles.length} 个 JSON 文件`, "saving", async () => {
-          for (const file of jsonFiles) {
-            await importProviderJsonMany(file.text);
-          }
-        }),
+      importJsonBatch,
       importLocal: () =>
         run("已导入本地 Codex 账号", "saving", async () => {
           await importLocalCodexProvider();

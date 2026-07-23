@@ -74,8 +74,10 @@
 }
 
 .select-content {
-  z-index: 20;
+  z-index: 50;
   overflow: hidden;
+  min-width: var(--radix-select-trigger-width);
+  max-height: var(--radix-select-content-available-height);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface-solid);

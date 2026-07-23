@@ -116,15 +116,13 @@ open "/Applications/Codex Companion.app"
 
 ### Windows：Windows 已保护你的电脑
 
-当前 Windows 安装包没有 Authenticode 发布者证书，SmartScreen 可能显示 `Windows protected your PC` / `Windows 已保护你的电脑`，发布者会显示为未知。确认下载来源和 SHA-256 后：
+当前 Windows 安装包没有 Authenticode 发布者证书。确认下载来源和 SHA-256 后：
 
 1. 在 SmartScreen 窗口点击 `更多信息`（`More info`）。
-2. 核对应用名称后点击 `仍要运行`（`Run anyway`）。
-3. 如果随后出现 UAC 的“未知发布者”提示，只在哈希已经核对一致时确认安装。
+2. 点击 `仍要运行`（`Run anyway`）。
+3. UAC 显示“未知发布者”时，仅在哈希一致的情况下继续。
 
-如果没有 `仍要运行`，设备可能启用了 Smart App Control、企业策略或管理员限制。不要为安装本软件而全局关闭 Microsoft Defender 或 SmartScreen；请联系管理员，或在可信环境中从源码构建。若 Defender 报告的是明确威胁而不是“未知/低信誉”，不要直接加入白名单，请先重新下载、核对哈希并提交 Issue。
-
-Microsoft 对未签名程序的当前行为和发布者信誉机制有单独说明，详见 [SmartScreen reputation for Windows app developers](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation)。
+如果没有 `仍要运行`，通常是 Smart App Control、企业策略或管理员限制；不要全局关闭 Defender 或 SmartScreen，改用可信环境从源码构建或联系管理员。
 
 ### Linux：AppImage、DEB 和 RPM
 
@@ -154,16 +152,20 @@ sudo dnf install "./Codex-Companion-${VERSION}-linux-x64-rpm.rpm"
 ## 它做什么
 
 - 导入官方 Codex 账号 JSON，例如 Codex Companion、CPA 或 sub2api 格式。
+- 导入 Agent Identity，并在 Companion 内动态签名、注册或恢复 task；私钥和 task 不会写入 Codex `auth.json`。
 - 导入 API Key 账号 JSON，或手动添加 OpenAI-compatible provider。
-- 把多个账号编排成 Provider Group，按优先级失败切换；能识别稳定会话时会保持账号粘性。
-- 把当前账号分组作为本地 OpenAI-compatible API，提供 `/v1/responses` 和 `/v1/models`。
+- 批量导入会逐项报告成功和失败，也可以把成功项直接加入当前分组。
+- 把多个账号编排成 Provider Group，支持优先级、轮询、随机、权重、最低负载和手动选择；能识别稳定会话时会保持账号粘性。
+- 把当前账号分组作为本地 OpenAI-compatible API，提供 HTTP 和 WebSocket `/v1/responses` 以及 `/v1/models`。
 - 为不同调用方创建独立 API client，支持一次性密钥显示、模型白名单、停用、轮换和删除。
 - 单个账号默认直连，也可以在账号卡片里切换为本地代理。
 - 地址明确指向 `/chat/completions` 的中转站会强制使用本地代理，由 Companion 转换 Responses、工具调用和多轮历史，避免误选直连。
 - 官方 Codex 账号由 Companion 负责 token 刷新和请求头处理。
 - 自动刷新账号健康度、订阅状态和可识别的 5h、周、30 天及模型专属额度；瞬时失败会重试并保留上次成功值。
 - 启动 Codex 前修复历史会话和插件状态，减少切换 provider 后上下文丢失的问题。
-- 从本地 Codex 会话记录里统计主会话与子代理 token，用模型价格分别估算新输入、缓存读取、缓存写入和输出成本。
+- 从本地 Codex 会话记录里统计主会话与子代理 token，支持日期、provider、模型筛选，并分别估算新输入、缓存读取、缓存写入和输出成本。
+- 在设置中预览和启动 Codex CLI，也可以从会话页直接执行 `codex resume`。
+- 记录已脱敏的本地诊断日志，前端异常时提供恢复、打开日志目录和清空日志入口。
 
 ## 截图
 
@@ -181,13 +183,13 @@ sudo dnf install "./Codex-Companion-${VERSION}-linux-x64-rpm.rpm"
 
 ### 添加账号
 
-支持 API Key、Token / JSON、本机 Codex 账号导入，也支持多个 JSON 批量导入。
+支持 API Key、Token / JSON、本机 Codex 账号和 Agent Identity 导入。多个 JSON 可以批量导入；单项失败不会中断其余项目，完成后会显示失败原因并可把成功项加入指定分组。
 
 <img src="assets/readme/provider-add-dialog.jpg" alt="Add provider dialog" width="720">
 
 ### 分组
 
-把多个账号放进一个分组，按顺序执行失败切换；有稳定会话标识时会保持账号粘性，绑定账号失败后切换并重新绑定。
+把多个账号放进一个分组，选择优先级、轮询、随机、权重、最低负载或手动策略；有稳定会话标识时会保持账号粘性，绑定账号失败后切换并重新绑定。
 
 <img src="assets/readme/groups.jpg" alt="Provider groups" width="720">
 
@@ -205,7 +207,7 @@ sudo dnf install "./Codex-Companion-${VERSION}-linux-x64-rpm.rpm"
 
 ### 用量
 
-从 Codex 本地会话记录中统计 token 使用量和估算成本。未匹配价格的模型会明确标记为“未定价”，不会当作真实 `$0`。
+从 Codex 本地会话记录中统计 token 使用量和估算成本，可按时间、provider 和模型筛选。未匹配价格的模型会明确标记为“未定价”，不会当作真实 `$0`。
 
 <img src="assets/readme/token-usage.jpg" alt="Token usage page" width="720">
 
@@ -218,7 +220,27 @@ sudo dnf install "./Codex-Companion-${VERSION}-linux-x64-rpm.rpm"
 - 使用 `转发` 查看本地代理状态和请求记录。
 - 使用 `修复` 预览或修复 Codex 历史会话和插件状态。
 - 使用 `用量` 查看本地 token 统计。
-- 使用 `设置` 写入或恢复 Codex 配置。
+- 使用 `会话` 复制恢复命令，或直接在终端执行 `codex resume`。
+- 使用 `设置` 写入或恢复 Codex 配置、启动 CLI、检查更新和管理诊断日志。
+
+### Agent Identity
+
+Agent Identity 账号只通过 Companion 本地 API 服务使用，不支持写入 Codex `auth.json` 后直连。导入时 Companion 会把凭据复制到自己的数据目录；请求时动态生成 `AgentAssertion`，task 缺失或上游返回 task 失效时会重新注册并原子写回，Unix 下文件权限设为 `0600`。
+
+同一 ChatGPT account 下的不同 user 会保留为不同账号，不会因为 account ID 相同而互相覆盖。账号卡片会明确显示 `Agent Identity` 状态。
+
+### 分组调度策略
+
+| 策略 | 行为 |
+| --- | --- |
+| 优先级失败切换 | 按列表顺序使用，失败后尝试下一项 |
+| 轮询分配 | 每个新请求轮换首选账号 |
+| 随机分配 | 每个新请求随机选择首选账号 |
+| 加权分配 | 按账号权重选择首选账号，失败后仍可继续 fallback |
+| 优先最低负载 | 优先选择当前进行中请求最少的账号 |
+| 手动选择 | 只使用列表中的第一个账号 |
+
+稳定会话 ID 会覆盖首选顺序并保持账号亲和。SSE 在产生有效输出前失败时可以切换账号；一旦已经向客户端输出内容，就不会重放请求，避免重复工具调用或重复文本。
 
 ### 本地 API 服务
 
@@ -231,12 +253,38 @@ curl http://127.0.0.1:17687/v1/responses \
   -d '{"model":"your-model","input":"hello","stream":false}'
 ```
 
-- 支持 `POST /v1/responses` 和 `GET /v1/models`。
+- 支持 `POST /v1/responses`、WebSocket `GET /v1/responses` 和 `GET /v1/models`。
 - API client 密钥只显示一次；SQLite 只保存 SHA-256 哈希和短前缀。
 - 可为每个 client 限制允许模型，并单独停用、轮换或删除。
 - 浏览器跨域请求始终需要有效 client 密钥；非浏览器本机请求可选择兼容模式或强制密钥。
 - 请求日志只保存路由元数据，不保存提示词、响应正文或完整密钥。
 - 上游流未产生终止事件就断开时，Companion 会返回 `response.failed`，并同步更新账号健康状态和请求审计。
+- Provider 可以单独配置 `websocket_url`。WebSocket 连接沿用 API client 认证和分组 fallback；官方账号会附加 Codex 所需请求头，Agent Identity task 失效时会重新注册后重连。
+- Responses 转 Chat Completions 时支持 function、custom、tool search、namespace 工具，以及顶层或嵌套的 `additional_tools` 和 namespace `tool_choice`。
+
+### Token 统计与缓存
+
+`用量` 页可以按开始日期、结束日期、provider 和模型筛选，并设置自动刷新周期；设为 `0` 可关闭自动刷新。缓存格式带版本号，版本变化时会自动重建，也可以在界面手动重建。
+
+子任务文件如果引用的父会话尚未落盘，会显示为“等待父会话”并暂不计入；后续扫描发现父文件后会自动重新归属。若同一父会话出现互相冲突的历史副本，文件会标记为“疑似重复”并暂不计入，避免静默重复计费。
+
+### CLI 启动与会话恢复
+
+`设置` 中可以选择工作目录和终端，预览、复制或直接执行命令。macOS 支持 Terminal 和 iTerm2，Windows 支持 Windows Terminal、PowerShell、PowerShell 7 和 CMD，Linux 会尝试常见终端。
+
+`会话` 页可以复制或直接执行：
+
+```bash
+codex resume SESSION_ID
+```
+
+工作目录和 session ID 会按当前平台进行 shell 转义。
+
+### 诊断日志
+
+Companion 的诊断日志默认位于 `~/.codex-companion/logs/`，采用 JSONL，每个文件达到 2 MB 后轮转，最多保留 5 个文件（含当前文件）。日志会脱敏 token、Authorization、cookie、API key、私钥和 `AgentAssertion`，不会记录提示词或响应正文。
+
+桌面 App 的 `设置` 可以查看日志大小、打开目录或清空日志。若 React 页面崩溃，恢复界面也提供重新加载和打开日志目录入口。
 
 ### 自定义模型价格
 
@@ -394,6 +442,7 @@ Tauri updater 的私钥只存放在发布环境，仓库内只有公钥。自动
 ## 支持的账号
 
 - 官方 Codex 账号 JSON。
+- Agent Identity JSON。
 - sub2api `accounts[]` OpenAI OAuth 账号。
 - Codex Companion / CPA 风格 Codex OAuth 账号。
 - API Key 账号 JSON。
@@ -408,6 +457,7 @@ API Key JSON 示例：
   "OPENAI_API_KEY": "sk-...",
   "email": "api-key-demo",
   "api_base_url": "https://api.example.com/v1",
+  "websocket_url": "wss://api.example.com/v1/responses",
   "api_provider_id": "example",
   "api_provider_name": "Example API"
 }
@@ -418,6 +468,8 @@ API Key JSON 示例：
 - 修复前可以先 dry-run 预览影响。
 - 正式修复使用 `~/.codex/backups/codex-companion/repair/` 下的事务备份；失败自动回滚，成功后保留最近 10 份。
 - 导入的账号材料只保存在本机。
+- Agent Identity 私钥保存在 Companion 私有账号目录，只用于本地动态签名，不会写入 Codex `auth.json`。
 - 本地 API client 密钥只显示一次，持久化时只保存哈希；请求审计不保存请求或响应正文。
 - Token 用量统计只读取本地 Codex 会话记录。
+- 诊断日志会轮转并脱敏；提交 Issue 前仍建议检查日志内容，只分享与问题相关的片段。
 - 成本是基于模型价格快照和本地覆盖配置的估算，不是 OpenAI 或中转站账单。

@@ -2,7 +2,8 @@ export type ThemeMode = "light" | "dark" | "system";
 export type ProviderViewMode = "compact" | "cards";
 export type ProviderLaunchMode = "auto" | "direct" | "relay";
 export type ProviderKind = "official_codex" | "openai_compatible" | "relay_provider";
-export type GroupPolicy = "priority_fallback" | "manual";
+export type GroupPolicy = "priority_fallback" | "round_robin" | "random" | "weighted" | "least_loaded" | "manual";
+export type TerminalKind = "auto" | "terminal" | "i_term2" | "power_shell" | "pwsh" | "windows_terminal" | "cmd" | "shell";
 
 export interface RelayConfig {
   host: string;
@@ -122,10 +123,23 @@ export interface ProviderRefreshProgress {
   lastError?: string | null;
 }
 
+export interface ProviderImportProgress {
+  active: boolean;
+  completed: number;
+  total: number;
+  currentLabel?: string | null;
+  succeeded: number;
+  failed: number;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+}
+
 export interface TokenUsageSyncStatus {
   active: boolean;
   scannedFiles: number;
   totalFiles: number;
+  deferredFiles: number;
+  suspectedDuplicates: number;
   phase: string;
   startedAt?: string | null;
   finishedAt?: string | null;
@@ -155,6 +169,7 @@ export interface SessionPage {
 export interface ApiServiceSelfTest {
   ok: boolean;
   baseUrl: string;
+  websocketUrl?: string | null;
   latencyMs: number;
   databaseOk: boolean;
   listenerOk: boolean;
@@ -166,6 +181,7 @@ export interface ProviderConfig {
   name: string;
   kind: ProviderKind;
   baseUrl: string;
+  websocketUrl?: string | null;
   authRef?: string | null;
   directAuthRef?: string | null;
   modelMap: Record<string, string>;
@@ -176,6 +192,7 @@ export interface ProviderConfig {
 }
 
 export interface ProviderAccountInfo {
+  authMode?: string | null;
   displayName?: string | null;
   email?: string | null;
   teamName?: string | null;
@@ -216,6 +233,7 @@ export interface ProviderGroup {
   name: string;
   policy: GroupPolicy;
   providerOrder: string[];
+  providerWeights: Record<string, number>;
   fallbackEnabled: boolean;
 }
 
@@ -235,6 +253,9 @@ export interface AppSettings {
   lastCodexTargetProviderId?: string | null;
   codexRestartRequiredOnNextRelay?: boolean;
   preserveOfficialCodexAuth?: boolean;
+  tokenUsageRefreshIntervalSeconds: number;
+  preferredTerminal: TerminalKind;
+  recentWorkingDirectories: string[];
 }
 
 export interface CodexInstallStatus {
@@ -286,6 +307,9 @@ export interface RelayEvent {
 export interface TokenUsageSummary {
   codexDir: string;
   filesScanned: number;
+  deferredFiles: number;
+  suspectedDuplicates: number;
+  cacheVersion: number;
   sessions: number;
   events: number;
   inputTokens: number;
@@ -359,6 +383,7 @@ export interface ProviderUpsert {
   name: string;
   kind: ProviderKind;
   baseUrl: string;
+  websocketUrl?: string | null;
   authRef?: string | null;
   directAuthRef?: string | null;
   modelMap: Record<string, string>;
@@ -374,6 +399,7 @@ export interface ApiKeyProviderUpdate {
   providerName: string;
   kind: Extract<ProviderKind, "openai_compatible" | "relay_provider">;
   baseUrl: string;
+  websocketUrl?: string | null;
   apiKey?: string | null;
   envVar?: string | null;
   refreshIntervalSeconds: number;
@@ -395,12 +421,47 @@ export interface ProviderImportOutcome {
   message: string;
 }
 
+export interface ProviderImportFailure {
+  index: number;
+  label: string;
+  message: string;
+}
+
+export interface ProviderImportBatchReport {
+  total: number;
+  succeeded: ProviderImportOutcome[];
+  failed: ProviderImportFailure[];
+  addedToGroup: string[];
+}
+
 export interface GroupUpsert {
   id: string;
   name: string;
   policy: GroupPolicy;
   providerOrder: string[];
+  providerWeights: Record<string, number>;
   fallbackEnabled: boolean;
+}
+
+export interface CliLaunchRequest {
+  workingDirectory: string;
+  terminal: TerminalKind;
+  resumeSessionId?: string | null;
+}
+
+export interface CliLaunchOutcome {
+  command: string;
+  terminal: TerminalKind;
+  workingDirectory: string;
+  launched: boolean;
+  message: string;
+}
+
+export interface DiagnosticInfo {
+  logDirectory: string;
+  currentLogPath: string;
+  retainedFiles: number;
+  totalBytes: number;
 }
 
 export interface RepairOutcome {
