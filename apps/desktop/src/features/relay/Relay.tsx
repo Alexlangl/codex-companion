@@ -14,19 +14,22 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Badge, Button, Field, IconButton, Panel } from "../../components/ui";
 import {
   apiServiceSelfTest,
   clearApiRequestLogs,
   createApiClient,
   deleteApiClient,
+  getApiRequestLogs,
   getApiServiceSnapshot,
+  getRelayEvents,
   rotateApiClientKey,
   updateApiClient,
   updateRelaySettings,
 } from "../../lib/api";
 import { formatTime } from "../../lib/format";
+import { apiRequestLogsEqual, relayEventsEqual } from "../../lib/log-snapshot";
 import { providerAccountTitle, shortId } from "../../lib/provider-display";
 import type {
   ApiClient,
@@ -51,6 +54,8 @@ type ClientEditor = {
   enabled: boolean;
 };
 
+const LOG_REFRESH_INTERVAL_MS = 2_000;
+
 export function Relay({ active, status }: RelayProps) {
   const [snapshot, setSnapshot] = useState<ApiServiceSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
@@ -62,6 +67,9 @@ export function Relay({ active, status }: RelayProps) {
   const [editor, setEditor] = useState<ClientEditor | null>(null);
   const [selfTest, setSelfTest] = useState<ApiServiceSelfTest | null>(null);
   const [settings, setSettings] = useState<RelaySettingsUpdate>(() => relaySettingsFromStatus(status));
+  const [relayEvents, setRelayEvents] = useState<RelayEvent[]>(status.recentEvents);
+  const [logsRefreshing, setLogsRefreshing] = useState(false);
+  const logRefreshInFlightRef = useRef(false);
 
   const loadSnapshot = useCallback(async () => {
     setLoading(true);
@@ -80,9 +88,35 @@ export function Relay({ active, status }: RelayProps) {
     }
   }, []);
 
+  const loadLogs = useCallback(async (showLoading: boolean): Promise<void> => {
+    if (logRefreshInFlightRef.current) return;
+    logRefreshInFlightRef.current = true;
+    if (showLoading) setLogsRefreshing(true);
+    try {
+      const [requests, events] = await Promise.all([getApiRequestLogs(), getRelayEvents()]);
+      setSnapshot((current) => {
+        if (!current || apiRequestLogsEqual(current.recentRequests, requests)) return current;
+        return { ...current, recentRequests: requests };
+      });
+      setRelayEvents((current) => relayEventsEqual(current, events) ? current : events);
+      if (showLoading) setError(null);
+    } catch (unknownError) {
+      if (showLoading) setError(String(unknownError));
+    } finally {
+      logRefreshInFlightRef.current = false;
+      if (showLoading) setLogsRefreshing(false);
+    }
+  }, []);
+
   useEffect(() => {
-    if (active) void loadSnapshot();
-  }, [active, loadSnapshot]);
+    if (!active) return;
+    void loadSnapshot();
+    void loadLogs(false);
+    const timer = window.setInterval(() => {
+      void loadLogs(false);
+    }, LOG_REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [active, loadLogs, loadSnapshot]);
 
   useEffect(() => {
     setSettings(relaySettingsFromStatus(status));
@@ -158,6 +192,10 @@ export function Relay({ active, status }: RelayProps) {
     void runAction("clear-logs", async () => {
       await clearApiRequestLogs();
     });
+  }
+
+  function handleRefreshLogs(): void {
+    void loadLogs(true);
   }
 
   const clients = snapshot?.clients ?? [];
@@ -404,10 +442,15 @@ export function Relay({ active, status }: RelayProps) {
 
       <Panel eyebrow="结构化审计" title="API 请求日志">
         <div className="api-log-toolbar">
-          <p className="relay-help">只记录路由元数据，不保存提示词、响应正文或完整密钥。日志持久化在本机 SQLite。</p>
-          <Button disabled={requests.length === 0 || action !== null} onClick={handleClearLogs} variant="ghost">
-            <Trash2 size={14} /> 清空日志
-          </Button>
+          <p className="relay-help">只记录路由元数据，不保存提示词、响应正文或完整密钥。日志持久化在本机 SQLite，每 2 秒自动刷新。</p>
+          <div className="actions">
+            <Button disabled={logsRefreshing} onClick={handleRefreshLogs} variant="ghost">
+              <RefreshCw aria-hidden="true" className={logsRefreshing ? "spin-icon" : undefined} size={14} /> 刷新日志
+            </Button>
+            <Button disabled={requests.length === 0 || action !== null} onClick={handleClearLogs} variant="ghost">
+              <Trash2 aria-hidden="true" size={14} /> 清空日志
+            </Button>
+          </div>
         </div>
         {requests.length === 0 ? (
           <div className="api-compact-empty"><Database size={18} /> 暂无 API 请求</div>
@@ -422,12 +465,12 @@ export function Relay({ active, status }: RelayProps) {
       </Panel>
 
       <details className="advanced-details api-diagnostics">
-        <summary>查看底层转发诊断事件（{status.recentEvents.length}）</summary>
+        <summary>查看底层转发诊断事件（{relayEvents.length}）</summary>
         <div className="relay-event-list">
-          {status.recentEvents.length === 0 ? (
+          {relayEvents.length === 0 ? (
             <div className="api-compact-empty">暂无诊断事件</div>
           ) : (
-            status.recentEvents.map((event) => (
+            relayEvents.map((event) => (
               <div className={`relay-event-row relay-event-${event.kind}`} key={`${event.timestamp}-${event.message}`}>
                 <div>
                   <strong>{relayEventTitle(status, event)}</strong>

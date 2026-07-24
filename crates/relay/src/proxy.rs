@@ -1,15 +1,21 @@
+use crate::content_encoding::{
+    decode_request_body, RequestBodyDecodeError, MAX_REQUEST_BODY_BYTES,
+};
 use crate::events::{append_event, update_health};
 use crate::state::{apply_group_policy, RelayState};
 use crate::upstream::{send_upstream, stream_response, text_response, upstream_url};
 use crate::{RequestLogFinish, RequestLogStart};
 use axum::{
     body::Body,
-    extract::State,
+    extract::{rejection::BytesRejection, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::Response,
 };
 use bytes::Bytes;
-use codex_companion_core::{ApiClient, CompanionConfig, HealthFailureKind, ProviderKind};
+use codex_companion_core::{
+    provider_endpoint_is_chat_completions, ApiClient, CompanionConfig, HealthFailureKind,
+    ProviderKind,
+};
 use codex_companion_health::{
     classify_failure, cooldown_active, mark_failure, mark_model_failure, mark_success,
     normalize_expired_cooldown,
@@ -27,9 +33,56 @@ pub(crate) async fn proxy(
     State(state): State<RelayState>,
     method: Method,
     uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
+    mut headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(body) => body,
+        Err(error) if error.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return api_error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "local_request_too_large",
+                &format!(
+                    "请求体超过 Codex Companion 本地代理的 {} MiB 上限；请先运行 /compact、移除大段日志或内联图片，或调整本地代理限制",
+                    MAX_REQUEST_BODY_BYTES / (1024 * 1024)
+                ),
+            );
+        }
+        Err(error) => {
+            return api_error_response(
+                StatusCode::BAD_REQUEST,
+                "request_body_read_failed",
+                &format!("读取请求体失败: {error}"),
+            );
+        }
+    };
+    let body = match decode_request_body(&mut headers, body, MAX_REQUEST_BODY_BYTES) {
+        Ok(body) => body,
+        Err(RequestBodyDecodeError::TooLarge { .. }) => {
+            return api_error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "local_decompressed_request_too_large",
+                &format!(
+                    "解压后的请求体超过 Codex Companion 本地代理的 {} MiB 上限；请先运行 /compact、移除大段日志或内联图片，或调整本地代理限制",
+                    MAX_REQUEST_BODY_BYTES / (1024 * 1024)
+                ),
+            );
+        }
+        Err(RequestBodyDecodeError::UnsupportedEncoding(encoding)) => {
+            return api_error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_content_encoding",
+                &format!("不支持请求体编码 {encoding}"),
+            );
+        }
+        Err(error @ RequestBodyDecodeError::InvalidEncoding { .. }) => {
+            return api_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_content_encoding",
+                &error.to_string(),
+            );
+        }
+    };
     match proxy_inner(state, method, uri, headers, body).await {
         Ok(response) => response,
         Err(message) => api_error_response(
@@ -294,7 +347,39 @@ async fn proxy_dispatch(
 
     let mut last_error = None;
     let candidate_count = candidates.len();
+    let compact_request = method == Method::POST && uri.path().ends_with("/responses/compact");
     for (index, provider) in candidates.into_iter().enumerate() {
+        if compact_request && provider_endpoint_is_chat_completions(&provider.base_url) {
+            let message = format!(
+                "Provider {} 仅支持 Chat Completions，无法处理 Responses Compact API",
+                provider.name
+            );
+            last_error = Some(message.clone());
+            if index + 1 < candidate_count && group.fallback_enabled {
+                append_event(
+                    &state.store,
+                    "fallback",
+                    Some(provider.id),
+                    format!("[{request_id}] {message}"),
+                );
+                continue;
+            }
+            record_request_finish(
+                &state,
+                request_id,
+                Some(&provider.id),
+                Some(StatusCode::NOT_IMPLEMENTED),
+                "failed",
+                (index + 1) as u16,
+                started_at,
+                Some(&message),
+            );
+            return Ok(api_error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "responses_compact_unsupported",
+                &message,
+            ));
+        }
         let _request_guard = state.begin_provider_request(&provider.id);
         let upstream = upstream_url(&provider, &uri);
         match send_upstream(
@@ -426,17 +511,41 @@ async fn proxy_dispatch(
                 let status = response.status();
                 let body_text = response.text().await.unwrap_or_default();
                 let failure = classify_failure(Some(status.as_u16()), &body_text);
-                let message = format!("上游返回 {}: {}", status, compact_error_body(&body_text));
-                record_provider_failure(
-                    &state,
-                    &config,
-                    &provider.id,
-                    requested_model.as_deref(),
-                    &failure,
-                    &message,
-                );
+                let upstream_payload_too_large = status == StatusCode::PAYLOAD_TOO_LARGE;
+                let compact_unsupported = compact_request
+                    && matches!(
+                        status,
+                        StatusCode::NOT_FOUND
+                            | StatusCode::METHOD_NOT_ALLOWED
+                            | StatusCode::NOT_IMPLEMENTED
+                    );
+                let message = if upstream_payload_too_large {
+                    format!(
+                        "上游 Provider {} 返回 413 Payload Too Large：请求体超过其服务端限制，并非 Codex Companion 本地限制；请运行 /compact、移除大段日志或内联图片，或联系 Provider 调高限制",
+                        provider.name
+                    )
+                } else if compact_unsupported {
+                    format!(
+                        "上游 Provider {} 不支持 Responses Compact API（HTTP {status}）",
+                        provider.name
+                    )
+                } else {
+                    format!("上游返回 {}: {}", status, compact_error_body(&body_text))
+                };
+                if !upstream_payload_too_large && !compact_unsupported {
+                    record_provider_failure(
+                        &state,
+                        &config,
+                        &provider.id,
+                        requested_model.as_deref(),
+                        &failure,
+                        &message,
+                    );
+                }
                 last_error = Some(message.clone());
-                let can_retry = fallback_eligible(&failure)
+                let can_retry = (upstream_payload_too_large
+                    || compact_unsupported
+                    || fallback_eligible(&failure))
                     && index + 1 < candidate_count
                     && group.fallback_enabled;
                 if can_retry {
@@ -466,7 +575,13 @@ async fn proxy_dispatch(
                 );
                 return Ok(api_error_response(
                     status,
-                    failure_error_code(&failure.kind),
+                    if upstream_payload_too_large {
+                        "upstream_request_too_large"
+                    } else if compact_unsupported {
+                        "responses_compact_unsupported"
+                    } else {
+                        failure_error_code(&failure.kind)
+                    },
                     &message,
                 ));
             }
@@ -907,6 +1022,188 @@ mod tests {
         assert_eq!(&body[..], b"ok from b");
         let events =
             std::fs::read_to_string(store.data_dir().join("relay/events.jsonl")).expect("events");
+        assert!(events.contains("\"kind\":\"fallback\""));
+    }
+
+    #[tokio::test]
+    async fn falls_back_when_upstream_rejects_request_body_as_too_large() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let provider_a_url = spawn_mock_server(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "<html>request too large</html>",
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_mock_server(
+            StatusCode::OK,
+            r#"{"object":"list","data":[]}"#,
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("small-gateway", &provider_a_url),
+            provider("large-gateway", &provider_b_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store.clone(), reqwest::Client::new()),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("large-gateway")
+        );
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+        assert!(!store
+            .load()
+            .expect("config")
+            .health
+            .contains_key("small-gateway"));
+        let events =
+            std::fs::read_to_string(store.data_dir().join("relay/events.jsonl")).expect("events");
+        assert!(events.contains("上游 Provider small-gateway 返回 413"));
+        assert!(events.contains("\"kind\":\"fallback\""));
+    }
+
+    #[tokio::test]
+    async fn returns_actionable_error_for_single_upstream_413() {
+        let provider_url = spawn_mock_server(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "<html>request too large</html>",
+            None,
+        )
+        .await;
+        let store = store_with_group(vec![provider("small-gateway", &provider_url)]);
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let value: Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(value["error"]["code"], "upstream_request_too_large");
+        assert!(value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("并非 Codex Companion 本地限制")));
+        assert!(value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("/compact")));
+    }
+
+    #[tokio::test]
+    async fn compact_skips_chat_only_provider_and_uses_responses_provider() {
+        let chat_hits = Arc::new(AtomicUsize::new(0));
+        let responses_hits = Arc::new(AtomicUsize::new(0));
+        let chat_url = spawn_mock_server(
+            StatusCode::OK,
+            "should not be called",
+            Some(chat_hits.clone()),
+        )
+        .await;
+        let responses_url = spawn_mock_server(
+            StatusCode::OK,
+            r#"{"object":"response.compaction","output":[]}"#,
+            Some(responses_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("chat-only", &format!("{chat_url}/chat/completions")),
+            provider("responses", &responses_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store.clone(), reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses/compact".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":[]}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("responses")
+        );
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+        let events =
+            std::fs::read_to_string(store.data_dir().join("relay/events.jsonl")).expect("events");
+        assert!(events.contains("无法处理 Responses Compact API"));
+    }
+
+    #[tokio::test]
+    async fn compact_falls_back_when_provider_does_not_expose_compact_endpoint() {
+        let unsupported_hits = Arc::new(AtomicUsize::new(0));
+        let responses_hits = Arc::new(AtomicUsize::new(0));
+        let unsupported_url = spawn_mock_server(
+            StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"endpoint not found"}}"#,
+            Some(unsupported_hits.clone()),
+        )
+        .await;
+        let responses_url = spawn_mock_server(
+            StatusCode::OK,
+            r#"{"object":"response.compaction","output":[]}"#,
+            Some(responses_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("responses-without-compact", &unsupported_url),
+            provider("responses-with-compact", &responses_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store.clone(), reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses/compact".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":[]}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("responses-with-compact")
+        );
+        assert_eq!(unsupported_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+        assert!(!store
+            .load()
+            .expect("config")
+            .health
+            .contains_key("responses-without-compact"));
+        let events =
+            std::fs::read_to_string(store.data_dir().join("relay/events.jsonl")).expect("events");
+        assert!(events.contains("不支持 Responses Compact API"));
         assert!(events.contains("\"kind\":\"fallback\""));
     }
 

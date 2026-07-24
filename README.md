@@ -253,7 +253,7 @@ curl http://127.0.0.1:17687/v1/responses \
   -d '{"model":"your-model","input":"hello","stream":false}'
 ```
 
-- 支持 `POST /v1/responses`、WebSocket `GET /v1/responses` 和 `GET /v1/models`。
+- 支持 `POST /v1/responses`、`POST /v1/responses/compact`、WebSocket `GET /v1/responses` 和 `GET /v1/models`。
 - API client 密钥只显示一次；SQLite 只保存 SHA-256 哈希和短前缀。
 - 可为每个 client 限制允许模型，并单独停用、轮换或删除。
 - 浏览器跨域请求始终需要有效 client 密钥；非浏览器本机请求可选择兼容模式或强制密钥。

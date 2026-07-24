@@ -1,5 +1,5 @@
 use crate::pricing::{default_pricing_override_path, CostBreakdown, PricingCatalog, PRICING_AS_OF};
-use chrono::{DateTime, Local, NaiveDate, Utc};
+use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use codex_companion_core::{
     CompanionError, Result, TokenUsageBucket, TokenUsageEvent, TokenUsageSummary,
     TokenUsageSyncStatus,
@@ -29,38 +29,38 @@ pub fn token_usage_sync_status() -> TokenUsageSyncStatus {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TokenUsageDateRange {
-    start_date: Option<NaiveDate>,
-    end_date: Option<NaiveDate>,
+    start_at: Option<DateTime<Utc>>,
+    end_at: Option<DateTime<Utc>>,
 }
 
 impl TokenUsageDateRange {
     pub fn parse(start_date: Option<&str>, end_date: Option<&str>) -> Result<Self> {
-        let start_date = parse_date_boundary("开始日期", start_date)?;
-        let end_date = parse_date_boundary("结束日期", end_date)?;
-        if start_date
-            .zip(end_date)
-            .is_some_and(|(start, end)| start > end)
-        {
+        let start_at = parse_date_boundary("开始时间", start_date, DateBoundary::Start)?;
+        let end_at = parse_date_boundary("结束时间", end_date, DateBoundary::End)?;
+        if start_at.zip(end_at).is_some_and(|(start, end)| start > end) {
             return Err(CompanionError::InvalidConfig(
-                "开始日期不能晚于结束日期".into(),
+                "开始时间不能晚于结束时间".into(),
             ));
         }
-        Ok(Self {
-            start_date,
-            end_date,
-        })
+        Ok(Self { start_at, end_at })
     }
 
     fn includes(&self, timestamp: Option<&str>) -> bool {
-        if self.start_date.is_none() && self.end_date.is_none() {
+        if self.start_at.is_none() && self.end_at.is_none() {
             return true;
         }
-        let Some(date) = timestamp.and_then(event_local_date) else {
+        let Some(timestamp) = timestamp.and_then(event_timestamp) else {
             return false;
         };
-        self.start_date.is_none_or(|start| date >= start)
-            && self.end_date.is_none_or(|end| date <= end)
+        self.start_at.is_none_or(|start| timestamp >= start)
+            && self.end_at.is_none_or(|end| timestamp <= end)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DateBoundary {
+    Start,
+    End,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -496,13 +496,23 @@ fn summarize_token_events(
     summary
 }
 
-fn parse_date_boundary(label: &str, value: Option<&str>) -> Result<Option<NaiveDate>> {
+fn parse_date_boundary(
+    label: &str,
+    value: Option<&str>,
+    boundary: DateBoundary,
+) -> Result<Option<DateTime<Utc>>> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
-    NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map(Some)
-        .map_err(|_| CompanionError::InvalidConfig(format!("{label}必须使用 YYYY-MM-DD 格式")))
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
+        return Ok(Some(timestamp.with_timezone(&Utc)));
+    }
+    let naive = parse_local_boundary(value, boundary).ok_or_else(|| {
+        CompanionError::InvalidConfig(format!(
+            "{label}必须使用 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM[:SS] 格式"
+        ))
+    })?;
+    local_boundary_to_utc(label, naive, boundary).map(Some)
 }
 
 fn normalize_filter_value(value: Option<&str>) -> Option<String> {
@@ -512,10 +522,47 @@ fn normalize_filter_value(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn event_local_date(timestamp: &str) -> Option<NaiveDate> {
+fn event_timestamp(timestamp: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(timestamp)
         .ok()
-        .map(|value| value.with_timezone(&Local).date_naive())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn parse_local_boundary(value: &str, boundary: DateBoundary) -> Option<NaiveDateTime> {
+    let parsed_datetime = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"]
+        .into_iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok());
+    if let Some(datetime) = parsed_datetime {
+        return match boundary {
+            DateBoundary::Start => Some(datetime),
+            DateBoundary::End => datetime.with_nanosecond(999_999_999),
+        };
+    }
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    match boundary {
+        DateBoundary::Start => date.and_hms_opt(0, 0, 0),
+        DateBoundary::End => date.and_hms_nano_opt(23, 59, 59, 999_999_999),
+    }
+}
+
+fn local_boundary_to_utc(
+    label: &str,
+    value: NaiveDateTime,
+    boundary: DateBoundary,
+) -> Result<DateTime<Utc>> {
+    let local = match Local.from_local_datetime(&value) {
+        LocalResult::Single(timestamp) => timestamp,
+        LocalResult::Ambiguous(first, second) => match boundary {
+            DateBoundary::Start => first.min(second),
+            DateBoundary::End => first.max(second),
+        },
+        LocalResult::None => {
+            return Err(CompanionError::InvalidConfig(format!(
+                "{label}在本地时区中不存在"
+            )))
+        }
+    };
+    Ok(local.with_timezone(&Utc))
 }
 
 fn parse_session_file(path: &Path) -> Result<ParsedTokenUsageFile> {
@@ -1273,6 +1320,23 @@ mod tests {
     }
 
     #[test]
+    fn filters_with_local_time_boundaries_to_the_second() {
+        let range =
+            TokenUsageDateRange::parse(Some("2026-07-10T09:30:15"), Some("2026-07-10T17:45:20"))
+                .expect("valid time range");
+
+        assert!(!range.includes(Some(&local_timestamp_at(2026, 7, 10, 9, 30, 14))));
+        assert!(range.includes(Some(&local_timestamp_at(2026, 7, 10, 9, 30, 15))));
+        assert!(range.includes(Some(&local_timestamp_at(2026, 7, 10, 17, 45, 20))));
+        assert!(!range.includes(Some(&local_timestamp_at(2026, 7, 10, 17, 45, 21))));
+        assert!(TokenUsageDateRange::parse(
+            Some("2026-07-10T17:45:20"),
+            Some("2026-07-10T09:30:15")
+        )
+        .is_err());
+    }
+
+    #[test]
     fn date_range_filters_every_summary_dimension() {
         let range = TokenUsageDateRange::parse(Some("2026-07-10"), Some("2026-07-12"))
             .expect("valid range");
@@ -1364,8 +1428,19 @@ mod tests {
     }
 
     fn local_timestamp(year: i32, month: u32, day: u32) -> String {
+        local_timestamp_at(year, month, day, 12, 0, 0)
+    }
+
+    fn local_timestamp_at(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        second: u32,
+    ) -> String {
         Local
-            .with_ymd_and_hms(year, month, day, 12, 0, 0)
+            .with_ymd_and_hms(year, month, day, hour, minute, second)
             .single()
             .expect("local timestamp")
             .to_rfc3339()

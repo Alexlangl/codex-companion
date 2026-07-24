@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import { Button, Field, Panel } from "../../components/ui";
 import { compactPath, formatTime, formatTokens } from "../../lib/format";
+import { providerAccountTitle } from "../../lib/provider-display";
 import { getTokenUsageSyncStatus } from "../../lib/token-usage-api";
 import type {
   CompanionStatus,
@@ -15,6 +16,17 @@ import type {
 } from "../../types/domain";
 
 type UsageRangePreset = "today" | "7d" | "30d" | "all" | "custom";
+
+type UsageFilterState = {
+  codexDir: string;
+  rangePreset: UsageRangePreset;
+  customStartTime: string;
+  customEndTime: string;
+  providerId: string;
+  model: string;
+};
+
+const USAGE_FILTER_STORAGE_KEY = "codex-companion:token-usage-filters:v1";
 
 const USAGE_RANGE_OPTIONS = [
   { value: "today", label: "今天" },
@@ -33,12 +45,7 @@ export function TokenStats({
   status: CompanionStatus;
   onLoad: (codexDir?: string, query?: TokenUsageQuery) => Promise<TokenUsageSummary>;
 }) {
-  const [codexDir, setCodexDir] = useState(status.codex.codexDir);
-  const [rangePreset, setRangePreset] = useState<UsageRangePreset>("all");
-  const [customStartDate, setCustomStartDate] = useState(() => localDateWithOffset(-6));
-  const [customEndDate, setCustomEndDate] = useState(() => localDateWithOffset(0));
-  const [providerId, setProviderId] = useState("");
-  const [model, setModel] = useState("");
+  const [filters, setFilters] = useState<UsageFilterState>(() => loadUsageFilterState(status.codex.codexDir));
   const [availableProviders, setAvailableProviders] = useState<string[]>([]);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [stats, setStats] = useState<TokenUsageSummary | null>(null);
@@ -48,20 +55,25 @@ export function TokenStats({
   const [syncStatus, setSyncStatus] = useState<TokenUsageSyncStatus | null>(null);
   const inFlightRef = useRef(false);
   const requestedQueryRef = useRef<string | null>(null);
+  const { codexDir, rangePreset, customStartTime, customEndTime, providerId, model } = filters;
   const hasStats = stats !== null;
   const dateRange = useMemo(
-    () => dateRangeForPreset(rangePreset, customStartDate, customEndDate),
-    [customEndDate, customStartDate, rangePreset],
+    () => dateRangeForPreset(rangePreset, customStartTime, customEndTime),
+    [customEndTime, customStartTime, rangePreset],
   );
-  const dateRangeError = validateDateRange(rangePreset, customStartDate, customEndDate);
+  const dateRangeError = validateDateRange(rangePreset, customStartTime, customEndTime);
   const query = useMemo<TokenUsageQuery>(() => ({
     ...dateRange,
     providerId: providerId || undefined,
     model: model || undefined,
   }), [dateRange, model, providerId]);
   const queryKey = `${codexDir.trim()}|${query.startDate ?? ""}|${query.endDate ?? ""}|${providerId}|${model}`;
-  const rangeLabel = usageRangeLabel(rangePreset, customStartDate, customEndDate);
+  const rangeLabel = usageRangeLabel(rangePreset, customStartTime, customEndTime);
   const refreshIntervalSeconds = status.config.app.tokenUsageRefreshIntervalSeconds;
+
+  useEffect(() => {
+    saveUsageFilterState(filters);
+  }, [filters]);
 
   const load = useCallback(async (mode: "manual" | "silent" | "rebuild" = "manual") => {
     if (inFlightRef.current) return;
@@ -132,6 +144,8 @@ export function TokenStats({
   const maxDayTokens = useMemo(() => maxTokens(stats?.byDay), [stats]);
   const unpricedModelText = stats?.unpricedModels.join("、") ?? "";
   const rangeCostLabel = stats?.unpricedEvents ? "范围内已定价成本" : "范围内估算成本";
+  const providerOptions = includeSelectedOption(availableProviders, providerId);
+  const modelOptions = includeSelectedOption(availableModels, model);
 
   function handleRefresh(): void {
     void load();
@@ -142,38 +156,43 @@ export function TokenStats({
   }
 
   function handleRangeChange(event: ChangeEvent<HTMLInputElement>): void {
-    setRangePreset(event.target.value as UsageRangePreset);
+    const nextRange = event.target.value as UsageRangePreset;
+    setFilters((current) => ({ ...current, rangePreset: nextRange }));
     setStats(null);
     setError(null);
   }
 
   function handleCodexDirChange(event: ChangeEvent<HTMLInputElement>): void {
-    setCodexDir(event.target.value);
+    const nextCodexDir = event.target.value;
+    setFilters((current) => ({ ...current, codexDir: nextCodexDir }));
     setStats(null);
     setError(null);
   }
 
   function handleCustomStartDateChange(event: ChangeEvent<HTMLInputElement>): void {
-    setCustomStartDate(event.target.value);
+    const nextStartTime = event.target.value;
+    setFilters((current) => ({ ...current, customStartTime: nextStartTime }));
     setStats(null);
     setError(null);
   }
 
   function handleCustomEndDateChange(event: ChangeEvent<HTMLInputElement>): void {
-    setCustomEndDate(event.target.value);
+    const nextEndTime = event.target.value;
+    setFilters((current) => ({ ...current, customEndTime: nextEndTime }));
     setStats(null);
     setError(null);
   }
 
   function handleProviderChange(event: ChangeEvent<HTMLSelectElement>): void {
-    setProviderId(event.target.value);
-    setModel("");
+    const nextProviderId = event.target.value;
+    setFilters((current) => ({ ...current, providerId: nextProviderId, model: "" }));
     setStats(null);
     setError(null);
   }
 
   function handleModelChange(event: ChangeEvent<HTMLSelectElement>): void {
-    setModel(event.target.value);
+    const nextModel = event.target.value;
+    setFilters((current) => ({ ...current, model: nextModel }));
     setStats(null);
     setError(null);
   }
@@ -204,26 +223,28 @@ export function TokenStats({
         </fieldset>
         {rangePreset === "custom" ? (
           <div className="usage-custom-dates">
-            <Field label="开始日期">
+            <Field label="开始时间">
               <input
                 aria-describedby={dateRangeError ? "usage-date-error" : undefined}
                 aria-invalid={Boolean(dateRangeError)}
                 disabled={loading || refreshing}
-                max={customEndDate || undefined}
+                max={customEndTime || undefined}
                 onChange={handleCustomStartDateChange}
-                type="date"
-                value={customStartDate}
+                step={1}
+                type="datetime-local"
+                value={customStartTime}
               />
             </Field>
-            <Field label="结束日期">
+            <Field label="结束时间">
               <input
                 aria-describedby={dateRangeError ? "usage-date-error" : undefined}
                 aria-invalid={Boolean(dateRangeError)}
                 disabled={loading || refreshing}
-                min={customStartDate || undefined}
+                min={customStartTime || undefined}
                 onChange={handleCustomEndDateChange}
-                type="date"
-                value={customEndDate}
+                step={1}
+                type="datetime-local"
+                value={customEndTime}
               />
             </Field>
           </div>
@@ -233,13 +254,15 @@ export function TokenStats({
           <Field label="Provider">
             <select disabled={loading || refreshing} onChange={handleProviderChange} value={providerId}>
               <option value="">全部 Provider</option>
-              {availableProviders.map((provider) => <option key={provider} value={provider}>{provider}</option>)}
+              {providerOptions.map((provider) => (
+                <option key={provider} value={provider}>{usageProviderLabel(status, provider)}</option>
+              ))}
             </select>
           </Field>
           <Field label="模型">
             <select disabled={loading || refreshing} onChange={handleModelChange} value={model}>
               <option value="">全部模型</option>
-              {availableModels.map((availableModel) => (
+              {modelOptions.map((availableModel) => (
                 <option key={availableModel} value={availableModel}>{availableModel}</option>
               ))}
             </select>
@@ -299,7 +322,7 @@ export function TokenStats({
           <dt>时间</dt>
           <dd>{rangeLabel}</dd>
           <dt>Provider</dt>
-          <dd>{providerId || "全部"}</dd>
+          <dd>{providerId ? usageProviderLabel(status, providerId) : "全部"}</dd>
           <dt>模型</dt>
           <dd>{model || "全部"}</dd>
           <dt>文件</dt>
@@ -458,12 +481,12 @@ function maxTokens(buckets?: TokenUsageBucket[]) {
 
 function dateRangeForPreset(
   preset: UsageRangePreset,
-  customStartDate: string,
-  customEndDate: string,
+  customStartTime: string,
+  customEndTime: string,
 ): TokenUsageDateRange {
   if (preset === "all") return {};
   if (preset === "custom") {
-    return { startDate: customStartDate || undefined, endDate: customEndDate || undefined };
+    return { startDate: customStartTime || undefined, endDate: customEndTime || undefined };
   }
   const daysByPreset: Record<Exclude<UsageRangePreset, "all" | "custom">, number> = {
     today: 1,
@@ -472,38 +495,111 @@ function dateRangeForPreset(
   };
   const days = daysByPreset[preset];
   return {
-    startDate: localDateWithOffset(-(days - 1)),
-    endDate: localDateWithOffset(0),
+    startDate: localDateTimeWithOffset(-(days - 1), "start"),
+    endDate: localDateTimeWithOffset(0, "end"),
   };
 }
 
 function validateDateRange(
   preset: UsageRangePreset,
-  customStartDate: string,
-  customEndDate: string,
+  customStartTime: string,
+  customEndTime: string,
 ): string | null {
   if (preset !== "custom") return null;
-  if (!customStartDate || !customEndDate) return "请选择开始日期和结束日期。";
-  if (customStartDate > customEndDate) return "开始日期不能晚于结束日期。";
+  if (!customStartTime || !customEndTime) return "请选择开始时间和结束时间。";
+  if (customStartTime > customEndTime) return "开始时间不能晚于结束时间。";
   return null;
 }
 
 function usageRangeLabel(
   preset: UsageRangePreset,
-  customStartDate: string,
-  customEndDate: string,
+  customStartTime: string,
+  customEndTime: string,
 ): string {
   const option = USAGE_RANGE_OPTIONS.find((candidate) => candidate.value === preset);
   if (preset !== "custom") return option?.label ?? "全部";
-  if (!customStartDate || !customEndDate) return "自定义";
-  return `${customStartDate} 至 ${customEndDate}`;
+  if (!customStartTime || !customEndTime) return "自定义";
+  return `${formatLocalDateTime(customStartTime)} 至 ${formatLocalDateTime(customEndTime)}`;
 }
 
-function localDateWithOffset(dayOffset: number): string {
+function localDateTimeWithOffset(dayOffset: number, boundary: "start" | "end"): string {
   const date = new Date();
   date.setDate(date.getDate() + dayOffset);
+  if (boundary === "start") {
+    date.setHours(0, 0, 0, 0);
+  } else {
+    date.setHours(23, 59, 59, 999);
+  }
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  const second = String(date.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}`;
+}
+
+function loadUsageFilterState(defaultCodexDir: string): UsageFilterState {
+  const fallback: UsageFilterState = {
+    codexDir: defaultCodexDir,
+    rangePreset: "all",
+    customStartTime: localDateTimeWithOffset(-6, "start"),
+    customEndTime: localDateTimeWithOffset(0, "end"),
+    providerId: "",
+    model: "",
+  };
+  try {
+    const stored: unknown = JSON.parse(window.localStorage.getItem(USAGE_FILTER_STORAGE_KEY) ?? "null");
+    if (!isRecord(stored)) return fallback;
+    return {
+      codexDir: stringPreference(stored.codexDir, fallback.codexDir),
+      rangePreset: isUsageRangePreset(stored.rangePreset) ? stored.rangePreset : fallback.rangePreset,
+      customStartTime: dateTimePreference(stored.customStartTime, fallback.customStartTime),
+      customEndTime: dateTimePreference(stored.customEndTime, fallback.customEndTime),
+      providerId: stringPreference(stored.providerId, fallback.providerId),
+      model: stringPreference(stored.model, fallback.model),
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function saveUsageFilterState(filters: UsageFilterState): void {
+  try {
+    window.localStorage.setItem(USAGE_FILTER_STORAGE_KEY, JSON.stringify(filters));
+  } catch {
+    // A read-only or full WebView storage should not block usage queries.
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isUsageRangePreset(value: unknown): value is UsageRangePreset {
+  return typeof value === "string" && USAGE_RANGE_OPTIONS.some((option) => option.value === value);
+}
+
+function stringPreference(value: unknown, fallback: string): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function dateTimePreference(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/.test(value) ? value : fallback;
+}
+
+function includeSelectedOption(options: string[], selected: string): string[] {
+  if (!selected || options.includes(selected)) return options;
+  return [selected, ...options];
+}
+
+function formatLocalDateTime(value: string): string {
+  return value.replace("T", " ");
+}
+
+function usageProviderLabel(status: CompanionStatus, providerId: string): string {
+  const provider = status.config.providers[providerId];
+  if (!provider) return providerId;
+  return providerAccountTitle(provider);
 }

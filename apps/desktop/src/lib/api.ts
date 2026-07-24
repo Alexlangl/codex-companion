@@ -4,6 +4,7 @@ import type {
   ApiClientCreate,
   ApiClientSecret,
   ApiClientUpdate,
+  ApiRequestLog,
   ApiServiceSelfTest,
   ApiServiceSnapshot,
   CliLaunchOutcome,
@@ -30,6 +31,7 @@ import type {
   ProviderUpsert,
   RepairOutcome,
   RelayConfig,
+  RelayEvent,
   RelaySettingsUpdate,
   SessionPage,
   ThemeMode,
@@ -55,6 +57,16 @@ export function getStatus() {
 export function getApiServiceSnapshot() {
   if (!isTauri()) return Promise.resolve(structuredClone(mockApiService));
   return invoke<ApiServiceSnapshot>("get_api_service_snapshot");
+}
+
+export function getApiRequestLogs() {
+  if (!isTauri()) return Promise.resolve(structuredClone(mockApiService.recentRequests));
+  return invoke<ApiRequestLog[]>("get_api_request_logs");
+}
+
+export function getRelayEvents() {
+  if (!isTauri()) return Promise.resolve(structuredClone(mockStatus.recentEvents));
+  return invoke<RelayEvent[]>("get_relay_events");
 }
 
 export function getProviderRefreshProgress() {

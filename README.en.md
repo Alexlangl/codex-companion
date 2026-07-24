@@ -253,7 +253,7 @@ curl http://127.0.0.1:17687/v1/responses \
   -d '{"model":"your-model","input":"hello","stream":false}'
 ```
 
-- Supports `POST /v1/responses`, WebSocket `GET /v1/responses`, and `GET /v1/models`.
+- Supports `POST /v1/responses`, `POST /v1/responses/compact`, WebSocket `GET /v1/responses`, and `GET /v1/models`.
 - API client secrets are shown once; SQLite stores only a SHA-256 hash and short prefix.
 - Each client can have its own model allowlist and can be disabled, rotated, or deleted independently.
 - Cross-origin browser requests always require a valid client key. Local non-browser requests can use compatibility mode or enforce keys.

@@ -1,4 +1,5 @@
 mod api_service;
+mod content_encoding;
 mod events;
 mod proxy;
 mod server;
@@ -7,4 +8,5 @@ mod upstream;
 mod websocket;
 
 pub use api_service::{ApiServiceStore, RequestLogFinish, RequestLogStart};
+pub use events::read_recent_events;
 pub use server::{serve, RelayStartOutcome};

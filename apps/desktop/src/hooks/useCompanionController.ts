@@ -47,29 +47,40 @@ export function useCompanionController() {
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState("");
   const [activeTab, setActiveTab] = useState("dashboard");
-  const pollingRef = useRef(false);
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
   const hasLoadedStatusRef = useRef(false);
   const appUpdater = useAppUpdater(setToast);
 
   const refresh = useCallback(async (options: { silent?: boolean } = {}) => {
-    if (options.silent && pollingRef.current) return;
-    pollingRef.current = true;
-    if (!options.silent) {
-      setBusy((current) => (current === "idle" ? "loading" : current));
+    while (refreshInFlightRef.current) {
+      if (options.silent) return;
+      await refreshInFlightRef.current;
     }
-    try {
-      const next = await getStatus();
-      setStatus(next);
-      hasLoadedStatusRef.current = true;
-      setError(null);
-    } catch (unknownError) {
-      if (!options.silent || !hasLoadedStatusRef.current) {
-        setError(String(unknownError));
-      }
-    } finally {
-      pollingRef.current = false;
+    const refreshTask = (async (): Promise<void> => {
       if (!options.silent) {
-        setBusy("idle");
+        setBusy((current) => (current === "idle" ? "loading" : current));
+      }
+      try {
+        const next = await getStatus();
+        setStatus(next);
+        hasLoadedStatusRef.current = true;
+        setError(null);
+      } catch (unknownError) {
+        if (!options.silent || !hasLoadedStatusRef.current) {
+          setError(String(unknownError));
+        }
+      } finally {
+        if (!options.silent) {
+          setBusy("idle");
+        }
+      }
+    })();
+    refreshInFlightRef.current = refreshTask;
+    try {
+      await refreshTask;
+    } finally {
+      if (refreshInFlightRef.current === refreshTask) {
+        refreshInFlightRef.current = null;
       }
     }
   }, []);

@@ -11,12 +11,14 @@ description.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
+brotli.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 codex-companion-core.workspace = true
 codex-companion-health.workspace = true
 codex-companion-provider.workspace = true
 futures-util.workspace = true
+flate2.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
@@ -29,6 +31,7 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tower-http.workspace = true
 url.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

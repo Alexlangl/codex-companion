@@ -1,19 +1,26 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Select from "@radix-ui/react-select";
 import { ArrowDown, ArrowUp, Play, Plus, Save, Settings2, X } from "lucide-react";
-import { useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Badge, Button, Field, IconButton, Panel } from "../../components/ui";
 import { currentApplication, userVisibleGroups } from "../../lib/current-application";
+import { getApiRequestLogs } from "../../lib/api";
+import { formatTime } from "../../lib/format";
+import { apiRequestLogsEqual } from "../../lib/log-snapshot";
 import { providerAccountTitle, providerHealthLabel, providerHealthTone, quotaInfo } from "../../lib/provider-display";
-import type { BusyState, CompanionStatus, GroupPolicy, GroupUpsert, ProviderConfig } from "../../types/domain";
+import type { ApiRequestLog, BusyState, CompanionStatus, GroupPolicy, GroupUpsert, ProviderConfig } from "../../types/domain";
+
+const GROUP_ROUTE_REFRESH_INTERVAL_MS = 2_000;
 
 export function Groups({
+  active,
   busy,
   status,
   onSave,
   onLaunch,
   onUse,
 }: {
+  active: boolean;
   busy: BusyState;
   status: CompanionStatus;
   onSave: (group: GroupUpsert) => Promise<void>;
@@ -25,7 +32,33 @@ export function Groups({
   const application = currentApplication(status);
   const [form, setForm] = useState<GroupUpsert>(newGroupDraft());
   const [open, setOpen] = useState(false);
+  const [recentRequests, setRecentRequests] = useState<ApiRequestLog[]>([]);
+  const routeRefreshInFlightRef = useRef(false);
   const disabled = busy !== "idle";
+  const lastRoutedRequest = recentRequests.find(isSuccessfulProviderRequest) ?? null;
+  const lastRoutedProviderId = lastRoutedRequest?.providerId ?? null;
+
+  const loadRecentRequests = useCallback(async (): Promise<void> => {
+    if (routeRefreshInFlightRef.current) return;
+    routeRefreshInFlightRef.current = true;
+    try {
+      const nextRequests = await getApiRequestLogs();
+      setRecentRequests((current) => apiRequestLogsEqual(current, nextRequests) ? current : nextRequests);
+    } catch {
+      // Keep the last known route marker when the local log database is briefly unavailable.
+    } finally {
+      routeRefreshInFlightRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!active) return;
+    void loadRecentRequests();
+    const timer = window.setInterval(() => {
+      void loadRecentRequests();
+    }, GROUP_ROUTE_REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [active, loadRecentRequests]);
 
   function openNewGroup() {
     setForm(newGroupDraft());
@@ -88,16 +121,30 @@ export function Groups({
         <div className="group-card-grid">
           {groups.map((group) => {
             const providerIds = existingProviderIds(group.providerOrder, providers);
-            const active = application.kind === "group" && application.id === group.id;
+            const isActiveGroup = application.kind === "group" && application.id === group.id;
+            const recentlyUsedProviderId = isActiveGroup && lastRoutedProviderId && providerIds.includes(lastRoutedProviderId)
+              ? lastRoutedProviderId
+              : null;
+            const recentlyUsedProvider = recentlyUsedProviderId
+              ? status.config.providers[recentlyUsedProviderId]
+              : null;
+            const routeStatusLabel = activeGroupRouteLabel(
+              isActiveGroup,
+              recentlyUsedProvider,
+              lastRoutedRequest?.startedAt ?? null,
+            );
             return (
               <div className="group-card" key={group.id}>
                 <div className="group-card-head">
                   <div>
                     <strong>{group.name}</strong>
-                    <span>{providerIds.length} 个账号 · {policyLabel(group.policy)}</span>
+                    <span>
+                      {providerIds.length} 个账号 · {policyLabel(group.policy)}
+                      {routeStatusLabel ? ` · ${routeStatusLabel}` : ""}
+                    </span>
                   </div>
                   <div className="badge-row">
-                    {active ? <Badge tone="ok">当前</Badge> : null}
+                    {isActiveGroup ? <Badge tone="ok">当前分组</Badge> : null}
                     <Badge tone={group.fallbackEnabled ? "accent" : "neutral"}>{group.fallbackEnabled ? "自动切换" : "固定首个"}</Badge>
                   </div>
                 </div>
@@ -117,6 +164,7 @@ export function Groups({
                                 <small>{provider ? groupProviderMeta(provider, quota?.percentLabel) : "账号不存在"}</small>
                               </div>
                               <div className="group-provider-badges">
+                                {recentlyUsedProviderId === id ? <Badge tone="accent">最近使用</Badge> : null}
                                 <Badge tone={providerHealthTone(health?.status)}>{providerHealthLabel(health?.status)}</Badge>
                                 {quota ? <Badge tone={quota.tone}>{quota.percentLabel}</Badge> : null}
                               </div>
@@ -132,7 +180,7 @@ export function Groups({
                   <IconButton disabled={disabled} label={`启动分组：${group.name}`} onClick={() => void onLaunch(group.id)}>
                     <Play size={16} />
                   </IconButton>
-                  <Button disabled={disabled || active} onClick={() => void onUse(group.id)} variant="secondary">
+                  <Button disabled={disabled || isActiveGroup} onClick={() => void onUse(group.id)} variant="secondary">
                     设为当前
                   </Button>
                 </div>
@@ -336,12 +384,29 @@ function slugify(value: string) {
 }
 
 function groupProviderMeta(provider: ProviderConfig, quotaLabel?: string) {
+  const accountTitle = providerAccountTitle(provider);
+  const providerName = provider.name !== accountTitle ? `${provider.name} · ` : "";
   if (provider.kind === "official_codex") {
     const plan = provider.account?.subscriptionType ?? "Codex 官方账号";
     const quota = quotaLabel && quotaLabel !== "待刷新" ? ` · 剩余额度 ${quotaLabel}` : "";
-    return `${plan}${quota}`;
+    return `${providerName}${plan}${quota}`;
   }
   const status = provider.account?.subscriptionStatus ?? "连接待检查";
   const quota = quotaLabel && quotaLabel !== "待刷新" ? ` · 余量 ${quotaLabel}` : "";
-  return `${status}${quota}`;
+  return `${providerName}${status}${quota}`;
+}
+
+function isSuccessfulProviderRequest(request: ApiRequestLog): boolean {
+  return request.outcome === "succeeded" && Boolean(request.providerId);
+}
+
+function activeGroupRouteLabel(
+  isActiveGroup: boolean,
+  provider: ProviderConfig | null,
+  startedAt: string | null,
+): string {
+  if (!isActiveGroup) return "";
+  if (!provider) return "等待新请求";
+  const routeTime = startedAt ? ` · ${formatTime(startedAt)}` : "";
+  return `最近使用 ${providerAccountTitle(provider)}${routeTime}`;
 }

@@ -1,7 +1,8 @@
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
-    ApiClient, ApiClientCreate, ApiClientSecret, ApiClientUpdate, ApiServiceSelfTest,
-    ApiServiceSnapshot, CompanionError, HealthStatusKind, RelayConfig, RelaySettingsUpdate, Result,
+    ApiClient, ApiClientCreate, ApiClientSecret, ApiClientUpdate, ApiRequestLog,
+    ApiServiceSelfTest, ApiServiceSnapshot, CompanionError, HealthStatusKind, RelayConfig,
+    RelaySettingsUpdate, Result,
 };
 use codex_companion_relay::ApiServiceStore;
 use std::time::Instant;
@@ -30,6 +31,10 @@ impl CompanionDaemon {
             }
         }
         Ok(snapshot)
+    }
+
+    pub fn api_request_logs(&self, limit: usize) -> Result<Vec<ApiRequestLog>> {
+        self.api_service_store()?.list_requests(limit)
     }
 
     pub fn create_api_client(&self, input: ApiClientCreate) -> Result<ApiClientSecret> {

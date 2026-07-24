@@ -363,7 +363,7 @@ fn normalize_official_responses_input(
         || method != Method::POST
         || !uri
             .path_and_query()
-            .is_some_and(|value| is_responses_url(value.as_str()))
+            .is_some_and(|value| is_responses_generation_url(value.as_str()))
     {
         return body;
     }
@@ -1005,7 +1005,7 @@ fn response_transform(provider: &ProviderConfig, method: &Method, uri: &Uri) -> 
     if method == Method::POST
         && uri
             .path_and_query()
-            .is_some_and(|value| is_responses_url(value.as_str()))
+            .is_some_and(|value| is_responses_generation_url(value.as_str()))
         && provider_endpoint_is_chat_completions(&provider.base_url)
     {
         ResponseTransform::ChatCompletionsToResponses
@@ -2687,6 +2687,23 @@ pub(crate) fn text_response(status: StatusCode, text: impl Into<String>) -> Resp
 
 pub(crate) fn upstream_url(provider: &ProviderConfig, uri: &Uri) -> String {
     if provider_base_url_is_endpoint(&provider.base_url) {
+        if uri.path().ends_with("/responses/compact") {
+            let (endpoint, query) = provider
+                .base_url
+                .trim()
+                .split_once('?')
+                .map(|(endpoint, query)| (endpoint, Some(query)))
+                .unwrap_or((provider.base_url.trim(), None));
+            let endpoint = endpoint.trim_end_matches('/');
+            if endpoint.ends_with("/responses") {
+                let mut compact_endpoint = format!("{endpoint}/compact");
+                if let Some(query) = query.filter(|query| !query.is_empty()) {
+                    compact_endpoint.push('?');
+                    compact_endpoint.push_str(query);
+                }
+                return compact_endpoint;
+            }
+        }
         return provider.base_url.trim().to_string();
     }
 
@@ -2871,6 +2888,40 @@ mod tests {
         assert_eq!(value["input"][0]["role"], "user");
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], true);
+    }
+
+    #[test]
+    fn official_codex_compact_request_preserves_standalone_compaction_semantics() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let uri: Uri = "/v1/responses/compact".parse().expect("uri");
+        let original = Bytes::from_static(
+            br#"{"model":"gpt-test","input":[{"role":"user","content":"hello"}]}"#,
+        );
+
+        let body = normalize_official_responses_input(
+            &provider,
+            &Method::POST,
+            &uri,
+            original.clone(),
+            None,
+        );
+
+        assert_eq!(body, original);
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert!(value.get("stream").is_none());
+        assert!(value.get("store").is_none());
+    }
+
+    #[test]
+    fn compact_request_is_not_translated_to_chat_completions() {
+        let mut provider = official_provider("https://api.example.com/v1/chat/completions");
+        provider.kind = ProviderKind::OpenAiCompatible;
+        let uri: Uri = "/v1/responses/compact".parse().expect("uri");
+
+        assert_eq!(
+            response_transform(&provider, &Method::POST, &uri),
+            ResponseTransform::None
+        );
     }
 
     #[test]
@@ -3089,6 +3140,34 @@ mod tests {
         assert_eq!(
             upstream,
             "https://api.example.com/v1/responses?api-version=2026-06-09"
+        );
+        assert_eq!(
+            response_transform(&provider, &Method::POST, &uri),
+            ResponseTransform::None
+        );
+    }
+
+    #[test]
+    fn explicit_responses_endpoint_routes_compact_to_the_compact_endpoint() {
+        let provider = ProviderConfig {
+            id: "p".to_string(),
+            name: "Provider".to_string(),
+            kind: ProviderKind::RelayProvider,
+            base_url: "https://api.example.com/v1/responses?api-version=2026-06-09".to_string(),
+            websocket_url: None,
+            auth_ref: None,
+            direct_auth_ref: None,
+            model_map: BTreeMap::new(),
+            priority: 0,
+            enabled: true,
+            refresh_interval_seconds: default_refresh_interval_seconds(),
+            account: None,
+        };
+        let uri: Uri = "/v1/responses/compact".parse().expect("uri");
+
+        assert_eq!(
+            upstream_url(&provider, &uri),
+            "https://api.example.com/v1/responses/compact?api-version=2026-06-09"
         );
         assert_eq!(
             response_transform(&provider, &Method::POST, &uri),

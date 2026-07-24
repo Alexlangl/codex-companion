@@ -152,6 +152,7 @@ function App() {
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="groups">
                   <Groups
+                    active={activeTab === "groups"}
                     busy={busy}
                     status={status}
                     onSave={actions.saveGroup}

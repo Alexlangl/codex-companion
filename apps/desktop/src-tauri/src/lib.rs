@@ -26,6 +26,18 @@ fn get_api_service_snapshot() -> Result<codex_companion_core::ApiServiceSnapshot
 }
 
 #[tauri::command]
+fn get_api_request_logs() -> Result<Vec<codex_companion_core::ApiRequestLog>, String> {
+    daemon()?
+        .api_request_logs(100)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_relay_events() -> Result<Vec<codex_companion_core::RelayEvent>, String> {
+    Ok(daemon()?.relay_events())
+}
+
+#[tauri::command]
 fn get_provider_refresh_progress() -> Result<codex_companion_core::ProviderRefreshProgress, String>
 {
     Ok(daemon()?.provider_refresh_progress())
@@ -465,6 +477,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_api_service_snapshot,
+            get_api_request_logs,
+            get_relay_events,
             get_provider_refresh_progress,
             get_provider_import_progress,
             get_diagnostic_info,
