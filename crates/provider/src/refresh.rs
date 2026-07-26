@@ -9,12 +9,35 @@ use codex_companion_core::{
 };
 use codex_companion_health::{classify_failure, mark_failure, mark_success};
 
+#[derive(Debug, Clone)]
+pub struct ProviderTestFailure {
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+impl ProviderTestFailure {
+    fn network(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+        }
+    }
+}
+
 pub async fn test_provider(provider: &ProviderConfig) -> std::result::Result<(), String> {
+    test_provider_detailed(provider)
+        .await
+        .map_err(|failure| failure.message)
+}
+
+pub async fn test_provider_detailed(
+    provider: &ProviderConfig,
+) -> std::result::Result<(), ProviderTestFailure> {
     if provider.kind == ProviderKind::OfficialCodex {
         return refresh_official_codex_account(provider)
             .await
             .map(|_| ())
-            .map_err(|error| error.to_string());
+            .map_err(|error| ProviderTestFailure::network(error.to_string()));
     }
 
     let client = reqwest::Client::new();
@@ -29,13 +52,16 @@ pub async fn test_provider(provider: &ProviderConfig) -> std::result::Result<(),
     let response = request
         .send()
         .await
-        .map_err(|error| format!("network failed: {error}"))?;
+        .map_err(|error| ProviderTestFailure::network(format!("network failed: {error}")))?;
     if response.status().is_success() {
         Ok(())
     } else {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        Err(format!("provider returned {status}: {body}"))
+        Err(ProviderTestFailure {
+            status: Some(status.as_u16()),
+            message: format!("provider returned {status}: {body}"),
+        })
     }
 }
 
@@ -50,7 +76,10 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
     let mut api_usage_error = None;
     let result = if provider.kind == ProviderKind::OfficialCodex {
         let result = refresh_official_codex_account(&provider).await;
-        let health_result = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+        let health_result = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| ProviderTestFailure::network(error.to_string()));
         account_result = Some(result);
         health_result
     } else if provider_supports_api_key_usage(&provider) {
@@ -61,11 +90,11 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
             }
             Err(error) => {
                 api_usage_error = Some(error.to_string());
-                test_provider(&provider).await
+                test_provider_detailed(&provider).await
             }
         }
     } else {
-        test_provider(&provider).await
+        test_provider_detailed(&provider).await
     };
     store.update(|config| {
         let now = Utc::now();
@@ -89,9 +118,9 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
                     }
                 }
             }
-            Err(message) => {
-                let failure = classify_failure(None, &message);
-                mark_failure(health, &failure, message);
+            Err(failure) => {
+                let classification = classify_failure(failure.status, &failure.message);
+                mark_failure(health, &classification, failure.message);
             }
         }
         Ok(health.clone())
@@ -143,7 +172,66 @@ fn clear_api_key_usage(account: &mut codex_companion_core::ProviderAccountInfo) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_companion_core::{ProviderAccountInfo, ProviderQuotaWindow};
+    use codex_companion_core::{
+        default_refresh_interval_seconds, HealthFailureKind, HealthStatusKind, ProviderAccountInfo,
+        ProviderQuotaWindow,
+    };
+
+    #[tokio::test]
+    async fn upstream_401_marks_provider_auth_failed() {
+        use axum::{http::StatusCode, routing::any, Router};
+        let app = Router::new().route(
+            "/{*path}",
+            any(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    r#"{"error":{"message":"invalid key"}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                config.providers.insert(
+                    "p".to_string(),
+                    ProviderConfig {
+                        id: "p".to_string(),
+                        name: "p".to_string(),
+                        kind: ProviderKind::OpenAiCompatible,
+                        base_url: format!("http://{addr}/v1"),
+                        websocket_url: None,
+                        auth_ref: None,
+                        direct_auth_ref: None,
+                        model_map: std::collections::BTreeMap::new(),
+                        priority: 0,
+                        enabled: true,
+                        refresh_interval_seconds: default_refresh_interval_seconds(),
+                        account: None,
+                    },
+                );
+                Ok(())
+            })
+            .expect("seed provider");
+
+        let health = refresh_provider_status(&store, "p").await.expect("refresh");
+
+        // 401 是凭据失效，必须归类为 AuthFailed 而不是网络故障，
+        // 否则代理层无法把吊销的 key 从候选里剔除。
+        assert_eq!(health.status, HealthStatusKind::AuthFailed);
+        assert_eq!(
+            health.last_failure_kind,
+            Some(HealthFailureKind::AuthFailed)
+        );
+    }
 
     #[test]
     fn transient_usage_failure_preserves_last_successful_snapshot() {

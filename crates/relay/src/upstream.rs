@@ -327,10 +327,13 @@ fn build_upstream_request(
 ) -> reqwest::RequestBuilder {
     let mut request = client.request(method.clone(), upstream);
     for (name, value) in headers {
+        // Accept-Encoding 必须剥掉：relay 未启用响应解压，压缩响应会破坏 SSE 预检和协议转换。
+        // x-api-key 是 relay 自己的 client 密钥，不能泄露给上游。
         if matches!(
             *name,
-            header::HOST | header::AUTHORIZATION | header::CONTENT_LENGTH
-        ) {
+            header::HOST | header::AUTHORIZATION | header::CONTENT_LENGTH | header::ACCEPT_ENCODING
+        ) || name.as_str() == "x-api-key"
+        {
             continue;
         }
         request = request.header(name, value);
@@ -1521,9 +1524,10 @@ fn responses_body_to_chat_completions_with_store(
     if let Some(max_output_tokens) = object.get("max_output_tokens") {
         output.insert("max_tokens".to_string(), max_output_tokens.clone());
     }
+    // Responses API 语义：省略 stream 表示非流式 JSON，不能默认成流式。
     output.insert(
         "stream".to_string(),
-        object.get("stream").cloned().unwrap_or(Value::Bool(true)),
+        object.get("stream").cloned().unwrap_or(Value::Bool(false)),
     );
     if let Some(stream_options) = object.get("stream_options") {
         output.insert("stream_options".to_string(), stream_options.clone());
@@ -2799,6 +2803,55 @@ mod tests {
     }
 
     #[test]
+    fn upstream_request_strips_encoding_and_relay_credential_headers() {
+        let client = reqwest::Client::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:1455"));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-relay-key"),
+        );
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, br"),
+        );
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("42"));
+        headers.insert("x-api-key", HeaderValue::from_static("relay-client-secret"));
+        headers.insert("x-session-id", HeaderValue::from_static("thread-1"));
+
+        let request = build_upstream_request(
+            &client,
+            &reqwest::Method::POST,
+            "https://api.example.com/v1/responses",
+            &headers,
+            false,
+            Some("Bearer upstream-token"),
+            None,
+            None,
+        )
+        .build()
+        .expect("request");
+
+        let sent = request.headers();
+        // 透传 Accept-Encoding 会让上游返回 gzip，relay 不解压时 SSE 预检和
+        // 协议转换读到的是压缩字节流(乱码)。
+        assert!(!sent.contains_key(header::ACCEPT_ENCODING));
+        assert!(!sent.contains_key("x-api-key"));
+        assert!(!sent.contains_key(header::HOST));
+        assert!(!sent.contains_key(header::CONTENT_LENGTH));
+        assert_eq!(
+            sent.get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer upstream-token")
+        );
+        assert_eq!(
+            sent.get("x-session-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("thread-1")
+        );
+    }
+
+    #[test]
     fn semantic_failure_detection_does_not_reject_valid_incomplete_response() {
         assert!(semantic_failure_message(&json!({
             "status": "failed",
@@ -3173,6 +3226,18 @@ mod tests {
             response_transform(&provider, &Method::POST, &uri),
             ResponseTransform::None
         );
+    }
+
+    #[test]
+    fn omitted_stream_defaults_to_non_streaming_in_chat_bridge() {
+        let (body, _, _) = responses_body_to_chat_completions(
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+            "p",
+            false,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["stream"], false);
+        assert!(value.get("stream_options").is_none());
     }
 
     #[test]

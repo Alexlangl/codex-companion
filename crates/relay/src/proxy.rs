@@ -14,13 +14,14 @@ use axum::{
 use bytes::Bytes;
 use codex_companion_core::{
     provider_endpoint_is_chat_completions, ApiClient, CompanionConfig, HealthFailureKind,
-    ProviderKind,
+    HealthStatusKind, ProviderKind,
 };
 use codex_companion_health::{
     classify_failure, cooldown_active, mark_failure, mark_model_failure, mark_success,
     normalize_expired_cooldown,
 };
 use codex_companion_provider::selected_providers_for_group;
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -278,36 +279,35 @@ async fn proxy_dispatch(
             return Ok(allowed_models_response(&models));
         }
     }
-    let should_skip_cooldown = group.fallback_enabled && selected.len() > 1;
-    let mut candidates = if should_skip_cooldown {
-        selected
-            .into_iter()
-            .filter(|provider| {
-                let globally_available = config
-                    .health
-                    .get(&provider.id)
-                    .is_none_or(|health| !cooldown_active(health));
-                let model_available = requested_model.as_deref().is_none_or(|model| {
-                    !state
-                        .api_service
-                        .model_cooldown_active(&provider.id, model)
-                        .unwrap_or(false)
-                });
-                globally_available && model_available
-            })
-            .collect::<Vec<_>>()
-    } else {
-        selected
-    };
+    // AuthFailed(key 被吊销/凭证失效)必须无条件排除：它不会随冷却到期恢复，
+    // 只有刷新成功(mark_success)才解除；单账号/关闭 fallback 时也不能拿它无
+    // 限重试。临时冷却(429/5xx)则只在有其他候选时跳过——只剩一个账号时拒绝
+    // 尝试会把瞬时故障放大成全量 503。
+    let has_alternatives = group.fallback_enabled && selected.len() > 1;
+    let mut candidates = selected
+        .into_iter()
+        .filter(|provider| {
+            let health = config.health.get(&provider.id);
+            if health.is_some_and(|health| matches!(health.status, HealthStatusKind::AuthFailed)) {
+                return false;
+            }
+            if !has_alternatives {
+                return true;
+            }
+            let globally_available = health.is_none_or(|health| !cooldown_active(health));
+            let model_available = requested_model.as_deref().is_none_or(|model| {
+                !state
+                    .api_service
+                    .model_cooldown_active(&provider.id, model)
+                    .unwrap_or(false)
+            });
+            globally_available && model_available
+        })
+        .collect::<Vec<_>>();
 
     apply_group_policy(&state, &group, &mut candidates);
 
-    if !group.fallback_enabled {
-        candidates.truncate(1);
-    }
-    if config.relay.retry_budget > 0 {
-        candidates.truncate(usize::from(config.relay.retry_budget).saturating_add(1));
-    }
+    // 粘性提升必须在截断之前：绑定账号排在截断线之后时会被截掉，多轮会话上下文静默丢失。
     if let Some(preferred_provider) = affinity_key
         .as_deref()
         .and_then(|key| state.preferred_provider(key, config.relay.session_affinity_ttl_seconds))
@@ -319,6 +319,12 @@ async fn proxy_dispatch(
             let provider = candidates.remove(index);
             candidates.insert(0, provider);
         }
+    }
+    if !group.fallback_enabled {
+        candidates.truncate(1);
+    }
+    if config.relay.retry_budget > 0 {
+        candidates.truncate(usize::from(config.relay.retry_budget).saturating_add(1));
     }
     if candidates.is_empty() {
         let message = "当前本地代理分组没有可用账号".to_string();
@@ -380,7 +386,7 @@ async fn proxy_dispatch(
                 &message,
             ));
         }
-        let _request_guard = state.begin_provider_request(&provider.id);
+        let request_guard = state.begin_provider_request(&provider.id);
         let upstream = upstream_url(&provider, &uri);
         match send_upstream(
             &state.client,
@@ -472,7 +478,8 @@ async fn proxy_dispatch(
                         started_at,
                         None,
                     );
-                    return Ok(downstream);
+                    // 守卫随响应体流存活，LeastLoaded 才统计得到流式生成期间的真实负载。
+                    return Ok(attach_request_guard(downstream, request_guard));
                 }
 
                 let message = format!("上游成功响应无法转换为本地协议（HTTP {downstream_status}）");
@@ -703,6 +710,15 @@ fn client_api_key(headers: &HeaderMap) -> Option<String> {
         })
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn attach_request_guard(response: Response, guard: crate::state::ProviderRequestGuard) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream().map(move |chunk| {
+        let _ = &guard;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 fn client_allows_model(client: &ApiClient, model: &str) -> bool {
@@ -1855,6 +1871,143 @@ mod tests {
             .api_service
             .model_cooldown_active("a", "gpt-two")
             .expect("gpt-two cooldown"));
+    }
+
+    #[tokio::test]
+    async fn revoked_key_is_not_retried_after_auth_failure() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = spawn_mock_server(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"invalid api key"}}"#,
+            Some(hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![provider("a", &url)]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+
+        let first = proxy_inner(
+            state.clone(),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+        )
+        .await
+        .expect("first request");
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let config = store.load().expect("config");
+        assert_eq!(
+            config.health.get("a").expect("health").status,
+            HealthStatusKind::AuthFailed
+        );
+
+        // key 已被判定吊销：即使没有备选账号也不能再拿它去上游循环重试。
+        let second = proxy_inner(
+            state,
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+        )
+        .await
+        .expect("second request");
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(second.into_body(), 1024).await.expect("body");
+        let value: Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(value["error"]["code"], "no_available_provider");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_load_is_tracked_until_response_body_is_consumed() {
+        let url = spawn_mock_server(StatusCode::OK, "ok", None).await;
+        let store = store_with_group(vec![provider("a", &url)]);
+        let state = RelayState::new(store, reqwest::Client::new());
+
+        let response = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("proxy");
+        assert_eq!(response.status(), StatusCode::OK);
+        // 响应头已返回但 body 还没消费：LeastLoaded 必须仍统计到这条在途请求。
+        assert_eq!(state.provider_inflight_count("a"), 1);
+
+        let body = to_bytes(response.into_body(), 1024).await.expect("body");
+        assert_eq!(&body[..], b"ok");
+        assert_eq!(state.provider_inflight_count("a"), 0);
+    }
+
+    #[tokio::test]
+    async fn session_affinity_survives_retry_budget_truncation() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_c = Arc::new(AtomicUsize::new(0));
+        let url_a = spawn_mock_server(StatusCode::OK, "from a", Some(hits_a.clone())).await;
+        let url_b = spawn_mock_server(StatusCode::OK, "from b", None).await;
+        let url_c = spawn_mock_server(StatusCode::OK, "from c", Some(hits_c.clone())).await;
+        let store = store_with_group(vec![
+            provider("a", &url_a),
+            provider("b", &url_b),
+            provider("c", &url_c),
+        ]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        let mut session_headers = HeaderMap::new();
+        session_headers.insert("x-session-id", HeaderValue::from_static("thread-affinity"));
+
+        // 先把会话绑定到 c：临时把 c 排到首位发起第一次请求。
+        store
+            .update(|config| {
+                config.groups.get_mut("test").expect("group").provider_order =
+                    vec!["c".to_string(), "a".to_string(), "b".to_string()];
+                Ok(())
+            })
+            .expect("reorder");
+        let first = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            session_headers.clone(),
+            Bytes::new(),
+        )
+        .await
+        .expect("first request");
+        assert_eq!(
+            &to_bytes(first.into_body(), 1024).await.expect("first body")[..],
+            b"from c"
+        );
+
+        // 恢复顺序并设 retry_budget=1(候选截断到 2 个)：绑定的 c 排在截断线
+        // 之后，只有先做粘性提升再截断才能保住绑定。
+        store
+            .update(|config| {
+                config.groups.get_mut("test").expect("group").provider_order =
+                    vec!["a".to_string(), "b".to_string(), "c".to_string()];
+                config.relay.retry_budget = 1;
+                Ok(())
+            })
+            .expect("tighten budget");
+        let sticky = proxy_inner(
+            state,
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            session_headers,
+            Bytes::new(),
+        )
+        .await
+        .expect("sticky request");
+        assert_eq!(
+            &to_bytes(sticky.into_body(), 1024)
+                .await
+                .expect("sticky body")[..],
+            b"from c"
+        );
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_c.load(Ordering::SeqCst), 2);
     }
 
     async fn spawn_mock_server(

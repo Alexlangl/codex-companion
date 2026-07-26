@@ -5,7 +5,10 @@ use base64::{
 use chrono::Utc;
 use codex_companion_core::{CompanionError, ProviderConfig, Result};
 use serde::Deserialize;
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
@@ -50,7 +53,7 @@ pub fn load_codex_auth_snapshot(provider: &ProviderConfig) -> Result<CodexAuthSn
 }
 
 pub async fn ensure_codex_auth_snapshot(provider: &ProviderConfig) -> Result<CodexAuthSnapshot> {
-    let mut auth_file = read_codex_auth_file(provider)?;
+    let auth_file = read_codex_auth_file(provider)?;
     let raw = auth_file.snapshot();
     let needs_refresh = raw
         .access_token
@@ -58,6 +61,22 @@ pub async fn ensure_codex_auth_snapshot(provider: &ProviderConfig) -> Result<Cod
         .is_none_or(access_token_needs_refresh);
 
     if !needs_refresh {
+        return snapshot_with_access(raw);
+    }
+
+    // 刷新必须跨进程串行：desktop 与 daemon(或 live-follow 的别的进程)可能
+    // 同时刷同一个 auth 文件，各自拿同一个 refresh_token 去刷会触发
+    // invalid_grant，乱序写回还可能把已作废的 refresh_token 持久化。进程内
+    // 的 Mutex 挡不住别的进程，这里对 auth 文件旁的 .lock 哨兵文件加独占
+    // flock；拿锁后重读文件做双重检查。
+    let _guard = lock_auth_file(&auth_file.path).await?;
+    let mut auth_file = read_codex_auth_file(provider)?;
+    let raw = auth_file.snapshot();
+    if raw
+        .access_token
+        .as_deref()
+        .is_some_and(|token| !access_token_needs_refresh(token))
+    {
         return snapshot_with_access(raw);
     }
 
@@ -102,6 +121,32 @@ async fn refresh_tokens(refresh_token: &str) -> Result<TokenRefreshResponse> {
     })
 }
 
+/// 对 auth 文件旁的哨兵文件(`.auth.json.lock`)加独占 flock。锁按 auth 文件
+/// 路径隔离；guard(打开的文件)释放时锁自动解除。锁文件必须与 auth 文件分离：
+/// 写回是 tmp+rename，rename 会替换 inode，直接锁 auth 文件本身会失效。
+async fn lock_auth_file(auth_path: &Path) -> Result<fs::File> {
+    let auth_path = auth_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file_name = auth_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("auth.json");
+        let lock_path = auth_path.with_file_name(format!(".{file_name}.lock"));
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| CompanionError::io(&lock_path, source))?;
+        lock_file
+            .lock()
+            .map_err(|source| CompanionError::io(&lock_path, source))?;
+        Ok(lock_file)
+    })
+    .await
+    .map_err(|source| CompanionError::InvalidConfig(format!("获取 auth 文件锁失败: {source}")))?
+}
+
 fn read_codex_auth_file(provider: &ProviderConfig) -> Result<CodexAuthFile> {
     let auth_ref = provider.auth_ref.as_deref().ok_or_else(|| {
         CompanionError::InvalidConfig(format!("provider {} 缺少 auth_ref", provider.id))
@@ -127,8 +172,11 @@ fn write_auth_file(auth_file: &CodexAuthFile) -> Result<()> {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("auth.json");
-    let tmp_path = auth_file.path.with_file_name(format!(".{file_name}.tmp"));
-    fs::write(&tmp_path, text).map_err(|source| CompanionError::io(&tmp_path, source))?;
+    // 临时文件名带 pid：live-follow 模式下别的进程也可能同时写这个文件。
+    let tmp_path = auth_file
+        .path
+        .with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    crate::write_private_auth_file(&tmp_path, &text)?;
     fs::rename(&tmp_path, &auth_file.path)
         .map_err(|source| CompanionError::io(&auth_file.path, source))
 }
@@ -319,6 +367,35 @@ mod tests {
     #[test]
     fn leaves_opaque_tokens_usable() {
         assert!(!access_token_needs_refresh_at("not-a-jwt", 1_000));
+    }
+
+    #[tokio::test]
+    async fn auth_file_lock_blocks_second_acquirer_until_released() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("auth.json");
+        let first = lock_auth_file(&auth_path).await.expect("first lock");
+
+        let acquired = Arc::new(AtomicBool::new(false));
+        let observer = acquired.clone();
+        let path = auth_path.clone();
+        let second = tokio::spawn(async move {
+            let _guard = lock_auth_file(&path).await.expect("second lock");
+            observer.store(true, Ordering::SeqCst);
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "第一个 guard 未释放前，第二个获取者必须阻塞"
+        );
+
+        drop(first);
+        second.await.expect("join second acquirer");
+        assert!(acquired.load(Ordering::SeqCst));
     }
 
     #[test]

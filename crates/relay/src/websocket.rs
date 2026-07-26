@@ -4,7 +4,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use codex_companion_core::{ProviderConfig, ProviderKind};
+use codex_companion_core::{ApiClient, ProviderConfig, ProviderKind};
 use codex_companion_provider::{
     ensure_agent_identity_authorization, ensure_codex_auth_snapshot, provider_uses_agent_identity,
     resolve_auth_token, selected_providers_for_group,
@@ -21,9 +21,13 @@ pub(crate) async fn responses_websocket(
     websocket: WebSocketUpgrade,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = authenticate_websocket_client(&state, &headers) {
-        return response;
-    }
+    let api_client = match authenticate_websocket_client(&state, &headers) {
+        Ok(api_client) => api_client,
+        Err(response) => return response,
+    };
+    let allowed_models = api_client
+        .map(|api_client| api_client.allowed_models)
+        .unwrap_or_default();
     let candidates = match websocket_candidates(&state) {
         Ok(candidates) if !candidates.is_empty() => candidates,
         Ok(_) => {
@@ -41,7 +45,7 @@ pub(crate) async fn responses_websocket(
     };
     let provider_id = provider.id.clone();
     let mut response = websocket
-        .on_upgrade(move |client| bridge_websocket(client, upstream))
+        .on_upgrade(move |client| bridge_websocket(client, upstream, allowed_models))
         .into_response();
     if let Ok(value) = axum::http::HeaderValue::from_str(&provider_id) {
         response
@@ -51,7 +55,10 @@ pub(crate) async fn responses_websocket(
     response
 }
 
-fn authenticate_websocket_client(state: &RelayState, headers: &HeaderMap) -> Result<(), Response> {
+fn authenticate_websocket_client(
+    state: &RelayState,
+    headers: &HeaderMap,
+) -> Result<Option<ApiClient>, Response> {
     let config = state
         .store
         .load()
@@ -67,16 +74,17 @@ fn authenticate_websocket_client(state: &RelayState, headers: &HeaderMap) -> Res
                 .map(str::trim)
         })
         .filter(|value| !value.is_empty());
-    let authenticated = token
+    let api_client = token
         .map(|token| state.api_service.authenticate(token))
         .transpose()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response())?
-        .flatten()
-        .is_some();
-    if !authenticated && (config.relay.require_api_key || headers.contains_key(header::ORIGIN)) {
+        .flatten();
+    if api_client.is_none()
+        && (config.relay.require_api_key || headers.contains_key(header::ORIGIN))
+    {
         return Err((StatusCode::UNAUTHORIZED, "WebSocket API key 无效或缺失").into_response());
     }
-    Ok(())
+    Ok(api_client)
 }
 
 fn websocket_candidates(state: &RelayState) -> Result<Vec<ProviderConfig>, String> {
@@ -204,6 +212,7 @@ fn websocket_request(
 async fn bridge_websocket(
     client: axum::extract::ws::WebSocket,
     upstream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    allowed_models: Vec<String>,
 ) {
     let (mut client_sink, mut client_stream) = client.split();
     let (mut upstream_sink, mut upstream_stream) = upstream.split();
@@ -211,6 +220,18 @@ async fn bridge_websocket(
         tokio::select! {
             client_message = client_stream.next() => {
                 let Some(Ok(message)) = client_message else { break; };
+                if let Some(model) = frame_disallowed_model(&message, &allowed_models) {
+                    let error = serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "code": "model_not_allowed",
+                            "message": format!("API client 无权使用模型 {model}"),
+                        },
+                    })
+                    .to_string();
+                    let _ = client_sink.send(ClientMessage::Text(error.into())).await;
+                    break;
+                }
                 let close = matches!(message, ClientMessage::Close(_));
                 if upstream_sink.send(client_to_upstream(message)).await.is_err() || close {
                     break;
@@ -227,6 +248,43 @@ async fn bridge_websocket(
     }
     let _ = client_sink.send(ClientMessage::Close(None)).await;
     let _ = upstream_sink.send(UpstreamMessage::Close(None)).await;
+}
+
+/// 白名单非空时，检查客户端帧里请求的模型是否越权；返回越权的模型名。
+fn frame_disallowed_model(message: &ClientMessage, allowed_models: &[String]) -> Option<String> {
+    if allowed_models.is_empty() {
+        return None;
+    }
+    let payload: &[u8] = match message {
+        ClientMessage::Text(text) => text.as_bytes(),
+        ClientMessage::Binary(bytes) => bytes,
+        _ => return None,
+    };
+    let value = serde_json::from_slice::<serde_json::Value>(payload).ok()?;
+    // 校验帧内所有可能生效的 model 字段，任一越权即拒绝；只取第一个存在的
+    // 字段会被 {"model":合法,"response":{"model":越权}} 这类嵌套载荷绕过。
+    let candidates = [
+        value.get("model"),
+        value
+            .get("response")
+            .and_then(|response| response.get("model")),
+        value
+            .get("session")
+            .and_then(|session| session.get("model")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        let Some(model) = candidate
+            .as_str()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        else {
+            continue;
+        };
+        if !allowed_models.iter().any(|allowed| allowed == model) {
+            return Some(model.to_string());
+        }
+    }
+    None
 }
 
 fn client_to_upstream(message: ClientMessage) -> UpstreamMessage {
@@ -354,6 +412,40 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("0.144.1")
         );
+    }
+
+    #[test]
+    fn websocket_model_allowlist_blocks_disallowed_models() {
+        let allowed = vec!["model-a".to_string()];
+        let ok = ClientMessage::Text(r#"{"model":"model-a"}"#.into());
+        let blocked = ClientMessage::Text(r#"{"model":"model-b"}"#.into());
+        let nested = ClientMessage::Text(r#"{"response":{"model":"model-b"}}"#.into());
+        // 攻击载荷：顶层放合法模型掩护，嵌套字段夹带越权模型。
+        let smuggled =
+            ClientMessage::Text(r#"{"model":"model-a","response":{"model":"model-b"}}"#.into());
+        let smuggled_session =
+            ClientMessage::Text(r#"{"model":"model-a","session":{"model":"model-b"}}"#.into());
+        let no_model = ClientMessage::Text(r#"{"type":"ping"}"#.into());
+
+        assert_eq!(frame_disallowed_model(&ok, &allowed), None);
+        assert_eq!(
+            frame_disallowed_model(&blocked, &allowed),
+            Some("model-b".to_string())
+        );
+        assert_eq!(
+            frame_disallowed_model(&nested, &allowed),
+            Some("model-b".to_string())
+        );
+        assert_eq!(
+            frame_disallowed_model(&smuggled, &allowed),
+            Some("model-b".to_string())
+        );
+        assert_eq!(
+            frame_disallowed_model(&smuggled_session, &allowed),
+            Some("model-b".to_string())
+        );
+        assert_eq!(frame_disallowed_model(&no_model, &allowed), None);
+        assert_eq!(frame_disallowed_model(&blocked, &[]), None);
     }
 
     #[test]
