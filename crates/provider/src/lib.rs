@@ -23,8 +23,9 @@ pub use groups::{
     set_group_order, upsert_group, use_group,
 };
 pub use import::{
-    import_api_key_provider, import_local_codex_provider, import_provider_json,
-    import_provider_json_many, parse_provider_import_draft, provider_import_progress,
+    import_api_key_provider, import_api_key_provider_request, import_local_codex_provider,
+    import_provider_json, import_provider_json_many, parse_provider_import_draft,
+    provider_import_progress, ApiKeyProviderImportRequest,
 };
 pub use refresh::{refresh_provider_status, test_provider};
 pub use registry::{add_provider, list_providers, remove_provider, update_api_key_provider};

@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use codex_companion_core::{CompanionError, Result, SessionPage, SessionSummary};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -82,7 +83,7 @@ pub fn list_sessions_cached(
     cache.version = SESSION_INDEX_VERSION;
     cache.files = next_files;
     write_cache(&cache_path, &cache)?;
-    summaries.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+    summaries.sort_by_key(|summary| Reverse(summary.modified_at));
     let normalized_query = query.unwrap_or_default().trim().to_lowercase();
     if !normalized_query.is_empty() {
         summaries.retain(|session| session_matches(session, &normalized_query));

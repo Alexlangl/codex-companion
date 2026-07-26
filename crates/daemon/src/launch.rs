@@ -1,19 +1,17 @@
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
     default_codex_dir, provider_endpoint_is_chat_completions, CliLaunchOutcome, CliLaunchRequest,
-    CodexLaunchMode, CodexLaunchOutcome, CompanionError, GroupPolicy, ProviderConfig,
-    ProviderGroup, ProviderKind, ProviderLaunchMode, RepairOptions, RepairOutcome, RepairPlan,
-    Result, TerminalKind, COMPANION_PROVIDER_ID,
+    CodexInstallStatus, CodexLaunchMode, CodexLaunchOutcome, CompanionError, GroupPolicy,
+    ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode, RelayConfig, RepairOptions,
+    RepairOutcome, RepairPlan, Result, TerminalKind, COMPANION_PROVIDER_ID,
 };
-use codex_companion_provider::{
-    provider_uses_agent_identity, selected_providers_for_group, use_group,
-};
+use codex_companion_provider::{provider_uses_agent_identity, selected_providers_for_group};
 use codex_companion_state::{
     doctor, install_companion_provider_with_token_source, install_direct_provider_with_options,
-    repair_state, DirectInstallOptions,
+    repair_state, CodexInstallSnapshot, DirectInstallOptions,
 };
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -69,28 +67,29 @@ impl CompanionDaemon {
         let previous_config = self.store.load()?;
         let previous_launch_mode = previous_config.app.last_codex_launch_mode.clone();
         let pending_relay_restart = previous_config.app.codex_restart_required_on_next_relay;
-        let group = use_group(&self.store, group_id)?;
-        let config = self.store.load()?;
+        let group = previous_config
+            .groups
+            .get(group_id)
+            .cloned()
+            .ok_or_else(|| CompanionError::InvalidConfig(format!("unknown group: {group_id}")))?;
         let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
-        let relay_installed = doctor(codex_dir.clone(), &config.relay)?.installed;
+        let relay_installed = doctor(codex_dir.clone(), &previous_config.relay)?.installed;
         let restart_required = relay_restart_required(
             relay_installed,
             previous_launch_mode.as_ref(),
             pending_relay_restart,
         );
-        let selected = selected_providers_for_group(&config, &group);
+        let selected = selected_providers_for_group(&previous_config, &group);
         let token_source = group_relay_token_source(&group, &selected);
-        let codex = install_companion_provider_with_token_source(
-            Some(codex_dir.clone()),
-            &config.relay,
-            Some(&token_source),
-        )?;
+        let (codex, install_snapshot) =
+            install_relay_for_launch(&codex_dir, &previous_config.relay, &token_source)?;
+        if let Err(error) =
+            self.commit_group_relay_launch(group_id, &previous_config.relay.base_url())
+        {
+            return Err(rollback_launch_install(install_snapshot, error));
+        }
         let repair = repair_for_launch(&codex_dir, COMPANION_PROVIDER_ID.to_string());
         let codex_launch = ensure_codex_started(restart_required);
-        self.record_codex_launch(
-            CodexLaunchMode::GroupRelay,
-            COMPANION_PROVIDER_ID.to_string(),
-        )?;
 
         Ok(CodexLaunchOutcome {
             mode: CodexLaunchMode::GroupRelay,
@@ -154,6 +153,7 @@ impl CompanionDaemon {
         };
 
         if should_direct {
+            let install_snapshot = CodexInstallSnapshot::capture(&codex_dir)?;
             let codex = install_direct_provider_with_options(
                 Some(codex_dir.clone()),
                 &provider,
@@ -161,11 +161,16 @@ impl CompanionDaemon {
                     preserve_official_codex_auth: config_snapshot.app.preserve_official_codex_auth,
                 },
             )?;
+            if let Err(error) = self.commit_direct_provider_launch(
+                &provider,
+                config_snapshot.app.preserve_official_codex_auth,
+            ) {
+                return Err(rollback_launch_install(install_snapshot, error));
+            }
             let target_provider_id = direct_repair_target_provider_id(&provider);
             let repair = repair_for_launch(&codex_dir, target_provider_id.clone());
             let restart_required = true;
             let codex_launch = restart_codex();
-            self.record_codex_launch(CodexLaunchMode::ProviderDirect, provider.id.clone())?;
             return Ok(CodexLaunchOutcome {
                 mode: CodexLaunchMode::ProviderDirect,
                 target_id: provider.id.clone(),
@@ -181,26 +186,22 @@ impl CompanionDaemon {
             });
         }
 
-        self.ensure_single_provider_group(&provider)?;
-        let config = self.store.load()?;
-        let relay_installed = doctor(codex_dir.clone(), &config.relay)?.installed;
+        let relay_installed = doctor(codex_dir.clone(), &config_snapshot.relay)?.installed;
         let restart_required = relay_restart_required(
             relay_installed,
             previous_launch_mode.as_ref(),
             pending_relay_restart,
         );
         let token_source = provider_relay_token_source(&provider);
-        let codex = install_companion_provider_with_token_source(
-            Some(codex_dir.clone()),
-            &config.relay,
-            Some(&token_source),
-        )?;
+        let (codex, install_snapshot) =
+            install_relay_for_launch(&codex_dir, &config_snapshot.relay, &token_source)?;
+        if let Err(error) =
+            self.commit_provider_relay_launch(&provider.id, &config_snapshot.relay.base_url())
+        {
+            return Err(rollback_launch_install(install_snapshot, error));
+        }
         let repair = repair_for_launch(&codex_dir, COMPANION_PROVIDER_ID.to_string());
         let codex_launch = ensure_codex_started(restart_required);
-        self.record_codex_launch(
-            CodexLaunchMode::ProviderRelay,
-            COMPANION_PROVIDER_ID.to_string(),
-        )?;
 
         Ok(CodexLaunchOutcome {
             mode: CodexLaunchMode::ProviderRelay,
@@ -226,31 +227,132 @@ impl CompanionDaemon {
         })
     }
 
-    fn ensure_single_provider_group(&self, provider: &ProviderConfig) -> Result<ProviderGroup> {
-        let group_id = single_provider_group_id(provider);
+    fn commit_direct_provider_launch(
+        &self,
+        expected_provider: &ProviderConfig,
+        expected_preserve_official_auth: bool,
+    ) -> Result<()> {
         self.store.update(|config| {
-            let group = ProviderGroup {
-                id: group_id.clone(),
-                name: format!("{} 单 Provider", provider.name),
-                policy: GroupPolicy::Manual,
-                provider_order: vec![provider.id.clone()],
-                provider_weights: Default::default(),
-                fallback_enabled: false,
-            };
-            config.groups.insert(group_id.clone(), group.clone());
-            config.relay.active_group_id = group_id;
-            config.health.remove(&provider.id);
-            Ok(group)
-        })
-    }
-
-    fn record_codex_launch(&self, mode: CodexLaunchMode, target_provider_id: String) -> Result<()> {
-        self.store.update(|config| {
-            config.app.last_codex_launch_mode = Some(mode.clone());
-            config.app.last_codex_target_provider_id = Some(target_provider_id);
+            let current = config
+                .providers
+                .get(&expected_provider.id)
+                .ok_or_else(|| {
+                    CompanionError::InvalidConfig(format!(
+                        "unknown provider: {}",
+                        expected_provider.id
+                    ))
+                })?;
+            if !same_direct_install_target(current, expected_provider)
+                || config.app.preserve_official_codex_auth != expected_preserve_official_auth
+            {
+                return Err(CompanionError::InvalidConfig(format!(
+                    "provider {} 的直连配置在启动过程中发生变化，已取消本次切换以避免 Codex 使用旧配置",
+                    expected_provider.id
+                )));
+            }
+            config.app.last_codex_launch_mode = Some(CodexLaunchMode::ProviderDirect);
+            config.app.last_codex_target_provider_id = Some(expected_provider.id.clone());
             config.app.codex_restart_required_on_next_relay = false;
             Ok(())
         })
+    }
+
+    fn commit_group_relay_launch(
+        &self,
+        group_id: &str,
+        expected_relay_base_url: &str,
+    ) -> Result<()> {
+        self.store.update(|config| {
+            ensure_relay_install_is_current(config, expected_relay_base_url)?;
+            if !config.groups.contains_key(group_id) {
+                return Err(CompanionError::InvalidConfig(format!(
+                    "unknown group: {group_id}"
+                )));
+            }
+            config.relay.active_group_id = group_id.to_string();
+            record_relay_launch(config, CodexLaunchMode::GroupRelay);
+            Ok(())
+        })
+    }
+
+    fn commit_provider_relay_launch(
+        &self,
+        provider_id: &str,
+        expected_relay_base_url: &str,
+    ) -> Result<ProviderGroup> {
+        self.store.update(|config| {
+            ensure_relay_install_is_current(config, expected_relay_base_url)?;
+            let provider = config.providers.get(provider_id).cloned().ok_or_else(|| {
+                CompanionError::InvalidConfig(format!("unknown provider: {provider_id}"))
+            })?;
+            let group = single_provider_group(&provider);
+            config.groups.insert(group.id.clone(), group.clone());
+            config.relay.active_group_id = group.id.clone();
+            record_relay_launch(config, CodexLaunchMode::ProviderRelay);
+            Ok(group)
+        })
+    }
+}
+
+fn same_direct_install_target(current: &ProviderConfig, expected: &ProviderConfig) -> bool {
+    current.id == expected.id
+        && current.name == expected.name
+        && current.kind == expected.kind
+        && current.base_url == expected.base_url
+        && effective_direct_auth_ref(current) == effective_direct_auth_ref(expected)
+}
+
+fn effective_direct_auth_ref(provider: &ProviderConfig) -> Option<&str> {
+    provider
+        .direct_auth_ref
+        .as_deref()
+        .or(provider.auth_ref.as_deref())
+}
+
+fn ensure_relay_install_is_current(
+    config: &codex_companion_core::CompanionConfig,
+    expected_relay_base_url: &str,
+) -> Result<()> {
+    let current = config.relay.base_url();
+    if current == expected_relay_base_url {
+        return Ok(());
+    }
+    Err(CompanionError::InvalidConfig(format!(
+        "本地代理地址在启动过程中从 {expected_relay_base_url} 变更为 {current}，已取消本次切换以避免 Codex 连接旧地址"
+    )))
+}
+
+fn record_relay_launch(config: &mut codex_companion_core::CompanionConfig, mode: CodexLaunchMode) {
+    config.app.last_codex_launch_mode = Some(mode);
+    config.app.last_codex_target_provider_id = Some(COMPANION_PROVIDER_ID.to_string());
+    config.app.codex_restart_required_on_next_relay = false;
+}
+
+fn install_relay_for_launch(
+    codex_dir: &Path,
+    relay: &RelayConfig,
+    token_source: &str,
+) -> Result<(CodexInstallStatus, CodexInstallSnapshot)> {
+    let snapshot = CodexInstallSnapshot::capture(codex_dir)?;
+    let codex = install_companion_provider_with_token_source(
+        Some(codex_dir.to_path_buf()),
+        relay,
+        Some(token_source),
+    )?;
+    Ok((codex, snapshot))
+}
+
+fn rollback_launch_install(
+    snapshot: CodexInstallSnapshot,
+    error: CompanionError,
+) -> CompanionError {
+    match snapshot.restore() {
+        Ok(()) => {
+            CompanionError::InvalidConfig(format!("{error}；启动未完成，Codex 配置已自动恢复"))
+        }
+        Err(rollback_error) => CompanionError::InvalidConfig(format!(
+            "{error}；自动恢复 Codex 配置失败: {rollback_error}"
+        )),
     }
 }
 
@@ -490,6 +592,17 @@ fn group_relay_token_source(group: &ProviderGroup, providers: &[ProviderConfig])
 
 pub fn single_provider_group_id(provider: &ProviderConfig) -> String {
     format!("{SINGLE_PROVIDER_GROUP_PREFIX}{}", provider.id)
+}
+
+fn single_provider_group(provider: &ProviderConfig) -> ProviderGroup {
+    ProviderGroup {
+        id: single_provider_group_id(provider),
+        name: format!("{} 单 Provider", provider.name),
+        policy: GroupPolicy::Manual,
+        provider_order: vec![provider.id.clone()],
+        provider_weights: Default::default(),
+        fallback_enabled: false,
+    }
 }
 
 pub(crate) fn direct_repair_target_provider_id(provider: &ProviderConfig) -> String {
@@ -971,8 +1084,12 @@ fn start_codex(target: &CodexLaunchTarget) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_companion_core::default_refresh_interval_seconds;
+    use codex_companion_core::{
+        default_refresh_interval_seconds, ConfigStore, HealthStatusKind, ProviderHealth,
+        DEFAULT_GROUP_ID,
+    };
     use std::collections::BTreeMap;
+    use std::fs;
 
     fn provider(kind: ProviderKind, auth_ref: Option<&str>) -> ProviderConfig {
         ProviderConfig {
@@ -1119,6 +1236,289 @@ mod tests {
 
         assert!(source.contains("environment variable OPENROUTER_API_KEY"));
         assert!(source.contains("Provider"));
+    }
+
+    #[test]
+    fn failed_group_launch_preserves_active_group_and_launch_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                config.groups.insert(
+                    "other".to_string(),
+                    ProviderGroup {
+                        id: "other".to_string(),
+                        name: "Other".to_string(),
+                        policy: GroupPolicy::Manual,
+                        provider_order: Vec::new(),
+                        provider_weights: Default::default(),
+                        fallback_enabled: false,
+                    },
+                );
+                Ok(())
+            })
+            .expect("seed config");
+        let invalid_codex_dir = temp.path().join("not-a-directory");
+        fs::write(&invalid_codex_dir, b"file").expect("invalid codex dir");
+        let daemon = CompanionDaemon::new(store.clone());
+
+        assert!(daemon
+            .launch_group("other", Some(invalid_codex_dir))
+            .is_err());
+
+        let config = store.load().expect("load config");
+        assert_eq!(config.relay.active_group_id, DEFAULT_GROUP_ID);
+        assert_eq!(config.app.last_codex_launch_mode, None);
+        assert_eq!(config.app.last_codex_target_provider_id, None);
+    }
+
+    #[test]
+    fn failed_provider_relay_launch_preserves_group_and_health() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let provider = provider(ProviderKind::OpenAiCompatible, None);
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .insert(provider.id.clone(), provider.clone());
+                config.health.insert(
+                    provider.id.clone(),
+                    ProviderHealth {
+                        status: HealthStatusKind::AuthFailed,
+                        ..ProviderHealth::default()
+                    },
+                );
+                Ok(())
+            })
+            .expect("seed config");
+        let invalid_codex_dir = temp.path().join("not-a-directory");
+        fs::write(&invalid_codex_dir, b"file").expect("invalid codex dir");
+        let daemon = CompanionDaemon::new(store.clone());
+
+        assert!(daemon
+            .launch_provider_with_mode(
+                &provider.id,
+                Some(invalid_codex_dir),
+                ProviderLaunchMode::Relay,
+            )
+            .is_err());
+
+        let config = store.load().expect("load config");
+        assert_eq!(config.relay.active_group_id, DEFAULT_GROUP_ID);
+        assert!(!config
+            .groups
+            .contains_key(&single_provider_group_id(&provider)));
+        assert_eq!(
+            config.health.get(&provider.id).map(|health| &health.status),
+            Some(&HealthStatusKind::AuthFailed)
+        );
+        assert_eq!(config.app.last_codex_launch_mode, None);
+    }
+
+    #[test]
+    fn provider_relay_commit_rejects_a_provider_removed_after_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let provider = provider(ProviderKind::OpenAiCompatible, None);
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .insert(provider.id.clone(), provider.clone());
+                Ok(())
+            })
+            .expect("seed provider");
+        let expected_relay_base_url = store.load().expect("config").relay.base_url();
+        let daemon = CompanionDaemon::new(store.clone());
+        store
+            .update(|config| {
+                config.providers.remove(&provider.id);
+                Ok(())
+            })
+            .expect("remove provider");
+
+        assert!(daemon
+            .commit_provider_relay_launch(&provider.id, &expected_relay_base_url)
+            .is_err());
+
+        let config = store.load().expect("load config");
+        assert_eq!(config.relay.active_group_id, DEFAULT_GROUP_ID);
+        assert!(!config
+            .groups
+            .contains_key(&single_provider_group_id(&provider)));
+        assert_eq!(config.app.last_codex_launch_mode, None);
+    }
+
+    #[test]
+    fn provider_relay_commit_rejects_a_changed_relay_address() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let provider = provider(ProviderKind::OpenAiCompatible, None);
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .insert(provider.id.clone(), provider.clone());
+                Ok(())
+            })
+            .expect("seed provider");
+        let expected_relay_base_url = store.load().expect("config").relay.base_url();
+        store
+            .update(|config| {
+                config.relay.port = config.relay.port.saturating_add(1);
+                Ok(())
+            })
+            .expect("change relay address");
+        let daemon = CompanionDaemon::new(store.clone());
+
+        assert!(daemon
+            .commit_provider_relay_launch(&provider.id, &expected_relay_base_url)
+            .is_err());
+
+        let config = store.load().expect("load config");
+        assert!(!config
+            .groups
+            .contains_key(&single_provider_group_id(&provider)));
+        assert_eq!(config.relay.active_group_id, DEFAULT_GROUP_ID);
+        assert_eq!(config.app.last_codex_launch_mode, None);
+    }
+
+    #[test]
+    fn direct_provider_commit_rejects_a_changed_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let provider = provider(
+            ProviderKind::OpenAiCompatible,
+            Some("env:CODEX_COMPANION_TEST_KEY"),
+        );
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .insert(provider.id.clone(), provider.clone());
+                Ok(())
+            })
+            .expect("seed provider");
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .get_mut(&provider.id)
+                    .expect("provider")
+                    .base_url = "https://changed.example.com/v1".to_string();
+                Ok(())
+            })
+            .expect("change provider");
+        let daemon = CompanionDaemon::new(store.clone());
+
+        assert!(daemon
+            .commit_direct_provider_launch(&provider, false)
+            .is_err());
+
+        let config = store.load().expect("load config");
+        assert_eq!(config.app.last_codex_launch_mode, None);
+        assert_eq!(config.app.last_codex_target_provider_id, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_commit_failure_restores_codex_install_state() {
+        use std::os::fd::AsRawFd;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let companion_config = temp.path().join("companion-config.json");
+        fs::write(
+            &companion_config,
+            serde_json::to_string_pretty(&codex_companion_core::CompanionConfig::default())
+                .expect("serialize config"),
+        )
+        .expect("write companion config");
+        let companion_file = fs::File::open(&companion_config).expect("open companion config");
+        let store = ConfigStore::new(PathBuf::from(format!(
+            "/dev/fd/{}",
+            companion_file.as_raw_fd()
+        )));
+
+        let codex_dir = temp.path().join("codex");
+        fs::create_dir_all(&codex_dir).expect("codex dir");
+        let original_config = concat!(
+            "model_provider = \"openai\"\n\n",
+            "[model_providers.openai]\n",
+            "name = \"OpenAI\"\n",
+            "base_url = \"https://api.openai.com/v1\"\n"
+        );
+        fs::write(codex_dir.join("config.toml"), original_config).expect("codex config");
+
+        let daemon = CompanionDaemon::new(store);
+        let error = daemon
+            .launch_group(DEFAULT_GROUP_ID, Some(codex_dir.clone()))
+            .expect_err("companion commit must fail");
+
+        assert!(
+            error.to_string().contains("Codex 配置已自动恢复"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(codex_dir.join("config.toml")).expect("restored config"),
+            original_config
+        );
+        assert!(!codex_dir
+            .join("backups/codex-companion/managed-state.json")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_launch_commit_failure_restores_codex_install_state() {
+        use std::os::fd::AsRawFd;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider = provider(
+            ProviderKind::OpenAiCompatible,
+            Some("env:CODEX_COMPANION_TEST_KEY"),
+        );
+        let mut companion = codex_companion_core::CompanionConfig::default();
+        companion
+            .providers
+            .insert(provider.id.clone(), provider.clone());
+        let companion_config = temp.path().join("companion-config.json");
+        fs::write(
+            &companion_config,
+            serde_json::to_string_pretty(&companion).expect("serialize config"),
+        )
+        .expect("write companion config");
+        let companion_file = fs::File::open(&companion_config).expect("open companion config");
+        let store = ConfigStore::new(PathBuf::from(format!(
+            "/dev/fd/{}",
+            companion_file.as_raw_fd()
+        )));
+
+        let codex_dir = temp.path().join("codex");
+        fs::create_dir_all(&codex_dir).expect("codex dir");
+        let original_config = "model_provider = \"openai\"\n";
+        fs::write(codex_dir.join("config.toml"), original_config).expect("codex config");
+
+        let daemon = CompanionDaemon::new(store);
+        let error = daemon
+            .launch_provider_with_mode(
+                &provider.id,
+                Some(codex_dir.clone()),
+                ProviderLaunchMode::Direct,
+            )
+            .expect_err("companion commit must fail");
+
+        assert!(
+            error.to_string().contains("Codex 配置已自动恢复"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(codex_dir.join("config.toml")).expect("restored config"),
+            original_config
+        );
+        assert!(!codex_dir
+            .join("backups/codex-companion/managed-state.json")
+            .exists());
     }
 
     #[cfg(not(target_os = "windows"))]

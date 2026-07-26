@@ -1,9 +1,11 @@
 use crate::content_encoding::{
     decode_request_body, RequestBodyDecodeError, MAX_REQUEST_BODY_BYTES,
 };
-use crate::events::{append_event, update_health};
+use crate::events::{append_event, record_health_success, update_health};
 use crate::state::{apply_group_policy, RelayState};
-use crate::upstream::{send_upstream, stream_response, text_response, upstream_url};
+use crate::upstream::{
+    send_upstream, stream_response, text_response, upstream_url, UpstreamRequest,
+};
 use crate::{RequestLogFinish, RequestLogStart};
 use axum::{
     body::Body,
@@ -17,8 +19,7 @@ use codex_companion_core::{
     HealthStatusKind, ProviderKind,
 };
 use codex_companion_health::{
-    classify_failure, cooldown_active, mark_failure, mark_model_failure, mark_success,
-    normalize_expired_cooldown,
+    classify_failure, cooldown_active, mark_failure, mark_model_failure, normalize_expired_cooldown,
 };
 use codex_companion_provider::selected_providers_for_group;
 use futures_util::StreamExt;
@@ -391,12 +392,7 @@ async fn proxy_dispatch(
         match send_upstream(
             &state.client,
             &state.api_service,
-            &provider,
-            &method,
-            &uri,
-            &headers,
-            body.clone(),
-            &upstream,
+            UpstreamRequest::new(&provider, &method, &uri, &headers, body.clone(), &upstream),
         )
         .await
         {
@@ -461,7 +457,7 @@ async fn proxy_dispatch(
                     if let Some(model) = requested_model.as_deref() {
                         let _ = state.api_service.clear_model_cooldown(&provider.id, model);
                     }
-                    update_health(&state.store, &provider.id, mark_success);
+                    record_health_success(&state.store, &provider.id);
                     append_event(
                         &state.store,
                         "stream",

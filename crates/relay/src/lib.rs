@@ -9,4 +9,4 @@ mod websocket;
 
 pub use api_service::{ApiServiceStore, RequestLogFinish, RequestLogStart};
 pub use events::read_recent_events;
-pub use server::{serve, RelayStartOutcome};
+pub use server::{serve, BoundRelay, RelayStartOutcome};

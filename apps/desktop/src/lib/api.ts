@@ -549,14 +549,16 @@ export function importApiKeyProvider(input: {
     });
   }
   return invoke<ProviderImportOutcome>("import_api_key_provider", {
-    providerName: input.providerName,
-    kind: input.kind,
-    baseUrl: input.baseUrl,
-    websocketUrl: emptyToNull(input.websocketUrl),
-    apiKey: input.apiKey,
-    envVar: emptyToNull(input.envVar),
-    model: emptyToNull(input.model),
-    refreshIntervalSeconds: input.refreshIntervalSeconds ?? null,
+    input: {
+      providerName: input.providerName,
+      kind: input.kind,
+      baseUrl: input.baseUrl,
+      websocketUrl: emptyToNull(input.websocketUrl),
+      apiKey: input.apiKey,
+      envVar: emptyToNull(input.envVar),
+      model: emptyToNull(input.model),
+      refreshIntervalSeconds: input.refreshIntervalSeconds ?? null,
+    },
   });
 }
 

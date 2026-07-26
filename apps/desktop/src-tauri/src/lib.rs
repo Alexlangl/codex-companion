@@ -1,10 +1,11 @@
 use codex_companion_core::{
-    default_codex_dir, ApiClientCreate, ApiClientUpdate, ProviderKind, ProviderLaunchMode,
-    ProviderViewMode, RelaySettingsUpdate, RepairOptions, ThemeMode,
+    default_codex_dir, ApiClientCreate, ApiClientUpdate, ProviderLaunchMode, ProviderViewMode,
+    RelaySettingsUpdate, RepairOptions, ThemeMode,
 };
 use codex_companion_daemon::CompanionDaemon;
 use codex_companion_provider::{
-    ApiKeyProviderUpdate, GroupUpsert, ProviderExportFormat, ProviderUpsert,
+    ApiKeyProviderImportRequest, ApiKeyProviderUpdate, GroupUpsert, ProviderExportFormat,
+    ProviderUpsert,
 };
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -196,26 +197,10 @@ fn import_provider_json_many(
 
 #[tauri::command]
 fn import_api_key_provider(
-    provider_name: String,
-    kind: ProviderKind,
-    base_url: String,
-    websocket_url: Option<String>,
-    api_key: String,
-    env_var: Option<String>,
-    model: Option<String>,
-    refresh_interval_seconds: Option<u64>,
+    input: ApiKeyProviderImportRequest,
 ) -> Result<codex_companion_provider::ProviderImportOutcome, String> {
     daemon()?
-        .import_api_key_provider(
-            provider_name,
-            kind,
-            base_url,
-            websocket_url,
-            api_key,
-            env_var,
-            model,
-            refresh_interval_seconds,
-        )
+        .import_api_key_provider_request(input)
         .map_err(|error| error.to_string())
 }
 

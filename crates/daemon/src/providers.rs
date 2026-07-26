@@ -1,15 +1,12 @@
-use crate::health_loop::{
-    begin_refresh, finish_refresh, mark_refresh_provider, refresh_coordinator,
-};
+use crate::health_loop::{refresh_coordinator, RefreshProgressGuard};
 use crate::runtime::CompanionDaemon;
-use codex_companion_core::{
-    ProviderConfig, ProviderHealth, ProviderImportProgress, ProviderKind, Result,
-};
+use codex_companion_core::{ProviderConfig, ProviderHealth, ProviderImportProgress, Result};
 use codex_companion_provider::{
-    add_provider, export_provider_json, import_api_key_provider, import_local_codex_provider,
-    import_provider_json, import_provider_json_many, list_providers, refresh_provider_status,
-    remove_provider, test_provider, ApiKeyProviderUpdate, ProviderExportFormat,
-    ProviderExportOutput, ProviderImportBatchReport, ProviderImportOutcome, ProviderUpsert,
+    add_provider, export_provider_json, import_api_key_provider, import_api_key_provider_request,
+    import_local_codex_provider, import_provider_json, import_provider_json_many, list_providers,
+    refresh_provider_status, remove_provider, test_provider, ApiKeyProviderImportRequest,
+    ApiKeyProviderUpdate, ProviderExportFormat, ProviderExportOutput, ProviderImportBatchReport,
+    ProviderImportOutcome, ProviderUpsert,
 };
 use std::path::PathBuf;
 
@@ -63,7 +60,7 @@ impl CompanionDaemon {
     pub fn import_api_key_provider(
         &self,
         provider_name: String,
-        kind: ProviderKind,
+        kind: codex_companion_core::ProviderKind,
         base_url: String,
         websocket_url: Option<String>,
         api_key: String,
@@ -82,6 +79,13 @@ impl CompanionDaemon {
             model,
             refresh_interval_seconds,
         )
+    }
+
+    pub fn import_api_key_provider_request(
+        &self,
+        input: ApiKeyProviderImportRequest,
+    ) -> Result<ProviderImportOutcome> {
+        import_api_key_provider_request(&self.store, input)
     }
 
     pub fn import_local_codex_provider(
@@ -113,10 +117,10 @@ impl CompanionDaemon {
 
     pub async fn refresh_provider(&self, id: &str) -> Result<ProviderHealth> {
         let _guard = refresh_coordinator().lock().await;
-        begin_refresh(&self.store, &[id.to_string()]);
-        mark_refresh_provider(&self.store, id, 0);
+        let progress = RefreshProgressGuard::begin(&self.store, &[id.to_string()]);
+        progress.mark_provider(id, 0);
         let result = refresh_provider_status(&self.store, id).await;
-        finish_refresh(&self.store, result.as_ref().err().map(ToString::to_string));
+        progress.finish(result.as_ref().err().map(ToString::to_string));
         result
     }
 
@@ -129,20 +133,20 @@ impl CompanionDaemon {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        begin_refresh(&self.store, &ids);
+        let progress = RefreshProgressGuard::begin(&self.store, &ids);
         let mut output = Vec::new();
         let mut first_error = None;
         for (index, id) in ids.iter().enumerate() {
-            mark_refresh_provider(&self.store, id, index);
+            progress.mark_provider(id, index);
             match refresh_provider_status(&self.store, id).await {
                 Ok(health) => output.push(health),
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
             }
-            mark_refresh_provider(&self.store, id, index + 1);
+            progress.mark_provider(id, index + 1);
         }
-        finish_refresh(&self.store, first_error.as_ref().map(ToString::to_string));
+        progress.finish(first_error.as_ref().map(ToString::to_string));
         first_error.map_or(Ok(output), Err)
     }
 }

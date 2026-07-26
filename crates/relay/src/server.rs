@@ -19,19 +19,43 @@ pub struct RelayStartOutcome {
     pub base_url: String,
 }
 
+pub struct BoundRelay {
+    store: ConfigStore,
+    listener: tokio::net::TcpListener,
+    outcome: RelayStartOutcome,
+}
+
+impl BoundRelay {
+    pub async fn bind(store: ConfigStore) -> anyhow::Result<Self> {
+        let config = store.load()?;
+        let bind_addr = config.relay.bind_addr();
+        let base_url = config.relay.base_url();
+        let addr: SocketAddr = bind_addr.parse()?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        Ok(Self {
+            store,
+            listener,
+            outcome: RelayStartOutcome {
+                bind_addr,
+                base_url,
+            },
+        })
+    }
+
+    pub fn outcome(&self) -> RelayStartOutcome {
+        self.outcome.clone()
+    }
+
+    pub async fn serve(self) -> anyhow::Result<RelayStartOutcome> {
+        let state = RelayState::new(self.store, reqwest::Client::new());
+        let app = relay_router(state);
+        axum::serve(self.listener, app).await?;
+        Ok(self.outcome)
+    }
+}
+
 pub async fn serve(store: ConfigStore) -> anyhow::Result<RelayStartOutcome> {
-    let config = store.load()?;
-    let bind_addr = config.relay.bind_addr();
-    let base_url = config.relay.base_url();
-    let addr: SocketAddr = bind_addr.parse()?;
-    let state = RelayState::new(store, reqwest::Client::new());
-    let app = relay_router(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(RelayStartOutcome {
-        bind_addr,
-        base_url,
-    })
+    BoundRelay::bind(store).await?.serve().await
 }
 
 fn relay_router(state: RelayState) -> Router {

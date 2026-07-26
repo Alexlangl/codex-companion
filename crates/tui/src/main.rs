@@ -433,15 +433,17 @@ fn add_api_key(daemon: &CompanionDaemon, app: &mut TuiState) {
     let Some(api_key) = prompt("API Key") else {
         return;
     };
-    match daemon.import_api_key_provider(
-        name,
-        ProviderKind::OpenAiCompatible,
-        base_url,
-        None,
-        api_key,
-        None,
-        None,
-        Some(60),
+    match daemon.import_api_key_provider_request(
+        codex_companion_provider::ApiKeyProviderImportRequest {
+            provider_name: name,
+            kind: ProviderKind::OpenAiCompatible,
+            base_url,
+            websocket_url: None,
+            api_key,
+            env_var: None,
+            model: None,
+            refresh_interval_seconds: Some(60),
+        },
     ) {
         Ok(outcome) => app.message = format!("已添加账号：{}", outcome.provider.name),
         Err(error) => app.message = format!("添加失败：{error}"),

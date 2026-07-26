@@ -23,7 +23,7 @@ pub(crate) async fn responses_websocket(
 ) -> Response {
     let api_client = match authenticate_websocket_client(&state, &headers) {
         Ok(api_client) => api_client,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let allowed_models = api_client
         .map(|api_client| api_client.allowed_models)
@@ -55,14 +55,42 @@ pub(crate) async fn responses_websocket(
     response
 }
 
+#[derive(Debug)]
+struct WebSocketAuthError {
+    status: StatusCode,
+    message: String,
+}
+
+impl WebSocketAuthError {
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for WebSocketAuthError {
+    fn into_response(self) -> Response {
+        (self.status, self.message).into_response()
+    }
+}
+
 fn authenticate_websocket_client(
     state: &RelayState,
     headers: &HeaderMap,
-) -> Result<Option<ApiClient>, Response> {
+) -> Result<Option<ApiClient>, WebSocketAuthError> {
     let config = state
         .store
         .load()
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response())?;
+        .map_err(|error| WebSocketAuthError::internal(error.to_string()))?;
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -77,12 +105,14 @@ fn authenticate_websocket_client(
     let api_client = token
         .map(|token| state.api_service.authenticate(token))
         .transpose()
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response())?
+        .map_err(|error| WebSocketAuthError::internal(error.to_string()))?
         .flatten();
     if api_client.is_none()
         && (config.relay.require_api_key || headers.contains_key(header::ORIGIN))
     {
-        return Err((StatusCode::UNAUTHORIZED, "WebSocket API key 无效或缺失").into_response());
+        return Err(WebSocketAuthError::unauthorized(
+            "WebSocket API key 无效或缺失",
+        ));
     }
     Ok(api_client)
 }
@@ -468,7 +498,7 @@ mod tests {
 
         let missing =
             authenticate_websocket_client(&state, &HeaderMap::new()).expect_err("missing key");
-        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(missing.status, StatusCode::UNAUTHORIZED);
 
         let mut headers = HeaderMap::new();
         headers.insert(

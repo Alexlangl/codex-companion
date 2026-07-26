@@ -755,7 +755,7 @@ fn period_start(period: Period) -> String {
         .and_time(NaiveTime::MIN)
         .and_local_timezone(Local)
         .single()
-        .unwrap_or_else(|| Local::now());
+        .unwrap_or_else(Local::now);
     timestamp(local.with_timezone(&Utc))
 }
 

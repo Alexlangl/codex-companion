@@ -11,6 +11,7 @@ use codex_companion_core::{
     COMPANION_PROVIDER_ID,
 };
 use ed25519_dalek::{pkcs8::DecodePrivateKey, SigningKey};
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::fs;
@@ -351,6 +352,19 @@ fn finish_provider_import_progress(succeeded: usize, failed: usize) {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyProviderImportRequest {
+    pub provider_name: String,
+    pub kind: ProviderKind,
+    pub base_url: String,
+    pub websocket_url: Option<String>,
+    pub api_key: String,
+    pub env_var: Option<String>,
+    pub model: Option<String>,
+    pub refresh_interval_seconds: Option<u64>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn import_api_key_provider(
     store: &ConfigStore,
@@ -363,9 +377,35 @@ pub fn import_api_key_provider(
     model: Option<String>,
     refresh_interval_seconds: Option<u64>,
 ) -> Result<ProviderImportOutcome> {
-    import_api_key_provider_with_metadata(
+    import_api_key_provider_request(
         store,
-        None,
+        ApiKeyProviderImportRequest {
+            provider_name,
+            kind,
+            base_url,
+            websocket_url,
+            api_key,
+            env_var,
+            model,
+            refresh_interval_seconds,
+        },
+    )
+}
+
+pub fn import_api_key_provider_request(
+    store: &ConfigStore,
+    input: ApiKeyProviderImportRequest,
+) -> Result<ProviderImportOutcome> {
+    import_api_key_provider_with_metadata(store, input, None, None)
+}
+
+fn import_api_key_provider_with_metadata(
+    store: &ConfigStore,
+    input: ApiKeyProviderImportRequest,
+    provider_id: Option<String>,
+    account_email: Option<String>,
+) -> Result<ProviderImportOutcome> {
+    let ApiKeyProviderImportRequest {
         provider_name,
         kind,
         base_url,
@@ -374,24 +414,7 @@ pub fn import_api_key_provider(
         env_var,
         model,
         refresh_interval_seconds,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn import_api_key_provider_with_metadata(
-    store: &ConfigStore,
-    provider_id: Option<String>,
-    provider_name: String,
-    kind: ProviderKind,
-    base_url: String,
-    websocket_url: Option<String>,
-    api_key: String,
-    env_var: Option<String>,
-    model: Option<String>,
-    refresh_interval_seconds: Option<u64>,
-    account_email: Option<String>,
-) -> Result<ProviderImportOutcome> {
+    } = input;
     let provider_name = normalize_non_empty(&provider_name)
         .ok_or_else(|| CompanionError::InvalidConfig("provider 名称不能为空".to_string()))?;
     let api_key = normalize_non_empty(&api_key);
@@ -510,15 +533,17 @@ fn import_api_key_provider_from_json(
 
     import_api_key_provider_with_metadata(
         store,
+        ApiKeyProviderImportRequest {
+            provider_name,
+            kind,
+            base_url,
+            websocket_url,
+            api_key,
+            env_var: None,
+            model,
+            refresh_interval_seconds: None,
+        },
         provider_id,
-        provider_name,
-        kind,
-        base_url,
-        websocket_url,
-        api_key,
-        None,
-        model,
-        None,
         email,
     )
 }
@@ -599,21 +624,23 @@ pub fn import_local_codex_provider(
         let api_key = extract_api_key(&value).ok_or_else(|| {
             CompanionError::InvalidConfig("auth.json 缺少 OPENAI_API_KEY".to_string())
         })?;
-        return import_api_key_provider(
+        return import_api_key_provider_request(
             store,
-            config_provider.provider_name.clone().unwrap_or_else(|| {
-                provider_name_from_base_url(config_provider.base_url.as_deref())
-            }),
-            ProviderKind::OpenAiCompatible,
-            config_provider
-                .base_url
-                .clone()
-                .unwrap_or_else(default_openai_api_base_url),
-            None,
-            api_key,
-            config_provider.api_key_env_var.clone(),
-            config_provider.model.clone(),
-            None,
+            ApiKeyProviderImportRequest {
+                provider_name: config_provider.provider_name.clone().unwrap_or_else(|| {
+                    provider_name_from_base_url(config_provider.base_url.as_deref())
+                }),
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: config_provider
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(default_openai_api_base_url),
+                websocket_url: None,
+                api_key,
+                env_var: config_provider.api_key_env_var.clone(),
+                model: config_provider.model.clone(),
+                refresh_interval_seconds: None,
+            },
         );
     }
 
@@ -662,21 +689,23 @@ pub fn import_local_codex_provider(
     }
 
     if let Some(api_key) = extract_api_key(&value) {
-        return import_api_key_provider(
+        return import_api_key_provider_request(
             store,
-            config_provider.provider_name.clone().unwrap_or_else(|| {
-                provider_name_from_base_url(config_provider.base_url.as_deref())
-            }),
-            ProviderKind::OpenAiCompatible,
-            config_provider
-                .base_url
-                .clone()
-                .unwrap_or_else(default_openai_api_base_url),
-            None,
-            api_key,
-            config_provider.api_key_env_var.clone(),
-            config_provider.model.clone(),
-            None,
+            ApiKeyProviderImportRequest {
+                provider_name: config_provider.provider_name.clone().unwrap_or_else(|| {
+                    provider_name_from_base_url(config_provider.base_url.as_deref())
+                }),
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: config_provider
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(default_openai_api_base_url),
+                websocket_url: None,
+                api_key,
+                env_var: config_provider.api_key_env_var.clone(),
+                model: config_provider.model.clone(),
+                refresh_interval_seconds: None,
+            },
         );
     }
 

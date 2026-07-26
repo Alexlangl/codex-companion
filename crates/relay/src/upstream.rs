@@ -150,16 +150,56 @@ enum ResponseTransform {
     OfficialCodexStreamToResponse,
 }
 
+pub(crate) struct UpstreamRequest<'a> {
+    provider: &'a ProviderConfig,
+    method: &'a Method,
+    uri: &'a Uri,
+    headers: &'a HeaderMap,
+    body: Bytes,
+    upstream: &'a str,
+}
+
+impl<'a> UpstreamRequest<'a> {
+    pub(crate) fn new(
+        provider: &'a ProviderConfig,
+        method: &'a Method,
+        uri: &'a Uri,
+        headers: &'a HeaderMap,
+        body: Bytes,
+        upstream: &'a str,
+    ) -> Self {
+        Self {
+            provider,
+            method,
+            uri,
+            headers,
+            body,
+            upstream,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UpstreamRequestHeaders<'a> {
+    official_codex: bool,
+    authorization: Option<&'a str>,
+    chatgpt_account_id: Option<&'a str>,
+    session_identity: Option<&'a str>,
+}
+
 pub(crate) async fn send_upstream(
     client: &reqwest::Client,
     api_service: &ApiServiceStore,
-    provider: &ProviderConfig,
-    method: &Method,
-    uri: &Uri,
-    headers: &HeaderMap,
-    body: Bytes,
-    upstream: &str,
+    request: UpstreamRequest<'_>,
 ) -> std::result::Result<UpstreamResponse, String> {
+    let UpstreamRequest {
+        provider,
+        method,
+        uri,
+        headers,
+        body,
+        upstream,
+    } = request;
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|error| format!("invalid method: {error}"))?;
     let transform = match response_transform(provider, method, uri) {
@@ -225,10 +265,12 @@ pub(crate) async fn send_upstream(
         &reqwest_method,
         &upstream,
         headers,
-        provider.kind == ProviderKind::OfficialCodex,
-        authorization.as_deref(),
-        chatgpt_account_id.as_deref(),
-        session_identity.as_deref(),
+        UpstreamRequestHeaders {
+            official_codex: provider.kind == ProviderKind::OfficialCodex,
+            authorization: authorization.as_deref(),
+            chatgpt_account_id: chatgpt_account_id.as_deref(),
+            session_identity: session_identity.as_deref(),
+        },
     )
     .body(body.clone())
     .send()
@@ -255,10 +297,12 @@ pub(crate) async fn send_upstream(
                 &reqwest_method,
                 &upstream,
                 headers,
-                true,
-                Some(&auth.header),
-                chatgpt_account_id.as_deref(),
-                session_identity.as_deref(),
+                UpstreamRequestHeaders {
+                    official_codex: true,
+                    authorization: Some(&auth.header),
+                    chatgpt_account_id: chatgpt_account_id.as_deref(),
+                    session_identity: session_identity.as_deref(),
+                },
             )
             .body(body.clone())
             .send()
@@ -320,11 +364,14 @@ fn build_upstream_request(
     method: &reqwest::Method,
     upstream: &str,
     headers: &HeaderMap,
-    official_codex: bool,
-    authorization: Option<&str>,
-    chatgpt_account_id: Option<&str>,
-    session_identity: Option<&str>,
+    request_headers: UpstreamRequestHeaders<'_>,
 ) -> reqwest::RequestBuilder {
+    let UpstreamRequestHeaders {
+        official_codex,
+        authorization,
+        chatgpt_account_id,
+        session_identity,
+    } = request_headers;
     let mut request = client.request(method.clone(), upstream);
     for (name, value) in headers {
         // Accept-Encoding 必须剥掉：relay 未启用响应解压，压缩响应会破坏 SSE 预检和协议转换。
@@ -2824,10 +2871,12 @@ mod tests {
             &reqwest::Method::POST,
             "https://api.example.com/v1/responses",
             &headers,
-            false,
-            Some("Bearer upstream-token"),
-            None,
-            None,
+            UpstreamRequestHeaders {
+                official_codex: false,
+                authorization: Some("Bearer upstream-token"),
+                chatgpt_account_id: None,
+                session_identity: None,
+            },
         )
         .build()
         .expect("request");

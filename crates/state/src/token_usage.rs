@@ -184,6 +184,14 @@ struct ParsedTokenUsageFile {
     suspected_duplicate: bool,
 }
 
+struct TokenUsageSummaryInput {
+    codex_dir: PathBuf,
+    files_scanned: usize,
+    deferred_files: usize,
+    suspected_duplicates: usize,
+    events: Vec<TokenUsageEvent>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplayResolution {
     NotApplicable,
@@ -204,11 +212,13 @@ pub fn collect_token_usage(codex_dir: PathBuf) -> Result<TokenUsageSummary> {
         all_events.extend(parsed.events);
     }
     Ok(summarize_token_events(
-        codex_dir,
-        files.len(),
-        deferred_files,
-        suspected_duplicates,
-        all_events,
+        TokenUsageSummaryInput {
+            codex_dir,
+            files_scanned: files.len(),
+            deferred_files,
+            suspected_duplicates,
+            events: all_events,
+        },
         &PricingCatalog::builtin(),
         &TokenUsageDateRange::default(),
         &TokenUsageFilters::default(),
@@ -325,11 +335,13 @@ fn collect_token_usage_cached_inner(
     let pricing_path = default_pricing_override_path(&cache_dir);
     let catalog = PricingCatalog::builtin().load_override(&pricing_path)?;
     Ok(summarize_token_events(
-        codex_dir,
-        files.len(),
-        deferred_files,
-        suspected_duplicates,
-        all_events,
+        TokenUsageSummaryInput {
+            codex_dir,
+            files_scanned: files.len(),
+            deferred_files,
+            suspected_duplicates,
+            events: all_events,
+        },
         &catalog,
         date_range,
         filters,
@@ -376,15 +388,18 @@ pub fn rebuild_token_usage_cached_with_filters(
 }
 
 fn summarize_token_events(
-    codex_dir: PathBuf,
-    files_scanned: usize,
-    deferred_files: usize,
-    suspected_duplicates: usize,
-    events: Vec<TokenUsageEvent>,
+    input: TokenUsageSummaryInput,
     pricing: &PricingCatalog,
     date_range: &TokenUsageDateRange,
     filters: &TokenUsageFilters,
 ) -> TokenUsageSummary {
+    let TokenUsageSummaryInput {
+        codex_dir,
+        files_scanned,
+        deferred_files,
+        suspected_duplicates,
+        events,
+    } = input;
     let mut summary = TokenUsageSummary {
         codex_dir,
         files_scanned,
@@ -1347,11 +1362,13 @@ mod tests {
             usage_event("after", "provider-after", 2026, 7, 13, 400),
         ];
         let summary = summarize_token_events(
-            PathBuf::from("/tmp/codex"),
-            4,
-            0,
-            0,
-            events,
+            TokenUsageSummaryInput {
+                codex_dir: PathBuf::from("/tmp/codex"),
+                files_scanned: 4,
+                deferred_files: 0,
+                suspected_duplicates: 0,
+                events,
+            },
             &PricingCatalog::builtin(),
             &range,
             &TokenUsageFilters::default(),
@@ -1380,11 +1397,13 @@ mod tests {
         ];
         let filters = TokenUsageFilters::parse(Some("provider-a"), Some("model-b"));
         let summary = summarize_token_events(
-            PathBuf::from("/tmp/codex"),
-            3,
-            0,
-            0,
-            events,
+            TokenUsageSummaryInput {
+                codex_dir: PathBuf::from("/tmp/codex"),
+                files_scanned: 3,
+                deferred_files: 0,
+                suspected_duplicates: 0,
+                events,
+            },
             &PricingCatalog::builtin(),
             &TokenUsageDateRange::default(),
             &filters,
@@ -1413,11 +1432,13 @@ mod tests {
         first.event_id = Some(stable_event_id(&first, 10));
         second.event_id = Some(stable_event_id(&second, 11));
         let summary = summarize_token_events(
-            PathBuf::from("/tmp/codex"),
-            1,
-            0,
-            0,
-            vec![first, second],
+            TokenUsageSummaryInput {
+                codex_dir: PathBuf::from("/tmp/codex"),
+                files_scanned: 1,
+                deferred_files: 0,
+                suspected_duplicates: 0,
+                events: vec![first, second],
+            },
             &PricingCatalog::builtin(),
             &TokenUsageDateRange::default(),
             &TokenUsageFilters::default(),

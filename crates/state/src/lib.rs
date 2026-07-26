@@ -799,25 +799,88 @@ impl AuthRollback {
 #[derive(Debug, Clone)]
 struct ConfigRollback {
     bytes: Option<Vec<u8>>,
+    permissions: Option<fs::Permissions>,
 }
 
 impl ConfigRollback {
     fn capture(config_path: &Path) -> Result<Self> {
-        let bytes = if config_path.exists() {
-            Some(fs::read(config_path).map_err(|source| CompanionError::io(config_path, source))?)
+        let (bytes, permissions) = if config_path.exists() {
+            let metadata = fs::metadata(config_path)
+                .map_err(|source| CompanionError::io(config_path, source))?;
+            (
+                Some(
+                    fs::read(config_path)
+                        .map_err(|source| CompanionError::io(config_path, source))?,
+                ),
+                Some(metadata.permissions()),
+            )
         } else {
-            None
+            (None, None)
         };
-        Ok(Self { bytes })
+        Ok(Self { bytes, permissions })
     }
 
     fn restore(&self, config_path: &Path) -> Result<()> {
         match self.bytes.as_deref() {
-            Some(bytes) => fs::write(config_path, bytes)
-                .map_err(|source| CompanionError::io(config_path, source)),
+            Some(bytes) => {
+                fs::write(config_path, bytes)
+                    .map_err(|source| CompanionError::io(config_path, source))?;
+                if let Some(permissions) = self.permissions.clone() {
+                    fs::set_permissions(config_path, permissions)
+                        .map_err(|source| CompanionError::io(config_path, source))?;
+                }
+                Ok(())
+            }
             None if config_path.exists() => fs::remove_file(config_path)
                 .map_err(|source| CompanionError::io(config_path, source)),
             None => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexInstallSnapshot {
+    config_path: PathBuf,
+    auth_path: PathBuf,
+    state_path: PathBuf,
+    config: ConfigRollback,
+    auth: ConfigRollback,
+    state: ConfigRollback,
+}
+
+impl CodexInstallSnapshot {
+    pub fn capture(codex_dir: &Path) -> Result<Self> {
+        let config_path = codex_dir.join("config.toml");
+        let auth_path = codex_dir.join("auth.json");
+        let state_path = companion_state_path(codex_dir);
+        Ok(Self {
+            config: ConfigRollback::capture(&config_path)?,
+            auth: ConfigRollback::capture(&auth_path)?,
+            state: ConfigRollback::capture(&state_path)?,
+            config_path,
+            auth_path,
+            state_path,
+        })
+    }
+
+    pub fn restore(self) -> Result<()> {
+        let mut errors = Vec::new();
+        for (label, result) in [
+            ("config.toml", self.config.restore(&self.config_path)),
+            ("auth.json", self.auth.restore(&self.auth_path)),
+            ("managed-state.json", self.state.restore(&self.state_path)),
+        ] {
+            if let Err(error) = result {
+                errors.push(format!("{label}: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CompanionError::InvalidConfig(format!(
+                "恢复 Codex 安装前状态失败: {}",
+                errors.join("；")
+            )))
         }
     }
 }
@@ -2617,6 +2680,52 @@ mod tests {
             refresh_interval_seconds: codex_companion_core::default_refresh_interval_seconds(),
             account: None,
         }
+    }
+
+    #[test]
+    fn codex_install_snapshot_restores_config_auth_and_managed_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        let auth_path = temp.path().join("auth.json");
+        let state_path = companion_state_path(temp.path());
+        fs::write(&config_path, "model_provider = \"openai\"\n").expect("config");
+        fs::write(&auth_path, b"original-auth").expect("auth");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))
+                .expect("private auth permissions");
+        }
+        let snapshot = CodexInstallSnapshot::capture(temp.path()).expect("snapshot");
+
+        fs::write(&config_path, "model_provider = \"codex-companion\"\n").expect("new config");
+        fs::write(&auth_path, b"changed-auth").expect("new auth");
+        fs::create_dir_all(state_path.parent().expect("state parent")).expect("state dir");
+        fs::write(&state_path, b"managed-state").expect("state");
+
+        snapshot.restore().expect("restore snapshot");
+
+        assert_eq!(
+            fs::read_to_string(config_path).expect("restored config"),
+            "model_provider = \"openai\"\n"
+        );
+        assert_eq!(
+            fs::read(auth_path).expect("restored auth"),
+            b"original-auth"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(temp.path().join("auth.json"))
+                    .expect("auth metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert!(!state_path.exists());
     }
 
     fn migrate_external_state_to_legacy_marker(

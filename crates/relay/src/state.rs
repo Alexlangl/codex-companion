@@ -126,7 +126,7 @@ impl RelayState {
 pub(crate) fn apply_group_policy(
     state: &RelayState,
     group: &ProviderGroup,
-    candidates: &mut Vec<ProviderConfig>,
+    candidates: &mut [ProviderConfig],
 ) {
     let mut rng = rand::rng();
     apply_group_policy_with_rng(state, group, candidates, &mut rng);
@@ -135,7 +135,7 @@ pub(crate) fn apply_group_policy(
 fn apply_group_policy_with_rng<R: Rng + ?Sized>(
     state: &RelayState,
     group: &ProviderGroup,
-    candidates: &mut Vec<ProviderConfig>,
+    candidates: &mut [ProviderConfig],
     rng: &mut R,
 ) {
     if candidates.len() <= 1 {
