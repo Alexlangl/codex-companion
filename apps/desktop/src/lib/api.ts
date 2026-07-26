@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { userFacingError } from "./errors";
 import type {
   ApiClient,
   ApiClientCreate,
@@ -740,7 +741,7 @@ export async function importProviderJsonMany(
         report.failed.push({
           index,
           label: `账号 ${index + 1}`,
-          message: String(unknownError),
+          message: userFacingError(unknownError),
         });
       }
     }

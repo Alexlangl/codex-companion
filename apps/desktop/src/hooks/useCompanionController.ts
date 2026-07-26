@@ -39,6 +39,7 @@ import type {
 } from "../types/domain";
 import type { ApiKeyForm, JsonImportFile } from "../features/providers/provider-types";
 import { useAppUpdater } from "../features/settings/useAppUpdater";
+import { userFacingError } from "../lib/errors";
 
 export function useCompanionController() {
   const [busy, setBusy] = useState<BusyState>("loading");
@@ -67,7 +68,7 @@ export function useCompanionController() {
         setError(null);
       } catch (unknownError) {
         if (!options.silent || !hasLoadedStatusRef.current) {
-          setError(String(unknownError));
+          setError(userFacingError(unknownError));
         }
       } finally {
         if (!options.silent) {
@@ -107,7 +108,7 @@ export function useCompanionController() {
       setToast(nextLabel || label);
       await refresh();
     } catch (unknownError) {
-      setError(String(unknownError));
+      setError(userFacingError(unknownError));
     } finally {
       setBusy("idle");
     }
@@ -138,7 +139,7 @@ export function useCompanionController() {
     try {
       await setProviderViewMode(mode);
     } catch (unknownError) {
-      setError(String(unknownError));
+      setError(userFacingError(unknownError));
       await refresh();
     }
   }
@@ -164,7 +165,7 @@ export function useCompanionController() {
     try {
       await setProviderLaunchMode(providerId, mode);
     } catch (unknownError) {
-      setError(String(unknownError));
+      setError(userFacingError(unknownError));
       await refresh();
     }
   }
@@ -187,7 +188,7 @@ export function useCompanionController() {
     try {
       await setPreserveOfficialCodexAuth(preserve);
     } catch (unknownError) {
-      setError(String(unknownError));
+      setError(userFacingError(unknownError));
       await refresh();
     }
   }
@@ -210,7 +211,7 @@ export function useCompanionController() {
     try {
       await setTokenUsageRefreshInterval(seconds);
     } catch (unknownError) {
-      setError(String(unknownError));
+      setError(userFacingError(unknownError));
       await refresh();
     }
   }
@@ -249,7 +250,7 @@ export function useCompanionController() {
       await refresh();
       return combined;
     } catch (unknownError) {
-      setError(String(unknownError));
+      setError(userFacingError(unknownError));
       throw unknownError;
     } finally {
       setBusy("idle");
@@ -269,7 +270,7 @@ export function useCompanionController() {
     try {
       return await exportProviderJson(id, format);
     } catch (unknownError) {
-      setError(String(unknownError));
+      setError(userFacingError(unknownError));
       throw unknownError;
     } finally {
       setBusy("idle");
@@ -353,7 +354,7 @@ export function useCompanionController() {
           setToast(dryRun ? "Dry-run 已完成" : "修复已完成");
           void refresh({ silent: true });
         } catch (unknownError) {
-          setError(String(unknownError));
+          setError(userFacingError(unknownError));
         }
       },
       resetPreferences,

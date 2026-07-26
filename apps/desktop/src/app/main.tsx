@@ -225,7 +225,7 @@ function App() {
               <div className="warning-box">
                 <strong>这会修改本机 Codex 登录材料</strong>
                 <p>
-                  Companion 会先备份并记录 ownership marker。开启“保留官方 Codex 登录”后，第三方 API key 会改写到 provider-scoped config.toml，不再修改官方 OAuth auth.json。
+                  Companion 会在改写前自动备份，并在配置变化时保留用户的最新内容。开启“保留官方 Codex 登录”后，第三方 API key 仅写入对应 Provider 配置，不再修改官方 OAuth 登录。
                 </p>
               </div>
               <div className="actions">

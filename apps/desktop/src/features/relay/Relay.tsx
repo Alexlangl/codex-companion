@@ -29,6 +29,7 @@ import {
   updateRelaySettings,
 } from "../../lib/api";
 import { formatTime } from "../../lib/format";
+import { userFacingError } from "../../lib/errors";
 import { apiRequestLogsEqual, relayEventsEqual } from "../../lib/log-snapshot";
 import { providerAccountTitle, shortId } from "../../lib/provider-display";
 import type {
@@ -82,7 +83,7 @@ export function Relay({ active, status }: RelayProps) {
       setSelfTest(nextSelfTest);
       setError(null);
     } catch (unknownError) {
-      setError(String(unknownError));
+      setError(userFacingError(unknownError));
     } finally {
       setLoading(false);
     }
@@ -101,7 +102,7 @@ export function Relay({ active, status }: RelayProps) {
       setRelayEvents((current) => relayEventsEqual(current, events) ? current : events);
       if (showLoading) setError(null);
     } catch (unknownError) {
-      if (showLoading) setError(String(unknownError));
+      if (showLoading) setError(userFacingError(unknownError));
     } finally {
       logRefreshInFlightRef.current = false;
       if (showLoading) setLogsRefreshing(false);
@@ -129,7 +130,7 @@ export function Relay({ active, status }: RelayProps) {
       await task();
       await loadSnapshot();
     } catch (unknownError) {
-      setError(String(unknownError));
+      setError(userFacingError(unknownError));
     } finally {
       setAction(null);
     }

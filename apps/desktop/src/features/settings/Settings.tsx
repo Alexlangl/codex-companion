@@ -22,6 +22,7 @@ import {
   previewCliCommand,
 } from "../../lib/api";
 import { compactPath } from "../../lib/format";
+import { userFacingError } from "../../lib/errors";
 import type {
   BusyState,
   CompanionStatus,
@@ -111,7 +112,7 @@ export function Settings(props: SettingsProps) {
       } catch (unknownError) {
         if (!cancelled) {
           setCliPreview("");
-          setCliMessage(String(unknownError));
+          setCliMessage(userFacingError(unknownError));
         }
       }
     }, 220);
@@ -127,7 +128,7 @@ export function Settings(props: SettingsProps) {
       setDiagnosticInfo(await getDiagnosticInfo());
       setDiagnosticMessage("");
     } catch (unknownError) {
-      setDiagnosticMessage(String(unknownError));
+      setDiagnosticMessage(userFacingError(unknownError));
     } finally {
       setDiagnosticBusy(false);
     }
@@ -164,7 +165,7 @@ export function Settings(props: SettingsProps) {
       setCliPreview(outcome.command);
       setCliMessage(outcome.message);
     } catch (unknownError) {
-      setCliMessage(String(unknownError));
+      setCliMessage(userFacingError(unknownError));
     } finally {
       setCliBusy(false);
     }
@@ -176,7 +177,7 @@ export function Settings(props: SettingsProps) {
       await navigator.clipboard.writeText(cliPreview);
       setCliMessage("命令已复制");
     } catch (unknownError) {
-      setCliMessage(String(unknownError));
+      setCliMessage(userFacingError(unknownError));
     }
   }
 
@@ -186,7 +187,7 @@ export function Settings(props: SettingsProps) {
       const opened = await openDiagnosticDirectory();
       setDiagnosticMessage(opened ? "已打开诊断日志目录" : "当前环境无法自动打开目录");
     } catch (unknownError) {
-      setDiagnosticMessage(String(unknownError));
+      setDiagnosticMessage(userFacingError(unknownError));
     } finally {
       setDiagnosticBusy(false);
     }
@@ -201,7 +202,7 @@ export function Settings(props: SettingsProps) {
       setDiagnosticMessage(`已清理 ${removed} 个日志文件`);
       setDiagnosticInfo(await getDiagnosticInfo());
     } catch (unknownError) {
-      setDiagnosticMessage(String(unknownError));
+      setDiagnosticMessage(userFacingError(unknownError));
     } finally {
       setDiagnosticBusy(false);
     }

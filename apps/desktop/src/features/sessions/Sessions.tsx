@@ -2,6 +2,7 @@ import { Copy, History, Play, RefreshCw, RotateCcw, Search } from "lucide-react"
 import { useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
 import { Badge, Button, Field, IconButton, Panel } from "../../components/ui";
 import { getSessionPage, launchCli } from "../../lib/api";
+import { userFacingError } from "../../lib/errors";
 import { compactPath, formatTime } from "../../lib/format";
 import type { CompanionStatus, SessionPage, SessionSummary } from "../../types/domain";
 
@@ -38,7 +39,7 @@ export function Sessions({ active, status }: SessionsProps) {
       }
     } catch (unknownError) {
       if (loadRequestRef.current === requestId) {
-        setError(String(unknownError));
+        setError(userFacingError(unknownError));
       }
     } finally {
       if (loadRequestRef.current === requestId) {
@@ -72,7 +73,7 @@ export function Sessions({ active, status }: SessionsProps) {
       });
       setLaunchMessage(outcome.message);
     } catch (unknownError) {
-      setLaunchMessage(String(unknownError));
+      setLaunchMessage(userFacingError(unknownError));
     } finally {
       setLaunchingId(null);
     }

@@ -20,6 +20,7 @@ import {
 import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import { Button, Field, Panel } from "../../components/ui";
 import { getProviderImportProgress, getProviderRefreshProgress } from "../../lib/api";
+import { userFacingError } from "../../lib/errors";
 import { providerKindLabel } from "../../lib/format";
 import { providerAccountTitle, providerUsesAgentIdentity } from "../../lib/provider-display";
 import type {
@@ -243,7 +244,7 @@ export function Providers({
       }
     } catch (unknownError) {
       if (exportRequestRef.current === requestId) {
-        setExportError(String(unknownError));
+        setExportError(userFacingError(unknownError));
       }
     } finally {
       if (exportRequestRef.current === requestId) {

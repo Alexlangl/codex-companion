@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import { Button, Field, Panel } from "../../components/ui";
 import { compactPath, formatTime, formatTokens } from "../../lib/format";
+import { userFacingError } from "../../lib/errors";
 import { providerAccountTitle } from "../../lib/provider-display";
 import { getTokenUsageSyncStatus } from "../../lib/token-usage-api";
 import type {
@@ -96,7 +97,7 @@ export function TokenStats({
       setAvailableModels(nextStats.availableModels);
       setStats(nextStats);
     } catch (unknownError) {
-      setError(String(unknownError));
+      setError(userFacingError(unknownError));
     } finally {
       inFlightRef.current = false;
       setLoading(false);
