@@ -676,12 +676,26 @@ fn provider_label(provider: &ProviderConfig) -> String {
                     .clone()
                     .filter(|label| is_meaningful_account_label(label))
             })
-            .or_else(|| account.account_id.clone())
-            .or_else(|| account.user_id.clone())
+            .or_else(|| {
+                (!matches!(provider.kind, ProviderKind::OfficialCodex))
+                    .then(|| account.account_id.clone())
+                    .flatten()
+            })
+            .or_else(|| {
+                (!matches!(provider.kind, ProviderKind::OfficialCodex))
+                    .then(|| account.user_id.clone())
+                    .flatten()
+            })
     });
     account_label
         .or_else(|| is_meaningful_account_label(&provider.name).then(|| provider.name.clone()))
-        .unwrap_or_else(|| provider.id.clone())
+        .unwrap_or_else(|| {
+            if matches!(provider.kind, ProviderKind::OfficialCodex) {
+                "Codex 官方账号".to_string()
+            } else {
+                provider.id.clone()
+            }
+        })
 }
 
 fn is_meaningful_account_label(label: &str) -> bool {
@@ -787,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn official_account_label_uses_account_id_instead_of_placeholder() {
+    fn official_account_label_uses_friendly_fallback_instead_of_account_id() {
         let mut official_provider = provider(Some("file:/tmp/official-auth.json"));
         official_provider.name = "Codex 官方账号".to_string();
         official_provider.kind = ProviderKind::OfficialCodex;
@@ -798,6 +812,6 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(provider_label(&official_provider), "account-id");
+        assert_eq!(provider_label(&official_provider), "Codex 官方账号");
     }
 }

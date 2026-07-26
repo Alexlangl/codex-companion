@@ -118,7 +118,7 @@ fn import_agent_identity_provider(
         .and_then(normalize_non_empty)
         .or_else(|| account.email.clone())
         .or_else(|| account.display_name.clone())
-        .unwrap_or_else(|| account_id.clone());
+        .unwrap_or_else(|| "Codex 官方账号".to_string());
     let existing_provider_id =
         existing_provider_id_for_identity(store, &account_id, user_id.as_deref())?;
     let provider_id = explicit_provider_id
@@ -704,7 +704,7 @@ pub fn parse_provider_import_draft(
     let provider_name = explicit_provider_name
         .and_then(normalize_non_empty)
         .or_else(|| extract_oauth_account_name(&auth))
-        .unwrap_or_else(|| account_id.clone());
+        .unwrap_or_else(|| "Codex 官方账号".to_string());
     let provider_id = explicit_provider_id
         .and_then(sanitize_provider_id)
         .unwrap_or_else(|| {
@@ -925,18 +925,27 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
         return None;
     }
 
+    let token_claims = [id_token.as_deref(), access_token.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(decode_jwt_payload)
+        .collect::<Vec<_>>();
+    let mut identity_sources = vec![credentials, extra, candidate, value];
+    identity_sources.extend(token_claims.iter());
+
     let account_id = pick_first_string(
-        &[credentials, extra, candidate, value],
+        &identity_sources,
         &[
             &["chatgpt_account_id"],
             &["account_id"],
+            &["accountId"],
             &["tokens", "chatgpt_account_id"],
             &["tokens", "account_id"],
             &["workspace_id"],
         ],
     );
     let user_id = pick_first_string(
-        &[credentials, extra, candidate, value],
+        &identity_sources,
         &[
             &["chatgpt_user_id"],
             &["user_id"],
@@ -945,26 +954,20 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
             &["tokens", "user_id"],
         ],
     );
-    let email = pick_first_string(
-        &[credentials, extra, candidate, value],
-        &[
-            &["email"],
-            &["name"],
-            &["tokens", "email"],
-            &["tokens", "name"],
-        ],
-    );
+    let email = pick_first_string(&identity_sources, &[&["email"], &["tokens", "email"]]);
     let name = pick_first_string(
-        &[credentials, extra, candidate, value],
+        &identity_sources,
         &[
             &["name"],
+            &["display_name"],
+            &["displayName"],
             &["email"],
             &["tokens", "name"],
             &["tokens", "email"],
         ],
     );
     let plan_type = pick_first_string(
-        &[credentials, extra, candidate, value],
+        &identity_sources,
         &[
             &["chatgpt_plan_type"],
             &["plan_type"],
@@ -1002,6 +1005,15 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
     insert_optional_string(&mut auth, "expired", expired);
     insert_optional_string(&mut auth, "last_refresh", last_refresh);
     Some(serde_json::Value::Object(auth))
+}
+
+fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.as_bytes())
+        .or_else(|_| general_purpose::URL_SAFE.decode(payload.as_bytes()))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 #[derive(Debug, Default)]
@@ -1737,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn uses_account_id_as_official_name_when_profile_has_no_label() {
+    fn uses_friendly_official_name_when_profile_has_no_label() {
         let value = serde_json::json!({
             "access_token": "access-token",
             "account_id": "account-id",
@@ -1746,7 +1758,7 @@ mod tests {
 
         let draft = parse_provider_import_draft(&value, None, None).expect("draft");
 
-        assert_eq!(draft.provider_name, "account-id");
+        assert_eq!(draft.provider_name, "Codex 官方账号");
     }
 
     #[test]
@@ -2021,6 +2033,48 @@ mod tests {
                 .and_then(|account| account.account_id),
             Some("local-account".to_string())
         );
+    }
+
+    #[test]
+    fn imports_local_codex_identity_from_jwt_claims() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("companion").join("config.json"));
+        let codex_dir = temp.path().join("codex");
+        fs::create_dir_all(&codex_dir).expect("codex dir");
+        let claims = serde_json::json!({
+            "email": "person@example.com",
+            "name": "Person Example",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-from-jwt",
+                "chatgpt_user_id": "user-from-jwt",
+                "chatgpt_plan_type": "plus"
+            }
+        });
+        let payload = general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        let id_token = format!("header.{payload}.signature");
+        fs::write(
+            codex_dir.join("auth.json"),
+            serde_json::json!({
+                "OPENAI_API_KEY": null,
+                "tokens": {
+                    "access_token": "access-token",
+                    "id_token": id_token,
+                    "refresh_token": "refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth");
+
+        let outcome = import_local_codex_provider(&store, Some(codex_dir)).expect("import");
+        let account = outcome.provider.account.expect("account");
+
+        assert_eq!(outcome.provider.name, "person@example.com");
+        assert_eq!(account.email.as_deref(), Some("person@example.com"));
+        assert_eq!(account.display_name.as_deref(), Some("Person Example"));
+        assert_eq!(account.account_id.as_deref(), Some("account-from-jwt"));
+        assert_eq!(account.user_id.as_deref(), Some("user-from-jwt"));
+        assert_eq!(account.subscription_type.as_deref(), Some("PLUS"));
     }
 
     #[test]

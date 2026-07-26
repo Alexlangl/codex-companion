@@ -838,7 +838,9 @@ fn prepare_config_write(
     doc: &DocumentMut,
 ) -> Result<ManagedConfigBackup> {
     if let Some(marker) = CompanionConfigMarker::from_doc(doc) {
-        ensure_marker_hash_matches(doc, &marker)?;
+        if !marker_hash_matches(doc, &marker) {
+            snapshot_changed_config(codex_dir, config_path)?;
+        }
         if let Some(backup_root) = marker.backup_root {
             return Ok(ManagedConfigBackup {
                 backup_root,
@@ -990,25 +992,20 @@ fn apply_companion_marker(
     doc[COMPANION_MARKER_TABLE]["config_hash"] = value(hash);
 }
 
-fn ensure_marker_hash_matches(doc: &DocumentMut, marker: &CompanionConfigMarker) -> Result<()> {
+fn marker_hash_matches(doc: &DocumentMut, marker: &CompanionConfigMarker) -> bool {
     let Some(expected) = marker
         .config_hash
         .as_deref()
         .filter(|value| !value.is_empty())
     else {
-        return Err(CompanionError::InvalidConfig(
-            "Codex config.toml 已带 Companion marker，但缺少 config_hash；为避免覆盖用户修改，已停止写入"
-                .to_string(),
-        ));
+        return false;
     };
-    let actual = config_doc_hash(doc);
-    if actual != expected {
-        return Err(CompanionError::InvalidConfig(
-            "Codex config.toml 在 Companion 接管后发生过手动修改；为避免覆盖用户配置，已停止写入。请先备份并手动处理 [codex_companion] marker"
-                .to_string(),
-        ));
-    }
-    Ok(())
+    config_doc_hash(doc) == expected
+}
+
+fn snapshot_changed_config(codex_dir: &Path, config_path: &Path) -> Result<()> {
+    let backup_root = create_backup_root(codex_dir)?;
+    backup_file(config_path, &backup_root, codex_dir)
 }
 
 fn config_doc_hash(doc: &DocumentMut) -> String {
@@ -1180,23 +1177,16 @@ pub fn uninstall_companion_provider(codex_dir: Option<PathBuf>) -> Result<CodexI
             return uninstall_legacy_companion_provider(codex_dir, config_path, doc);
         }
     };
-    ensure_marker_hash_matches(&doc, &marker)?;
-    if !matches!(marker.install_kind.as_deref(), Some("relay" | "direct")) {
-        return Err(CompanionError::InvalidConfig(
-            "Codex config.toml 的 Companion marker 缺少有效 install_kind；为避免覆盖用户配置，已停止卸载"
-                .to_string(),
-        ));
-    }
     let live_provider = doc.get("model_provider").and_then(Item::as_str);
-    if marker.target_provider.as_deref() != live_provider {
-        return Err(CompanionError::InvalidConfig(format!(
-            "Codex config.toml 当前 provider ({}) 与 Companion marker 目标 ({}) 不一致；为避免覆盖用户配置，已停止卸载",
-            live_provider.unwrap_or("<none>"),
-            marker.target_provider.as_deref().unwrap_or("<none>")
-        )));
+    let marker_metadata_matches =
+        matches!(marker.install_kind.as_deref(), Some("relay" | "direct"))
+            && marker.target_provider.as_deref() == live_provider;
+    let config_changed = !marker_hash_matches(&doc, &marker) || !marker_metadata_matches;
+    if config_changed {
+        snapshot_changed_config(&codex_dir, &config_path)?;
     }
     validate_restore_inputs(&codex_dir, &marker)?;
-    restore_managed_install(&codex_dir, &config_path, &marker)?;
+    restore_managed_install(&codex_dir, &config_path, &marker, config_changed, doc)?;
     doctor(codex_dir, &RelayConfig::default())
 }
 
@@ -1285,10 +1275,16 @@ fn restore_managed_install(
     codex_dir: &Path,
     config_path: &Path,
     marker: &CompanionConfigMarker,
+    config_changed: bool,
+    current_doc: DocumentMut,
 ) -> Result<()> {
     let config_rollback = ConfigRollback::capture(config_path)?;
     let auth_rollback = AuthRollback::capture(codex_dir)?;
-    restore_config_from_marker(codex_dir, config_path, marker)?;
+    if config_changed {
+        restore_changed_config_from_marker(codex_dir, config_path, marker, current_doc)?;
+    } else {
+        restore_config_from_marker(codex_dir, config_path, marker)?;
+    }
     if let Err(auth_error) = restore_auth_from_marker(codex_dir, marker) {
         let config_restore = config_rollback.restore(config_path);
         let auth_restore = auth_rollback.restore(codex_dir);
@@ -1300,6 +1296,112 @@ fn restore_managed_install(
         return Err(auth_error);
     }
     Ok(())
+}
+
+fn restore_changed_config_from_marker(
+    codex_dir: &Path,
+    config_path: &Path,
+    marker: &CompanionConfigMarker,
+    mut current_doc: DocumentMut,
+) -> Result<()> {
+    let original_doc = marker
+        .config_backup
+        .as_deref()
+        .map(|backup| resolve_codex_relative(codex_dir, backup))
+        .map(|backup_path| {
+            let text = fs::read_to_string(&backup_path)
+                .map_err(|source| CompanionError::io(&backup_path, source))?;
+            text.parse::<DocumentMut>().map_err(|source| {
+                CompanionError::InvalidConfig(format!(
+                    "Companion config backup 不是有效 TOML: {source}"
+                ))
+            })
+        })
+        .transpose()?;
+
+    let live_provider = current_doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(ToOwned::to_owned);
+    if live_provider.as_deref() == marker.target_provider.as_deref() {
+        if let Some(original_provider) = original_doc
+            .as_ref()
+            .and_then(|doc| doc.get("model_provider"))
+        {
+            current_doc["model_provider"] = original_provider.clone();
+        } else if let Some(previous_provider) = marker.previous_model_provider.as_deref() {
+            current_doc["model_provider"] = value(previous_provider);
+        } else {
+            current_doc["model_provider"] = Item::None;
+        }
+    }
+
+    if let Some(target_provider) = marker.target_provider.as_deref() {
+        restore_model_provider_entry(&mut current_doc, original_doc.as_ref(), target_provider);
+    }
+    if let Some(previous_provider) = marker.previous_model_provider.as_deref() {
+        restore_missing_model_provider_entry(
+            &mut current_doc,
+            original_doc.as_ref(),
+            previous_provider,
+        );
+    }
+    if current_doc.get("openai_base_url").is_none() {
+        if let Some(original_base_url) = original_doc
+            .as_ref()
+            .and_then(|doc| doc.get("openai_base_url"))
+        {
+            current_doc["openai_base_url"] = original_base_url.clone();
+        }
+    }
+    current_doc.as_table_mut().remove(COMPANION_MARKER_TABLE);
+    fs::write(config_path, current_doc.to_string())
+        .map_err(|source| CompanionError::io(config_path, source))
+}
+
+fn restore_model_provider_entry(
+    current_doc: &mut DocumentMut,
+    original_doc: Option<&DocumentMut>,
+    provider_id: &str,
+) {
+    let original = original_doc
+        .and_then(|doc| doc.get("model_providers"))
+        .and_then(|providers| providers.get(provider_id))
+        .cloned();
+    if let Some(original) = original {
+        current_doc["model_providers"][provider_id] = original;
+        return;
+    }
+    if let Some(providers) = current_doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_like_mut)
+    {
+        providers.remove(provider_id);
+        if providers.is_empty() {
+            current_doc["model_providers"] = Item::None;
+        }
+    }
+}
+
+fn restore_missing_model_provider_entry(
+    current_doc: &mut DocumentMut,
+    original_doc: Option<&DocumentMut>,
+    provider_id: &str,
+) {
+    let already_present = current_doc
+        .get("model_providers")
+        .and_then(|providers| providers.get(provider_id))
+        .is_some();
+    if already_present {
+        return;
+    }
+    if let Some(original) = original_doc
+        .and_then(|doc| doc.get("model_providers"))
+        .and_then(|providers| providers.get(provider_id))
+        .cloned()
+    {
+        current_doc["model_providers"][provider_id] = original;
+    }
 }
 
 fn restore_config_from_marker(
@@ -2291,7 +2393,7 @@ fn is_provider_field_key(key: &str) -> bool {
 }
 
 fn create_backup_root(codex_dir: &Path) -> Result<PathBuf> {
-    let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S-%9f").to_string();
     let root = codex_dir
         .join("backups")
         .join("codex-companion")
@@ -2462,7 +2564,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_stops_when_managed_config_changed_after_install() {
+    fn uninstall_preserves_user_config_changed_after_install() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("config.toml"),
@@ -2475,13 +2577,67 @@ mod tests {
         config.push_str("\nmodel = \"manual-change\"\n");
         fs::write(temp.path().join("config.toml"), config).expect("config");
 
-        let error = uninstall_companion_provider(Some(temp.path().to_path_buf()))
-            .expect_err("manual drift should block uninstall");
+        let status = uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect("manual drift should be merged during uninstall");
 
-        assert!(error.to_string().contains("发生过手动修改"));
+        assert!(!status.installed);
         let current = fs::read_to_string(temp.path().join("config.toml")).expect("config");
         assert!(current.contains("model = \"manual-change\""));
+        assert!(current.contains("model_provider = \"openai\""));
+        assert!(!current.contains("codex_companion ="));
+        assert!(!current.contains("codex-companion"), "{current}");
+    }
+
+    #[test]
+    fn reinstall_preserves_user_config_changed_after_install() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("config");
+        let relay = RelayConfig::default();
+        install_companion_provider(Some(temp.path().to_path_buf()), &relay).expect("install");
+        let mut config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        config.push_str("\nmodel = \"user-selected-model\"\n");
+        fs::write(temp.path().join("config.toml"), config).expect("config");
+
+        install_companion_provider(Some(temp.path().to_path_buf()), &relay)
+            .expect("manual drift should be merged during reinstall");
+
+        let current = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(current.contains("model = \"user-selected-model\""));
+        assert!(current.contains("model_provider = \"codex-companion\""));
         assert!(current.contains("codex_companion ="));
+    }
+
+    #[test]
+    fn uninstall_preserves_user_selected_provider_after_install() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("config");
+        install_companion_provider(Some(temp.path().to_path_buf()), &RelayConfig::default())
+            .expect("install");
+        let mut config = fs::read_to_string(temp.path().join("config.toml"))
+            .expect("managed config")
+            .parse::<DocumentMut>()
+            .expect("managed config TOML");
+        config["model_provider"] = value("user-provider");
+        config["model_providers"]["user-provider"]["name"] = value("User Provider");
+        config["model_providers"]["user-provider"]["base_url"] = value("https://example.test/v1");
+        fs::write(temp.path().join("config.toml"), config.to_string()).expect("config");
+
+        uninstall_companion_provider(Some(temp.path().to_path_buf()))
+            .expect("user-selected provider should be preserved");
+
+        let current = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(current.contains("model_provider = \"user-provider\""));
+        assert!(current.contains("User Provider"));
+        assert!(!current.contains("codex-companion"), "{current}");
+        assert!(!current.contains("codex_companion ="));
     }
 
     #[test]

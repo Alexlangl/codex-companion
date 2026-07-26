@@ -21,10 +21,8 @@ export function providerAccountTitle(provider: ProviderConfig) {
       meaningfulAccountLabel(provider, account?.email) ||
       meaningfulAccountLabel(provider, account?.displayName) ||
       extractEmail(provider.name) ||
-      clean(account?.accountId) ||
-      clean(account?.userId) ||
       meaningfulAccountLabel(provider, provider.name) ||
-      provider.id
+      "Codex 官方账号"
     );
   }
   return (
@@ -224,6 +222,16 @@ function meaningfulAccountLabel(provider: ProviderConfig, value?: string | null)
   const label = clean(value);
   if (!label || provider.kind !== "official_codex") return label;
   if (isGenericOfficialAccountName(label)) return null;
+  if (
+    label === clean(provider.account?.accountId) ||
+    label === clean(provider.account?.userId) ||
+    label === provider.id ||
+    /^openai_account_[a-f0-9]+$/i.test(label) ||
+    /^codex_openai_.+_[a-f0-9]{8}$/i.test(label) ||
+    /^[a-f0-9]{12,}$/i.test(label)
+  ) {
+    return null;
+  }
   return label;
 }
 
