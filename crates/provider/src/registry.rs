@@ -149,6 +149,9 @@ pub fn remove_provider(store: &ConfigStore, id: &str) -> Result<bool> {
         for group in config.groups.values_mut() {
             group.provider_order.retain(|provider_id| provider_id != id);
             group.provider_weights.remove(id);
+            if group.priority_failback_target_provider_id.as_deref() == Some(id) {
+                group.priority_failback_target_provider_id = None;
+            }
         }
         Ok(removed)
     })
@@ -220,6 +223,9 @@ mod tests {
                         provider_order: vec!["a".to_string(), "b".to_string()],
                         provider_weights: Default::default(),
                         fallback_enabled: true,
+                        priority_failback_interval_seconds: 0,
+                        priority_failback_revision: 0,
+                        priority_failback_target_provider_id: Some("a".to_string()),
                     },
                 );
                 Ok(())
@@ -229,6 +235,10 @@ mod tests {
         assert!(remove_provider(&store, "a").expect("remove"));
         let config = store.load().expect("load");
         assert_eq!(config.groups["work"].provider_order, vec!["b".to_string()]);
+        assert_eq!(
+            config.groups["work"].priority_failback_target_provider_id,
+            None
+        );
         assert!(config.groups[DEFAULT_GROUP_ID].provider_order.is_empty());
     }
 

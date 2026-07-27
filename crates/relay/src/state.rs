@@ -14,6 +14,11 @@ const MAX_SESSION_AFFINITY_BINDINGS: usize = 4096;
 struct SessionAffinityBinding {
     provider_id: String,
     updated_at: Instant,
+    route_generation: u64,
+    priority_failback_group_id: String,
+    priority_failback_revision: u64,
+    priority_probe_generation: u64,
+    last_priority_failback_probe_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -22,6 +27,7 @@ pub(crate) struct RelayState {
     pub client: reqwest::Client,
     pub api_service: ApiServiceStore,
     session_affinity: Arc<Mutex<HashMap<String, SessionAffinityBinding>>>,
+    priority_failback_baselines: Arc<HashMap<String, u64>>,
     provider_inflight: Arc<Mutex<HashMap<String, usize>>>,
     round_robin_sequence: Arc<AtomicU64>,
 }
@@ -29,6 +35,25 @@ pub(crate) struct RelayState {
 pub(crate) struct ProviderRequestGuard {
     provider_id: String,
     provider_inflight: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PriorityFailbackClaim {
+    pub manual: bool,
+    pub automatic: bool,
+    pub probe_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionAffinityPreference {
+    pub provider_id: String,
+    pub route_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AffinityBindContext {
+    pub expected_route_generation: Option<u64>,
+    pub priority_probe_generation: Option<u64>,
 }
 
 impl Drop for ProviderRequestGuard {
@@ -49,52 +74,173 @@ impl RelayState {
     pub(crate) fn new(store: ConfigStore, client: reqwest::Client) -> Self {
         let api_service = ApiServiceStore::from_config_store(&store);
         let _ = api_service.initialize();
+        let priority_failback_baselines = store
+            .load()
+            .map(|config| {
+                config
+                    .groups
+                    .into_iter()
+                    .map(|(id, group)| (id, group.priority_failback_revision))
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             store,
             client,
             api_service,
             session_affinity: Arc::new(Mutex::new(HashMap::new())),
+            priority_failback_baselines: Arc::new(priority_failback_baselines),
             provider_inflight: Arc::new(Mutex::new(HashMap::new())),
             round_robin_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub(crate) fn preferred_provider(&self, key: &str, ttl_seconds: u64) -> Option<String> {
+    pub(crate) fn preferred_provider(
+        &self,
+        key: &str,
+        ttl_seconds: u64,
+        group: &ProviderGroup,
+    ) -> Option<SessionAffinityPreference> {
         let mut bindings = self.session_affinity.lock().ok()?;
         prune_bindings(&mut bindings, ttl_seconds);
         if let Some(binding) = bindings.get_mut(key) {
-            binding.updated_at = Instant::now();
-            return Some(binding.provider_id.clone());
+            self.refresh_affinity_binding(binding, group);
+            return Some(preference_from_binding(binding));
         }
         drop(bindings);
-        self.api_service
+        let provider_id = self
+            .api_service
             .preferred_affinity(key, ttl_seconds)
             .ok()
-            .flatten()
+            .flatten()?;
+        let mut bindings = self.session_affinity.lock().ok()?;
+        let preference = self.restore_persisted_affinity(&mut bindings, key, provider_id, group);
+        prune_excess_bindings(&mut bindings);
+        Some(preference)
     }
 
-    pub(crate) fn bind_provider(&self, key: &str, provider_id: &str, ttl_seconds: u64) {
-        let Ok(mut bindings) = self.session_affinity.lock() else {
-            return;
-        };
-        prune_bindings(&mut bindings, ttl_seconds);
+    fn restore_persisted_affinity(
+        &self,
+        bindings: &mut HashMap<String, SessionAffinityBinding>,
+        key: &str,
+        provider_id: String,
+        group: &ProviderGroup,
+    ) -> SessionAffinityPreference {
+        if let Some(binding) = bindings.get_mut(key) {
+            self.refresh_affinity_binding(binding, group);
+            return preference_from_binding(binding);
+        }
         bindings.insert(
             key.to_string(),
             SessionAffinityBinding {
-                provider_id: provider_id.to_string(),
+                provider_id: provider_id.clone(),
                 updated_at: Instant::now(),
+                route_generation: 0,
+                priority_failback_group_id: group.id.clone(),
+                priority_failback_revision: self.priority_failback_baseline(group),
+                priority_probe_generation: 0,
+                last_priority_failback_probe_at: Instant::now(),
             },
         );
-        let _ = self.api_service.bind_affinity(key, provider_id);
-        if bindings.len() > MAX_SESSION_AFFINITY_BINDINGS {
-            if let Some(oldest) = bindings
-                .iter()
-                .min_by_key(|(_, binding)| binding.updated_at)
-                .map(|(key, _)| key.clone())
-            {
-                bindings.remove(&oldest);
-            }
+        SessionAffinityPreference {
+            provider_id,
+            route_generation: 0,
         }
+    }
+
+    pub(crate) fn bind_provider(
+        &self,
+        key: &str,
+        provider_id: &str,
+        ttl_seconds: u64,
+        group: &ProviderGroup,
+        context: AffinityBindContext,
+    ) -> bool {
+        let Ok(mut bindings) = self.session_affinity.lock() else {
+            return false;
+        };
+        prune_bindings(&mut bindings, ttl_seconds);
+        let now = Instant::now();
+        let committed = match bindings.get_mut(key) {
+            Some(binding) if binding.priority_failback_group_id != group.id => false,
+            Some(binding) if binding.provider_id == provider_id => {
+                binding.updated_at = now;
+                true
+            }
+            Some(binding) => {
+                let route_is_current =
+                    context.expected_route_generation == Some(binding.route_generation);
+                let probe_is_current =
+                    context.priority_probe_generation == Some(binding.priority_probe_generation);
+                if !route_is_current && !probe_is_current {
+                    false
+                } else {
+                    binding.provider_id = provider_id.to_string();
+                    binding.updated_at = now;
+                    binding.route_generation = binding.route_generation.wrapping_add(1);
+                    binding.priority_failback_revision = group.priority_failback_revision;
+                    binding.last_priority_failback_probe_at = now;
+                    true
+                }
+            }
+            None => {
+                let route_generation = context
+                    .expected_route_generation
+                    .map(|generation| generation.wrapping_add(1))
+                    .unwrap_or_default();
+                bindings.insert(
+                    key.to_string(),
+                    SessionAffinityBinding {
+                        provider_id: provider_id.to_string(),
+                        updated_at: now,
+                        route_generation,
+                        priority_failback_group_id: group.id.clone(),
+                        priority_failback_revision: group.priority_failback_revision,
+                        priority_probe_generation: context
+                            .priority_probe_generation
+                            .unwrap_or_default(),
+                        last_priority_failback_probe_at: now,
+                    },
+                );
+                true
+            }
+        };
+        if committed {
+            let _ = self.api_service.bind_affinity(key, provider_id);
+        }
+        prune_excess_bindings(&mut bindings);
+        committed
+    }
+
+    pub(crate) fn claim_priority_failback_probe(
+        &self,
+        key: &str,
+        group: &ProviderGroup,
+    ) -> Option<PriorityFailbackClaim> {
+        let Ok(mut bindings) = self.session_affinity.lock() else {
+            return None;
+        };
+        let binding = bindings.get_mut(key)?;
+        if binding.priority_failback_group_id != group.id {
+            return None;
+        }
+        let now = Instant::now();
+        let manual_probe_due =
+            binding.priority_failback_revision != group.priority_failback_revision;
+        let automatic_probe_due = group.priority_failback_interval_seconds > 0
+            && now.duration_since(binding.last_priority_failback_probe_at)
+                >= Duration::from_secs(group.priority_failback_interval_seconds);
+        if !manual_probe_due && !automatic_probe_due {
+            return None;
+        }
+        binding.priority_failback_revision = group.priority_failback_revision;
+        binding.priority_probe_generation = binding.priority_probe_generation.wrapping_add(1);
+        binding.last_priority_failback_probe_at = now;
+        Some(PriorityFailbackClaim {
+            manual: manual_probe_due,
+            automatic: automatic_probe_due,
+            probe_generation: binding.priority_probe_generation,
+        })
     }
 
     pub(crate) fn next_round_robin_index(&self, len: usize) -> usize {
@@ -120,6 +266,37 @@ impl RelayState {
             provider_id: provider_id.to_string(),
             provider_inflight: self.provider_inflight.clone(),
         }
+    }
+
+    fn priority_failback_baseline(&self, group: &ProviderGroup) -> u64 {
+        self.priority_failback_baselines
+            .get(&group.id)
+            .copied()
+            .unwrap_or(group.priority_failback_revision)
+    }
+
+    fn refresh_affinity_binding(
+        &self,
+        binding: &mut SessionAffinityBinding,
+        group: &ProviderGroup,
+    ) {
+        let now = Instant::now();
+        binding.updated_at = now;
+        if binding.priority_failback_group_id == group.id {
+            return;
+        }
+        binding.route_generation = binding.route_generation.wrapping_add(1);
+        binding.priority_failback_group_id = group.id.clone();
+        binding.priority_failback_revision = self.priority_failback_baseline(group);
+        binding.priority_probe_generation = binding.priority_probe_generation.wrapping_add(1);
+        binding.last_priority_failback_probe_at = now;
+    }
+}
+
+fn preference_from_binding(binding: &SessionAffinityBinding) -> SessionAffinityPreference {
+    SessionAffinityPreference {
+        provider_id: binding.provider_id.clone(),
+        route_generation: binding.route_generation,
     }
 }
 
@@ -199,6 +376,19 @@ fn prune_bindings(bindings: &mut HashMap<String, SessionAffinityBinding>, ttl_se
     bindings.retain(|_, binding| now.duration_since(binding.updated_at) <= ttl);
 }
 
+fn prune_excess_bindings(bindings: &mut HashMap<String, SessionAffinityBinding>) {
+    if bindings.len() <= MAX_SESSION_AFFINITY_BINDINGS {
+        return;
+    }
+    if let Some(oldest) = bindings
+        .iter()
+        .min_by_key(|(_, binding)| binding.updated_at)
+        .map(|(key, _)| key.clone())
+    {
+        bindings.remove(&oldest);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +430,9 @@ mod tests {
             provider_order: vec!["a".to_string(), "b".to_string(), "c".to_string()],
             provider_weights: BTreeMap::new(),
             fallback_enabled: true,
+            priority_failback_interval_seconds: 0,
+            priority_failback_revision: 0,
+            priority_failback_target_provider_id: None,
         }
     }
 
@@ -315,5 +508,186 @@ mod tests {
         apply_group_policy(&state, &group, &mut candidates);
 
         assert_eq!(ids(&candidates), vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn manual_priority_failback_revision_is_claimed_once_per_session() {
+        let state = state();
+        let mut group = group(GroupPolicy::PriorityFallback);
+        state.bind_provider(
+            "session",
+            "c",
+            3_600,
+            &group,
+            AffinityBindContext::default(),
+        );
+
+        assert!(state
+            .claim_priority_failback_probe("session", &group)
+            .is_none());
+        group.priority_failback_revision = 1;
+        assert_eq!(
+            state.claim_priority_failback_probe("session", &group),
+            Some(PriorityFailbackClaim {
+                manual: true,
+                automatic: false,
+                probe_generation: 1,
+            })
+        );
+        assert!(state
+            .claim_priority_failback_probe("session", &group)
+            .is_none());
+    }
+
+    #[test]
+    fn automatic_priority_failback_only_runs_when_enabled_and_due() {
+        let state = state();
+        let mut group = group(GroupPolicy::PriorityFallback);
+        state.bind_provider(
+            "session",
+            "c",
+            3_600,
+            &group,
+            AffinityBindContext::default(),
+        );
+        {
+            let mut bindings = state.session_affinity.lock().expect("bindings");
+            bindings
+                .get_mut("session")
+                .expect("session binding")
+                .last_priority_failback_probe_at = Instant::now() - Duration::from_secs(60);
+        }
+
+        assert!(state
+            .claim_priority_failback_probe("session", &group)
+            .is_none());
+        group.priority_failback_interval_seconds = 60;
+        assert_eq!(
+            state.claim_priority_failback_probe("session", &group),
+            Some(PriorityFailbackClaim {
+                manual: false,
+                automatic: true,
+                probe_generation: 1,
+            })
+        );
+        assert!(state
+            .claim_priority_failback_probe("session", &group)
+            .is_none());
+    }
+
+    #[test]
+    fn stale_request_cannot_undo_a_successful_priority_probe() {
+        let state = state();
+        let mut group = group(GroupPolicy::PriorityFallback);
+        assert!(state.bind_provider(
+            "session",
+            "c",
+            3_600,
+            &group,
+            AffinityBindContext::default(),
+        ));
+        let stale_preference = state
+            .preferred_provider("session", 3_600, &group)
+            .expect("preference");
+        group.priority_failback_revision = 1;
+        let claim = state
+            .claim_priority_failback_probe("session", &group)
+            .expect("claim");
+
+        assert!(state.bind_provider(
+            "session",
+            "a",
+            3_600,
+            &group,
+            AffinityBindContext {
+                expected_route_generation: Some(stale_preference.route_generation),
+                priority_probe_generation: Some(claim.probe_generation),
+            },
+        ));
+        assert!(!state.bind_provider(
+            "session",
+            "c",
+            3_600,
+            &group,
+            AffinityBindContext {
+                expected_route_generation: Some(stale_preference.route_generation),
+                priority_probe_generation: None,
+            },
+        ));
+        assert_eq!(
+            state
+                .preferred_provider("session", 3_600, &group)
+                .expect("updated preference")
+                .provider_id,
+            "a"
+        );
+    }
+
+    #[test]
+    fn persisted_affinity_restore_does_not_replace_a_newer_memory_binding() {
+        let state = state();
+        let group = group(GroupPolicy::PriorityFallback);
+        assert!(state.bind_provider(
+            "session",
+            "b",
+            3_600,
+            &group,
+            AffinityBindContext::default(),
+        ));
+        let mut bindings = state.session_affinity.lock().expect("bindings");
+
+        let preference =
+            state.restore_persisted_affinity(&mut bindings, "session", "a".to_string(), &group);
+
+        assert_eq!(preference.provider_id, "b");
+        assert_eq!(bindings["session"].provider_id, "b");
+    }
+
+    #[test]
+    fn current_priority_probe_can_override_a_concurrent_normal_fallback() {
+        let state = state();
+        let mut group = group(GroupPolicy::PriorityFallback);
+        assert!(state.bind_provider(
+            "session",
+            "c",
+            3_600,
+            &group,
+            AffinityBindContext::default(),
+        ));
+        let preference = state
+            .preferred_provider("session", 3_600, &group)
+            .expect("preference");
+        group.priority_failback_revision = 1;
+        let claim = state
+            .claim_priority_failback_probe("session", &group)
+            .expect("claim");
+
+        assert!(state.bind_provider(
+            "session",
+            "b",
+            3_600,
+            &group,
+            AffinityBindContext {
+                expected_route_generation: Some(preference.route_generation),
+                priority_probe_generation: None,
+            },
+        ));
+        assert!(state.bind_provider(
+            "session",
+            "a",
+            3_600,
+            &group,
+            AffinityBindContext {
+                expected_route_generation: Some(preference.route_generation),
+                priority_probe_generation: Some(claim.probe_generation),
+            },
+        ));
+        assert_eq!(
+            state
+                .preferred_provider("session", 3_600, &group)
+                .expect("updated preference")
+                .provider_id,
+            "a"
+        );
     }
 }

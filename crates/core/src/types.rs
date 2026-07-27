@@ -197,6 +197,12 @@ pub struct ProviderGroup {
     #[serde(default)]
     pub provider_weights: BTreeMap<String, u16>,
     pub fallback_enabled: bool,
+    #[serde(default)]
+    pub priority_failback_interval_seconds: u64,
+    #[serde(default)]
+    pub priority_failback_revision: u64,
+    #[serde(default)]
+    pub priority_failback_target_provider_id: Option<String>,
 }
 
 impl ProviderGroup {
@@ -208,6 +214,9 @@ impl ProviderGroup {
             provider_order: Vec::new(),
             provider_weights: BTreeMap::new(),
             fallback_enabled: true,
+            priority_failback_interval_seconds: 0,
+            priority_failback_revision: 0,
+            priority_failback_target_provider_id: None,
         }
     }
 }
@@ -439,6 +448,9 @@ pub struct TokenUsageSyncStatus {
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub cwd_available: bool,
     pub model: String,
     pub provider_id: Option<String>,
     pub path: PathBuf,
@@ -628,6 +640,8 @@ pub fn default_token_usage_refresh_interval_seconds() -> u64 {
 pub struct CliLaunchRequest {
     pub working_directory: PathBuf,
     #[serde(default)]
+    pub fallback_working_directories: Vec<PathBuf>,
+    #[serde(default)]
     pub terminal: TerminalKind,
     #[serde(default)]
     pub resume_session_id: Option<String>,
@@ -740,4 +754,27 @@ pub struct RepairOutcome {
     pub migrated_plugin_files: usize,
     pub migrated_state_rows: usize,
     pub skipped_reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderGroup;
+
+    #[test]
+    fn legacy_provider_group_defaults_priority_failback_to_disabled() {
+        let group: ProviderGroup = serde_json::from_str(
+            r#"{
+                "id": "default",
+                "name": "Default",
+                "policy": "priority_fallback",
+                "providerOrder": ["a", "b"],
+                "fallbackEnabled": true
+            }"#,
+        )
+        .expect("legacy group");
+
+        assert_eq!(group.priority_failback_interval_seconds, 0);
+        assert_eq!(group.priority_failback_revision, 0);
+        assert_eq!(group.priority_failback_target_provider_id, None);
+    }
 }

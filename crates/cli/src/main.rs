@@ -401,6 +401,7 @@ async fn main() -> anyhow::Result<()> {
                     provider_order: args.providers,
                     provider_weights: BTreeMap::new(),
                     fallback_enabled: args.fallback,
+                    priority_failback_interval_seconds: 0,
                 })?;
                 print_json(group)?;
             }

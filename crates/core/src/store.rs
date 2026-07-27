@@ -172,6 +172,9 @@ mod tests {
             provider_order: Vec::new(),
             provider_weights: Default::default(),
             fallback_enabled: true,
+            priority_failback_interval_seconds: 0,
+            priority_failback_revision: 0,
+            priority_failback_target_provider_id: None,
         }
     }
 

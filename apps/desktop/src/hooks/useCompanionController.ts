@@ -13,6 +13,7 @@ import {
   repair,
   refreshAllProviders,
   refreshProvider,
+  requestPriorityFailback,
   resetAppSettings,
   setPreserveOfficialCodexAuth,
   setProviderLaunchMode,
@@ -358,6 +359,10 @@ export function useCompanionController() {
         }
       },
       resetPreferences,
+      requestPriorityFailback: (id: string, providerId: string) =>
+        run("已安排活跃会话尝试指定 Provider", "saving", async () => {
+          await requestPriorityFailback(id, providerId);
+        }),
       saveGroup: (group: GroupUpsert) =>
         run("分组已保存", "saving", async () => {
           await upsertGroup(group);

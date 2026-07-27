@@ -24,12 +24,13 @@ const CODEX_CLIENT_DISPLAY_NAME: &str = "ChatGPT / Codex";
 
 impl CompanionDaemon {
     pub fn preview_cli_command(&self, request: &CliLaunchRequest) -> Result<String> {
-        validate_working_directory(&request.working_directory)?;
-        Ok(cli_shell_command(request))
+        let mut request = request.clone();
+        request.working_directory = resolve_working_directory(&request)?;
+        Ok(cli_shell_command(&request))
     }
 
-    pub fn launch_cli(&self, request: CliLaunchRequest) -> Result<CliLaunchOutcome> {
-        validate_working_directory(&request.working_directory)?;
+    pub fn launch_cli(&self, mut request: CliLaunchRequest) -> Result<CliLaunchOutcome> {
+        request.working_directory = resolve_working_directory(&request)?;
         let terminal = resolve_terminal(request.terminal.clone());
         let command = cli_shell_command(&request);
         let launched = launch_cli_terminal(&terminal, &request.working_directory, &command);
@@ -366,6 +367,17 @@ fn validate_working_directory(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn resolve_working_directory(request: &CliLaunchRequest) -> Result<PathBuf> {
+    if let Some(path) = std::iter::once(&request.working_directory)
+        .chain(request.fallback_working_directories.iter())
+        .find(|path| path.is_dir())
+    {
+        return Ok(path.clone());
+    }
+    validate_working_directory(&request.working_directory)?;
+    Ok(request.working_directory.clone())
+}
+
 #[cfg(not(target_os = "windows"))]
 fn cli_shell_command(request: &CliLaunchRequest) -> String {
     let codex_command = request
@@ -602,6 +614,9 @@ fn single_provider_group(provider: &ProviderConfig) -> ProviderGroup {
         provider_order: vec![provider.id.clone()],
         provider_weights: Default::default(),
         fallback_enabled: false,
+        priority_failback_interval_seconds: 0,
+        priority_failback_revision: 0,
+        priority_failback_target_provider_id: None,
     }
 }
 
@@ -1253,6 +1268,9 @@ mod tests {
                         provider_order: Vec::new(),
                         provider_weights: Default::default(),
                         fallback_enabled: false,
+                        priority_failback_interval_seconds: 0,
+                        priority_failback_revision: 0,
+                        priority_failback_target_provider_id: None,
                     },
                 );
                 Ok(())
@@ -1526,6 +1544,7 @@ mod tests {
     fn cli_command_quotes_working_directory_and_resume_session_id() {
         let request = CliLaunchRequest {
             working_directory: PathBuf::from("/tmp/Client's project"),
+            fallback_working_directories: Vec::new(),
             terminal: TerminalKind::Shell,
             resume_session_id: Some("session'; touch /tmp/unexpected #".to_string()),
         };
@@ -1541,6 +1560,7 @@ mod tests {
     fn cli_command_ignores_an_empty_resume_session_id() {
         let request = CliLaunchRequest {
             working_directory: PathBuf::from("/tmp/project with spaces"),
+            fallback_working_directories: Vec::new(),
             terminal: TerminalKind::Shell,
             resume_session_id: Some("   ".to_string()),
         };
@@ -1548,6 +1568,24 @@ mod tests {
         assert_eq!(
             cli_shell_command(&request),
             "cd '/tmp/project with spaces' && codex"
+        );
+    }
+
+    #[test]
+    fn cli_launch_uses_the_first_available_fallback_directory() {
+        let temp = tempfile::tempdir().expect("temp");
+        let fallback = temp.path().join("fallback");
+        std::fs::create_dir_all(&fallback).expect("fallback directory");
+        let request = CliLaunchRequest {
+            working_directory: temp.path().join("missing"),
+            fallback_working_directories: vec![temp.path().join("also-missing"), fallback.clone()],
+            terminal: TerminalKind::Shell,
+            resume_session_id: Some("session-a".to_string()),
+        };
+
+        assert_eq!(
+            resolve_working_directory(&request).expect("resolved"),
+            fallback
         );
     }
 }

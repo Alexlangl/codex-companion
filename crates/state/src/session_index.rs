@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
-const SESSION_INDEX_VERSION: u32 = 1;
+const SESSION_INDEX_VERSION: u32 = 2;
 const RUNNING_WINDOW: Duration = Duration::from_secs(120);
+const REQUEST_MARKERS: [&str; 2] = ["## My request for Codex:", "## My request:"];
+const INJECTED_CONTEXT_TAGS: [&str; 2] = ["environment_context", "in-app-browser-context"];
 static SESSION_INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -64,6 +66,8 @@ pub fn list_sessions_cached(
         let session = match cached {
             Some(mut cached) => {
                 cached.summary.is_running = signature.is_running;
+                cached.summary.cwd_available =
+                    cached.summary.cwd.as_deref().is_some_and(Path::is_dir);
                 cached
             }
             None => {
@@ -203,7 +207,7 @@ fn parse_session_summary(path: &Path, signature: &FileSignature) -> Result<Sessi
             _ => {}
         }
         if title.is_empty() {
-            title = user_message_text(&value).unwrap_or_default();
+            title = meaningful_user_message_text(&value).unwrap_or_default();
         }
     }
 
@@ -217,9 +221,13 @@ fn parse_session_summary(path: &Path, signature: &FileSignature) -> Result<Sessi
     }
     title = compact_title(&title);
 
+    let cwd = cwd.map(PathBuf::from);
+    let cwd_available = cwd.as_deref().is_some_and(Path::is_dir);
     Ok(SessionSummary {
         id,
         title,
+        cwd,
+        cwd_available,
         model,
         provider_id,
         path: path.to_path_buf(),
@@ -258,6 +266,47 @@ fn user_message_text(value: &Value) -> Option<String> {
     })
 }
 
+fn meaningful_user_message_text(value: &Value) -> Option<String> {
+    let message = user_message_text(value)?;
+    let explicit_request = REQUEST_MARKERS
+        .iter()
+        .find_map(|marker| message.rsplit_once(marker).map(|(_, request)| request));
+    let candidate = strip_leading_context_blocks(explicit_request.unwrap_or(&message));
+    if candidate.is_empty() || candidate.starts_with("# AGENTS.md instructions for ") {
+        return None;
+    }
+    let candidate = candidate
+        .find("<image ")
+        .map(|index| &candidate[..index])
+        .unwrap_or(candidate);
+    let title = compact_title(candidate);
+    (!title.is_empty()).then_some(title)
+}
+
+fn strip_leading_context_blocks(mut value: &str) -> &str {
+    loop {
+        let trimmed = value.trim_start();
+        let Some(tag) = INJECTED_CONTEXT_TAGS
+            .iter()
+            .find(|tag| starts_with_tag(trimmed, tag))
+        else {
+            return trimmed;
+        };
+        let closing_tag = format!("</{tag}>");
+        let Some(end) = trimmed.find(&closing_tag) else {
+            return "";
+        };
+        value = &trimmed[end + closing_tag.len()..];
+    }
+}
+
+fn starts_with_tag(value: &str, tag: &str) -> bool {
+    let Some(remainder) = value.strip_prefix(&format!("<{tag}")) else {
+        return false;
+    };
+    remainder.starts_with('>') || remainder.starts_with(char::is_whitespace)
+}
+
 fn compact_title(value: &str) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     compact.chars().take(120).collect()
@@ -273,6 +322,11 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
     [
         session.id.as_str(),
         session.title.as_str(),
+        session
+            .cwd
+            .as_deref()
+            .and_then(Path::to_str)
+            .unwrap_or_default(),
         session.model.as_str(),
         session.provider_id.as_deref().unwrap_or_default(),
         session.path.to_str().unwrap_or_default(),
@@ -316,14 +370,38 @@ mod tests {
     fn caches_and_searches_session_first_page() {
         let temp = tempfile::tempdir().expect("temp");
         let day = temp.path().join("codex/sessions/2026/07/22");
+        let project = temp.path().join("alpha");
         fs::create_dir_all(&day).expect("mkdir");
-        fs::write(
-            day.join("rollout-session-a.jsonl"),
-            r#"{"type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/alpha","model_provider":"openai"}}
-{"type":"turn_context","payload":{"model":"gpt-5.6-codex"}}
-{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Repair the release workflow"}]}}"#,
-        )
-        .expect("write");
+        fs::create_dir_all(&project).expect("project mkdir");
+        let contents = [
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "session-a",
+                    "cwd": project,
+                    "model_provider": "openai",
+                },
+            }),
+            serde_json::json!({
+                "type": "turn_context",
+                "payload": { "model": "gpt-5.6-codex" },
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "Repair the release workflow",
+                    }],
+                },
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(day.join("rollout-session-a.jsonl"), contents).expect("write");
         let cache_dir = temp.path().join("cache");
 
         let first = list_sessions_cached(
@@ -336,6 +414,9 @@ mod tests {
         .expect("first");
         assert!(!first.from_cache);
         assert_eq!(first.sessions[0].title, "Repair the release workflow");
+        assert_eq!(first.sessions[0].cwd.as_deref(), Some(project.as_path()));
+        assert!(first.sessions[0].cwd_available);
+        fs::remove_dir(&project).expect("remove project");
         let second = list_sessions_cached(
             temp.path().join("codex"),
             cache_dir,
@@ -347,5 +428,52 @@ mod tests {
         assert!(second.from_cache);
         assert_eq!(second.total, 1);
         assert_eq!(second.sessions[0].id, "session-a");
+        assert!(!second.sessions[0].cwd_available);
+    }
+
+    #[test]
+    fn skips_injected_context_and_extracts_the_explicit_user_request() {
+        let injected = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "<environment_context><cwd>/tmp/project</cwd></environment_context>"
+                }]
+            }
+        });
+        let request = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "# Files mentioned by the user:\n\n## My request for Codex:\n让历史会话显示真正的用户请求\n<image name=\"screenshot\">"
+                }]
+            }
+        });
+
+        assert_eq!(meaningful_user_message_text(&injected), None);
+        assert_eq!(
+            meaningful_user_message_text(&request).as_deref(),
+            Some("让历史会话显示真正的用户请求")
+        );
+    }
+
+    #[test]
+    fn skips_repository_instructions_when_choosing_a_title() {
+        let instructions = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>Internal rules</INSTRUCTIONS>"
+                }]
+            }
+        });
+
+        assert_eq!(meaningful_user_message_text(&instructions), None);
     }
 }

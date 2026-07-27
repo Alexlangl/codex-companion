@@ -1801,6 +1801,12 @@ dd {
   gap: 6px;
 }
 
+.group-provider-badges .button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
 .group-empty {
   padding: 12px;
   border-radius: var(--radius);
@@ -2285,11 +2291,15 @@ dd {
 }
 
 .session-row-title strong {
+  display: -webkit-box;
   min-width: 0;
+  flex: 1 1 320px;
   overflow: hidden;
   font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .session-row-main > span,

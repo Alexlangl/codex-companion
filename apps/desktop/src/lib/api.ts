@@ -163,6 +163,8 @@ export function getSessionPage(
       {
         id: "019f7dcb-642d-70c2-a12d-19d7e603a8c0",
         title: "完善 Codex Companion 发布和用量能力",
+        cwd: "/Users/demo/work/codex-companion",
+        cwdAvailable: true,
         model: "gpt-5.6-codex",
         providerId: "official-team",
         path: `${MOCK_CODEX_DIR}/sessions/2026/07/22/rollout-demo.jsonl`,
@@ -176,7 +178,7 @@ export function getSessionPage(
     const query = options.query?.trim().toLowerCase() ?? "";
     const filtered = sessions.filter((session) => {
       if (!query) return true;
-      return [session.id, session.title, session.model, session.providerId]
+      return [session.id, session.title, session.cwd, session.model, session.providerId]
         .some((value) => value.toLowerCase().includes(query));
     });
     return Promise.resolve<SessionPage>({
@@ -985,20 +987,50 @@ export function refreshAllProviders() {
 
 export function upsertGroup(input: GroupUpsert) {
   if (!isTauri()) {
+    const previousGroup = mockStatus.config.groups[input.id];
+    const group: ProviderGroup = {
+      ...input,
+      priorityFailbackRevision: previousGroup?.priorityFailbackRevision ?? 0,
+      priorityFailbackTargetProviderId: previousGroup?.priorityFailbackTargetProviderId ?? null,
+    };
     mockStatus = {
       ...mockStatus,
       config: {
         ...mockStatus.config,
         groups: {
           ...mockStatus.config.groups,
-          [input.id]: input,
+          [input.id]: group,
         },
       },
     };
     mockStatus = syncMockDerived(mockStatus);
-    return Promise.resolve(input);
+    return Promise.resolve(group);
   }
   return invoke<ProviderGroup>("upsert_group", { input });
+}
+
+export function requestPriorityFailback(id: string, providerId: string) {
+  if (!isTauri()) {
+    const group = mockStatus.config.groups[id];
+    if (!group) return Promise.reject(new Error(`unknown group: ${id}`));
+    const updatedGroup = {
+      ...group,
+      priorityFailbackRevision: group.priorityFailbackRevision + 1,
+      priorityFailbackTargetProviderId: providerId,
+    };
+    mockStatus = {
+      ...mockStatus,
+      config: {
+        ...mockStatus.config,
+        groups: {
+          ...mockStatus.config.groups,
+          [id]: updatedGroup,
+        },
+      },
+    };
+    return Promise.resolve(updatedGroup);
+  }
+  return invoke<ProviderGroup>("request_priority_failback", { id, providerId });
 }
 
 export function useGroup(id: string) {
@@ -1079,6 +1111,9 @@ export function launchProvider(id: string, mode: ProviderLaunchMode = "auto", co
       providerOrder: [provider.id],
       providerWeights: {},
       fallbackEnabled: false,
+      priorityFailbackIntervalSeconds: 0,
+      priorityFailbackRevision: 0,
+      priorityFailbackTargetProviderId: null,
     };
     mockStatus = {
       ...mockStatus,
@@ -1492,6 +1527,9 @@ function createMockStatus(): CompanionStatus {
           providerOrder: ["official-team", "backup-api"],
           providerWeights: { "official-team": 3, "backup-api": 1 },
           fallbackEnabled: true,
+          priorityFailbackIntervalSeconds: 0,
+          priorityFailbackRevision: 0,
+          priorityFailbackTargetProviderId: null,
         },
       },
       health: {
@@ -1551,7 +1589,7 @@ function createMockApiServiceSnapshot(): ApiServiceSnapshot {
         model: "gpt-5.6-codex",
         clientId: "client_local_cli",
         clientName: "本地开发 CLI",
-        providerId: "official-team",
+        providerId: "backup-api",
         statusCode: 200,
         outcome: "succeeded",
         attempts: 1,
@@ -1566,7 +1604,7 @@ function createMockApiServiceSnapshot(): ApiServiceSnapshot {
         model: "gpt-5.6",
         clientId: "client_local_cli",
         clientName: "本地开发 CLI",
-        providerId: "backup-api",
+        providerId: "official-team",
         statusCode: 200,
         outcome: "succeeded",
         attempts: 2,

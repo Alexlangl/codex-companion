@@ -155,6 +155,7 @@ function App() {
                     active={activeTab === "groups"}
                     busy={busy}
                     status={status}
+                    onRequestPriorityFailback={actions.requestPriorityFailback}
                     onSave={actions.saveGroup}
                     onUse={actions.useGroup}
                     onLaunch={actions.launchGroup}

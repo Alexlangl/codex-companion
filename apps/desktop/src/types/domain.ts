@@ -148,6 +148,8 @@ export interface TokenUsageSyncStatus {
 export interface SessionSummary {
   id: string;
   title: string;
+  cwd?: string | null;
+  cwdAvailable: boolean;
   model: string;
   providerId?: string | null;
   path: string;
@@ -235,6 +237,9 @@ export interface ProviderGroup {
   providerOrder: string[];
   providerWeights: Record<string, number>;
   fallbackEnabled: boolean;
+  priorityFailbackIntervalSeconds: number;
+  priorityFailbackRevision: number;
+  priorityFailbackTargetProviderId?: string | null;
 }
 
 export interface CompanionConfig {
@@ -441,10 +446,12 @@ export interface GroupUpsert {
   providerOrder: string[];
   providerWeights: Record<string, number>;
   fallbackEnabled: boolean;
+  priorityFailbackIntervalSeconds: number;
 }
 
 export interface CliLaunchRequest {
   workingDirectory: string;
+  fallbackWorkingDirectories?: string[];
   terminal: TerminalKind;
   resumeSessionId?: string | null;
 }

@@ -254,6 +254,16 @@ fn use_group(id: String) -> Result<codex_companion_core::ProviderGroup, String> 
 }
 
 #[tauri::command]
+fn request_priority_failback(
+    id: String,
+    provider_id: String,
+) -> Result<codex_companion_core::ProviderGroup, String> {
+    daemon()?
+        .request_priority_failback(&id, &provider_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn launch_group(
     id: String,
     codex_dir: Option<String>,
@@ -492,6 +502,7 @@ pub fn run() {
             refresh_all_providers,
             upsert_group,
             use_group,
+            request_priority_failback,
             launch_group,
             launch_provider,
             preview_cli_command,

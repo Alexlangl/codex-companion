@@ -557,7 +557,7 @@ fn create_group(daemon: &CompanionDaemon, app: &mut TuiState) {
     let Some(order) = prompt("账号 ID 顺序，逗号分隔") else {
         return;
     };
-    save_group(daemon, app, id, name, parse_csv(&order), true);
+    save_group(daemon, app, id, name, parse_csv(&order), true, 0);
 }
 
 fn edit_group(daemon: &CompanionDaemon, app: &mut TuiState, status: &CompanionStatus) {
@@ -574,6 +574,7 @@ fn edit_group(daemon: &CompanionDaemon, app: &mut TuiState, status: &CompanionSt
         group.name.clone(),
         parse_csv(&order),
         group.fallback_enabled,
+        group.priority_failback_interval_seconds,
     );
 }
 
@@ -584,6 +585,7 @@ fn save_group(
     name: String,
     provider_order: Vec<String>,
     fallback_enabled: bool,
+    priority_failback_interval_seconds: u64,
 ) {
     match daemon.upsert_group(GroupUpsert {
         id,
@@ -596,6 +598,7 @@ fn save_group(
         provider_order,
         provider_weights: Default::default(),
         fallback_enabled,
+        priority_failback_interval_seconds,
     }) {
         Ok(group) => app.message = format!("已保存分组：{}", group.name),
         Err(error) => app.message = format!("保存失败：{error}"),

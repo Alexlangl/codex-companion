@@ -62,12 +62,18 @@ export function Sessions({ active, status }: SessionsProps) {
   }
 
   async function handleLaunchResume(session: SessionSummary): Promise<void> {
-    const workingDirectory = status.config.app.recentWorkingDirectories[0] ?? status.codex.codexDir;
+    const fallbackDirectory = status.config.app.recentWorkingDirectories[0] ?? status.codex.codexDir;
+    const workingDirectory = session.cwdAvailable && session.cwd ? session.cwd : fallbackDirectory;
+    const fallbackWorkingDirectories = uniqueFallbackDirectories(workingDirectory, [
+      fallbackDirectory,
+      status.codex.codexDir,
+    ]);
     setLaunchingId(session.id);
     setLaunchMessage("");
     try {
       const outcome = await launchCli({
         workingDirectory,
+        fallbackWorkingDirectories,
         terminal: status.config.app.preferredTerminal,
         resumeSessionId: session.id,
       });
@@ -91,7 +97,7 @@ export function Sessions({ active, status }: SessionsProps) {
               <Search aria-hidden="true" size={15} />
               <input
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder="标题、Session ID、模型或 Provider"
+                placeholder="标题、项目、Session ID、模型或 Provider"
                 type="search"
                 value={query}
               />
@@ -126,11 +132,11 @@ export function Sessions({ active, status }: SessionsProps) {
           <article className="session-row" key={session.path}>
             <div className="session-row-main">
               <div className="session-row-title">
-                <strong>{session.title}</strong>
+                <strong title={session.title}>{session.title}</strong>
                 {session.isRunning ? <Badge tone="ok">运行中</Badge> : null}
                 {session.isSubagent ? <Badge tone="info">子任务</Badge> : null}
               </div>
-              <span>{session.model}{session.providerId ? ` · ${session.providerId}` : ""}</span>
+              <span title={session.cwd ?? undefined}>{sessionContextLabel(session)}</span>
               {session.parentId ? (
                 <span title={session.parentId}>父会话 {compactSessionId(session.parentId)}</span>
               ) : null}
@@ -172,4 +178,22 @@ function shellQuote(value: string): string {
 
 function compactSessionId(value: string): string {
   return value.length > 16 ? `${value.slice(0, 8)}...${value.slice(-5)}` : value;
+}
+
+function sessionContextLabel(session: SessionSummary): string {
+  const context: string[] = [];
+  if (session.cwd) {
+    context.push(compactPath(session.cwd));
+  }
+  context.push(session.model);
+  if (session.providerId) {
+    context.push(session.providerId);
+  }
+  return context.join(" · ");
+}
+
+function uniqueFallbackDirectories(workingDirectory: string, candidates: string[]): string[] {
+  return candidates.filter((directory, index) => (
+    directory !== workingDirectory && candidates.indexOf(directory) === index
+  ));
 }

@@ -73,6 +73,8 @@ pub struct GroupUpsert {
     #[serde(default)]
     pub provider_weights: BTreeMap<String, u16>,
     pub fallback_enabled: bool,
+    #[serde(default)]
+    pub priority_failback_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,21 +12,26 @@ import type { ApiRequestLog, BusyState, CompanionStatus, GroupPolicy, GroupUpser
 
 const GROUP_ROUTE_REFRESH_INTERVAL_MS = 2_000;
 
-export function Groups({
-  active,
-  busy,
-  status,
-  onSave,
-  onLaunch,
-  onUse,
-}: {
+type GroupsProps = {
   active: boolean;
   busy: BusyState;
   status: CompanionStatus;
+  onRequestPriorityFailback: (id: string, providerId: string) => Promise<void>;
   onSave: (group: GroupUpsert) => Promise<void>;
   onLaunch: (id: string) => Promise<void>;
   onUse: (id: string) => Promise<void>;
-}) {
+};
+
+export function Groups(props: GroupsProps) {
+  const {
+    active,
+    busy,
+    status,
+    onRequestPriorityFailback,
+    onSave,
+    onLaunch,
+    onUse,
+  } = props;
   const providers = useMemo(() => Object.values(status.config.providers), [status]);
   const groups = userVisibleGroups(status);
   const application = currentApplication(status);
@@ -70,6 +75,7 @@ export function Groups({
       ...group,
       providerOrder: existingProviderIds(group.providerOrder, providers),
       providerWeights: group.providerWeights ?? {},
+      priorityFailbackIntervalSeconds: group.priorityFailbackIntervalSeconds ?? 0,
     });
     setOpen(true);
   }
@@ -110,6 +116,41 @@ export function Groups({
     setForm({ ...form, providerOrder });
   }
 
+  function changePolicy(policy: string): void {
+    const nextPolicy = policy as GroupPolicy;
+    setForm({
+      ...form,
+      policy: nextPolicy,
+      fallbackEnabled: nextPolicy !== "manual",
+      priorityFailbackIntervalSeconds: nextPolicy === "priority_fallback"
+        ? form.priorityFailbackIntervalSeconds
+        : 0,
+    });
+  }
+
+  function changeFallback(enabled: boolean): void {
+    setForm({
+      ...form,
+      fallbackEnabled: enabled,
+      priorityFailbackIntervalSeconds: enabled ? form.priorityFailbackIntervalSeconds : 0,
+    });
+  }
+
+  function togglePriorityFailback(enabled: boolean): void {
+    setForm({
+      ...form,
+      priorityFailbackIntervalSeconds: enabled ? 60 : 0,
+    });
+  }
+
+  function changePriorityFailbackInterval(value: string): void {
+    const seconds = Number(value);
+    setForm({
+      ...form,
+      priorityFailbackIntervalSeconds: Number.isFinite(seconds) ? seconds : 60,
+    });
+  }
+
   return (
     <div className="content-stack">
       <Panel eyebrow="分组" title="账号分组">
@@ -128,6 +169,9 @@ export function Groups({
             const recentlyUsedProvider = recentlyUsedProviderId
               ? status.config.providers[recentlyUsedProviderId]
               : null;
+            const recentlyUsedProviderIndex = recentlyUsedProviderId
+              ? providerIds.indexOf(recentlyUsedProviderId)
+              : -1;
             const routeStatusLabel = activeGroupRouteLabel(
               isActiveGroup,
               recentlyUsedProvider,
@@ -146,6 +190,9 @@ export function Groups({
                   <div className="badge-row">
                     {isActiveGroup ? <Badge tone="ok">当前分组</Badge> : null}
                     <Badge tone={group.fallbackEnabled ? "accent" : "neutral"}>{group.fallbackEnabled ? "自动切换" : "固定首个"}</Badge>
+                    {group.priorityFailbackIntervalSeconds > 0 ? (
+                      <Badge tone="accent">自动回切 {group.priorityFailbackIntervalSeconds}s</Badge>
+                    ) : null}
                   </div>
                 </div>
                 {providerIds.length === 0 ? (
@@ -156,6 +203,13 @@ export function Groups({
                           const provider = status.config.providers[id];
                           const health = status.config.health[id];
                           const quota = provider ? quotaInfo(provider.account) : null;
+                          const canRequestPriorityFailback = isActiveGroup
+                            && group.policy === "priority_fallback"
+                            && group.fallbackEnabled
+                            && recentlyUsedProviderIndex > index;
+                          const isPriorityFailbackDisabled = disabled
+                            || !provider?.enabled
+                            || health?.status === "auth_failed";
                           return (
                             <div className="group-provider-row" key={id}>
                               <span>{index + 1}</span>
@@ -164,6 +218,15 @@ export function Groups({
                                 <small>{provider ? groupProviderMeta(provider, quota?.percentLabel) : "账号不存在"}</small>
                               </div>
                               <div className="group-provider-badges">
+                                {canRequestPriorityFailback && (
+                                    <Button
+                                      disabled={isPriorityFailbackDisabled}
+                                      onClick={() => void onRequestPriorityFailback(group.id, id)}
+                                      variant="secondary"
+                                    >
+                                      <ArrowUp aria-hidden="true" size={14} /> 尝试此账号
+                                    </Button>
+                                  )}
                                 {recentlyUsedProviderId === id ? <Badge tone="accent">最近使用</Badge> : null}
                                 <Badge tone={providerHealthTone(health?.status)}>{providerHealthLabel(health?.status)}</Badge>
                                 {quota ? <Badge tone={quota.tone}>{quota.percentLabel}</Badge> : null}
@@ -217,14 +280,7 @@ export function Groups({
                 </Field>
               </div>
               <Field label="切换方式">
-                <Select.Root value={form.policy} onValueChange={(policy) => {
-                  const nextPolicy = policy as GroupPolicy;
-                  setForm({
-                    ...form,
-                    policy: nextPolicy,
-                    fallbackEnabled: nextPolicy !== "manual",
-                  });
-                }}>
+                <Select.Root value={form.policy} onValueChange={changePolicy}>
                   <Select.Trigger className="select-trigger">
                     <Select.Value />
                   </Select.Trigger>
@@ -327,9 +383,35 @@ export function Groups({
               </div>
 
               <label className="check-row">
-                <input checked={form.fallbackEnabled} disabled={form.policy === "manual"} onChange={(event) => setForm({ ...form, fallbackEnabled: event.target.checked })} type="checkbox" />
+                <input checked={form.fallbackEnabled} disabled={form.policy === "manual"} onChange={(event) => changeFallback(event.target.checked)} type="checkbox" />
                 <span>请求失败时自动切换下一个账号</span>
               </label>
+              {form.policy === "priority_fallback" ? (
+                <div className="priority-failback-settings">
+                  <label className="check-row">
+                    <input
+                      checked={form.priorityFailbackIntervalSeconds > 0}
+                      disabled={!form.fallbackEnabled}
+                      onChange={(event) => togglePriorityFailback(event.target.checked)}
+                      type="checkbox"
+                    />
+                    <span>定期尝试上一级账号</span>
+                  </label>
+                  {form.priorityFailbackIntervalSeconds > 0 ? (
+                    <Field label="尝试间隔（秒）">
+                      <input
+                        max={3600}
+                        min={10}
+                        onChange={(event) => changePriorityFailbackInterval(event.target.value)}
+                        required
+                        step={1}
+                        type="number"
+                        value={form.priorityFailbackIntervalSeconds}
+                      />
+                    </Field>
+                  ) : null}
+                </div>
+              ) : null}
               <div className="actions">
                 <Button disabled={disabled} type="submit">
                   <Save size={15} /> 保存分组
@@ -351,6 +433,7 @@ function newGroupDraft(): GroupUpsert {
     providerOrder: [],
     providerWeights: {},
     fallbackEnabled: true,
+    priorityFailbackIntervalSeconds: 0,
   };
 }
 

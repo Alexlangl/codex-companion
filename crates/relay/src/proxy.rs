@@ -2,7 +2,7 @@ use crate::content_encoding::{
     decode_request_body, RequestBodyDecodeError, MAX_REQUEST_BODY_BYTES,
 };
 use crate::events::{append_event, record_health_success, update_health};
-use crate::state::{apply_group_policy, RelayState};
+use crate::state::{apply_group_policy, AffinityBindContext, RelayState};
 use crate::upstream::{
     send_upstream, stream_response, text_response, upstream_url, UpstreamRequest,
 };
@@ -15,8 +15,8 @@ use axum::{
 };
 use bytes::Bytes;
 use codex_companion_core::{
-    provider_endpoint_is_chat_completions, ApiClient, CompanionConfig, HealthFailureKind,
-    HealthStatusKind, ProviderKind,
+    provider_endpoint_is_chat_completions, ApiClient, CompanionConfig, GroupPolicy,
+    HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderGroup, ProviderKind,
 };
 use codex_companion_health::{
     classify_failure, cooldown_active, mark_failure, mark_model_failure, normalize_expired_cooldown,
@@ -280,6 +280,26 @@ async fn proxy_dispatch(
             return Ok(allowed_models_response(&models));
         }
     }
+    let affinity_preference = affinity_key.as_deref().and_then(|key| {
+        state
+            .preferred_provider(key, config.relay.session_affinity_ttl_seconds, &group)
+            .map(|provider| (key, provider))
+    });
+    let priority_failback_claim = affinity_preference
+        .as_ref()
+        .and_then(|(key, _)| state.claim_priority_failback_probe(key, &group));
+    let manually_requested_provider = priority_failback_claim
+        .filter(|claim| claim.manual)
+        .and_then(|_| {
+            let (_, preference) = affinity_preference.as_ref()?;
+            let target_provider = group.priority_failback_target_provider_id.as_deref()?;
+            specific_higher_priority_provider(
+                &group,
+                &selected,
+                &preference.provider_id,
+                target_provider,
+            )
+        });
     // AuthFailed(key 被吊销/凭证失效)必须无条件排除：它不会随冷却到期恢复，
     // 只有刷新成功(mark_success)才解除；单账号/关闭 fallback 时也不能拿它无
     // 限重试。临时冷却(429/5xx)则只在有其他候选时跳过——只剩一个账号时拒绝
@@ -291,6 +311,12 @@ async fn proxy_dispatch(
             let health = config.health.get(&provider.id);
             if health.is_some_and(|health| matches!(health.status, HealthStatusKind::AuthFailed)) {
                 return false;
+            }
+            if manually_requested_provider
+                .as_deref()
+                .is_some_and(|provider_id| provider_id == provider.id)
+            {
+                return true;
             }
             if !has_alternatives {
                 return true;
@@ -308,17 +334,43 @@ async fn proxy_dispatch(
 
     apply_group_policy(&state, &group, &mut candidates);
 
-    // 粘性提升必须在截断之前：绑定账号排在截断线之后时会被截掉，多轮会话上下文静默丢失。
-    if let Some(preferred_provider) = affinity_key
-        .as_deref()
-        .and_then(|key| state.preferred_provider(key, config.relay.session_affinity_ttl_seconds))
-    {
-        if let Some(index) = candidates
-            .iter()
-            .position(|provider| provider.id == preferred_provider)
-        {
-            let provider = candidates.remove(index);
-            candidates.insert(0, provider);
+    // 会话亲和与向上探测都必须在 retry_budget 截断之前排序，确保探测失败时
+    // 当前已知可用的 Provider 紧跟其后，不会被截断。
+    let priority_probe_provider = affinity_preference.as_ref().and_then(|(_, preference)| {
+        let automatic_probe_provider = priority_failback_claim
+            .filter(|claim| claim.automatic)
+            .and_then(|_| {
+                nearest_higher_priority_provider(&group, &candidates, &preference.provider_id)
+            });
+        manually_requested_provider
+            .filter(|provider_id| {
+                candidates
+                    .iter()
+                    .any(|provider| provider.id == *provider_id)
+            })
+            .or(automatic_probe_provider)
+    });
+    if let Some((_, preference)) = affinity_preference.as_ref() {
+        prioritize_session_affinity(
+            &mut candidates,
+            &preference.provider_id,
+            priority_probe_provider.as_deref(),
+        );
+        if let Some(provider_id) = priority_probe_provider.as_ref() {
+            let trigger = if priority_failback_claim.is_some_and(|claim| claim.manual)
+                && group.priority_failback_target_provider_id.as_deref()
+                    == Some(provider_id.as_str())
+            {
+                "手动"
+            } else {
+                "自动"
+            };
+            append_event(
+                &state.store,
+                "failback",
+                Some(provider_id.clone()),
+                format!("[{request_id}] 会话{trigger}向上探测 Provider {provider_id}"),
+            );
         }
     }
     if !group.fallback_enabled {
@@ -448,10 +500,23 @@ async fn proxy_dispatch(
                 let downstream_status = downstream.status();
                 if downstream_status.is_success() {
                     if let Some(affinity_key) = affinity_key.as_deref() {
+                        let priority_probe_generation = priority_probe_provider
+                            .as_deref()
+                            .filter(|provider_id| *provider_id == provider.id.as_str())
+                            .and_then(|_| {
+                                priority_failback_claim.map(|claim| claim.probe_generation)
+                            });
                         state.bind_provider(
                             affinity_key,
                             &provider.id,
                             config.relay.session_affinity_ttl_seconds,
+                            &group,
+                            AffinityBindContext {
+                                expected_route_generation: affinity_preference
+                                    .as_ref()
+                                    .map(|(_, preference)| preference.route_generation),
+                                priority_probe_generation,
+                            },
                         );
                     }
                     if let Some(model) = requested_model.as_deref() {
@@ -646,6 +711,82 @@ async fn proxy_dispatch(
         "all_providers_failed",
         &error,
     ))
+}
+
+fn nearest_higher_priority_provider(
+    group: &ProviderGroup,
+    candidates: &[ProviderConfig],
+    preferred_provider: &str,
+) -> Option<String> {
+    if !matches!(group.policy, GroupPolicy::PriorityFallback) || !group.fallback_enabled {
+        return None;
+    }
+    let preferred_index = group
+        .provider_order
+        .iter()
+        .position(|provider_id| provider_id == preferred_provider)?;
+    candidates
+        .iter()
+        .filter_map(|provider| {
+            let index = group
+                .provider_order
+                .iter()
+                .position(|provider_id| provider_id == &provider.id)?;
+            (index < preferred_index).then_some((index, provider.id.clone()))
+        })
+        .max_by_key(|(index, _)| *index)
+        .map(|(_, provider_id)| provider_id)
+}
+
+fn specific_higher_priority_provider(
+    group: &ProviderGroup,
+    candidates: &[ProviderConfig],
+    preferred_provider: &str,
+    target_provider: &str,
+) -> Option<String> {
+    if !matches!(group.policy, GroupPolicy::PriorityFallback) || !group.fallback_enabled {
+        return None;
+    }
+    let preferred_index = group
+        .provider_order
+        .iter()
+        .position(|provider_id| provider_id == preferred_provider)?;
+    let target_index = group
+        .provider_order
+        .iter()
+        .position(|provider_id| provider_id == target_provider)?;
+    if target_index >= preferred_index {
+        return None;
+    }
+    candidates
+        .iter()
+        .find(|provider| provider.id == target_provider)
+        .map(|provider| provider.id.clone())
+}
+
+fn prioritize_session_affinity(
+    candidates: &mut Vec<ProviderConfig>,
+    preferred_provider: &str,
+    priority_probe_provider: Option<&str>,
+) {
+    let priority_probe = priority_probe_provider.and_then(|provider_id| {
+        candidates
+            .iter()
+            .position(|provider| provider.id == provider_id)
+            .map(|index| candidates.remove(index))
+    });
+    let preferred = candidates
+        .iter()
+        .position(|provider| provider.id == preferred_provider)
+        .map(|index| candidates.remove(index));
+    if let Some(priority_probe) = priority_probe {
+        candidates.insert(0, priority_probe);
+        if let Some(preferred) = preferred {
+            candidates.insert(1, preferred);
+        }
+    } else if let Some(preferred) = preferred {
+        candidates.insert(0, preferred);
+    }
 }
 
 fn fallback_eligible(failure: &codex_companion_health::FailureClassification) -> bool {
@@ -947,6 +1088,7 @@ fn relay_root_response() -> Response {
 mod tests {
     use super::*;
     use axum::{body::to_bytes, routing::any, Router};
+    use chrono::{Duration as ChronoDuration, Utc};
     use codex_companion_core::{
         ApiClientCreate, ConfigStore, GroupPolicy, HealthFailureKind, ProviderConfig,
         ProviderGroup, ProviderHealth, ProviderKind,
@@ -2006,6 +2148,252 @@ mod tests {
         assert_eq!(hits_c.load(Ordering::SeqCst), 2);
     }
 
+    #[tokio::test]
+    async fn manual_priority_failback_rebinds_to_the_selected_higher_provider() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let hits_c = Arc::new(AtomicUsize::new(0));
+        let url_a = spawn_mock_server(StatusCode::OK, "from a", Some(hits_a.clone())).await;
+        let url_b = spawn_mock_server(StatusCode::OK, "from b", Some(hits_b.clone())).await;
+        let url_c = spawn_mock_server(StatusCode::OK, "from c", Some(hits_c.clone())).await;
+        let store = store_with_group(vec![
+            provider("a", &url_a),
+            provider("b", &url_b),
+            provider("c", &url_c),
+        ]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        let mut session_headers = HeaderMap::new();
+        session_headers.insert("x-session-id", HeaderValue::from_static("thread-failback"));
+
+        store
+            .update(|config| {
+                config.groups.get_mut("test").expect("group").provider_order =
+                    vec!["c".to_string(), "a".to_string(), "b".to_string()];
+                Ok(())
+            })
+            .expect("bind order");
+        let bound = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            session_headers.clone(),
+            Bytes::new(),
+        )
+        .await
+        .expect("bound request");
+        assert_eq!(
+            &to_bytes(bound.into_body(), 1024).await.expect("bound body")[..],
+            b"from c"
+        );
+
+        store
+            .update(|config| {
+                let group = config.groups.get_mut("test").expect("group");
+                group.provider_order = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+                group.priority_failback_revision += 1;
+                group.priority_failback_target_provider_id = Some("a".to_string());
+                config.health.insert(
+                    "a".to_string(),
+                    ProviderHealth {
+                        status: HealthStatusKind::Cooldown,
+                        cooldown_until: Some(Utc::now() + ChronoDuration::minutes(5)),
+                        ..ProviderHealth::default()
+                    },
+                );
+                config.relay.retry_budget = 1;
+                Ok(())
+            })
+            .expect("request failback");
+        let failback = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            session_headers.clone(),
+            Bytes::new(),
+        )
+        .await
+        .expect("failback request");
+        assert_eq!(
+            &to_bytes(failback.into_body(), 1024)
+                .await
+                .expect("failback body")[..],
+            b"from a"
+        );
+
+        let sticky = proxy_inner(
+            state,
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            session_headers,
+            Bytes::new(),
+        )
+        .await
+        .expect("sticky request");
+        assert_eq!(
+            &to_bytes(sticky.into_body(), 1024)
+                .await
+                .expect("sticky body")[..],
+            b"from a"
+        );
+        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_c.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn manual_priority_failback_still_prioritizes_target_when_current_is_unavailable() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let hits_c = Arc::new(AtomicUsize::new(0));
+        let url_a = spawn_mock_server(StatusCode::OK, "from a", Some(hits_a.clone())).await;
+        let url_b = spawn_mock_server(StatusCode::OK, "from b", Some(hits_b.clone())).await;
+        let url_c = spawn_mock_server(StatusCode::OK, "from c", Some(hits_c.clone())).await;
+        let store = store_with_group(vec![
+            provider("a", &url_a),
+            provider("b", &url_b),
+            provider("c", &url_c),
+        ]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        let mut session_headers = HeaderMap::new();
+        session_headers.insert(
+            "x-session-id",
+            HeaderValue::from_static("thread-unavailable-current"),
+        );
+
+        store
+            .update(|config| {
+                config.groups.get_mut("test").expect("group").provider_order =
+                    vec!["c".to_string(), "a".to_string(), "b".to_string()];
+                Ok(())
+            })
+            .expect("bind order");
+        let bound = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            session_headers.clone(),
+            Bytes::new(),
+        )
+        .await
+        .expect("bound request");
+        assert_eq!(
+            &to_bytes(bound.into_body(), 1024).await.expect("bound body")[..],
+            b"from c"
+        );
+
+        store
+            .update(|config| {
+                let group = config.groups.get_mut("test").expect("group");
+                group.provider_order = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+                group.priority_failback_revision += 1;
+                group.priority_failback_target_provider_id = Some("b".to_string());
+                config.health.insert(
+                    "c".to_string(),
+                    ProviderHealth {
+                        status: HealthStatusKind::AuthFailed,
+                        ..ProviderHealth::default()
+                    },
+                );
+                config.relay.retry_budget = 1;
+                Ok(())
+            })
+            .expect("request failback");
+        let failback = proxy_inner(
+            state,
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            session_headers,
+            Bytes::new(),
+        )
+        .await
+        .expect("failback request");
+        assert_eq!(
+            &to_bytes(failback.into_body(), 1024)
+                .await
+                .expect("failback body")[..],
+            b"from b"
+        );
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_c.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_priority_failback_keeps_the_current_provider_inside_retry_budget() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let hits_c = Arc::new(AtomicUsize::new(0));
+        let url_a = spawn_mock_server(StatusCode::OK, "from a", Some(hits_a.clone())).await;
+        let url_b = spawn_mock_server(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed b",
+            Some(hits_b.clone()),
+        )
+        .await;
+        let url_c = spawn_mock_server(StatusCode::OK, "from c", Some(hits_c.clone())).await;
+        let store = store_with_group(vec![
+            provider("a", &url_a),
+            provider("b", &url_b),
+            provider("c", &url_c),
+        ]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        let mut session_headers = HeaderMap::new();
+        session_headers.insert(
+            "x-session-id",
+            HeaderValue::from_static("thread-failed-failback"),
+        );
+
+        store
+            .update(|config| {
+                config.groups.get_mut("test").expect("group").provider_order =
+                    vec!["c".to_string(), "a".to_string(), "b".to_string()];
+                Ok(())
+            })
+            .expect("bind order");
+        let bound = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            session_headers.clone(),
+            Bytes::new(),
+        )
+        .await
+        .expect("bound request");
+        assert_eq!(
+            &to_bytes(bound.into_body(), 1024).await.expect("bound body")[..],
+            b"from c"
+        );
+
+        store
+            .update(|config| {
+                let group = config.groups.get_mut("test").expect("group");
+                group.provider_order = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+                group.priority_failback_revision += 1;
+                group.priority_failback_target_provider_id = Some("b".to_string());
+                config.relay.retry_budget = 1;
+                Ok(())
+            })
+            .expect("request failback");
+        let failback = proxy_inner(
+            state,
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            session_headers,
+            Bytes::new(),
+        )
+        .await
+        .expect("failback request");
+        assert_eq!(
+            &to_bytes(failback.into_body(), 1024)
+                .await
+                .expect("failback body")[..],
+            b"from c"
+        );
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_c.load(Ordering::SeqCst), 2);
+    }
+
     async fn spawn_mock_server(
         status: StatusCode,
         body: &'static str,
@@ -2079,6 +2467,9 @@ mod tests {
                         provider_order,
                         provider_weights: Default::default(),
                         fallback_enabled: true,
+                        priority_failback_interval_seconds: 0,
+                        priority_failback_revision: 0,
+                        priority_failback_target_provider_id: None,
                     },
                 );
                 Ok(())
