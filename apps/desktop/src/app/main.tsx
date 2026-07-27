@@ -3,7 +3,7 @@ import * as Progress from "@radix-ui/react-progress";
 import * as Tabs from "@radix-ui/react-tabs";
 import * as Toast from "@radix-ui/react-toast";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { Boxes, Command, Gauge, GitBranch, Hammer, History, LayoutDashboard, Moon, RadioTower, Settings as SettingsIcon, Sun, X } from "lucide-react";
+import { Boxes, Gauge, GitBranch, Hammer, History, LayoutDashboard, Moon, RadioTower, Settings as SettingsIcon, Sun, X } from "lucide-react";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { Button, IconButton } from "../components/ui";
@@ -253,9 +253,7 @@ function App() {
 function Brand() {
   return (
     <div className="brand" aria-label="Codex Companion">
-      <div className="brand-icon" aria-hidden="true">
-        <Command size={16} strokeWidth={2.2} />
-      </div>
+      <div className="brand-icon" aria-hidden="true">CC</div>
       <div className="brand-copy">
         <strong>Companion</strong>
         <span>Codex 本地工具</span>

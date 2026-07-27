@@ -37,6 +37,9 @@
   border-radius: 6px;
   color: var(--primary-foreground);
   background: var(--primary);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
 }
 
 .brand-copy {
