@@ -1,250 +1,249 @@
+<div align="center">
+
+<img src="apps/desktop/src-tauri/icons/icon.png" width="112" alt="Codex Companion logo" />
+
 # Codex Companion
 
-[中文](./README.md) | English
+**A local account pool, compatibility gateway, and session continuity runtime built for Codex.**
 
-`codex-companion` is a local account and proxy tool for Codex inside the ChatGPT desktop app (with legacy Codex Desktop compatibility) and the Codex CLI.
+Connect Codex in the ChatGPT desktop app, legacy Codex Desktop, or Codex CLI to one local endpoint. Companion manages official accounts, API-key gateways, OpenAI-compatible providers, group routing, failover, and usage reporting behind it.
 
-The current macOS and Windows client is displayed as `ChatGPT` while continuing to use Codex configuration and CLI state. Companion prefers the ChatGPT client for lifecycle control and falls back to the legacy Codex app.
+<p>
+  <a href="https://github.com/Alexlangl/codex-companion/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/Alexlangl/codex-companion?style=flat" /></a>
+  <a href="https://github.com/Alexlangl/codex-companion/releases"><img alt="GitHub Downloads" src="https://img.shields.io/github/downloads/Alexlangl/codex-companion/total?style=flat" /></a>
+  <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-5b6573?style=flat" />
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Alexlangl/codex-companion?style=flat" /></a>
+  <a href="https://tauri.app/"><img alt="Built with Tauri 2" src="https://img.shields.io/badge/Tauri-2-24C8DB?style=flat" /></a>
+</p>
 
-It lets Codex connect to one Companion runtime while you manage official Codex accounts, API-key gateways, and third-party OpenAI-compatible providers locally. It supports provider groups, fallback, health refresh, history repair, plugin state repair, and token usage stats.
+[简体中文](README.md) · English
 
-It provides:
+</div>
 
-- Desktop app.
-- CLI.
-- TUI.
+> Codex Companion is local-first. Account material, request audits, and session usage data stay on your device; request bodies are never written to audit logs.
 
-> Screenshots use sanitized demo data. They do not contain real account tokens or real Codex usage.
+<img src="assets/readme/dashboard.jpg" alt="Codex Companion dashboard" width="100%" />
+
+## Why Codex Companion
+
+Many tools solve “switch the active API configuration.” Codex Companion focuses on what happens after that switch: one Codex client can use an account pool, select a route before each request, fail over when an upstream breaks, preserve session affinity, and expose health, quota, audit, and token-cost data locally.
+
+- **Focused on Codex**: works with the real configuration, authentication material, Responses API, and session files used by ChatGPT / Codex Desktop and Codex CLI.
+- **An account pool, not one active profile**: official OAuth, Agent Identity, API keys, and third-party gateways can participate in the same group.
+- **Request-level reliability**: priority, round-robin, random, weighted, least-loaded, and manual routing with cooldowns and failover.
+- **Continuity across switches**: session affinity, history namespace repair, plugin-state repair, and direct `codex resume` entry points.
+- **Local observability**: account health, recognizable quotas, structured request audits, and token usage across main sessions and subagents.
+- **Three interfaces**: a desktop app for daily work, a CLI for automation, and a TUI for terminal-only environments.
+
+### From configuration switching to runtime management
+
+| Concern | Switching Codex configuration only | Using the Companion local relay |
+| --- | --- | --- |
+| Upstream | One active provider | A group can contain multiple accounts and providers |
+| Switch point | Rewrite configuration, then restart Codex | Route before a request and try a fallback on failure |
+| Sessions | The caller handles continuity | Stable sessions keep affinity and rebind after failure |
+| Protocols | The upstream must directly support Codex | Companion can bridge Responses and Chat Completions |
+| Runtime state | Usually only the final error is visible | Health, quota, cooldowns, attempts, and audits are centralized |
+
+If you use one fixed `base_url` and API key, configuring Codex directly may be all you need. Companion becomes useful when you need multiple accounts, hot switching, failure recovery, or a reusable local API.
+
+## Quick Start
+
+1. Install the desktop app from [GitHub Releases](https://github.com/Alexlangl/codex-companion/releases), or run `brew install --cask Alexlangl/tap/codex-companion` on macOS.
+2. Open `账号` (Accounts) → `添加账号` (Add Account), then import the local Codex login, paste Token / JSON, or enter an API key and Base URL.
+3. Choose `自动` (Auto), `直连` (Direct), or `本地代理` (Local Relay) on an account card and launch it. For multiple accounts, create a group, choose its routing policy, and launch the group.
+
+Recommended modes:
+
+| Scenario | Launch mode |
+| --- | --- |
+| One official account or standard API key, shortest possible path | `Auto` or `Direct` |
+| Multi-account failover, hot switching, or session affinity | `Local Relay` / launch a group |
+| Upstream only exposes `/chat/completions` | `Local Relay`, with protocol translation |
+| Agent Identity | `Local Relay`, with dynamic signing |
+
+Direct mode updates Codex configuration and may write `auth.json`; ChatGPT / Codex must reload afterward. Local Relay keeps Codex connected to Companion, so later account and group switches do not require a restart.
+
+## Core Capabilities
+
+### Accounts and Providers
+
+- Import official Codex, Codex Companion / CPA, sub2api, Agent Identity, API Key, and New API connection JSON.
+- Batch-import multiple files, report each result independently, and add successful entries to the active group.
+- Detect supported subscription, quota-window, and reset metadata; transient refresh failures keep the last successful snapshot.
+- Choose Direct or Local Relay per account, and export accounts as portable JSON.
+
+### Group Routing and Reliability
+
+- Priority fallback, round-robin, random, weighted, least-loaded, and manual policies.
+- Stable session IDs keep account affinity; failed bindings switch providers and rebind automatically.
+- Model-level 404 / 429 failures cool down only the affected provider-model pair.
+- SSE requests retry only before meaningful output reaches the client, preventing duplicate text or tool calls.
+
+### Local Responses API
+
+- HTTP and WebSocket `/v1/responses`, `/v1/responses/compact`, and `/v1/models` endpoints.
+- Independent API clients with model allowlists, disable, rotate, and delete controls.
+- Responses-to-Chat-Completions translation with streaming events, tool calls, and multi-turn history.
+- Request audits retain routing metadata without prompts, response bodies, or complete keys.
+
+### Sessions, Repair, and Usage
+
+- Search local Codex sessions and copy or run `codex resume SESSION_ID`.
+- Preview history and plugin repairs with dry-run; real repairs use transactional backups and roll back on failure.
+- Scan `token_count` events from main sessions and subagents, filtered by date, provider, and model.
+- Separate fresh input, cache reads, cache writes, and output, then estimate cost with an overridable price table.
+
+## Interface Preview
+
+<table>
+  <tr>
+    <td width="50%"><strong>Account pool</strong><br />Import, refresh, export, and select launch modes.</td>
+    <td width="50%"><strong>Groups</strong><br />Arrange priority, weights, fallback, and failback.</td>
+  </tr>
+  <tr>
+    <td><img src="assets/readme/providers-compact.jpg" alt="Codex Companion account list" /></td>
+    <td><img src="assets/readme/groups.jpg" alt="Codex Companion group routing" /></td>
+  </tr>
+  <tr>
+    <td><strong>Local API</strong><br />Inspect the listener, API clients, cooldowns, and request audits.</td>
+    <td><strong>Token usage</strong><br />Analyze local sessions by time, provider, and model.</td>
+  </tr>
+  <tr>
+    <td><img src="assets/readme/relay.jpg" alt="Codex Companion local API" /></td>
+    <td><img src="assets/readme/token-usage.jpg" alt="Codex Companion token usage" /></td>
+  </tr>
+  <tr>
+    <td><strong>Batch import</strong><br />Import Token / JSON, local accounts, and group members.</td>
+    <td><strong>Session repair</strong><br />Preview with dry-run, then apply a rollback-safe repair.</td>
+  </tr>
+  <tr>
+    <td><img src="assets/readme/provider-add-dialog.jpg" alt="Codex Companion add account dialog" /></td>
+    <td><img src="assets/readme/repair.jpg" alt="Codex Companion session repair" /></td>
+  </tr>
+</table>
+
+> Screenshots use sanitized demo data and contain no real account tokens or Codex usage.
 
 ## Download and Installation
 
-All official artifacts are published on [GitHub Releases](https://github.com/Alexlangl/codex-companion/releases). Each release includes desktop installers, CLI/TUI archives, desktop updater files, and `SHA256SUMS`.
+Release artifacts are published on [GitHub Releases](https://github.com/Alexlangl/codex-companion/releases). Each release includes desktop installers, CLI/TUI archives, updater artifacts, and `SHA256SUMS`.
 
-If the Releases page is empty, the project does not yet have a downloadable release and the Homebrew formula may not exist yet. Use the [build-from-source instructions](#build-from-source) in the meantime.
-
-> Current distribution status: the macOS desktop bundles use an ad-hoc signature, not an Apple Developer ID, and are not notarized by Apple. The Windows installers do not yet have an Authenticode certificate. Gatekeeper or SmartScreen may therefore warn on first launch. Verify the downloaded file as described below before deciding whether to allow it.
+If no downloadable release is available yet, follow [Build from Source](#build-from-source).
 
 ### Desktop App
 
-Download the file that matches your machine. `<version>` represents the release version.
+| System | Architecture | Package |
+| --- | --- | --- |
+| macOS | Apple Silicon / Intel / Universal | `.dmg` |
+| Windows | x64 | NSIS `.exe` or `.msi` |
+| Linux | x64 / ARM64 | `.AppImage`, `.deb`, or `.rpm` |
 
-| System | Architecture | Recommended file | Notes |
-| --- | --- | --- | --- |
-| macOS | Apple Silicon (M1/M2/M3/M4 and newer) | `Codex-Companion-<version>-macos-arm64-dmg.dmg` | `macos-universal` also works |
-| macOS | Intel | `Codex-Companion-<version>-macos-x64-dmg.dmg` | `macos-universal` also works |
-| Windows | x64 | `Codex-Companion-<version>-windows-x64-setup.exe` | NSIS installer; an `.msi` is also published |
-| Linux | x64 | `Codex-Companion-<version>-linux-x64-appimage.AppImage` | `.deb` and `.rpm` are also published |
-| Linux | ARM64 | `Codex-Companion-<version>-linux-arm64-appimage.AppImage` | `.deb` and `.rpm` are also published |
-
-On macOS, the desktop app can also be installed or upgraded with Homebrew Cask:
+Install and upgrade the macOS app with Homebrew Cask:
 
 ```bash
 brew install --cask Alexlangl/tap/codex-companion
 brew upgrade --cask Alexlangl/tap/codex-companion
 ```
 
-Files ending in `.sig`, `latest.json`, and `*-updater.tar.gz` are used by desktop auto-update. They are not first-install packages and normally should not be opened manually.
-
 ### CLI and TUI
 
-Homebrew is recommended on macOS and Linux. The tap updates after every successful stable release:
+Homebrew is the recommended installation path on macOS and Linux:
 
 ```bash
 brew install Alexlangl/tap/codex-companion
 ```
 
-You can also download a command-line archive directly:
+You can also download `codex-companion-<version>-<platform>.tar.gz`, or the Windows `.zip`, from a release. Each archive contains both `codex-companion` and `codex-companion-tui`.
 
-| System | File |
-| --- | --- |
-| macOS Apple Silicon | `codex-companion-<version>-macos-arm64.tar.gz` |
-| macOS Intel | `codex-companion-<version>-macos-x64.tar.gz` |
-| Linux x64 | `codex-companion-<version>-linux-x64.tar.gz` |
-| Linux ARM64 | `codex-companion-<version>-linux-arm64.tar.gz` |
-| Windows x64 | `codex-companion-<version>-windows-x64.zip` |
+<details>
+<summary><strong>First install, checksum verification, and system warnings</strong></summary>
 
-On macOS or Linux, extract the archive and place both binaries on `PATH`:
+Download only from this repository's GitHub Releases and verify files against `SHA256SUMS` from the same release. Use `shasum -a 256 FILE` on macOS, `sha256sum FILE` on Linux, or `Get-FileHash FILE -Algorithm SHA256` in Windows PowerShell.
 
-```bash
-VERSION="0.1.0" # Replace with the release version you are installing
-tar -xzf "codex-companion-${VERSION}-macos-arm64.tar.gz"
-sudo install -m 0755 codex-companion codex-companion-tui /usr/local/bin/
-```
+Current macOS packages use ad-hoc signing and do not yet have an Apple Developer ID or notarization. Windows installers do not yet have Authenticode signing. Manual downloads may therefore trigger Gatekeeper or SmartScreen.
 
-On Windows, extract the ZIP and run the binaries from PowerShell:
-
-```powershell
-.\codex-companion.exe status
-.\codex-companion-tui.exe
-```
-
-## First Launch and System Security Warnings
-
-### Verify the Download First
-
-Download only from this repository's GitHub Releases and download `SHA256SUMS` from the same release. If the calculated value does not match `SHA256SUMS`, delete the file and stop the installation.
-
-macOS:
-
-```bash
-VERSION="0.1.0" # Replace with the downloaded release version
-shasum -a 256 "Codex-Companion-${VERSION}-macos-arm64-dmg.dmg"
-```
-
-Windows PowerShell:
-
-```powershell
-$Version = "0.1.0" # Replace with the downloaded release version
-Get-FileHash ".\Codex-Companion-$Version-windows-x64-setup.exe" -Algorithm SHA256
-```
-
-Linux:
-
-```bash
-VERSION="0.1.0" # Replace with the downloaded release version
-sha256sum "Codex-Companion-${VERSION}-linux-x64-appimage.AppImage"
-```
-
-### macOS: Developer Cannot Be Verified
-
-The current macOS bundle is not notarized by Apple. After moving the app to `/Applications`, run:
+After confirming the source and SHA-256 on macOS, run:
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Codex Companion.app"
 open "/Applications/Codex Companion.app"
 ```
 
-### Windows: Windows Protected Your PC
+On Windows, after verifying the hash, choose `More info` → `Run anyway` in SmartScreen. Do not disable Defender or SmartScreen globally.
 
-The current Windows installers do not have an Authenticode publisher certificate. After verifying the source and SHA-256:
+Run `chmod +x Codex-Companion-*.AppImage` before opening a Linux AppImage. Use the `.deb` or `.rpm` package if FUSE is unavailable.
 
-1. Select `More info` in the SmartScreen dialog.
-2. Select `Run anyway`.
-3. Continue through an unknown-publisher UAC prompt only when the checksum matches.
+Tauri updater artifacts are verified with `.sig` files, but updater signatures do not replace Apple Developer ID, notarization, or Windows Authenticode. Trust for the first download still comes from the GitHub Release source and `SHA256SUMS`.
 
-If `Run anyway` is unavailable, Smart App Control, enterprise policy, or an administrator restriction is usually enforcing the block. Do not disable Defender or SmartScreen globally; build from source in a trusted environment or contact the administrator.
+</details>
 
-### Linux: AppImage, DEB, and RPM
+## Supported Accounts and Import Formats
 
-Make the AppImage executable before first launch:
+| Source | Import path | Result |
+| --- | --- | --- |
+| Local Codex login | `导入本机 Codex 账号` (Import Local Codex Account) | Reads the existing `~/.codex/auth.json` and provider configuration |
+| Official Codex / ChatGPT OAuth | Token / JSON | Creates an official-account provider |
+| Codex Companion / CPA / sub2api | One JSON file, `accounts[]`, or multiple files | Extracts identity, tokens, and supported metadata |
+| Agent Identity | Token / JSON | Stores private credentials and generates `AgentAssertion` dynamically |
+| API-key provider | Form or API Key JSON | Creates an OpenAI-compatible or relay provider |
+| New API connection | `_type: "newapi_channel_conn"` JSON | Maps `key` / `url` into an API-key provider |
+| Custom provider | Enter Base URL, key, environment variable, and model manually | Creates a provider usable in Direct or Relay mode |
 
-```bash
-VERSION="0.1.0" # Replace with the downloaded release version
-APPIMAGE="Codex-Companion-${VERSION}-linux-x64-appimage.AppImage"
-chmod +x "${APPIMAGE}"
-"./${APPIMAGE}"
+<details>
+<summary><strong>API Key and New API JSON examples</strong></summary>
+
+Standard API Key JSON:
+
+```json
+{
+  "auth_mode": "apikey",
+  "OPENAI_API_KEY": "sk-...",
+  "api_base_url": "https://api.example.com/v1",
+  "api_provider_id": "example",
+  "api_provider_name": "Example API"
+}
 ```
 
-If AppImage or FUSE support is unavailable, use the native package instead:
+New API connection JSON:
 
-```bash
-VERSION="0.1.0" # Replace with the downloaded release version
-
-# Debian / Ubuntu
-sudo apt install "./Codex-Companion-${VERSION}-linux-x64-deb.deb"
-
-# Fedora / RHEL
-sudo dnf install "./Codex-Companion-${VERSION}-linux-x64-rpm.rpm"
+```json
+{
+  "_type": "newapi_channel_conn",
+  "key": "sk-...",
+  "url": "https://api.example.com"
+}
 ```
 
-The current first-install Linux artifacts do not have a separate GPG release signature. Verify them against `SHA256SUMS` from the release.
+A New API root URL is normalized to an OpenAI-compatible `/v1` base. Generic `key` / `url` fields are treated as connection data only when `_type` is exactly `newapi_channel_conn`.
 
-## What It Does
+</details>
 
-- Import official Codex account JSON, including Codex Companion, CPA, and sub2api formats.
-- Import Agent Identity credentials and let Companion sign requests and register or recover tasks locally; private keys and tasks are never written to Codex `auth.json`.
-- Import API Key account JSON or manually add OpenAI-compatible providers.
-- Batch imports report each success and failure and can add successful entries directly to a group.
-- Compose multiple accounts into a Provider Group with priority, round-robin, random, weighted, least-loaded, or manual scheduling; stable sessions keep account affinity when identifiable.
-- Expose the active account group through HTTP and WebSocket `/v1/responses` plus `/v1/models`.
-- Create independent API clients with one-time secrets, model allowlists, disable, rotate, and delete controls.
-- Single accounts default to direct mode, and you can switch them to local proxy mode from the account card.
-- Relay providers whose URL explicitly targets `/chat/completions` are forced through the local relay so Companion can translate Responses requests, tool calls, and multi-turn history.
-- Let Companion handle token refresh and request headers for official Codex accounts.
-- Refresh account health, subscription state, and recognizable 5-hour, weekly, 30-day, and model-specific quotas; transient failures retry while keeping the last successful value.
-- Repair Codex history and plugin state before launching Codex, reducing provider-switch continuity issues.
-- Scan main and subagent Codex session logs, filter by date, provider, and model, and estimate fresh-input, cache-read, cache-write, and output costs.
-- Preview and launch Codex CLI from Settings or run `codex resume` directly from Sessions.
-- Write redacted local diagnostics and provide recovery, open-folder, and clear-log actions for frontend failures.
+## How It Works
 
-## Screenshots
+```mermaid
+flowchart LR
+    Manager["Codex Companion<br/>App / CLI / TUI"] --> Registry["Accounts and groups"]
+    Codex["ChatGPT / Codex CLI"] -->|"Direct: install Codex config"| Direct["Selected upstream"]
+    Codex -->|"Local Relay"| API["127.0.0.1:17687/v1"]
+    Registry --> API
+    API --> Router["Routing · affinity · failover"]
+    Router --> Official["Official Codex OAuth"]
+    Router --> Keys["API keys / gateways"]
+    Router --> Compatible["OpenAI-compatible"]
+```
 
-### Dashboard
+| Mode | Behavior | Must Codex reload? |
+| --- | --- | --- |
+| `Auto` | Prefer Direct for a compatible single account, otherwise use Companion | Depends on the resolved mode |
+| `Direct` | Install provider configuration and required account material into Codex | Yes |
+| `Local Relay` | Keep Codex connected to Companion; Companion injects credentials and routes requests | Once for initial setup; not for later account/group switches |
 
-View the current group, local proxy address, available accounts, and Codex integration status.
+With `保留官方 Codex 登录` (Preserve Official Codex Login) enabled, third-party API keys are written to provider configuration while the official ChatGPT OAuth login remains in `auth.json`. Companion creates backups before changing Codex configuration and preserves newer user changes where possible.
 
-<img src="assets/readme/dashboard.jpg" alt="Codex Companion dashboard" width="720">
+## Local API Service
 
-### Providers
-
-Manage official accounts, API Key accounts, and gateway providers in one place. Each account can be refreshed and launched with a selected mode.
-
-<img src="assets/readme/providers-compact.jpg" alt="Provider compact list" width="720">
-
-### Add Account
-
-Add API Key accounts, paste Token / JSON, import local Codex accounts, or import Agent Identity. Batch import continues after individual failures, reports each reason, and can add successful entries to a selected group.
-
-<img src="assets/readme/provider-add-dialog.jpg" alt="Add provider dialog" width="720">
-
-### Groups
-
-Put multiple accounts into one group and choose priority, round-robin, random, weighted, least-loaded, or manual scheduling. Requests with stable session identifiers keep account affinity and rebind after a provider failure.
-
-<img src="assets/readme/groups.jpg" alt="Provider groups" width="720">
-
-### Local Proxy
-
-Inspect the local API service, verified listener state, clients, request logs, model cooldowns, upstream errors, and fallback events.
-
-<img src="assets/readme/relay.jpg" alt="Relay page" width="720">
-
-### Repair
-
-Preview or repair Codex history and plugin state. Real repair uses an isolated transactional backup, restores files changed by the current run if any later step fails, and keeps the 10 newest repair backups after a successful run.
-
-<img src="assets/readme/repair.jpg" alt="Repair page" width="720">
-
-### Usage
-
-Read token usage and estimated cost from local Codex session logs with date, provider, and model filters. Models without a matching price are shown as unpriced instead of being reported as a real `$0`.
-
-<img src="assets/readme/token-usage.jpg" alt="Token usage page" width="720">
-
-## App Usage
-
-After opening the desktop app:
-
-- Use `Providers` to add or import accounts.
-- Use `Groups` to arrange fallback order.
-- Use `Relay` to inspect local proxy status and request logs.
-- Use `Repair` to preview or repair Codex history and plugin state.
-- Use `Usage` to view local token stats.
-- Use `Sessions` to copy a resume command or run `codex resume` in a terminal.
-- Use `Settings` to install or restore Codex configuration, launch CLI, check for updates, and manage diagnostics.
-
-### Agent Identity
-
-Agent Identity accounts are served only through Companion's local API and cannot be installed into Codex `auth.json` for direct mode. Import copies the credential into Companion's data directory. Each request receives a dynamic `AgentAssertion`; if the task is missing or rejected as invalid, Companion registers a replacement and atomically persists it with `0600` permissions on Unix.
-
-Different users under the same ChatGPT account remain separate providers. Provider cards show an explicit `Agent Identity` status.
-
-### Group Scheduling Policies
-
-| Policy | Behavior |
-| --- | --- |
-| Priority fallback | Use list order and try the next provider after a failure |
-| Round robin | Rotate the first provider for each new request |
-| Random | Randomize the first provider for each new request |
-| Weighted | Select the first provider by configured weights, then preserve fallback |
-| Least loaded | Prefer the provider with the fewest in-flight requests |
-| Manual | Use only the first provider in the list |
-
-A stable session ID overrides the initial ordering to preserve affinity. SSE failures may switch providers only before valid output begins. After any output has reached the client, Companion never replays the request, avoiding duplicate text or tool calls.
-
-### Local API Service
-
-The active account group is exposed at `http://127.0.0.1:17687/v1`. Clients use the Responses API while Companion handles official OAuth, Responses / Chat Completions translation, session affinity, account fallback, and stream termination checks.
+The active group is exposed at `http://127.0.0.1:17687/v1` by default:
 
 ```bash
 curl http://127.0.0.1:17687/v1/responses \
@@ -254,41 +253,72 @@ curl http://127.0.0.1:17687/v1/responses \
 ```
 
 - Supports `POST /v1/responses`, `POST /v1/responses/compact`, WebSocket `GET /v1/responses`, and `GET /v1/models`.
-- API client secrets are shown once; SQLite stores only a SHA-256 hash and short prefix.
-- Each client can have its own model allowlist and can be disabled, rotated, or deleted independently.
-- Cross-origin browser requests always require a valid client key. Local non-browser requests can use compatibility mode or enforce keys.
-- Request logs store routing metadata only, never prompts, response bodies, or complete keys.
-- If an upstream stream ends without a terminal event, Companion emits `response.failed` and updates provider health and request audit state.
-- Providers may define a separate `websocket_url`. WebSocket connections use the same API client authentication and group fallback; official accounts receive the required Codex headers, and Agent Identity retries after task recovery.
-- Responses-to-Chat-Completions translation supports function, custom, tool-search, and namespace tools, including top-level or nested `additional_tools` and namespace `tool_choice`.
+- API client keys are shown once; SQLite stores only a SHA-256 hash and short prefix.
+- Each client can have a model allowlist and can be disabled, rotated, or deleted independently.
+- Cross-origin browser requests always require a valid client key; local non-browser requests can use compatibility or strict-key mode.
+- Providers may define a separate `websocket_url`; official accounts and Agent Identity receive their required dynamic headers.
+- Request logs store provider, model, status, attempts, and latency without prompts, response bodies, or complete keys.
 
-### Token Stats and Cache
+## CLI and TUI
 
-The `Usage` page filters by start date, end date, provider, and model. Its refresh interval is configurable, and `0` disables automatic refresh. The cache has an explicit format version and rebuilds automatically after a version change; it can also be rebuilt manually.
-
-When a child task references a parent session that has not appeared yet, the child is shown as deferred and excluded until a later scan can resolve it. Conflicting copies of the same parent history are marked as suspected duplicates and excluded instead of silently double-counting usage.
-
-### CLI Launch and Session Resume
-
-`Settings` lets you choose a working directory and terminal, preview the command, copy it, or launch it directly. macOS supports Terminal and iTerm2; Windows supports Windows Terminal, Windows PowerShell, PowerShell 7, and CMD; Linux tries common terminal applications.
-
-`Sessions` can copy or run:
+Common commands:
 
 ```bash
-codex resume SESSION_ID
+codex-companion status
+codex-companion provider import --json-file ./account.json
+codex-companion provider import-local
+codex-companion provider refresh-all
+codex-companion relay start
+codex-companion relay self-test
+codex-companion repair --history --plugins --dry-run
+codex-companion token-stats
+codex-companion sessions --query "project name"
+codex-companion-tui
 ```
 
-The working directory and session ID are shell-escaped for the current platform.
+| Command | Purpose |
+| --- | --- |
+| `install` / `uninstall` | Install or restore Codex configuration |
+| `doctor` / `status` | Check integration health or print full status |
+| `provider add/import/import-local/list/remove/test/refresh` | Manage and inspect accounts/providers |
+| `group create/list/use/set` | Create, activate, and arrange groups |
+| `relay start/status/self-test` | Start and diagnose the local API |
+| `relay client ...` | Create, inspect, update, rotate, and delete API clients |
+| `relay logs/clear-logs/settings` | Manage request audits and runtime policy |
+| `repair` | Preview or repair session history and plugin state |
+| `token-stats` | Scan local sessions and print token usage |
+| `sessions` | Search the local Codex session index |
 
-### Diagnostic Logs
+Every command supports `--help`. Press `?` inside the TUI for shortcuts.
 
-Diagnostic logs are stored under `~/.codex-companion/logs/` as JSONL. Each file rotates at 2 MB, with at most five files including the current file. Tokens, Authorization headers, cookies, API keys, private keys, and `AgentAssertion` values are redacted; prompts and response bodies are not logged.
+## Local Data and Security Boundaries
 
-The desktop `Settings` page shows log size and can open or clear the directory. A React crash recovery screen also provides reload and open-log actions.
+Default data locations:
 
-### Custom Model Pricing
+| Path | Contents |
+| --- | --- |
+| `~/.codex-companion/config.json` | Provider, group, app, and relay settings |
+| `~/.codex-companion/auth/` | Private imported account and API-key files |
+| `~/.codex-companion/relay/api-service.sqlite3` | API client hashes, request audits, affinity, and translation history |
+| `~/.codex-companion/logs/` | Redacted Companion JSONL diagnostics |
+| `~/.codex-companion/cache/` | Session-index and token-usage caches |
+| `~/.codex/backups/codex-companion/` | Codex installation and repair backups |
 
-Built-in prices are dated estimation snapshots, not upstream billing records. Create `model-pricing.json` in the Companion data directory (default `~/.codex-companion`) to override or add model prices:
+Set `CODEX_COMPANION_HOME` to move Companion's data directory and `CODEX_COMPANION_CODEX_DIR` to target another Codex directory.
+
+Security boundaries:
+
+- Imported account material remains local; new and overwritten private auth files use `0600` permissions on Unix.
+- Agent Identity private keys are used only for local dynamic signing and are never written to Codex `auth.json`.
+- API client keys are shown once and persisted only as hashes.
+- Diagnostic logs redact tokens, Authorization, cookies, API keys, private keys, and `AgentAssertion`; they rotate at 2 MB and retain at most five files.
+- Repair supports dry-run first; real repairs use transactional backups and roll back the current operation on failure.
+- Token cost is an estimate based on local sessions and price snapshots, not an OpenAI or gateway invoice.
+
+<details>
+<summary><strong>Custom model pricing</strong></summary>
+
+Create `model-pricing.json` in the Companion data directory:
 
 ```json
 {
@@ -308,102 +338,69 @@ Built-in prices are dated estimation snapshots, not upstream billing records. Cr
 }
 ```
 
-Prices are USD estimates per one million tokens. `cacheWriteInputPerMillion` is optional and falls back to the normal input price; use `providerMultipliers` to represent a gateway markup or discount.
+Prices are USD estimates per million tokens. Models without a matching price are marked unpriced instead of silently appearing as `$0`.
 
-## CLI Usage
+</details>
 
-See [Download and Installation](#download-and-installation) for installation options. The following are common operations; every command supports `--help` for its current arguments.
+## FAQ
 
-Show status:
+<details>
+<summary><strong>Must I restart ChatGPT / Codex after switching accounts?</strong></summary>
 
-```bash
-codex-companion status
-```
+Direct mode requires the target app to reload configuration and authentication material. After the initial Local Relay setup, switching accounts or groups does not require a restart.
 
-Import account JSON:
+</details>
 
-```bash
-codex-companion provider import --json-file ./account.json
-```
+<details>
+<summary><strong>Does Companion upload my accounts or prompts?</strong></summary>
 
-Import an existing local Codex account:
+Companion has no account cloud-sync service. Credentials stay on your machine, and requests go only to the upstreams you configure. Structured audits do not retain prompts or response bodies.
 
-```bash
-codex-companion provider import-local
-```
+</details>
 
-Refresh account status:
+<details>
+<summary><strong>How do I return to my previous Codex configuration?</strong></summary>
 
-```bash
-codex-companion provider refresh-all
-```
+Restore the pre-Companion configuration from `设置` (Settings), or run `codex-companion uninstall`. Companion uses its installation backup and avoids overwriting newer user changes.
 
-Preview repair:
+</details>
 
-```bash
-codex-companion repair --history --plugins --dry-run
-```
+<details>
+<summary><strong>Why must some gateways use Local Relay?</strong></summary>
 
-Start local proxy:
+Codex uses the Responses API. A provider URL that explicitly targets `/chat/completions` needs Companion to translate requests, SSE events, tool calls, and history, so it cannot be used as a direct endpoint.
 
-```bash
-codex-companion relay start
-```
+</details>
 
-Manage the local API:
+<details>
+<summary><strong>Why can the Usage page differ from my upstream invoice?</strong></summary>
 
-```bash
-codex-companion relay status
-codex-companion relay self-test
-codex-companion relay client create --name local-script --models model-a,model-b
-codex-companion relay client list
-codex-companion relay client update --id CLIENT_ID --enabled false
-codex-companion relay client rotate CLIENT_ID
-codex-companion relay client delete CLIENT_ID
-codex-companion relay logs --limit 50
-codex-companion relay clear-logs
-codex-companion relay settings --require-api-key true --retry-budget 2
-```
+Usage reads token events from local Codex sessions and applies built-in or custom price snapshots. Upstreams may use different billing categories, discounts, multipliers, or rounding.
 
-### Command Coverage
-
-| Command | Purpose |
-| --- | --- |
-| `install` / `uninstall` | Write or restore the Codex configuration |
-| `doctor` / `status` | Check integration health or print full status |
-| `daemon start` | Start the Companion daemon in the foreground |
-| `provider add` | Add a provider manually |
-| `provider import` / `import-local` | Import accounts from JSON or the local Codex installation |
-| `provider list` / `remove` / `test` / `refresh` / `refresh-all` | Inspect, remove, test, and refresh providers |
-| `group create` / `list` / `use` / `set` | Create, switch, and reorder groups |
-| `relay start` / `status` / `self-test` | Start and diagnose the local API service |
-| `relay client create/list/update/rotate/delete` | Manage local API clients and secrets |
-| `relay logs` / `clear-logs` / `settings` | Inspect audit records and change relay policies |
-| `repair` | Preview or repair history and plugin state |
-| `token-stats` | Scan local sessions and report token usage |
-
-## TUI Usage
-
-```bash
-codex-companion-tui
-```
-
-Press `?` inside the TUI to view shortcuts.
+</details>
 
 ## Build from Source
 
-You need Node.js 22, pnpm 10.23, a stable Rust toolchain, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform.
+You need Node.js 22, pnpm 10.23, the stable Rust toolchain, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform. The repository includes `.nvmrc`; run `nvm use` first when using nvm.
 
 ```bash
 git clone https://github.com/Alexlangl/codex-companion.git
 cd codex-companion
+corepack enable
 pnpm install --frozen-lockfile
-pnpm check
-cargo test --workspace
-pnpm dev:app
+pnpm dev
 ```
 
-Build desktop packages for the current platform:
+By default, `pnpm dev` starts an isolated Companion instance and the automatically discovered ChatGPT app. Legacy Codex apps and Codex CLI fallback remain supported. See the [development guide](README.devcodex.md#english) for Companion-only, local-state, CLI, and advanced launch modes.
+
+Before submitting changes, run:
+
+```bash
+pnpm check
+cargo test --workspace
+```
+
+Build a desktop bundle for the current platform:
 
 ```bash
 pnpm build:tauri
@@ -415,61 +412,8 @@ Build only the CLI and TUI:
 cargo build --release -p codex-companion-cli -p codex-companion-tui
 ```
 
-## Manual Remote Packaging
+Maintainers can run the `Release` workflow in GitHub Actions with a version such as `0.1.1` or `v0.1.1`. It builds macOS, Windows, and Linux desktop packages plus CLI/TUI archives, generates `SHA256SUMS`, and updates the Homebrew tap after a stable release.
 
-The repository provides a `Release` GitHub Actions workflow. Open `Actions` → `Release` → `Run workflow` on GitHub and enter a version such as `0.1.1` or `v0.1.1`.
+## License
 
-The workflow builds desktop bundles for macOS Universal / Intel / Apple Silicon, Windows x64, and Linux x64 / ARM64, plus command-line archives containing both the CLI and TUI. It creates the GitHub Release only after every platform succeeds and includes `SHA256SUMS`.
-
-After a successful stable release, the workflow updates both the CLI/TUI Formula and desktop Cask in `Alexlangl/homebrew-tap`. The desktop app checks stable releases quietly at startup, lets the user choose `Update now` or `Later` when one is available, and also supports manual check, download, and restart installation from `Settings`; Tauri signatures protect update artifacts.
-
-## Update and Signing Boundaries
-
-These mechanisms protect different parts of the distribution process. The presence of a `.sig` file does not mean that the operating system trusts the publisher.
-
-| Mechanism | Current status | Scope |
-| --- | --- | --- |
-| Release `SHA256SUMS` | Available | Lets users compare a download with the file published in that release |
-| Tauri updater `.sig` | Enabled and mandatory | Verifies the source and integrity of updates downloaded by an installed desktop app |
-| macOS Developer ID + notarization | Not configured | Establishes an Apple-recognized publisher identity and reduces Gatekeeper blocks once configured |
-| Windows Authenticode | Not configured | Displays publisher identity once configured; SmartScreen reputation may still take time to build |
-| Linux GPG/AppImage release signing | Not configured | First installs currently rely on the GitHub Release source and SHA-256 verification |
-
-The Tauri updater private key exists only in the release environment; the repository contains only the public key. An updater signature does not replace macOS Developer ID signing, Apple notarization, or Windows Authenticode, and cannot remove the operating-system reputation warning shown for a first browser download.
-
-Removing those first-install warnings requires separate Apple Developer ID/notarization credentials and a Windows code-signing certificate in CI. Certificates and private keys must never be committed to the repository.
-
-## Supported Accounts
-
-- Official Codex account JSON.
-- Agent Identity JSON.
-- sub2api `accounts[]` OpenAI OAuth accounts.
-- Codex Companion / CPA style Codex OAuth accounts.
-- API Key account JSON.
-- Manually added OpenAI-compatible providers.
-- Existing local Codex accounts.
-
-API Key JSON example:
-
-```json
-{
-  "auth_mode": "apikey",
-  "OPENAI_API_KEY": "sk-...",
-  "email": "api-key-demo",
-  "api_base_url": "https://api.example.com/v1",
-  "websocket_url": "wss://api.example.com/v1/responses",
-  "api_provider_id": "example",
-  "api_provider_name": "Example API"
-}
-```
-
-## Safety Notes
-
-- You can run dry-run before writing repair changes.
-- Real repair uses transactional backups under `~/.codex/backups/codex-companion/repair/`; failures roll back automatically and a successful run keeps the 10 newest repair backups.
-- Imported account material stays on your machine.
-- Agent Identity private keys stay in Companion's private account directory, are used only for local signing, and are never written to Codex `auth.json`.
-- Local API client secrets are shown once and stored only as hashes; request audit records do not store request or response bodies.
-- Token usage stats only read local Codex session logs.
-- Diagnostic logs rotate and redact sensitive values. Review them before sharing and include only issue-relevant excerpts.
-- Cost is an estimate based on the model price snapshot and local overrides, not an OpenAI or gateway invoice.
+Codex Companion is released under the [MIT License](LICENSE).

@@ -1,8 +1,43 @@
 import type { ProviderQuotaWindow } from "../types/domain";
 
-export function isApiKeyJson(value: unknown) {
+export function isApiKeyJson(value: unknown): boolean {
+  if (isNewApiChannelConnection(value)) {
+    return true;
+  }
+
   const authMode = findString(value, ["auth_mode", "authMode"])?.toLowerCase();
-  return Boolean((authMode === "apikey" || authMode === "api_key") && findString(value, ["OPENAI_API_KEY", "openai_api_key", "openaiApiKey", "api_key", "apiKey"]));
+  const apiKey = findString(value, ["OPENAI_API_KEY", "openai_api_key", "openaiApiKey", "api_key", "apiKey"]);
+  return Boolean((authMode === "apikey" || authMode === "api_key") && apiKey);
+}
+
+export function findApiKey(value: unknown): string | null {
+  const apiKey = findString(value, ["OPENAI_API_KEY", "openai_api_key", "openaiApiKey", "api_key", "apiKey"]);
+  if (apiKey) {
+    return apiKey;
+  }
+  if (!isNewApiChannelConnection(value)) {
+    return null;
+  }
+  return readTopLevelString(value, "key");
+}
+
+export function findApiBaseUrl(value: unknown): string | null {
+  const baseUrl = findString(value, ["api_base_url", "apiBaseUrl", "base_url", "baseUrl"]);
+  if (baseUrl) {
+    return baseUrl.replace(/\/+$/, "");
+  }
+  if (!isNewApiChannelConnection(value)) {
+    return null;
+  }
+
+  const newApiUrl = readTopLevelString(value, "url")?.replace(/\/+$/, "");
+  if (!newApiUrl) {
+    return null;
+  }
+  if (newApiUrl.endsWith("/v1") || newApiUrl.endsWith("/responses") || newApiUrl.endsWith("/chat/completions")) {
+    return newApiUrl;
+  }
+  return `${newApiUrl}/v1`;
 }
 
 export function providerNameFromBaseUrl(baseUrl: string) {
@@ -32,6 +67,19 @@ export function findString(value: unknown, keys: string[]): string | null {
     if (found) return found;
   }
   return null;
+}
+
+export function isNewApiChannelConnection(value: unknown): value is Record<string, unknown> {
+  return isJsonRecord(value) && value._type === "newapi_channel_conn";
+}
+
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function readTopLevelString(value: Record<string, unknown>, key: string): string | null {
+  const field = value[key];
+  return typeof field === "string" && field.trim() ? field.trim() : null;
 }
 
 export function findNumber(value: unknown, keys: string[]): number | null {

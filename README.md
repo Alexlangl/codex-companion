@@ -1,250 +1,249 @@
+<div align="center">
+
+<img src="apps/desktop/src-tauri/icons/icon.png" width="112" alt="Codex Companion logo" />
+
 # Codex Companion
 
-中文 | [English](./README.en.md)
+**为 Codex 打造的本地账号池、兼容网关与会话连续性工具。**
 
-`codex-companion` 是给 ChatGPT 桌面端内的 Codex（同时兼容旧版 Codex Desktop）/ Codex CLI 使用的本地账号与代理工具。
+让 ChatGPT 桌面端内的 Codex、旧版 Codex Desktop 和 Codex CLI 只连接一个本地入口，Companion 在背后管理官方账号、API Key 中转、OpenAI-compatible provider、分组路由、故障切换与用量统计。
 
-新版 macOS / Windows 官方客户端虽然显示为 `ChatGPT`，仍使用 Codex 的配置目录与 CLI。Companion 会优先发现并控制 ChatGPT 客户端，同时保留对旧版 Codex 应用的兼容。
+<p>
+  <a href="https://github.com/Alexlangl/codex-companion/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/Alexlangl/codex-companion?style=flat" /></a>
+  <a href="https://github.com/Alexlangl/codex-companion/releases"><img alt="GitHub Downloads" src="https://img.shields.io/github/downloads/Alexlangl/codex-companion/total?style=flat" /></a>
+  <img alt="Platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-5b6573?style=flat" />
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/Alexlangl/codex-companion?style=flat" /></a>
+  <a href="https://tauri.app/"><img alt="Built with Tauri 2" src="https://img.shields.io/badge/Tauri-2-24C8DB?style=flat" /></a>
+</p>
 
-它让 Codex 只需要接入一个 Companion，本地就可以管理官方 Codex 账号、API Key 中转、第三方 OpenAI-compatible provider，并支持账号分组、失败切换、健康刷新、历史会话修复和 token 用量统计。
+简体中文 · [English](README.en.md)
 
-它提供：
+</div>
 
-- 桌面 App。
-- CLI 命令行。
-- TUI 终端界面。
+> Codex Companion 是本地优先工具。账号材料、请求审计和会话统计保存在你的设备上；请求正文不会写入审计日志。
 
-> 截图使用的是脱敏 demo 数据，不包含真实账号 token 或真实 Codex 用量。
+<img src="assets/readme/dashboard.jpg" alt="Codex Companion 总览" width="100%" />
+
+## 为什么选择 Codex Companion
+
+很多工具解决的是“把当前配置切到另一个 API”。Codex Companion 更关注切换之后的运行过程：一个 Codex 可以使用账号池，在请求开始前选路、失败时切换上游、保持会话亲和，并在本地看到健康度、额度、请求记录与 token 成本。
+
+- **专注 Codex**：围绕 ChatGPT / Codex Desktop 与 Codex CLI 的真实配置、登录材料、Responses API 和会话文件工作。
+- **账号池而不是单一配置**：官方 OAuth、Agent Identity、API Key 和第三方中转可以放进同一个分组。
+- **请求级可靠性**：支持优先级、轮询、随机、权重、最低负载、手动选择、模型冷却和失败切换。
+- **切换时保留上下文**：提供会话亲和、历史 namespace 修复、插件状态修复和 `codex resume` 入口。
+- **本地可观测**：查看账号健康、可识别额度、结构化请求审计，以及主会话和子代理的 token 用量。
+- **三种使用界面**：桌面 App 负责日常操作，CLI 适合脚本，TUI 适合纯终端环境。
+
+### 从配置切换到运行时管理
+
+| 关注点 | 只切换 Codex 配置 | 使用 Companion 本地代理 |
+| --- | --- | --- |
+| 上游 | 当前只使用一个 provider | 一个分组可以包含多个账号与 provider |
+| 切换时机 | 改写配置后重启 Codex | 请求开始前选路，失败时自动尝试后备账号 |
+| 会话 | 切换后由调用方自行处理 | 稳定会话保持账号亲和，失败后重新绑定 |
+| 协议 | 依赖上游直接兼容 Codex | 可在 Responses 与 Chat Completions 之间转换 |
+| 运行状态 | 通常只看到最终错误 | 健康度、额度、冷却、尝试次数与请求审计集中展示 |
+
+如果你只需要长期使用一个固定的 `base_url` 和 API Key，直接配置 Codex 已经足够；如果你需要多账号、热切换、失败恢复或本地 API 服务，Companion 才会体现价值。
+
+## 快速开始
+
+1. 从 [GitHub Releases](https://github.com/Alexlangl/codex-companion/releases) 安装桌面 App，或在 macOS 上运行 `brew install --cask Alexlangl/tap/codex-companion`。
+2. 打开 `账号` → `添加账号`，导入本机 Codex 登录、粘贴 Token / JSON，或填写 API Key 与 Base URL。
+3. 在账号卡片上选择 `自动`、`直连` 或 `本地代理` 后启动；需要多个账号时，到 `分组` 中编排顺序与调度策略，再启动分组。
+
+推荐选择：
+
+| 场景 | 启动方式 |
+| --- | --- |
+| 单个官方账号或标准 API Key，希望最短链路 | `自动` 或 `直连` |
+| 多账号故障切换、热切换或会话亲和 | `本地代理` / 启动分组 |
+| 上游只提供 `/chat/completions` | `本地代理`，由 Companion 转换协议 |
+| Agent Identity | `本地代理`，由 Companion 动态签名 |
+
+直连会更新 Codex 配置，并可能写入 `auth.json`，启动后需要 ChatGPT / Codex 重新载入；本地代理让 Codex 固定连接 Companion，切换账号和分组时无需重启。
+
+## 核心能力
+
+### 账号与 Provider
+
+- 导入官方 Codex、Codex Companion / CPA、sub2api、Agent Identity、API Key 和 New API 连接 JSON。
+- 支持多文件批量导入，逐项报告结果，并可把成功项直接加入当前分组。
+- 自动识别可用的订阅、额度窗口和重置时间；瞬时刷新失败会保留上次成功快照。
+- 单账号可独立选择直连或本地代理，也可以导出为可迁移 JSON。
+
+### 分组路由与可靠性
+
+- 提供优先级失败切换、轮询、随机、加权、最低负载和手动选择六种策略。
+- 稳定 session ID 保持账号亲和；绑定账号失败后自动切换并重新绑定。
+- 404 / 429 等模型级失败只冷却“账号 + 模型”，不会误伤该账号的其他模型。
+- SSE 只在尚未向客户端输出有效内容时重试，避免重复文本或重复工具调用。
+
+### 本地 Responses API
+
+- 暴露 HTTP 与 WebSocket `/v1/responses`、`/v1/responses/compact` 和 `/v1/models`。
+- 为不同调用方创建独立 API client，支持模型白名单、停用、轮换与删除。
+- 将 Responses 请求转换到 Chat Completions 上游，并处理流式事件、工具调用和多轮历史。
+- 请求审计只保存路由元数据，不保存提示词、响应正文或完整密钥。
+
+### 会话、修复与用量
+
+- 搜索本地 Codex 会话，复制或直接执行 `codex resume SESSION_ID`。
+- Dry-run 预览历史与插件修复；正式修复使用事务备份，失败时自动回滚。
+- 扫描主会话和子代理的 `token_count`，按日期、provider 和模型筛选。
+- 分开统计新输入、缓存读取、缓存写入和输出，并基于可覆盖价格表估算成本。
+
+## 界面预览
+
+<table>
+  <tr>
+    <td width="50%"><strong>账号池</strong><br />导入、刷新、导出并选择账号启动方式。</td>
+    <td width="50%"><strong>分组</strong><br />编排账号顺序、权重、fallback 与 failback。</td>
+  </tr>
+  <tr>
+    <td><img src="assets/readme/providers-compact.jpg" alt="Codex Companion 账号列表" /></td>
+    <td><img src="assets/readme/groups.jpg" alt="Codex Companion 分组编排" /></td>
+  </tr>
+  <tr>
+    <td><strong>本地 API</strong><br />查看监听状态、API client、冷却与请求审计。</td>
+    <td><strong>Token 用量</strong><br />按时间、provider 和模型分析本地会话。</td>
+  </tr>
+  <tr>
+    <td><img src="assets/readme/relay.jpg" alt="Codex Companion 本地 API" /></td>
+    <td><img src="assets/readme/token-usage.jpg" alt="Codex Companion Token 用量" /></td>
+  </tr>
+  <tr>
+    <td><strong>批量导入</strong><br />支持 Token / JSON、本机账号和分组导入。</td>
+    <td><strong>会话修复</strong><br />先 dry-run，再执行可回滚的修复。</td>
+  </tr>
+  <tr>
+    <td><img src="assets/readme/provider-add-dialog.jpg" alt="Codex Companion 添加账号" /></td>
+    <td><img src="assets/readme/repair.jpg" alt="Codex Companion 会话修复" /></td>
+  </tr>
+</table>
+
+> 截图使用脱敏 demo 数据，不包含真实 token 或真实 Codex 用量。
 
 ## 下载与安装
 
-所有正式产物都发布在 [GitHub Releases](https://github.com/Alexlangl/codex-companion/releases)。每个 Release 同时提供桌面安装包、CLI/TUI 压缩包、自动更新文件和 `SHA256SUMS`。
+正式产物发布在 [GitHub Releases](https://github.com/Alexlangl/codex-companion/releases)。每个 Release 包含桌面安装包、CLI/TUI 压缩包、自动更新文件和 `SHA256SUMS`。
 
-如果 Releases 页面为空，表示项目尚未发布可供下载的版本，此时 Homebrew formula 也可能尚未生成；请先按[从源码运行](#从源码运行)操作。
-
-> 当前发行状态：macOS 桌面包使用 ad-hoc 签名，尚未使用 Apple Developer ID，也没有经过 Apple notarization；Windows 安装包尚未使用 Authenticode 证书。因此首次启动可能出现 Gatekeeper 或 SmartScreen 提示。请先按下文校验下载文件，再决定是否放行。
+如果 Releases 页面暂时没有可下载版本，请按[从源码运行](#从源码运行)操作。
 
 ### 桌面 App
 
-下载与机器架构匹配的文件；`<version>` 代表 Release 版本号。
+| 系统 | 架构 | 安装包 |
+| --- | --- | --- |
+| macOS | Apple Silicon / Intel / Universal | `.dmg` |
+| Windows | x64 | NSIS `.exe` 或 `.msi` |
+| Linux | x64 / ARM64 | `.AppImage`、`.deb` 或 `.rpm` |
 
-| 系统 | 架构 | 推荐文件 | 备注 |
-| --- | --- | --- | --- |
-| macOS | Apple Silicon（M1/M2/M3/M4 等） | `Codex-Companion-<version>-macos-arm64-dmg.dmg` | 也可使用 `macos-universal` |
-| macOS | Intel | `Codex-Companion-<version>-macos-x64-dmg.dmg` | 也可使用 `macos-universal` |
-| Windows | x64 | `Codex-Companion-<version>-windows-x64-setup.exe` | NSIS 安装器；也会提供 `.msi` |
-| Linux | x64 | `Codex-Companion-<version>-linux-x64-appimage.AppImage` | 同时提供 `.deb` 和 `.rpm` |
-| Linux | ARM64 | `Codex-Companion-<version>-linux-arm64-appimage.AppImage` | 同时提供 `.deb` 和 `.rpm` |
-
-macOS 也可以通过 Homebrew Cask 安装或升级桌面 App：
+macOS 可以通过 Homebrew Cask 安装和升级：
 
 ```bash
 brew install --cask Alexlangl/tap/codex-companion
 brew upgrade --cask Alexlangl/tap/codex-companion
 ```
 
-Release 中的 `.sig`、`latest.json` 和 `*-updater.tar.gz` 是桌面自动更新使用的文件，普通用户首次安装时不需要手动打开。
+### CLI 与 TUI
 
-### CLI 和 TUI
-
-macOS 或 Linux 推荐使用 Homebrew；稳定版 Release 成功后 tap 会自动更新：
+macOS 和 Linux 推荐使用 Homebrew：
 
 ```bash
 brew install Alexlangl/tap/codex-companion
 ```
 
-也可以从 Release 直接下载：
+也可以从 Release 下载对应平台的 `codex-companion-<version>-<platform>.tar.gz` 或 Windows `.zip`。压缩包同时包含 `codex-companion` 和 `codex-companion-tui`。
 
-| 系统 | 文件 |
-| --- | --- |
-| macOS Apple Silicon | `codex-companion-<version>-macos-arm64.tar.gz` |
-| macOS Intel | `codex-companion-<version>-macos-x64.tar.gz` |
-| Linux x64 | `codex-companion-<version>-linux-x64.tar.gz` |
-| Linux ARM64 | `codex-companion-<version>-linux-arm64.tar.gz` |
-| Windows x64 | `codex-companion-<version>-windows-x64.zip` |
+<details>
+<summary><strong>首次安装、校验与系统安全提示</strong></summary>
 
-macOS/Linux 解压后可把两个二进制放进 `PATH`：
+只从本仓库的 GitHub Release 下载文件，并使用同一 Release 中的 `SHA256SUMS` 校验。macOS 可运行 `shasum -a 256 FILE`，Linux 可运行 `sha256sum FILE`，Windows PowerShell 可运行 `Get-FileHash FILE -Algorithm SHA256`。
 
-```bash
-VERSION="0.1.0" # 替换为要安装的 Release 版本
-tar -xzf "codex-companion-${VERSION}-macos-arm64.tar.gz"
-sudo install -m 0755 codex-companion codex-companion-tui /usr/local/bin/
-```
+当前 macOS 安装包使用 ad-hoc 签名，尚未配置 Apple Developer ID 与 notarization；Windows 安装包尚未配置 Authenticode。手动下载安装时可能遇到 Gatekeeper 或 SmartScreen 提示。
 
-Windows 解压 ZIP 后，可以直接在 PowerShell 中运行：
-
-```powershell
-.\codex-companion.exe status
-.\codex-companion-tui.exe
-```
-
-## 首次启动与系统安全提示
-
-### 先校验下载文件
-
-只从本仓库的 GitHub Release 下载文件，并同时下载同一版本的 `SHA256SUMS`。如果计算结果与 `SHA256SUMS` 不一致，请删除文件并停止安装。
-
-macOS：
-
-```bash
-VERSION="0.1.0" # 替换为下载的 Release 版本
-shasum -a 256 "Codex-Companion-${VERSION}-macos-arm64-dmg.dmg"
-```
-
-Windows PowerShell：
-
-```powershell
-$Version = "0.1.0" # 替换为下载的 Release 版本
-Get-FileHash ".\Codex-Companion-$Version-windows-x64-setup.exe" -Algorithm SHA256
-```
-
-Linux：
-
-```bash
-VERSION="0.1.0" # 替换为下载的 Release 版本
-sha256sum "Codex-Companion-${VERSION}-linux-x64-appimage.AppImage"
-```
-
-### macOS：无法验证开发者或无法检查恶意软件
-
-当前 macOS 包尚未经过 Apple 公证。将 App 拖入 `/Applications` 后运行：
+macOS 在确认来源与 SHA-256 后，可以运行：
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Codex Companion.app"
 open "/Applications/Codex Companion.app"
 ```
 
-### Windows：Windows 已保护你的电脑
+Windows 在确认哈希后，可在 SmartScreen 中选择 `更多信息` → `仍要运行`。不要为此全局关闭 Defender 或 SmartScreen。
 
-当前 Windows 安装包没有 Authenticode 发布者证书。确认下载来源和 SHA-256 后：
+Linux AppImage 首次运行前需要执行 `chmod +x Codex-Companion-*.AppImage`。缺少 FUSE 时请改用 `.deb` 或 `.rpm`。
 
-1. 在 SmartScreen 窗口点击 `更多信息`（`More info`）。
-2. 点击 `仍要运行`（`Run anyway`）。
-3. UAC 显示“未知发布者”时，仅在哈希一致的情况下继续。
+Tauri 自动更新包使用 `.sig` 校验，但它不能替代 macOS Developer ID、Apple notarization 或 Windows Authenticode。首次下载的信任依据仍是 GitHub Release 来源与 `SHA256SUMS`。
 
-如果没有 `仍要运行`，通常是 Smart App Control、企业策略或管理员限制；不要全局关闭 Defender 或 SmartScreen，改用可信环境从源码构建或联系管理员。
+</details>
 
-### Linux：AppImage、DEB 和 RPM
+## 支持的账号与导入格式
 
-AppImage 首次运行前需要可执行权限：
+| 来源 | 导入方式 | 结果 |
+| --- | --- | --- |
+| 本机 Codex 登录 | `导入本机 Codex 账号` | 读取现有 `~/.codex/auth.json` 与 provider 配置 |
+| 官方 Codex / ChatGPT OAuth | Token / JSON | 创建官方账号 provider |
+| Codex Companion / CPA / sub2api | 单个 JSON、`accounts[]` 或多文件 | 提取账号身份、token 与可用元数据 |
+| Agent Identity | Token / JSON | 保存私有凭据，请求时动态生成 `AgentAssertion` |
+| API Key provider | 表单或 API Key JSON | 创建 OpenAI-compatible 或中转 provider |
+| New API 连接信息 | `_type: "newapi_channel_conn"` JSON | 将 `key` / `url` 映射为 API Key provider |
+| 自定义 provider | 手动填写 Base URL、Key、环境变量与模型 | 创建可直连或代理的 provider |
 
-```bash
-VERSION="0.1.0" # 替换为下载的 Release 版本
-APPIMAGE="Codex-Companion-${VERSION}-linux-x64-appimage.AppImage"
-chmod +x "${APPIMAGE}"
-"./${APPIMAGE}"
+<details>
+<summary><strong>API Key 与 New API JSON 示例</strong></summary>
+
+标准 API Key JSON：
+
+```json
+{
+  "auth_mode": "apikey",
+  "OPENAI_API_KEY": "sk-...",
+  "api_base_url": "https://api.example.com/v1",
+  "api_provider_id": "example",
+  "api_provider_name": "Example API"
+}
 ```
 
-如果系统缺少 AppImage/FUSE 支持，可以改用发行版安装包：
+New API 连接 JSON：
 
-```bash
-VERSION="0.1.0" # 替换为下载的 Release 版本
-
-# Debian / Ubuntu
-sudo apt install "./Codex-Companion-${VERSION}-linux-x64-deb.deb"
-
-# Fedora / RHEL
-sudo dnf install "./Codex-Companion-${VERSION}-linux-x64-rpm.rpm"
+```json
+{
+  "_type": "newapi_channel_conn",
+  "key": "sk-...",
+  "url": "https://api.example.com"
+}
 ```
 
-当前 Linux 首次安装包没有单独的 GPG 发布签名，请使用 Release 中的 `SHA256SUMS` 校验。
+New API 根地址会自动规范为 OpenAI-compatible 的 `/v1` 基地址。只有 `_type` 明确为 `newapi_channel_conn` 时，普通 `key` / `url` 字段才会被当作连接信息。
 
-## 它做什么
+</details>
 
-- 导入官方 Codex 账号 JSON，例如 Codex Companion、CPA 或 sub2api 格式。
-- 导入 Agent Identity，并在 Companion 内动态签名、注册或恢复 task；私钥和 task 不会写入 Codex `auth.json`。
-- 导入 API Key 账号 JSON，或手动添加 OpenAI-compatible provider。
-- 批量导入会逐项报告成功和失败，也可以把成功项直接加入当前分组。
-- 把多个账号编排成 Provider Group，支持优先级、轮询、随机、权重、最低负载和手动选择；能识别稳定会话时会保持账号粘性。
-- 把当前账号分组作为本地 OpenAI-compatible API，提供 HTTP 和 WebSocket `/v1/responses` 以及 `/v1/models`。
-- 为不同调用方创建独立 API client，支持一次性密钥显示、模型白名单、停用、轮换和删除。
-- 单个账号默认直连，也可以在账号卡片里切换为本地代理。
-- 地址明确指向 `/chat/completions` 的中转站会强制使用本地代理，由 Companion 转换 Responses、工具调用和多轮历史，避免误选直连。
-- 官方 Codex 账号由 Companion 负责 token 刷新和请求头处理。
-- 自动刷新账号健康度、订阅状态和可识别的 5h、周、30 天及模型专属额度；瞬时失败会重试并保留上次成功值。
-- 启动 Codex 前修复历史会话和插件状态，减少切换 provider 后上下文丢失的问题。
-- 从本地 Codex 会话记录里统计主会话与子代理 token，支持日期、provider、模型筛选，并分别估算新输入、缓存读取、缓存写入和输出成本。
-- 在设置中预览和启动 Codex CLI，也可以从会话页直接执行 `codex resume`。
-- 记录已脱敏的本地诊断日志，前端异常时提供恢复、打开日志目录和清空日志入口。
+## 工作方式
 
-## 截图
+```mermaid
+flowchart LR
+    Manager["Codex Companion<br/>App / CLI / TUI"] --> Registry["账号与分组"]
+    Codex["ChatGPT / Codex CLI"] -->|"直连：写入 Codex 配置"| Direct["选定的单个上游"]
+    Codex -->|"本地代理"| API["127.0.0.1:17687/v1"]
+    Registry --> API
+    API --> Router["路由 · 会话亲和 · 故障切换"]
+    Router --> Official["官方 Codex OAuth"]
+    Router --> Keys["API Key / 中转"]
+    Router --> Compatible["OpenAI-compatible"]
+```
 
-### 总览
+| 模式 | 行为 | 是否需要重新载入 Codex |
+| --- | --- | --- |
+| `自动` | 单账号可直连时优先直连，否则使用 Companion 代理 | 取决于最终模式 |
+| `直连` | 把 provider 配置和需要的账号材料安装到 Codex | 需要 |
+| `本地代理` | Codex 固定连接 Companion，由 Companion 注入凭据并路由 | 首次接入需要；之后切换账号/分组不需要 |
 
-查看当前分组、本地代理地址、可用账号和 Codex 接入状态。
+开启 `保留官方 Codex 登录` 后，第三方 API Key 直连会写入 provider 配置，官方 ChatGPT OAuth 继续保留在 `auth.json`。Companion 在修改 Codex 配置前会创建备份，并尽量保留修改后产生的用户内容。
 
-<img src="assets/readme/dashboard.jpg" alt="Codex Companion dashboard" width="720">
+## 本地 API 服务
 
-### 账号
-
-集中管理官方账号、API Key 账号和中转 provider。每个账号可以刷新状态，也可以选择启动方式。
-
-<img src="assets/readme/providers-compact.jpg" alt="Provider compact list" width="720">
-
-### 添加账号
-
-支持 API Key、Token / JSON、本机 Codex 账号和 Agent Identity 导入。多个 JSON 可以批量导入；单项失败不会中断其余项目，完成后会显示失败原因并可把成功项加入指定分组。
-
-<img src="assets/readme/provider-add-dialog.jpg" alt="Add provider dialog" width="720">
-
-### 分组
-
-把多个账号放进一个分组，选择优先级、轮询、随机、权重、最低负载或手动策略；有稳定会话标识时会保持账号粘性，绑定账号失败后切换并重新绑定。
-
-<img src="assets/readme/groups.jpg" alt="Provider groups" width="720">
-
-### 本地代理
-
-查看 Companion 本地 API 服务、真实监听状态、client、请求记录、模型冷却、上游错误和切换事件。
-
-<img src="assets/readme/relay.jpg" alt="Relay page" width="720">
-
-### 修复
-
-预览或修复 Codex 历史会话和插件状态。正式修复使用独立事务备份；任一步失败会恢复本次已修改文件，成功后保留最近 10 份修复备份。
-
-<img src="assets/readme/repair.jpg" alt="Repair page" width="720">
-
-### 用量
-
-从 Codex 本地会话记录中统计 token 使用量和估算成本，可按时间、provider 和模型筛选。未匹配价格的模型会明确标记为“未定价”，不会当作真实 `$0`。
-
-<img src="assets/readme/token-usage.jpg" alt="Token usage page" width="720">
-
-## App 用法
-
-打开桌面 App 后：
-
-- 使用 `账号` 添加或导入 provider。
-- 使用 `分组` 编排 fallback 顺序。
-- 使用 `转发` 查看本地代理状态和请求记录。
-- 使用 `修复` 预览或修复 Codex 历史会话和插件状态。
-- 使用 `用量` 查看本地 token 统计。
-- 使用 `会话` 复制恢复命令，或直接在终端执行 `codex resume`。
-- 使用 `设置` 写入或恢复 Codex 配置、启动 CLI、检查更新和管理诊断日志。
-
-### Agent Identity
-
-Agent Identity 账号只通过 Companion 本地 API 服务使用，不支持写入 Codex `auth.json` 后直连。导入时 Companion 会把凭据复制到自己的数据目录；请求时动态生成 `AgentAssertion`，task 缺失或上游返回 task 失效时会重新注册并原子写回，Unix 下文件权限设为 `0600`。
-
-同一 ChatGPT account 下的不同 user 会保留为不同账号，不会因为 account ID 相同而互相覆盖。账号卡片会明确显示 `Agent Identity` 状态。
-
-### 分组调度策略
-
-| 策略 | 行为 |
-| --- | --- |
-| 优先级失败切换 | 按列表顺序使用，失败后尝试下一项 |
-| 轮询分配 | 每个新请求轮换首选账号 |
-| 随机分配 | 每个新请求随机选择首选账号 |
-| 加权分配 | 按账号权重选择首选账号，失败后仍可继续 fallback |
-| 优先最低负载 | 优先选择当前进行中请求最少的账号 |
-| 手动选择 | 只使用列表中的第一个账号 |
-
-稳定会话 ID 会覆盖首选顺序并保持账号亲和。SSE 在产生有效输出前失败时可以切换账号；一旦已经向客户端输出内容，就不会重放请求，避免重复工具调用或重复文本。
-
-### 本地 API 服务
-
-当前账号分组会暴露为 `http://127.0.0.1:17687/v1`。调用方使用 Responses API；Companion 负责官方 OAuth、Responses / Chat Completions 协议转换、会话亲和、账号失败切换和流式终止检查。
+当前分组默认暴露为 `http://127.0.0.1:17687/v1`：
 
 ```bash
 curl http://127.0.0.1:17687/v1/responses \
@@ -254,41 +253,72 @@ curl http://127.0.0.1:17687/v1/responses \
 ```
 
 - 支持 `POST /v1/responses`、`POST /v1/responses/compact`、WebSocket `GET /v1/responses` 和 `GET /v1/models`。
-- API client 密钥只显示一次；SQLite 只保存 SHA-256 哈希和短前缀。
-- 可为每个 client 限制允许模型，并单独停用、轮换或删除。
-- 浏览器跨域请求始终需要有效 client 密钥；非浏览器本机请求可选择兼容模式或强制密钥。
-- 请求日志只保存路由元数据，不保存提示词、响应正文或完整密钥。
-- 上游流未产生终止事件就断开时，Companion 会返回 `response.failed`，并同步更新账号健康状态和请求审计。
-- Provider 可以单独配置 `websocket_url`。WebSocket 连接沿用 API client 认证和分组 fallback；官方账号会附加 Codex 所需请求头，Agent Identity task 失效时会重新注册后重连。
-- Responses 转 Chat Completions 时支持 function、custom、tool search、namespace 工具，以及顶层或嵌套的 `additional_tools` 和 namespace `tool_choice`。
+- API client 密钥只显示一次；SQLite 仅保存 SHA-256 哈希和短前缀。
+- 可为每个 client 配置模型白名单，并独立停用、轮换或删除。
+- 浏览器跨域请求始终要求有效 client 密钥；本机非浏览器请求可选择兼容模式或强制密钥。
+- Provider 可配置独立 `websocket_url`；官方账号和 Agent Identity 会使用各自所需的动态请求头。
+- 请求日志保存 provider、模型、状态、尝试次数与延迟，不保存提示词、响应正文或完整密钥。
 
-### Token 统计与缓存
+## CLI 与 TUI
 
-`用量` 页可以按开始日期、结束日期、provider 和模型筛选，并设置自动刷新周期；设为 `0` 可关闭自动刷新。缓存格式带版本号，版本变化时会自动重建，也可以在界面手动重建。
-
-子任务文件如果引用的父会话尚未落盘，会显示为“等待父会话”并暂不计入；后续扫描发现父文件后会自动重新归属。若同一父会话出现互相冲突的历史副本，文件会标记为“疑似重复”并暂不计入，避免静默重复计费。
-
-### CLI 启动与会话恢复
-
-`设置` 中可以选择工作目录和终端，预览、复制或直接执行命令。macOS 支持 Terminal 和 iTerm2，Windows 支持 Windows Terminal、PowerShell、PowerShell 7 和 CMD，Linux 会尝试常见终端。
-
-`会话` 页可以复制或直接执行：
+常用命令：
 
 ```bash
-codex resume SESSION_ID
+codex-companion status
+codex-companion provider import --json-file ./account.json
+codex-companion provider import-local
+codex-companion provider refresh-all
+codex-companion relay start
+codex-companion relay self-test
+codex-companion repair --history --plugins --dry-run
+codex-companion token-stats
+codex-companion sessions --query "project name"
+codex-companion-tui
 ```
 
-工作目录和 session ID 会按当前平台进行 shell 转义。
+| 命令 | 用途 |
+| --- | --- |
+| `install` / `uninstall` | 写入或恢复 Codex 配置 |
+| `doctor` / `status` | 检查接入状态或输出完整状态 |
+| `provider add/import/import-local/list/remove/test/refresh` | 管理与检查账号/provider |
+| `group create/list/use/set` | 创建、切换和编排分组 |
+| `relay start/status/self-test` | 启动与诊断本地 API |
+| `relay client ...` | 创建、查询、修改、轮换和删除 API client |
+| `relay logs/clear-logs/settings` | 管理请求审计与运行策略 |
+| `repair` | Dry-run 或修复历史会话与插件状态 |
+| `token-stats` | 扫描本地会话并输出 token 统计 |
+| `sessions` | 搜索本地 Codex 会话索引 |
 
-### 诊断日志
+所有命令都支持 `--help`。TUI 内按 `?` 查看快捷键。
 
-Companion 的诊断日志默认位于 `~/.codex-companion/logs/`，采用 JSONL，每个文件达到 2 MB 后轮转，最多保留 5 个文件（含当前文件）。日志会脱敏 token、Authorization、cookie、API key、私钥和 `AgentAssertion`，不会记录提示词或响应正文。
+## 本地数据与安全边界
 
-桌面 App 的 `设置` 可以查看日志大小、打开目录或清空日志。若 React 页面崩溃，恢复界面也提供重新加载和打开日志目录入口。
+默认数据位置：
 
-### 自定义模型价格
+| 路径 | 内容 |
+| --- | --- |
+| `~/.codex-companion/config.json` | provider、分组、应用与代理设置 |
+| `~/.codex-companion/auth/` | 导入后的账号与 API Key 私有文件 |
+| `~/.codex-companion/relay/api-service.sqlite3` | API client 哈希、请求审计、会话亲和与转换历史 |
+| `~/.codex-companion/logs/` | 已脱敏的 Companion JSONL 诊断日志 |
+| `~/.codex-companion/cache/` | 会话索引与 token 用量缓存 |
+| `~/.codex/backups/codex-companion/` | Codex 配置安装与修复备份 |
 
-内置价格是带日期的估算快照，不代表上游账单。可以在 Companion 数据目录（默认 `~/.codex-companion`）创建 `model-pricing.json` 覆盖或补充模型价格：
+可以使用 `CODEX_COMPANION_HOME` 修改 Companion 数据目录，使用 `CODEX_COMPANION_CODEX_DIR` 指向另一个 Codex 目录。
+
+安全边界：
+
+- 导入的账号材料留在本机；Unix 下新建和覆盖的私有认证文件使用 `0600` 权限。
+- Agent Identity 私钥只用于本地动态签名，不会写入 Codex `auth.json`。
+- API client 密钥只显示一次，持久化时只保存哈希。
+- 诊断日志会脱敏 token、Authorization、cookie、API Key、私钥和 `AgentAssertion`，并按 2 MB 轮转，最多保留 5 个文件。
+- 修复操作先支持 dry-run；正式修复使用事务备份，任一步失败会回滚本次修改。
+- Token 成本是根据本地会话和价格快照计算的估算值，不等同于 OpenAI 或中转站账单。
+
+<details>
+<summary><strong>自定义模型价格</strong></summary>
+
+在 Companion 数据目录创建 `model-pricing.json`：
 
 ```json
 {
@@ -308,168 +338,82 @@ Companion 的诊断日志默认位于 `~/.codex-companion/logs/`，采用 JSONL�
 }
 ```
 
-价格单位为每百万 Token 的美元估算值。`cacheWriteInputPerMillion` 可省略，省略时按普通输入价格计算；`providerMultipliers` 可用于表达中转站加价或折扣。
+价格单位为每百万 Token 的美元估算值。未匹配价格的模型会显示为“未定价”，不会静默当作 `$0`。
 
-## CLI 用法
+</details>
 
-安装方式见[下载与安装](#下载与安装)。下面是常用操作；所有命令都支持 `--help` 查看当前参数。
+## 常见问题
 
-查看状态：
+<details>
+<summary><strong>切换账号后需要重启 ChatGPT / Codex 吗？</strong></summary>
 
-```bash
-codex-companion status
-```
+直连模式需要目标应用重新读取配置和认证材料。本地代理首次接入后，后续切换账号或分组无需重启。
 
-导入账号 JSON：
+</details>
 
-```bash
-codex-companion provider import --json-file ./account.json
-```
+<details>
+<summary><strong>Companion 会上传我的账号或提示词吗？</strong></summary>
 
-导入本机已有 Codex 账号：
+Companion 没有账号云同步服务。认证材料保存在本机；请求只会发送到你配置的上游。结构化审计不保存提示词或响应正文。
 
-```bash
-codex-companion provider import-local
-```
+</details>
 
-刷新账号状态：
+<details>
+<summary><strong>如何回到原来的 Codex 配置？</strong></summary>
 
-```bash
-codex-companion provider refresh-all
-```
+在 `设置` 中恢复 Companion 管理前的配置，或运行 `codex-companion uninstall`。Companion 会使用安装时创建的备份，并避免覆盖安装后由用户修改的内容。
 
-预览修复：
+</details>
 
-```bash
-codex-companion repair --history --plugins --dry-run
-```
+<details>
+<summary><strong>为什么有些中转必须使用本地代理？</strong></summary>
 
-启动本地代理：
+Codex 使用 Responses API。地址明确指向 `/chat/completions` 的 provider 需要 Companion 转换请求、SSE、工具调用和历史消息，因此不能按原地址直连。
 
-```bash
-codex-companion relay start
-```
+</details>
 
-管理本地 API：
+<details>
+<summary><strong>用量页为什么和上游账单不完全一致？</strong></summary>
 
-```bash
-codex-companion relay status
-codex-companion relay self-test
-codex-companion relay client create --name local-script --models model-a,model-b
-codex-companion relay client list
-codex-companion relay client update --id CLIENT_ID --enabled false
-codex-companion relay client rotate CLIENT_ID
-codex-companion relay client delete CLIENT_ID
-codex-companion relay logs --limit 50
-codex-companion relay clear-logs
-codex-companion relay settings --require-api-key true --retry-budget 2
-```
+用量页读取本地 Codex 会话中的 token 事件，并使用内置或自定义价格快照估算。上游可能采用不同的计费分类、折扣、倍率或舍入方式。
 
-### 命令范围
-
-| 命令 | 用途 |
-| --- | --- |
-| `install` / `uninstall` | 写入或恢复 Codex 配置 |
-| `doctor` / `status` | 检查接入状态或输出完整状态 |
-| `daemon start` | 前台启动 Companion daemon |
-| `provider add` | 手动添加 provider |
-| `provider import` / `import-local` | 从 JSON 或本机 Codex 导入账号 |
-| `provider list` / `remove` / `test` / `refresh` / `refresh-all` | 查询、删除、测试和刷新 provider |
-| `group create` / `list` / `use` / `set` | 创建分组、切换分组和调整顺序 |
-| `relay start` / `status` / `self-test` | 启动和诊断本地 API 服务 |
-| `relay client create/list/update/rotate/delete` | 管理本地 API client 和密钥 |
-| `relay logs` / `clear-logs` / `settings` | 查看审计记录和修改转发策略 |
-| `repair` | dry-run 或修复历史会话与插件状态 |
-| `token-stats` | 扫描本地会话并输出 token 统计 |
-
-## TUI 用法
-
-```bash
-codex-companion-tui
-```
-
-在 TUI 里按 `?` 查看快捷键。
+</details>
 
 ## 从源码运行
 
-需要 Node.js 22、pnpm 10.23、稳定版 Rust 工具链，以及对应系统的 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)。
+需要 Node.js 22、pnpm 10.23、稳定版 Rust 工具链，以及当前系统对应的 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)。仓库提供 `.nvmrc`，使用 nvm 时先运行 `nvm use`。
 
 ```bash
 git clone https://github.com/Alexlangl/codex-companion.git
 cd codex-companion
+corepack enable
 pnpm install --frozen-lockfile
-pnpm check
-cargo test --workspace
-pnpm dev:app
+pnpm dev
 ```
 
-构建当前平台桌面安装包：
+`pnpm dev` 默认同时启动隔离的 Companion 和自动发现的 ChatGPT App（兼容旧 Codex App，并可回退到 Codex CLI）。只启动 Companion、使用本机配置、CLI 模式和所有高级参数请参考 [开发环境说明](README.devcodex.md#中文)。
+
+提交前检查：
+
+```bash
+pnpm check
+cargo test --workspace
+```
+
+构建桌面安装包：
 
 ```bash
 pnpm build:tauri
 ```
 
-只构建 CLI 和 TUI：
+只构建 CLI 与 TUI：
 
 ```bash
 cargo build --release -p codex-companion-cli -p codex-companion-tui
 ```
 
-## 远端手动打包
+维护者可以在 GitHub Actions 的 `Release` workflow 中输入 `0.1.1` 或 `v0.1.1` 形式的版本号。工作流会构建 macOS、Windows、Linux 桌面包与 CLI/TUI 压缩包，生成 `SHA256SUMS`，并在稳定版发布后更新 Homebrew tap。
 
-仓库提供 `Release` GitHub Actions 工作流。在 GitHub 的 `Actions` → `Release` 页面选择 `Run workflow`，输入 `0.1.1` 或 `v0.1.1` 形式的版本号即可开始打包。
+## 许可证
 
-工作流会构建 macOS Universal / Intel / Apple Silicon、Windows x64、Linux x64 / ARM64 桌面安装包，以及包含 CLI 和 TUI 的命令行压缩包。全部平台成功后才会创建对应 GitHub Release，并附带 `SHA256SUMS`。
-
-稳定版 Release 成功后会自动更新 `Alexlangl/homebrew-tap` 中的 CLI/TUI Formula 和桌面 Cask。桌面端启动时会静默检查稳定版本，发现更新后由用户选择“立即更新”或“稍后”，也可以在 `设置` 中手动检查、下载并重启安装；更新包使用 Tauri 签名校验。
-
-## 更新与签名边界
-
-这些机制保护的对象不同，不能把“有 `.sig`”理解成“操作系统已信任发布者”。
-
-| 机制 | 当前状态 | 保护范围 |
-| --- | --- | --- |
-| Release `SHA256SUMS` | 已提供 | 让用户核对下载内容是否与该 Release 发布的文件一致 |
-| Tauri updater `.sig` | 已启用且强制校验 | 已安装的桌面 App 下载更新时验证更新包来源和完整性 |
-| macOS Developer ID + notarization | 尚未配置 | 配置后可建立 Apple 认可的发布者身份并减少 Gatekeeper 拦截 |
-| Windows Authenticode | 尚未配置 | 配置后显示发布者身份；SmartScreen 信誉仍可能需要积累 |
-| Linux GPG/AppImage 发布签名 | 尚未配置 | 首次下载目前依赖 GitHub Release 来源和 SHA-256 校验 |
-
-Tauri updater 的私钥只存放在发布环境，仓库内只有公钥。自动更新签名不会替代 macOS Developer ID、Apple notarization 或 Windows Authenticode；它也不能消除首次从浏览器下载安装时的系统信誉提示。
-
-要消除这些首次安装提示，需要为 CI 另外配置 Apple Developer ID/公证凭据和 Windows 代码签名证书。证书和私钥不得提交到仓库。
-
-## 支持的账号
-
-- 官方 Codex 账号 JSON。
-- Agent Identity JSON。
-- sub2api `accounts[]` OpenAI OAuth 账号。
-- Codex Companion / CPA 风格 Codex OAuth 账号。
-- API Key 账号 JSON。
-- 手动添加的 OpenAI-compatible provider。
-- 本机已有 Codex 账号。
-
-API Key JSON 示例：
-
-```json
-{
-  "auth_mode": "apikey",
-  "OPENAI_API_KEY": "sk-...",
-  "email": "api-key-demo",
-  "api_base_url": "https://api.example.com/v1",
-  "websocket_url": "wss://api.example.com/v1/responses",
-  "api_provider_id": "example",
-  "api_provider_name": "Example API"
-}
-```
-
-## 安全说明
-
-- 修复前可以先 dry-run 预览影响。
-- 正式修复使用 `~/.codex/backups/codex-companion/repair/` 下的事务备份；失败自动回滚，成功后保留最近 10 份。
-- 导入的账号材料只保存在本机。
-- Agent Identity 私钥保存在 Companion 私有账号目录，只用于本地动态签名，不会写入 Codex `auth.json`。
-- 本地 API client 密钥只显示一次，持久化时只保存哈希；请求审计不保存请求或响应正文。
-- Token 用量统计只读取本地 Codex 会话记录。
-- 诊断日志会轮转并脱敏；提交 Issue 前仍建议检查日志内容，只分享与问题相关的片段。
-- 成本是基于模型价格快照和本地覆盖配置的估算，不是 OpenAI 或中转站账单。
+Codex Companion 基于 [MIT License](LICENSE) 发布。

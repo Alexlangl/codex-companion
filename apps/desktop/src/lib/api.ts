@@ -39,7 +39,17 @@ import type {
   TokenUsageQuery,
 } from "../types/domain";
 import { isGenericOfficialAccountName } from "./provider-display";
-import { extractQuotaWindows, findNumber, findString, isApiKeyJson, lowestQuotaPercent, providerNameFromBaseUrl } from "./provider-json";
+import {
+  extractQuotaWindows,
+  findApiBaseUrl,
+  findApiKey,
+  findNumber,
+  findString,
+  isApiKeyJson,
+  isNewApiChannelConnection,
+  lowestQuotaPercent,
+  providerNameFromBaseUrl,
+} from "./provider-json";
 import { getTokenUsage as getTokenUsageFromRuntime } from "./token-usage-api";
 
 const APP_PREFS_STORAGE_KEY = "codex-companion:app-settings";
@@ -1294,11 +1304,24 @@ function emptyToNull(value?: string) {
   return value && value.trim() ? value.trim() : null;
 }
 
-function importApiKeyJsonMock(value: unknown, providerId?: string, providerName?: string) {
-  const apiKey = findString(value, ["OPENAI_API_KEY", "openai_api_key", "openaiApiKey", "api_key", "apiKey"]) ?? "";
-  const baseUrl = (
-    findString(value, ["api_base_url", "apiBaseUrl", "base_url", "baseUrl"]) ?? "https://api.openai.com/v1"
-  ).replace(/\/+$/, "");
+function importApiKeyJsonMock(
+  value: unknown,
+  providerId?: string,
+  providerName?: string,
+): Promise<ProviderImportOutcome> {
+  const isNewApiConnection = isNewApiChannelConnection(value);
+  const apiKey = findApiKey(value);
+  if (!apiKey) {
+    const message = isNewApiConnection
+      ? "New API 连接 JSON 缺少 key"
+      : "API Key JSON 缺少 OPENAI_API_KEY";
+    return Promise.reject(new Error(message));
+  }
+  const detectedBaseUrl = findApiBaseUrl(value);
+  if (isNewApiConnection && !detectedBaseUrl) {
+    return Promise.reject(new Error("New API 连接 JSON 缺少 url"));
+  }
+  const baseUrl = detectedBaseUrl ?? "https://api.openai.com/v1";
   const name =
     emptyToNull(providerName) ||
     findString(value, ["api_provider_name", "apiProviderName", "provider_name", "providerName", "name"]) ||

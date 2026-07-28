@@ -784,7 +784,7 @@ function ProviderAddTabs({
             <textarea
               className="json-import-textarea"
               onChange={(event) => setPastedJson(event.target.value)}
-              placeholder="粘贴 session JSON、auth.json、Sub2API JSON、accessToken 或 refresh_token"
+              placeholder="粘贴 session JSON、auth.json、Sub2API / New API 连接 JSON、accessToken 或 refresh_token"
               value={pastedJson}
             />
           </Field>

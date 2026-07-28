@@ -32,7 +32,10 @@ pub fn import_provider_json(
     if let Some(auth) = extract_agent_identity_auth(&value) {
         return import_agent_identity_provider(store, &value, auth, provider_id, provider_name);
     }
-    if is_auth_mode_api_key(&value) || extract_api_key(&value).is_some() {
+    if is_auth_mode_api_key(&value)
+        || is_newapi_channel_connection(&value)
+        || extract_api_key(&value).is_some()
+    {
         return import_api_key_provider_from_json(store, &value, provider_id, provider_name);
     }
     let mut draft =
@@ -504,14 +507,25 @@ fn import_api_key_provider_from_json(
     explicit_provider_name: Option<String>,
 ) -> Result<ProviderImportOutcome> {
     let api_key = extract_api_key(value).ok_or_else(|| {
-        CompanionError::InvalidConfig("API Key JSON 缺少 OPENAI_API_KEY".to_string())
+        let message = if is_newapi_channel_connection(value) {
+            "New API 连接 JSON 缺少 key"
+        } else {
+            "API Key JSON 缺少 OPENAI_API_KEY"
+        };
+        CompanionError::InvalidConfig(message.to_string())
     })?;
     if looks_like_http_url(&api_key) {
         return Err(CompanionError::InvalidConfig(
             "API Key 不能是 URL，请检查 JSON 字段是否填反".to_string(),
         ));
     }
-    let base_url = extract_api_base_url(value).unwrap_or_else(default_openai_api_base_url);
+    let base_url = if is_newapi_channel_connection(value) {
+        extract_api_base_url(value).ok_or_else(|| {
+            CompanionError::InvalidConfig("New API 连接 JSON 缺少 url".to_string())
+        })?
+    } else {
+        extract_api_base_url(value).unwrap_or_else(default_openai_api_base_url)
+    };
     if !looks_like_http_url(&base_url) {
         return Err(CompanionError::InvalidConfig(format!(
             "API Key JSON 的 api_base_url 无效: {base_url}"
@@ -1103,7 +1117,7 @@ fn is_auth_mode_api_key(value: &serde_json::Value) -> bool {
 }
 
 fn extract_api_key(value: &serde_json::Value) -> Option<String> {
-    pick_string(
+    let api_key = pick_string(
         value,
         &[
             &["OPENAI_API_KEY"],
@@ -1113,11 +1127,16 @@ fn extract_api_key(value: &serde_json::Value) -> Option<String> {
             &["credentials", "api_key"],
             &["tokens", "api_key"],
         ],
-    )
+    );
+    api_key.or_else(|| {
+        is_newapi_channel_connection(value)
+            .then(|| pick_string(value, &[&["key"]]))
+            .flatten()
+    })
 }
 
 fn extract_api_base_url(value: &serde_json::Value) -> Option<String> {
-    pick_string(
+    let base_url = pick_string(
         value,
         &[
             &["api_base_url"],
@@ -1127,8 +1146,33 @@ fn extract_api_base_url(value: &serde_json::Value) -> Option<String> {
             &["credentials", "api_base_url"],
             &["credentials", "base_url"],
         ],
-    )
-    .map(|value| value.trim_end_matches('/').to_string())
+    );
+    if let Some(base_url) = base_url {
+        return Some(base_url.trim_end_matches('/').to_string());
+    }
+
+    is_newapi_channel_connection(value)
+        .then(|| pick_string(value, &[&["url"]]))
+        .flatten()
+        .map(normalize_newapi_channel_base_url)
+}
+
+fn is_newapi_channel_connection(value: &serde_json::Value) -> bool {
+    value
+        .get("_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind == "newapi_channel_conn")
+}
+
+fn normalize_newapi_channel_base_url(base_url: String) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.ends_with("/v1")
+        || base_url.ends_with("/responses")
+        || base_url.ends_with("/chat/completions")
+    {
+        return base_url.to_string();
+    }
+    format!("{base_url}/v1")
 }
 
 fn extract_websocket_url(value: &serde_json::Value) -> Option<String> {
@@ -2224,6 +2268,56 @@ base_url = "https://api.deepseek.com/v1"
             outcome.provider.account.unwrap().email.as_deref(),
             Some("api-key-1234")
         );
+    }
+
+    #[test]
+    fn imports_newapi_channel_connection_json() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let value = serde_json::json!({
+            "_type": "newapi_channel_conn",
+            "key": "sk-newapi",
+            "url": "https://api.rtoc.cc"
+        });
+
+        let outcome = import_provider_json(&store, &value.to_string(), None, None).expect("import");
+
+        assert_eq!(outcome.import_kind, "api_key");
+        assert_eq!(outcome.provider.name, "api.rtoc.cc");
+        assert_eq!(outcome.provider.kind, ProviderKind::RelayProvider);
+        assert_eq!(outcome.provider.base_url, "https://api.rtoc.cc/v1");
+        let auth = fs::read_to_string(outcome.auth_path).expect("auth file");
+        assert!(auth.contains("sk-newapi"));
+    }
+
+    #[test]
+    fn ignores_generic_key_and_url_json_without_newapi_type() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let value = serde_json::json!({
+            "key": "not-an-api-key-field",
+            "url": "https://example.com"
+        });
+
+        let error = import_provider_json(&store, &value.to_string(), None, None)
+            .expect_err("generic JSON must not be imported");
+
+        assert!(error.to_string().contains("仅支持"));
+    }
+
+    #[test]
+    fn rejects_newapi_channel_connection_without_url() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let value = serde_json::json!({
+            "_type": "newapi_channel_conn",
+            "key": "sk-newapi"
+        });
+
+        let error = import_provider_json(&store, &value.to_string(), None, None)
+            .expect_err("connection JSON without url must not be imported");
+
+        assert!(error.to_string().contains("缺少 url"));
     }
 
     #[test]

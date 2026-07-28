@@ -1,355 +1,277 @@
-# Dev Codex 调试 / Dev Codex Debugging
+# Codex Companion Development
+
+[中文](#中文) | [English](#english)
 
 ## 中文
 
-`codex-companion` 的开发模式支持两种 Codex 启动目标：
+### 快速启动
 
-- `sandbox`：默认模式。启动隔离的 Codex app，不碰真实 `~/.codex`。
-- `local`：本机模式。开发时直接使用本机真实 Codex。
-
-### 1. 默认：沙盒 Codex app
-
-直接运行：
+需要 Node.js 22、pnpm 10.23、稳定版 Rust 工具链，以及当前系统对应的 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)。仓库提供了 `.nvmrc`，使用 nvm 时可直接运行：
 
 ```bash
+nvm use
+corepack enable
+pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-或者：
+`pnpm dev` 会同时启动：
+
+- 使用隔离数据目录的 Codex Companion 开发版；
+- 自动发现的 ChatGPT 桌面 App；
+- 如果没有桌面 App，则回退到 Codex CLI。
+
+macOS 会优先使用 `/Applications/ChatGPT.app`，同时兼容旧的 `Codex.app`。正常开发不再需要预先设置一组环境变量。
+
+### 启动模式
+
+| 命令 | Companion 数据 | ChatGPT / Codex 数据 | 是否立即启动客户端 |
+| --- | --- | --- | --- |
+| `pnpm dev` | 隔离 | 隔离 | 是 |
+| `pnpm dev:companion` | 隔离 | 隔离 | 否；桌面 App 可稍后从 UI 启动 |
+| `pnpm dev:local` | 隔离 | 使用本机配置与 App profile | 是 |
+| `pnpm dev:cli` | 隔离 | 隔离 | 是；在当前终端启动 Codex CLI |
+
+首次排查环境时先运行：
 
 ```bash
-yarn dev
+pnpm dev --dry-run
 ```
 
-默认等价于：
+它只输出解析后的模式、路径、客户端类型和可执行文件，不会启动 ChatGPT、Codex CLI 或 Tauri。
+
+`pnpm dev:local` 会让开发版 Companion 操作本机 Codex 目录，并启动真实的 ChatGPT / Codex profile。涉及安装、切换或修复配置时可能修改本机 `~/.codex`；日常开发优先使用默认的沙盒模式。
+
+桌面 App 可以由 Companion 根据隔离 profile 或进程名安全地启动和重启。交互式 CLI 与任意 `--command` 默认只在开发命令启动时运行，Companion UI 不会自动启停它们；CLI 独占当前终端输入，切换配置后请手动重启。自定义命令只有在同时设置精确的 `CODEX_COMPANION_CLIENT_PROCESS_MATCH` 或 `CODEX_COMPANION_CLIENT_APP_NAME` 时才启用自动管理。
+
+### 自动发现与隔离目录
+
+桌面客户端发现顺序：
+
+1. `--app-path` 或 `DEV_CLIENT_APP_PATH` 指定的位置；
+2. macOS 的 `/Applications/ChatGPT.app`、`~/Applications/ChatGPT.app`；
+3. 旧的 `Codex.app`；
+4. Windows 下常见的 ChatGPT 和旧 Codex 安装位置；
+5. 找不到桌面 App 时，在 `auto` 模式回退到 PATH 中的 `codex` CLI。
+
+默认沙盒位于系统临时目录的 `codex-companion-dev/` 下：
+
+| 目录 | 用途 |
+| --- | --- |
+| `companion-home/` | Companion 配置、认证材料与数据库 |
+| `client-home/` | 隔离的 `CODEX_HOME` / `CODEX_SQLITE_HOME` |
+| `client-app-data/` | ChatGPT / Codex Electron profile |
+| `workspace/` | 客户端启动工作目录 |
+
+启动器会自动创建目录和最小沙盒配置。macOS 下直接执行 `.app/Contents/MacOS/ChatGPT`，确保隔离环境和 `--user-data-dir` 能传给客户端进程。
+
+### 常用参数
 
 ```bash
-CODEX_COMPANION_DEV_TARGET=sandbox pnpm dev
+# 查看完整帮助
+pnpm dev --help
+
+# 指定 ChatGPT.app；相对路径按仓库根目录解析
+pnpm dev --app --app-path "/Applications/ChatGPT.app"
+
+# 使用系统语言，不注入 --lang
+pnpm dev --lang system
+
+# 修改隔离根目录和工作目录
+pnpm dev --dev-root .dev-data --workspace ./fixtures/workspace
+
+# 使用另一个 Codex CLI
+pnpm dev:cli --cli-bin /absolute/path/to/codex
+
+# 把剩余参数交给 tauri dev
+pnpm dev --tauri --release
 ```
 
-这个模式会让 companion 后续的“启动 Codex / 启动当前分组”动作启动一个隔离的 Codex app。
+| 参数 | 用途 |
+| --- | --- |
+| `--sandbox` / `--local` | 选择隔离或本机客户端状态 |
+| `--app` / `--cli` | 强制使用桌面 App 或 CLI |
+| `--start-client` / `--no-start-client` | 控制是否立即启动客户端 |
+| `--app-path <path>` | 指定 ChatGPT / 旧 Codex 的 `.app`、`.exe` 或可执行文件 |
+| `--cli-bin <path>` | 指定 Codex CLI 可执行文件 |
+| `--command <command>` | 使用完整的自定义客户端启动命令 |
+| `--lang <locale>` | 设置 `zh-CN`、`en-US` 等语言；`system` 表示不注入 |
+| `--dev-root <path>` | 修改所有默认隔离数据的根目录 |
+| `--workspace <path>` | 修改客户端启动工作目录 |
+| `--host <address>` / `--port <number>` | 设置 Vite 地址和首选端口 |
+| `--skip-client-restart` | 写配置时不停止或重启客户端 |
+| `--dry-run` | 只检查解析结果和客户端发现 |
+| `--tauri <args...>` | 把剩余参数传给 `tauri dev` |
 
-默认隔离目录位于系统临时目录：
+pnpm 9/10 的 `pnpm dev --help` 和 `pnpm dev -- --help` 写法都受支持。
 
-- `DEV_CODEX_HOME`：devcodex 状态目录，macOS/Linux 通常是 `/tmp/devcodex-home`，Windows 通常是 `%TEMP%\devcodex-home`。
-- `DEV_CODEX_WORKSPACE`：devcodex 工作目录，macOS/Linux 通常是 `/tmp/devcodex-workspace`，Windows 通常是 `%TEMP%\devcodex-workspace`。
-- `DEV_CODEX_APP_DATA`：devcodex app data，macOS/Linux 通常是 `/tmp/devcodex-app-data`，Windows 通常是 `%TEMP%\devcodex-app-data`。
-- `DEV_COMPANION_HOME`：dev companion 状态目录，macOS/Linux 通常是 `/tmp/devcodex-companion`，Windows 通常是 `%TEMP%\devcodex-companion`。
+### 环境变量兼容
 
-沙盒模式会强制写入 devcodex 的 sandbox 配置：
+命令行参数适合本地开发；环境变量仍可用于 CI、IDE launch configuration 和自定义脚本。
 
-```toml
-sandbox_mode = "workspace-write"
-approval_policy = "on-request"
+| 当前名称 | 用途 |
+| --- | --- |
+| `CODEX_COMPANION_DEV_TARGET` | `sandbox` 或 `local` |
+| `CODEX_COMPANION_DEV_ROOT` | 默认隔离目录的根路径 |
+| `DEV_COMPANION_HOME` | Companion 开发数据目录 |
+| `DEV_CLIENT_HOME` | 隔离的 Codex 状态目录 |
+| `DEV_CLIENT_WORKSPACE` | 客户端工作目录 |
+| `DEV_CLIENT_APP_DATA` | 隔离的桌面 App profile |
+| `DEV_CLIENT_KIND` | `auto`、`app` 或 `cli` |
+| `DEV_CLIENT_APP_PATH` | ChatGPT / 旧 Codex App 路径 |
+| `DEV_CLIENT_LANG` | 客户端语言 |
+| `DEV_CLIENT_BIN` | Codex CLI 可执行文件 |
+| `DEV_CLIENT_COMMAND` | 完整自定义启动命令 |
+| `CODEX_COMPANION_START_CLIENT` | `1` 表示立即启动客户端 |
+| `CODEX_COMPANION_SKIP_CLIENT_RESTART` | `1` 表示不自动重启客户端 |
+| `CODEX_COMPANION_CLIENT_PROCESS_MATCH` | 自定义命令的精确进程命令行匹配文本 |
+| `CODEX_COMPANION_CLIENT_APP_NAME` | 自定义桌面命令对应的精确进程名 |
+| `CODEX_COMPANION_DEV_HOST` / `CODEX_COMPANION_DEV_PORT` | Vite 地址和首选端口 |
 
-[sandbox_workspace_write]
-network_access = false
-exclude_tmpdir_env_var = false
-exclude_slash_tmp = false
-```
+旧的 `DEV_CODEX_*`、`DEVCODEX_*`、`CODEX_COMPANION_START_DEVCODEX`、`CODEX_COMPANION_SKIP_CODEX_RESTART` 和 `CODEX_COMPANION_*_CODEX_*` 名称仍然可用，但新脚本和文档统一使用 `CLIENT` 命名。`CODEX_HOME`、`CODEX_SQLITE_HOME` 与 `CODEX_COMPANION_CODEX_DIR` 仍保留原名，因为它们指向的配置目录依然是 `.codex`。
 
-macOS 下默认启动：
+### 常见问题
 
-```text
-/Applications/Codex.app/Contents/MacOS/Codex
-```
-
-沙盒 Codex app 默认会从本机 locale 推断语言，并通过 `--lang` 传给 Codex。
-
-如果需要临时强制语言，可以显式设置：
-
-```bash
-DEVCODEX_LANG=zh-CN
-```
-
-如果要强制英文：
-
-```bash
-DEVCODEX_LANG=en-US pnpm dev
-```
-
-显式不传语言参数，让 Codex 自己决定：
-
-```bash
-DEVCODEX_LANG=system pnpm dev
-```
-
-Windows 下会尝试查找 Codex `.exe`。如果找不到，手动指定：
-
-```powershell
-$env:DEVCODEX_APP_PATH="C:\Path\To\Codex.exe"
-pnpm dev
-```
-
-如果你有单独的 dev Codex app：
-
-```bash
-DEVCODEX_APP_PATH=/absolute/path/to/DevCodex.app pnpm dev
-```
-
-Windows：
-
-```powershell
-$env:DEVCODEX_APP_PATH="C:\Path\To\DevCodex.exe"
-pnpm dev
-```
-
-### 2. run dev 时立刻启动沙盒 Codex
-
-默认 `pnpm dev` 只启动 companion dev app；当你在 UI 里点“启动 Codex”时才启动沙盒 Codex。
-
-如果想 `pnpm dev` 时就立刻启动沙盒 Codex：
-
-```bash
-CODEX_COMPANION_START_DEVCODEX=1 pnpm dev
-```
-
-Windows：
-
-```powershell
-$env:CODEX_COMPANION_START_DEVCODEX="1"
-pnpm dev
-```
-
-立刻启动后，UI 按钮仍然会按当前启动模式启动/重启沙盒 Codex。脚本会用 `DEV_CODEX_APP_DATA` 标记沙盒进程，避免误判真实本机 Codex。
-
-如果你只想让 UI 写配置、不自动停止或启动 Codex，可以手动设置：
-
-```bash
-CODEX_COMPANION_SKIP_CODEX_RESTART=1 pnpm dev
-```
-
-### 3. 本机 Codex 模式
-
-如果你开发时就是想启用本机真实 Codex，而不是沙盒：
-
-```bash
-CODEX_COMPANION_DEV_TARGET=local pnpm dev
-```
-
-Windows：
-
-```powershell
-$env:CODEX_COMPANION_DEV_TARGET="local"
-pnpm dev
-```
-
-这个模式下：
-
-- companion dev 状态仍然默认写到 `DEV_COMPANION_HOME`。
-- Codex 目录不再强制指向 `DEV_CODEX_HOME`。
-- Codex 启动命令不再走 sandbox wrapper。
-- UI 里的“启动 Codex”会使用本机默认 Codex 行为。
-
-也就是说，`local` 会影响真实本机 Codex 配置和进程，适合你明确要做本机联调时使用。
-
-### 4. CLI 模式
-
-默认沙盒目标是 Codex app，不是 CLI。
-
-如果你确实想调 CLI：
-
-```bash
-DEVCODEX_KIND=cli DEVCODEX_BIN=/absolute/path/to/codex pnpm dev
-```
-
-或者单独启动：
-
-```bash
-DEVCODEX_KIND=cli ./scripts/devcodex.sh
-```
-
-### 5. 重要环境变量
-
-- `CODEX_COMPANION_DEV_TARGET`：`sandbox` 或 `local`。默认 `sandbox`。
-- `CODEX_COMPANION_START_DEVCODEX`：设为 `1` 时，`pnpm dev` 期间立刻启动沙盒 Codex。
-- `CODEX_COMPANION_SKIP_CODEX_RESTART`：设为 `1` 时，companion 写配置但不停止/启动 Codex；默认不设置。
-- `CODEX_COMPANION_CODEX_PROCESS_MATCH`：自定义 Codex 启动命令时可设置进程命令行匹配片段，供 UI 判断是否已运行以及停止目标进程；沙盒模式自动设置。
-- `DEV_CODEX_HOME`：沙盒 Codex 状态目录。
-- `DEV_CODEX_WORKSPACE`：沙盒 Codex 工作目录。
-- `DEV_CODEX_APP_DATA`：沙盒 Codex app data 目录。
-- `DEV_COMPANION_HOME`：dev companion 状态目录。
-- `DEVCODEX_KIND`：`app` 或 `cli`。能找到 app 时默认 `app`。
-- `DEVCODEX_APP_PATH`：沙盒 Codex app 路径。macOS 可传 `.app`，Windows 可传 `.exe`。
-- `DEVCODEX_LANG`：沙盒 Codex app 语言。默认从本机 locale 推断；可显式设为 `zh-CN`、`en-US` 等，或设为 `system` 表示不传 `--lang`。
-- `DEVCODEX_BIN`：CLI 模式下的 Codex binary。
-- `DEVCODEX_COMMAND`：完整自定义启动命令。设置后会在 `pnpm dev` 时立刻启动。
-
-macOS 下脚本不会使用 `open -a Codex`，因为那样不可靠地传入 `CODEX_HOME`。它会直接执行 `.app/Contents/MacOS/Codex`，让 app 继承隔离环境变量。
+- **提示 Node 版本不匹配**：运行 `nvm use`，确认 `node --version` 为 22 或更高。
+- **没有找到桌面 App**：运行 `pnpm dev --dry-run` 检查发现结果，再用 `--app-path` 指定位置；也可以使用 `pnpm dev:cli`。
+- **1420 端口被占用**：开发脚本会自动向后查找最多 100 个端口，并把最终地址传给 Tauri。
+- **只想调试 Companion UI**：使用 `pnpm dev:companion`，需要时再从 UI 启动隔离客户端。
+- **CLI 切换配置后没有自动重启**：这是预期行为；开发启动器不会模糊匹配并终止其他 `codex` 进程，请在当前终端手动退出并重新运行 CLI。
+- **需要直接运行客户端包装器**：使用 `node scripts/devcodex.mjs --print-config` 检查发现结果，或使用 `scripts/devcodex.sh` 启动。文件名暂时保留用于兼容旧开发脚本，实际会优先启动 ChatGPT。
 
 ## English
 
-Development mode supports two Codex targets:
+### Quick Start
 
-- `sandbox`: default. Starts an isolated Codex app and does not touch the real `~/.codex`.
-- `local`: uses the real local Codex during development.
-
-### 1. Default: sandbox Codex app
-
-Run:
+You need Node.js 22, pnpm 10.23, the stable Rust toolchain, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform. The repository includes `.nvmrc`; with nvm installed, run:
 
 ```bash
+nvm use
+corepack enable
+pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-Or:
+`pnpm dev` starts both:
+
+- an isolated Codex Companion development instance;
+- the automatically discovered ChatGPT desktop app;
+- or Codex CLI when no desktop app is available.
+
+On macOS, `/Applications/ChatGPT.app` takes precedence while legacy `Codex.app` installations remain supported. Normal development no longer requires a set of environment variables.
+
+### Launch Modes
+
+| Command | Companion data | ChatGPT / Codex data | Starts the client now |
+| --- | --- | --- | --- |
+| `pnpm dev` | Isolated | Isolated | Yes |
+| `pnpm dev:companion` | Isolated | Isolated | No; a desktop app can be launched later from the UI |
+| `pnpm dev:local` | Isolated | Local config and app profile | Yes |
+| `pnpm dev:cli` | Isolated | Isolated | Yes; starts Codex CLI in the current terminal |
+
+When diagnosing a machine for the first time, start with:
 
 ```bash
-yarn dev
+pnpm dev --dry-run
 ```
 
-This is equivalent to:
+It prints the resolved mode, paths, client kind, and executable without starting ChatGPT, Codex CLI, or Tauri.
+
+`pnpm dev:local` lets the development build operate on the local Codex directory and starts the real ChatGPT / Codex profile. Installing, switching, or repairing configuration may modify local `~/.codex` data; prefer the default sandbox for routine development.
+
+Companion can safely start and restart desktop apps by matching an isolated profile or an exact process name. Interactive CLI sessions and arbitrary `--command` values run only when the development command starts; Companion UI actions do not automatically stop or relaunch them. The CLI owns the current terminal input, so restart it manually after configuration changes. Automatic management for a custom command is enabled only when an exact `CODEX_COMPANION_CLIENT_PROCESS_MATCH` or `CODEX_COMPANION_CLIENT_APP_NAME` is also set.
+
+### Discovery and Isolation
+
+Desktop client discovery order:
+
+1. The location supplied through `--app-path` or `DEV_CLIENT_APP_PATH`.
+2. `/Applications/ChatGPT.app` and `~/Applications/ChatGPT.app` on macOS.
+3. Legacy `Codex.app` installations.
+4. Common ChatGPT and legacy Codex installation paths on Windows.
+5. The `codex` CLI on PATH when no app is found in `auto` mode.
+
+The default sandbox lives under `codex-companion-dev/` in the system temporary directory:
+
+| Directory | Purpose |
+| --- | --- |
+| `companion-home/` | Companion configuration, credentials, and databases |
+| `client-home/` | Isolated `CODEX_HOME` / `CODEX_SQLITE_HOME` |
+| `client-app-data/` | ChatGPT / Codex Electron profile |
+| `workspace/` | Client launch working directory |
+
+The launcher creates the directories and a minimal sandbox configuration automatically. On macOS it executes `.app/Contents/MacOS/ChatGPT` directly so the isolated environment and `--user-data-dir` reach the client process.
+
+### Common Options
 
 ```bash
-CODEX_COMPANION_DEV_TARGET=sandbox pnpm dev
+# Show complete help
+pnpm dev --help
+
+# Select ChatGPT.app; relative paths resolve from the repository root
+pnpm dev --app --app-path "/Applications/ChatGPT.app"
+
+# Keep the client language unchanged
+pnpm dev --lang system
+
+# Move the sandbox root and launch workspace
+pnpm dev --dev-root .dev-data --workspace ./fixtures/workspace
+
+# Select another Codex CLI binary
+pnpm dev:cli --cli-bin /absolute/path/to/codex
+
+# Forward the remaining arguments to tauri dev
+pnpm dev --tauri --release
 ```
 
-In this mode, companion's later "Launch Codex" / "Launch Current Group" action starts an isolated Codex app.
+| Option | Purpose |
+| --- | --- |
+| `--sandbox` / `--local` | Select isolated or local client state |
+| `--app` / `--cli` | Require the desktop app or Codex CLI |
+| `--start-client` / `--no-start-client` | Control immediate client launch |
+| `--app-path <path>` | Set the ChatGPT / legacy Codex `.app`, `.exe`, or executable |
+| `--cli-bin <path>` | Set the Codex CLI executable |
+| `--command <command>` | Use a complete custom client launch command |
+| `--lang <locale>` | Set a locale such as `zh-CN` or `en-US`; `system` injects nothing |
+| `--dev-root <path>` | Move all default isolated development data |
+| `--workspace <path>` | Change the client launch working directory |
+| `--host <address>` / `--port <number>` | Set the Vite address and preferred port |
+| `--skip-client-restart` | Write configuration without stopping or restarting the client |
+| `--dry-run` | Inspect resolution and client discovery only |
+| `--tauri <args...>` | Forward the remaining arguments to `tauri dev` |
 
-Default isolated directories live under the OS temp directory:
+Both `pnpm dev --help` and `pnpm dev -- --help` are accepted with pnpm 9/10.
 
-- `DEV_CODEX_HOME`: devcodex state, usually `/tmp/devcodex-home` on macOS/Linux and `%TEMP%\devcodex-home` on Windows.
-- `DEV_CODEX_WORKSPACE`: devcodex workspace.
-- `DEV_CODEX_APP_DATA`: devcodex app data.
-- `DEV_COMPANION_HOME`: dev companion state.
+### Environment Compatibility
 
-Sandbox mode enforces this devcodex config:
+CLI options are intended for local development. Environment variables remain available for CI, IDE launch configurations, and custom scripts.
 
-```toml
-sandbox_mode = "workspace-write"
-approval_policy = "on-request"
+| Current name | Purpose |
+| --- | --- |
+| `CODEX_COMPANION_DEV_TARGET` | `sandbox` or `local` |
+| `CODEX_COMPANION_DEV_ROOT` | Root for the default isolated directories |
+| `DEV_COMPANION_HOME` | Companion development data directory |
+| `DEV_CLIENT_HOME` | Isolated Codex state directory |
+| `DEV_CLIENT_WORKSPACE` | Client working directory |
+| `DEV_CLIENT_APP_DATA` | Isolated desktop app profile |
+| `DEV_CLIENT_KIND` | `auto`, `app`, or `cli` |
+| `DEV_CLIENT_APP_PATH` | ChatGPT / legacy Codex app path |
+| `DEV_CLIENT_LANG` | Client locale |
+| `DEV_CLIENT_BIN` | Codex CLI executable |
+| `DEV_CLIENT_COMMAND` | Complete custom launch command |
+| `CODEX_COMPANION_START_CLIENT` | `1` starts the client immediately |
+| `CODEX_COMPANION_SKIP_CLIENT_RESTART` | `1` disables automatic client restarts |
+| `CODEX_COMPANION_CLIENT_PROCESS_MATCH` | Exact process-command match for a custom command |
+| `CODEX_COMPANION_CLIENT_APP_NAME` | Exact process name for a custom desktop command |
+| `CODEX_COMPANION_DEV_HOST` / `CODEX_COMPANION_DEV_PORT` | Vite address and preferred port |
 
-[sandbox_workspace_write]
-network_access = false
-exclude_tmpdir_env_var = false
-exclude_slash_tmp = false
-```
+Legacy `DEV_CODEX_*`, `DEVCODEX_*`, `CODEX_COMPANION_START_DEVCODEX`, `CODEX_COMPANION_SKIP_CODEX_RESTART`, and `CODEX_COMPANION_*_CODEX_*` names remain supported. New scripts and documentation use `CLIENT` consistently. `CODEX_HOME`, `CODEX_SQLITE_HOME`, and `CODEX_COMPANION_CODEX_DIR` keep their existing names because the underlying configuration directory is still `.codex`.
 
-On macOS, the default app executable is:
+### Troubleshooting
 
-```text
-/Applications/Codex.app/Contents/MacOS/Codex
-```
-
-The sandbox Codex app infers the host locale by default and passes it to Codex with `--lang`.
-
-To temporarily force a language, set:
-
-```bash
-DEVCODEX_LANG=zh-CN
-```
-
-To force English:
-
-```bash
-DEVCODEX_LANG=en-US pnpm dev
-```
-
-To explicitly pass no language flag and let Codex decide:
-
-```bash
-DEVCODEX_LANG=system pnpm dev
-```
-
-On Windows, the script tries to find the Codex `.exe`. If needed, set it manually:
-
-```powershell
-$env:DEVCODEX_APP_PATH="C:\Path\To\Codex.exe"
-pnpm dev
-```
-
-For a separate dev Codex app:
-
-```bash
-DEVCODEX_APP_PATH=/absolute/path/to/DevCodex.app pnpm dev
-```
-
-Windows:
-
-```powershell
-$env:DEVCODEX_APP_PATH="C:\Path\To\DevCodex.exe"
-pnpm dev
-```
-
-### 2. Start sandbox Codex immediately during run dev
-
-By default, `pnpm dev` starts only the companion dev app; sandbox Codex starts when you click "Launch Codex" in the UI.
-
-To start sandbox Codex immediately:
-
-```bash
-CODEX_COMPANION_START_DEVCODEX=1 pnpm dev
-```
-
-Windows:
-
-```powershell
-$env:CODEX_COMPANION_START_DEVCODEX="1"
-pnpm dev
-```
-
-After immediate startup, UI launch buttons still start or restart the sandbox Codex according to the selected launch mode. The script marks the sandbox process with `DEV_CODEX_APP_DATA` so Companion does not confuse it with the real local Codex.
-
-If you only want UI launch buttons to write config without stopping or starting Codex, set it manually:
-
-```bash
-CODEX_COMPANION_SKIP_CODEX_RESTART=1 pnpm dev
-```
-
-### 3. Local Codex mode
-
-To use the real local Codex during development:
-
-```bash
-CODEX_COMPANION_DEV_TARGET=local pnpm dev
-```
-
-Windows:
-
-```powershell
-$env:CODEX_COMPANION_DEV_TARGET="local"
-pnpm dev
-```
-
-In this mode:
-
-- Companion dev state still defaults to `DEV_COMPANION_HOME`.
-- Codex is not forced to `DEV_CODEX_HOME`.
-- Codex launch does not use the sandbox wrapper.
-- UI launch buttons use the normal local Codex behavior.
-
-`local` can affect your real local Codex config and process. Use it only when you intentionally want local integration testing.
-
-### 4. CLI mode
-
-The default sandbox target is the Codex app, not CLI.
-
-To use CLI mode:
-
-```bash
-DEVCODEX_KIND=cli DEVCODEX_BIN=/absolute/path/to/codex pnpm dev
-```
-
-Or start it directly:
-
-```bash
-DEVCODEX_KIND=cli ./scripts/devcodex.sh
-```
-
-### 5. Important environment variables
-
-- `CODEX_COMPANION_DEV_TARGET`: `sandbox` or `local`. Defaults to `sandbox`.
-- `CODEX_COMPANION_START_DEVCODEX`: set to `1` to start sandbox Codex immediately during `pnpm dev`.
-- `CODEX_COMPANION_SKIP_CODEX_RESTART`: set to `1` to let companion write config without stopping or starting Codex; unset by default.
-- `CODEX_COMPANION_CODEX_PROCESS_MATCH`: optional process command-line substring for custom Codex launch commands; UI launch buttons use it to detect and stop the target process. Sandbox mode sets it automatically.
-- `DEV_CODEX_HOME`: sandbox Codex state directory.
-- `DEV_CODEX_WORKSPACE`: sandbox Codex workspace directory.
-- `DEV_CODEX_APP_DATA`: sandbox Codex app data directory.
-- `DEV_COMPANION_HOME`: dev companion state directory.
-- `DEVCODEX_KIND`: `app` or `cli`. Defaults to `app` when an app is found.
-- `DEVCODEX_APP_PATH`: sandbox Codex app path. Use `.app` on macOS or `.exe` on Windows.
-- `DEVCODEX_LANG`: sandbox Codex app language. Defaults to the inferred host locale; set it explicitly to `zh-CN`, `en-US`, etc., or set `system` to pass no `--lang`.
-- `DEVCODEX_BIN`: Codex binary for CLI mode.
-- `DEVCODEX_COMMAND`: full custom launch command. When set, it starts immediately during `pnpm dev`.
-
-On macOS, the scripts do not use `open -a Codex`, because that does not reliably pass `CODEX_HOME`. They execute `.app/Contents/MacOS/Codex` directly so the app inherits the isolated environment.
+- **Node version mismatch**: run `nvm use` and confirm that `node --version` is 22 or newer.
+- **Desktop app not found**: inspect `pnpm dev --dry-run`, then provide `--app-path`; `pnpm dev:cli` is also available.
+- **Port 1420 is busy**: the development script searches up to 100 subsequent ports and passes the selected URL to Tauri.
+- **Only the Companion UI is needed**: use `pnpm dev:companion`, then launch the isolated client from the UI when needed.
+- **The CLI did not restart after a configuration switch**: this is expected. The launcher does not broadly match and terminate other `codex` processes; exit and restart the CLI in the current terminal.
+- **Direct client wrapper access**: run `node scripts/devcodex.mjs --print-config` to inspect discovery, or use `scripts/devcodex.sh` to launch it. The legacy filename remains for compatibility, but ChatGPT is preferred at runtime.

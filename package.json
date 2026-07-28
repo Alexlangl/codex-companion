@@ -4,7 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node scripts/companion-devcodex.mjs",
+    "dev": "node scripts/companion-devcodex.mjs --start-client",
+    "dev:companion": "node scripts/companion-devcodex.mjs --no-start-client",
+    "dev:local": "node scripts/companion-devcodex.mjs --local --start-client",
+    "dev:cli": "node scripts/companion-devcodex.mjs --cli --start-client",
     "dev:app": "pnpm --filter @codex-companion/desktop dev",
     "build": "pnpm --filter @codex-companion/desktop build",
     "build:tauri": "pnpm --filter @codex-companion/desktop build:tauri",

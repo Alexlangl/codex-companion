@@ -22,6 +22,9 @@ if (port === preferredPort) {
 }
 
 if (process.env.CODEX_COMPANION_DEV_DRY_RUN === "1") {
+  if (process.argv.length > 2) {
+    console.log(`[codex-companion] tauri arguments: ${process.argv.slice(2).join(" ")}`);
+  }
   console.log("[codex-companion] dry run; tauri dev was not started");
   process.exit(0);
 }
