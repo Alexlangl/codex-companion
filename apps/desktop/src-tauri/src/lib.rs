@@ -1,6 +1,6 @@
 use codex_companion_core::{
-    default_codex_dir, ApiClientCreate, ApiClientUpdate, ProviderLaunchMode, ProviderViewMode,
-    RelaySettingsUpdate, RepairOptions, ThemeMode,
+    default_codex_dir, ApiClientCreate, ApiClientUpdate, HealthStatusKind, ProviderLaunchMode,
+    ProviderViewMode, RelaySettingsUpdate, RepairOptions, ThemeMode,
 };
 use codex_companion_daemon::CompanionDaemon;
 use codex_companion_provider::{
@@ -9,6 +9,139 @@ use codex_companion_provider::{
 };
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, Runtime,
+};
+
+const MAIN_WINDOW_LABEL: &str = "main";
+const TRAY_ICON_ID: &str = "main-tray";
+const TRAY_ACTION_EVENT: &str = "tray-action";
+const TRAY_STATUS_ID: &str = "tray-status";
+const TRAY_ROUTE_ID: &str = "tray-route";
+const TRAY_OPEN_ID: &str = "tray-open";
+const TRAY_HIDE_ID: &str = "tray-hide";
+const TRAY_QUIT_ID: &str = "tray-quit";
+const TRAY_LAUNCH_ID: &str = "tray-launch";
+const TRAY_REFRESH_ID: &str = "tray-refresh";
+const TRAY_LOGS_ID: &str = "tray-logs";
+const TRAY_DASHBOARD_ID: &str = "tray-dashboard";
+const TRAY_PROVIDERS_ID: &str = "tray-providers";
+const TRAY_GROUPS_ID: &str = "tray-groups";
+const TRAY_RELAY_ID: &str = "tray-relay";
+const TRAY_TOKEN_ID: &str = "tray-token";
+const TRAY_SESSIONS_ID: &str = "tray-sessions";
+const TRAY_REPAIR_ID: &str = "tray-repair";
+const TRAY_SETTINGS_ID: &str = "tray-settings";
+
+struct TrayMenuLabels {
+    runtime: String,
+    route: String,
+    launch: String,
+    can_launch: bool,
+}
+
+fn tray_menu_labels() -> TrayMenuLabels {
+    let Ok(status) = daemon().and_then(|daemon| daemon.status().map_err(|error| error.to_string()))
+    else {
+        return TrayMenuLabels {
+            runtime: "● Companion 正在启动".to_string(),
+            route: "当前分组：读取中".to_string(),
+            launch: "启动 Codex（读取配置中）".to_string(),
+            can_launch: false,
+        };
+    };
+
+    let total = status.active_providers.len();
+    let available = status
+        .active_providers
+        .iter()
+        .filter(|provider| {
+            matches!(
+                status
+                    .config
+                    .health
+                    .get(&provider.id)
+                    .map(|health| &health.status),
+                None | Some(HealthStatusKind::Healthy | HealthStatusKind::Unknown)
+            )
+        })
+        .count();
+    let Some(group) = status.active_group else {
+        return TrayMenuLabels {
+            runtime: format!("● Companion 正在运行 · {}", status.relay_base_url),
+            route: "当前分组：未配置".to_string(),
+            launch: "启动 Codex（需先配置分组）".to_string(),
+            can_launch: false,
+        };
+    };
+    let can_launch = total > 0;
+    let launch = if can_launch {
+        format!("启动 Codex（{}）", group.name)
+    } else {
+        "启动 Codex（分组暂无账号）".to_string()
+    };
+
+    TrayMenuLabels {
+        runtime: format!("● Companion 正在运行 · {}", status.relay_base_url),
+        route: format!("当前分组：{} · 可用账号 {available}/{total}", group.name),
+        launch,
+        can_launch,
+    }
+}
+
+fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn hide_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.hide();
+    }
+}
+
+fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return;
+    };
+
+    let is_visible = window.is_visible().unwrap_or(false);
+    let is_minimized = window.is_minimized().unwrap_or(false);
+    if is_visible && !is_minimized {
+        let _ = window.hide();
+    } else {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn emit_tray_action<R: Runtime>(app: &AppHandle<R>, action: &str, reveal_window: bool) {
+    if reveal_window {
+        show_main_window(app);
+    }
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        if let Err(error) = window.emit(TRAY_ACTION_EVENT, action) {
+            eprintln!("Codex Companion tray action failed: {error}");
+        }
+    }
+}
+
+fn open_tray_diagnostics() {
+    if let Err(error) = daemon().and_then(|daemon| {
+        daemon
+            .open_diagnostic_directory()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }) {
+        eprintln!("Codex Companion could not open diagnostics from tray: {error}");
+    }
+}
 
 fn daemon() -> Result<CompanionDaemon, String> {
     CompanionDaemon::default().map_err(|error| error.to_string())
@@ -440,7 +573,95 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .setup(|_app| {
+        .setup(|app| {
+            let labels = tray_menu_labels();
+            let tray_runtime_status = MenuItemBuilder::with_id(TRAY_STATUS_ID, &labels.runtime)
+                .enabled(false)
+                .build(app)?;
+            let tray_route_status = MenuItemBuilder::with_id(TRAY_ROUTE_ID, &labels.route)
+                .enabled(false)
+                .build(app)?;
+            let tray_launch = MenuItemBuilder::with_id(TRAY_LAUNCH_ID, &labels.launch)
+                .enabled(labels.can_launch)
+                .build(app)?;
+            let page_menu = SubmenuBuilder::new(app, "打开页面")
+                .text(TRAY_DASHBOARD_ID, "总览")
+                .text(TRAY_PROVIDERS_ID, "账号")
+                .text(TRAY_GROUPS_ID, "分组")
+                .text(TRAY_RELAY_ID, "转发")
+                .text(TRAY_TOKEN_ID, "用量")
+                .text(TRAY_SESSIONS_ID, "会话")
+                .text(TRAY_REPAIR_ID, "修复")
+                .text(TRAY_SETTINGS_ID, "设置")
+                .build()?;
+            let tray_menu = MenuBuilder::new(app)
+                .item(&tray_runtime_status)
+                .item(&tray_route_status)
+                .separator()
+                .text(TRAY_OPEN_ID, "打开 Codex Companion")
+                .item(&page_menu)
+                .separator()
+                .item(&tray_launch)
+                .text(TRAY_REFRESH_ID, "刷新账号状态")
+                .text(TRAY_LOGS_ID, "打开诊断日志")
+                .separator()
+                .text(TRAY_HIDE_ID, "隐藏到托盘")
+                .text(TRAY_QUIT_ID, "退出 Codex Companion")
+                .build()?;
+            let mut tray = TrayIconBuilder::with_id(TRAY_ICON_ID)
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .tooltip("Codex Companion")
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    TRAY_OPEN_ID => show_main_window(app),
+                    TRAY_HIDE_ID => hide_main_window(app),
+                    TRAY_QUIT_ID => app.exit(0),
+                    TRAY_LAUNCH_ID => {
+                        emit_tray_action(app, "launch-active-group", false);
+                    }
+                    TRAY_REFRESH_ID => {
+                        emit_tray_action(app, "refresh-providers", false);
+                    }
+                    TRAY_LOGS_ID => open_tray_diagnostics(),
+                    TRAY_DASHBOARD_ID => emit_tray_action(app, "navigate:dashboard", true),
+                    TRAY_PROVIDERS_ID => emit_tray_action(app, "navigate:providers", true),
+                    TRAY_GROUPS_ID => emit_tray_action(app, "navigate:groups", true),
+                    TRAY_RELAY_ID => emit_tray_action(app, "navigate:relay", true),
+                    TRAY_TOKEN_ID => emit_tray_action(app, "navigate:token", true),
+                    TRAY_SESSIONS_ID => emit_tray_action(app, "navigate:sessions", true),
+                    TRAY_REPAIR_ID => emit_tray_action(app, "navigate:repair", true),
+                    TRAY_SETTINGS_ID => emit_tray_action(app, "navigate:settings", true),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        toggle_main_window(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            tray.build(app)?;
+
+            let runtime_status_for_refresh = tray_runtime_status.clone();
+            let route_status_for_refresh = tray_route_status.clone();
+            let launch_for_refresh = tray_launch.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let labels = tray_menu_labels();
+                    let _ = runtime_status_for_refresh.set_text(labels.runtime);
+                    let _ = route_status_for_refresh.set_text(labels.route);
+                    let _ = launch_for_refresh.set_text(labels.launch);
+                    let _ = launch_for_refresh.set_enabled(labels.can_launch);
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                }
+            });
+
             tauri::async_runtime::spawn(async {
                 let mut retry_delay = Duration::from_secs(1);
                 loop {
@@ -468,6 +689,14 @@ pub fn run() {
                 }
             });
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == MAIN_WINDOW_LABEL {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_status,

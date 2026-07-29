@@ -4,6 +4,7 @@ import * as Tabs from "@radix-ui/react-tabs";
 import * as Toast from "@radix-ui/react-toast";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import "@fontsource-variable/geologica";
+import { listen } from "@tauri-apps/api/event";
 import {
   Boxes,
   Gauge,
@@ -44,6 +45,8 @@ import { AppErrorBoundary } from "./AppErrorBoundary";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 const sidebarCollapsedStorageKey = "codex-companion.sidebar-collapsed";
+const trayActionEvent = "tray-action";
+const trayNavigatePrefix = "navigate:";
 
 type PageMeta = {
   title: string;
@@ -62,7 +65,7 @@ type NavigationTabProps = {
   showTooltip: boolean;
 };
 
-const pageMeta: Record<string, PageMeta> = {
+const pageMeta = {
   dashboard: { title: "总览", description: "确认当前路由、账号健康与 Codex 启动状态" },
   providers: { title: "账号", description: "管理认证材料、健康状态与启动方式" },
   groups: { title: "分组", description: "编排账号顺序与故障切换策略" },
@@ -71,7 +74,17 @@ const pageMeta: Record<string, PageMeta> = {
   sessions: { title: "会话", description: "查找并恢复本地 Codex 会话" },
   repair: { title: "修复", description: "预览并修复会话归属与插件状态" },
   settings: { title: "设置", description: "调整启动、更新与本地诊断选项" },
-};
+} satisfies Record<string, PageMeta>;
+
+type AppPage = keyof typeof pageMeta;
+
+function isAppPage(value: string): value is AppPage {
+  return value in pageMeta;
+}
+
+function isTauriRuntime(): boolean {
+  return "__TAURI_INTERNALS__" in window;
+}
 
 function readSidebarCollapsed(): boolean {
   try {
@@ -93,13 +106,69 @@ function App() {
     provider: ProviderConfig;
   } | null>(null);
   const directLaunchDialogTitleRef = React.useRef<HTMLHeadingElement>(null);
-  const activePage = pageMeta[activeTab] ?? { title: "Companion", description: "Codex 本地控制平面" };
+  const activePage = isAppPage(activeTab)
+    ? pageMeta[activeTab]
+    : { title: "Companion", description: "Codex 本地控制平面" };
   const appShellClassName = isSidebarCollapsed ? "app-shell sidebar-collapsed" : "app-shell";
   let directLaunchDescription = "直连会更新 Codex auth.json。";
+  const handleTrayAction = React.useEffectEvent((action: string): void => {
+    if (action.startsWith(trayNavigatePrefix)) {
+      const page = action.slice(trayNavigatePrefix.length);
+      if (!isAppPage(page)) {
+        return;
+      }
+      actions.setActiveTab(page);
+      window.requestAnimationFrame(() => {
+        document.querySelector<HTMLElement>("#main-content")?.focus();
+      });
+      return;
+    }
+
+    if (action === "launch-active-group") {
+      const activeGroup = status?.activeGroup;
+      if (!activeGroup) {
+        actions.setToast("当前没有可启动的分组");
+        return;
+      }
+      void actions.launchGroup(activeGroup.id);
+      return;
+    }
+
+    if (action === "refresh-providers") {
+      void actions.refreshAllProviders();
+    }
+  });
 
   React.useEffect(() => {
     document.title = `${activePage.title} · Codex Companion`;
   }, [activePage.title]);
+
+  React.useEffect(() => {
+    if (!isTauriRuntime()) {
+      return undefined;
+    }
+
+    let isDisposed = false;
+    let stopListening: (() => void) | undefined;
+    void listen<string>(trayActionEvent, (event) => {
+      handleTrayAction(event.payload);
+    })
+      .then((unlisten) => {
+        if (isDisposed) {
+          unlisten();
+          return;
+        }
+        stopListening = unlisten;
+      })
+      .catch((unknownError: unknown) => {
+        console.error("Failed to register tray action listener", unknownError);
+      });
+
+    return () => {
+      isDisposed = true;
+      stopListening?.();
+    };
+  }, []);
 
   React.useEffect(() => {
     try {

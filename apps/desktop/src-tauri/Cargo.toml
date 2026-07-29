@@ -24,7 +24,7 @@ codex-companion-daemon.workspace = true
 codex-companion-provider.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tauri.workspace = true
+tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-process.workspace = true
 tauri-plugin-updater.workspace = true
 tokio.workspace = true
