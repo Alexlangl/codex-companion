@@ -2,8 +2,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, SecondsFormat, Utc};
 use codex_companion_core::{
     ApiClient, ApiClientCreate, ApiClientHealth, ApiClientPeriodUsage, ApiClientSecret,
-    ApiClientUpdate, ApiClientUsage, ApiRequestLog, ApiServiceSnapshot, CompanionError,
-    ConfigStore, ModelCooldown, Result,
+    ApiClientUpdate, ApiClientUsage, ApiRequestAttemptLog, ApiRequestLog, ApiServiceSnapshot,
+    CompanionError, ConfigStore, ModelCooldown, Result,
 };
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -40,6 +40,24 @@ pub struct RequestLogFinish<'a> {
     pub status_code: Option<u16>,
     pub outcome: &'a str,
     pub attempts: u16,
+    pub latency_ms: u64,
+    pub error: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestAttemptStart<'a> {
+    pub request_id: &'a str,
+    pub attempt: u16,
+    pub provider_id: &'a str,
+    pub route_reason: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestAttemptFinish<'a> {
+    pub request_id: &'a str,
+    pub attempt: u16,
+    pub status_code: Option<u16>,
+    pub outcome: &'a str,
     pub latency_ms: u64,
     pub error: Option<&'a str>,
 }
@@ -88,6 +106,22 @@ impl ApiServiceStore {
                     ON api_requests(started_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_api_requests_client_id
                     ON api_requests(client_id);
+                CREATE TABLE IF NOT EXISTS api_request_attempts (
+                    request_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    route_reason TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    status_code INTEGER,
+                    outcome TEXT NOT NULL DEFAULT 'processing',
+                    latency_ms INTEGER,
+                    error TEXT,
+                    PRIMARY KEY(request_id, attempt),
+                    FOREIGN KEY(request_id) REFERENCES api_requests(request_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_api_request_attempts_request_id
+                    ON api_request_attempts(request_id, attempt);
                 CREATE TABLE IF NOT EXISTS session_affinity (
                     affinity_key TEXT PRIMARY KEY,
                     provider_id TEXT NOT NULL,
@@ -444,6 +478,47 @@ impl ApiServiceStore {
         Ok(())
     }
 
+    pub fn record_request_attempt_start(&self, input: RequestAttemptStart<'_>) -> Result<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO api_request_attempts \
+                 (request_id, attempt, provider_id, route_reason, started_at, outcome) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'processing')",
+                params![
+                    input.request_id,
+                    input.attempt,
+                    input.provider_id,
+                    input.route_reason,
+                    timestamp(Utc::now()),
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn record_request_attempt_finish(&self, input: RequestAttemptFinish<'_>) -> Result<()> {
+        let error = input.error.map(compact_log_error);
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "UPDATE api_request_attempts SET finished_at = ?3, status_code = ?4, \
+                 outcome = ?5, latency_ms = ?6, error = ?7 \
+                 WHERE request_id = ?1 AND attempt = ?2",
+                params![
+                    input.request_id,
+                    input.attempt,
+                    timestamp(Utc::now()),
+                    input.status_code,
+                    input.outcome,
+                    input.latency_ms,
+                    error,
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     pub fn record_stream_outcome(
         &self,
         request_id: &str,
@@ -456,6 +531,15 @@ impl ApiServiceStore {
             .execute(
                 "UPDATE api_requests SET outcome = ?2, error = ?3 WHERE request_id = ?1",
                 params![request_id, outcome, error],
+            )
+            .map_err(database_error)?;
+        connection
+            .execute(
+                "UPDATE api_request_attempts SET finished_at = ?3, outcome = ?2, error = ?4 \
+                 WHERE request_id = ?1 AND attempt = (\
+                    SELECT MAX(attempt) FROM api_request_attempts WHERE request_id = ?1\
+                 )",
+                params![request_id, outcome, timestamp(Utc::now()), error],
             )
             .map_err(database_error)?;
         Ok(())
@@ -475,8 +559,13 @@ impl ApiServiceStore {
         let rows = statement
             .query_map(params![limit], api_request_from_row)
             .map_err(database_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(database_error)
+        let mut requests = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        for request in &mut requests {
+            request.attempt_log = request_attempts(&connection, &request.request_id)?;
+        }
+        Ok(requests)
     }
 
     pub fn clear_request_logs(&self) -> Result<usize> {
@@ -710,6 +799,9 @@ impl ApiServiceStore {
         }
         let connection = Connection::open(&self.path).map_err(database_error)?;
         connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(database_error)?;
+        connection
             .busy_timeout(std::time::Duration::from_secs(2))
             .map_err(database_error)?;
         Ok(connection)
@@ -782,6 +874,44 @@ fn api_request_from_row(row: &Row<'_>) -> rusqlite::Result<ApiRequestLog> {
         attempts: row.get(10)?,
         latency_ms: row.get(11)?,
         error: row.get(12)?,
+        attempt_log: Vec::new(),
+    })
+}
+
+fn request_attempts(
+    connection: &Connection,
+    request_id: &str,
+) -> Result<Vec<ApiRequestAttemptLog>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT attempt, provider_id, route_reason, started_at, finished_at, status_code, \
+             outcome, latency_ms, error FROM api_request_attempts \
+             WHERE request_id = ?1 ORDER BY attempt ASC",
+        )
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map(params![request_id], api_request_attempt_from_row)
+        .map_err(database_error)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(database_error)
+}
+
+fn api_request_attempt_from_row(row: &Row<'_>) -> rusqlite::Result<ApiRequestAttemptLog> {
+    let started_at: String = row.get(3)?;
+    let finished_at: Option<String> = row.get(4)?;
+    Ok(ApiRequestAttemptLog {
+        attempt: row.get(0)?,
+        provider_id: row.get(1)?,
+        route_reason: row.get(2)?,
+        started_at: parse_timestamp_sql(3, &started_at)?,
+        finished_at: finished_at
+            .as_deref()
+            .map(|value| parse_timestamp_sql(4, value))
+            .transpose()?,
+        status_code: row.get(5)?,
+        outcome: row.get(6)?,
+        latency_ms: row.get(7)?,
+        error: row.get(8)?,
     })
 }
 
@@ -943,9 +1073,45 @@ mod tests {
             })
             .expect("start");
         store
+            .record_request_attempt_start(RequestAttemptStart {
+                request_id: "request-1",
+                attempt: 1,
+                provider_id: "provider-a",
+                route_reason: "policy",
+            })
+            .expect("first attempt start");
+        store
+            .record_request_attempt_finish(RequestAttemptFinish {
+                request_id: "request-1",
+                attempt: 1,
+                status_code: Some(503),
+                outcome: "failed",
+                latency_ms: 12,
+                error: Some("temporarily unavailable"),
+            })
+            .expect("first attempt finish");
+        store
+            .record_request_attempt_start(RequestAttemptStart {
+                request_id: "request-1",
+                attempt: 2,
+                provider_id: "provider-b",
+                route_reason: "fallback",
+            })
+            .expect("second attempt start");
+        store
+            .record_request_attempt_finish(RequestAttemptFinish {
+                request_id: "request-1",
+                attempt: 2,
+                status_code: Some(200),
+                outcome: "succeeded",
+                latency_ms: 30,
+                error: None,
+            })
+            .expect("second attempt finish");
+        store
             .record_request_finish(RequestLogFinish {
                 request_id: "request-1",
-                provider_id: Some("provider-a"),
+                provider_id: Some("provider-b"),
                 status_code: Some(200),
                 outcome: "succeeded",
                 attempts: 2,
@@ -960,6 +1126,19 @@ mod tests {
         let snapshot = store.snapshot(100).expect("snapshot");
         assert_eq!(snapshot.recent_requests.len(), 1);
         assert_eq!(snapshot.recent_requests[0].attempts, 2);
+        assert_eq!(snapshot.recent_requests[0].attempt_log.len(), 2);
+        assert_eq!(
+            snapshot.recent_requests[0].attempt_log[0].provider_id,
+            "provider-a"
+        );
+        assert_eq!(
+            snapshot.recent_requests[0].attempt_log[0].error.as_deref(),
+            Some("temporarily unavailable")
+        );
+        assert_eq!(
+            snapshot.recent_requests[0].attempt_log[1].route_reason,
+            "fallback"
+        );
         assert_eq!(snapshot.model_cooldowns.len(), 1);
         assert!(store
             .model_cooldown_active("provider-a", "gpt-test")

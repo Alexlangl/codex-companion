@@ -1478,6 +1478,7 @@ function recordMockCodexLaunch(mode: CodexLaunchOutcome["mode"], targetProviderI
 }
 
 function createMockStatus(): CompanionStatus {
+  const now = Date.now();
   const app = readStoredAppSettings();
   const providers: Record<string, ProviderConfig> = {
     "official-team": {
@@ -1574,7 +1575,38 @@ function createMockStatus(): CompanionStatus {
       companionBaseUrl: "http://127.0.0.1:17687/v1",
       message: "Codex 配置存在，但尚未设置 model_provider",
     },
-    recentEvents: [],
+    recentEvents: [
+      {
+        timestamp: new Date(now - 8 * 60 * 1000).toISOString(),
+        kind: "request",
+        providerId: null,
+        message: "[cc-demo-02] POST /v1/responses",
+      },
+      {
+        timestamp: new Date(now - 8 * 60 * 1000 + 620).toISOString(),
+        kind: "fallback",
+        providerId: "official-team",
+        message: "[cc-demo-02] 上游返回 503 Service Unavailable: upstream overloaded",
+      },
+      {
+        timestamp: new Date(now - 8 * 60 * 1000 + 1_240).toISOString(),
+        kind: "stream",
+        providerId: "backup-api",
+        message: "[cc-demo-02] POST /v1/responses -> 200 OK",
+      },
+      {
+        timestamp: new Date(now - 90 * 1000).toISOString(),
+        kind: "request",
+        providerId: null,
+        message: "[cc-demo-01] POST /v1/responses",
+      },
+      {
+        timestamp: new Date(now - 90 * 1000 + 842).toISOString(),
+        kind: "stream",
+        providerId: "official-team",
+        message: "[cc-demo-01] POST /v1/responses -> 200 OK",
+      },
+    ],
     dataRoots: {
       companionIsolated: false,
       codexIsolated: false,
@@ -1612,12 +1644,25 @@ function createMockApiServiceSnapshot(): ApiServiceSnapshot {
         model: "gpt-5.6-codex",
         clientId: "client_local_cli",
         clientName: "本地开发 CLI",
-        providerId: "backup-api",
+        providerId: "official-team",
         statusCode: 200,
         outcome: "succeeded",
         attempts: 1,
         latencyMs: 842,
         error: null,
+        attemptLog: [
+          {
+            attempt: 1,
+            providerId: "official-team",
+            routeReason: "affinity",
+            startedAt: new Date(now - 90 * 1000).toISOString(),
+            finishedAt: new Date(now - 90 * 1000 + 842).toISOString(),
+            statusCode: 200,
+            outcome: "succeeded",
+            latencyMs: 842,
+            error: null,
+          },
+        ],
       },
       {
         requestId: "cc-demo-02",
@@ -1627,12 +1672,36 @@ function createMockApiServiceSnapshot(): ApiServiceSnapshot {
         model: "gpt-5.6",
         clientId: "client_local_cli",
         clientName: "本地开发 CLI",
-        providerId: "official-team",
+        providerId: "backup-api",
         statusCode: 200,
         outcome: "succeeded",
         attempts: 2,
         latencyMs: 1240,
         error: null,
+        attemptLog: [
+          {
+            attempt: 1,
+            providerId: "official-team",
+            routeReason: "policy",
+            startedAt: new Date(now - 8 * 60 * 1000).toISOString(),
+            finishedAt: new Date(now - 8 * 60 * 1000 + 620).toISOString(),
+            statusCode: 503,
+            outcome: "failed",
+            latencyMs: 620,
+            error: "上游返回 503 Service Unavailable: upstream overloaded",
+          },
+          {
+            attempt: 2,
+            providerId: "backup-api",
+            routeReason: "fallback",
+            startedAt: new Date(now - 8 * 60 * 1000 + 620).toISOString(),
+            finishedAt: new Date(now - 8 * 60 * 1000 + 1_240).toISOString(),
+            statusCode: 200,
+            outcome: "succeeded",
+            latencyMs: 620,
+            error: null,
+          },
+        ],
       },
     ],
     modelCooldowns: [],

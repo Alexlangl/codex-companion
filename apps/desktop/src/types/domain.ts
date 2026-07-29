@@ -74,6 +74,18 @@ export interface ApiClientSecret {
   apiKey: string;
 }
 
+export interface ApiRequestAttemptLog {
+  attempt: number;
+  providerId: string;
+  routeReason: string;
+  startedAt: string;
+  finishedAt?: string | null;
+  statusCode?: number | null;
+  outcome: string;
+  latencyMs?: number | null;
+  error?: string | null;
+}
+
 export interface ApiRequestLog {
   requestId: string;
   startedAt: string;
@@ -88,6 +100,7 @@ export interface ApiRequestLog {
   attempts: number;
   latencyMs?: number | null;
   error?: string | null;
+  attemptLog: ApiRequestAttemptLog[];
 }
 
 export interface ModelCooldown {

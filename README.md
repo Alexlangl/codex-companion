@@ -393,6 +393,8 @@ pnpm dev
 
 `pnpm dev` 默认同时启动隔离的 Companion 和自动发现的 ChatGPT App（兼容旧 Codex App，并可回退到 Codex CLI）。只启动 Companion、使用本机配置、CLI 模式和所有高级参数请参考 [开发环境说明](README.devcodex.md#中文)。
 
+只调试浏览器 UI 时可以直接运行 `pnpm dev:ui`。它只启动使用内置 mock 数据的 Vite 页面，不需要 Tauri、ChatGPT / Codex 客户端或额外环境变量。
+
 提交前检查：
 
 ```bash

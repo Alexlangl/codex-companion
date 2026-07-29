@@ -31,6 +31,7 @@ macOS 会优先使用 `/Applications/ChatGPT.app`，同时兼容旧的 `Codex.ap
 | `pnpm dev:companion` | 隔离 | 隔离 | 否；桌面 App 可稍后从 UI 启动 |
 | `pnpm dev:local` | 隔离 | 使用本机配置与 App profile | 是 |
 | `pnpm dev:cli` | 隔离 | 隔离 | 是；在当前终端启动 Codex CLI |
+| `pnpm dev:ui` | 浏览器内置 mock | 不使用 | 否；只启动 Vite UI |
 
 首次排查环境时先运行：
 
@@ -135,7 +136,8 @@ pnpm 9/10 的 `pnpm dev --help` 和 `pnpm dev -- --help` 写法都受支持。
 - **提示 Node 版本不匹配**：运行 `nvm use`，确认 `node --version` 为 22 或更高。
 - **没有找到桌面 App**：运行 `pnpm dev --dry-run` 检查发现结果，再用 `--app-path` 指定位置；也可以使用 `pnpm dev:cli`。
 - **1420 端口被占用**：开发脚本会自动向后查找最多 100 个端口，并把最终地址传给 Tauri。
-- **只想调试 Companion UI**：使用 `pnpm dev:companion`，需要时再从 UI 启动隔离客户端。
+- **只想调试浏览器 UI**：使用 `pnpm dev:ui`；它只启动内置 mock 数据的 Vite 页面，不需要 Tauri 或客户端。
+- **需要完整 Companion 桌面开发版，但不想立即启动客户端**：使用 `pnpm dev:companion`，需要时再从 UI 启动隔离客户端。
 - **CLI 切换配置后没有自动重启**：这是预期行为；开发启动器不会模糊匹配并终止其他 `codex` 进程，请在当前终端手动退出并重新运行 CLI。
 - **需要直接运行客户端包装器**：使用 `node scripts/devcodex.mjs --print-config` 检查发现结果，或使用 `scripts/devcodex.sh` 启动。文件名暂时保留用于兼容旧开发脚本，实际会优先启动 ChatGPT。
 
@@ -168,6 +170,7 @@ On macOS, `/Applications/ChatGPT.app` takes precedence while legacy `Codex.app` 
 | `pnpm dev:companion` | Isolated | Isolated | No; a desktop app can be launched later from the UI |
 | `pnpm dev:local` | Isolated | Local config and app profile | Yes |
 | `pnpm dev:cli` | Isolated | Isolated | Yes; starts Codex CLI in the current terminal |
+| `pnpm dev:ui` | In-browser mock | Not used | No; starts only the Vite UI |
 
 When diagnosing a machine for the first time, start with:
 
@@ -272,6 +275,7 @@ Legacy `DEV_CODEX_*`, `DEVCODEX_*`, `CODEX_COMPANION_START_DEVCODEX`, `CODEX_COM
 - **Node version mismatch**: run `nvm use` and confirm that `node --version` is 22 or newer.
 - **Desktop app not found**: inspect `pnpm dev --dry-run`, then provide `--app-path`; `pnpm dev:cli` is also available.
 - **Port 1420 is busy**: the development script searches up to 100 subsequent ports and passes the selected URL to Tauri.
-- **Only the Companion UI is needed**: use `pnpm dev:companion`, then launch the isolated client from the UI when needed.
+- **Only the browser UI is needed**: use `pnpm dev:ui`; it starts the Vite page with built-in mock data and does not require Tauri or a client.
+- **The full Companion desktop development app is needed without starting a client immediately**: use `pnpm dev:companion`, then launch the isolated client from the UI when needed.
 - **The CLI did not restart after a configuration switch**: this is expected. The launcher does not broadly match and terminate other `codex` processes; exit and restart the CLI in the current terminal.
 - **Direct client wrapper access**: run `node scripts/devcodex.mjs --print-config` to inspect discovery, or use `scripts/devcodex.sh` to launch it. The legacy filename remains for compatibility, but ChatGPT is preferred at runtime.

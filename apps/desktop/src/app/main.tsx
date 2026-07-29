@@ -3,7 +3,22 @@ import * as Progress from "@radix-ui/react-progress";
 import * as Tabs from "@radix-ui/react-tabs";
 import * as Toast from "@radix-ui/react-toast";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { Boxes, Gauge, GitBranch, Hammer, History, LayoutDashboard, Moon, RadioTower, Settings as SettingsIcon, Sun, X } from "lucide-react";
+import "@fontsource-variable/geologica";
+import {
+  Boxes,
+  Gauge,
+  GitBranch,
+  Hammer,
+  History,
+  LayoutDashboard,
+  Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
+  RadioTower,
+  Settings as SettingsIcon,
+  Sun,
+  X,
+} from "lucide-react";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { Button, IconButton } from "../components/ui";
@@ -28,17 +43,43 @@ import type { ProviderConfig, ProviderLaunchMode } from "../types/domain";
 import { AppErrorBoundary } from "./AppErrorBoundary";
 
 const root = document.querySelector<HTMLDivElement>("#app");
+const sidebarCollapsedStorageKey = "codex-companion.sidebar-collapsed";
 
-const pageTitles: Record<string, string> = {
-  dashboard: "总览",
-  providers: "账号",
-  groups: "分组",
-  relay: "转发",
-  token: "用量",
-  sessions: "会话",
-  repair: "修复",
-  settings: "设置",
+type PageMeta = {
+  title: string;
+  description: string;
 };
+
+type SidebarHeaderProps = {
+  isCollapsed: boolean;
+  onToggle: () => void;
+};
+
+type NavigationTabProps = {
+  value: string;
+  icon: React.ReactNode;
+  label: string;
+  showTooltip: boolean;
+};
+
+const pageMeta: Record<string, PageMeta> = {
+  dashboard: { title: "总览", description: "确认当前路由、账号健康与 Codex 启动状态" },
+  providers: { title: "账号", description: "管理认证材料、健康状态与启动方式" },
+  groups: { title: "分组", description: "编排账号顺序与故障切换策略" },
+  relay: { title: "转发", description: "监控本地 API、客户端与请求路由" },
+  token: { title: "用量", description: "分析本地会话 Token 与估算成本" },
+  sessions: { title: "会话", description: "查找并恢复本地 Codex 会话" },
+  repair: { title: "修复", description: "预览并修复会话归属与插件状态" },
+  settings: { title: "设置", description: "调整启动、更新与本地诊断选项" },
+};
+
+function readSidebarCollapsed(): boolean {
+  try {
+    return window.localStorage.getItem(sidebarCollapsedStorageKey) === "true";
+  } catch {
+    return false;
+  }
+}
 
 if (!root) {
   throw new Error("Missing #app root");
@@ -46,12 +87,28 @@ if (!root) {
 
 function App() {
   const { activeTab, actions, appUpdater, busy, error, progress, repairOutcome, status, toast } = useCompanionController();
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = React.useState(readSidebarCollapsed);
   const [pendingProviderLaunch, setPendingProviderLaunch] = React.useState<{
     mode: ProviderLaunchMode;
     provider: ProviderConfig;
   } | null>(null);
   const directLaunchDialogTitleRef = React.useRef<HTMLHeadingElement>(null);
+  const activePage = pageMeta[activeTab] ?? { title: "Companion", description: "Codex 本地控制平面" };
+  const appShellClassName = isSidebarCollapsed ? "app-shell sidebar-collapsed" : "app-shell";
   let directLaunchDescription = "直连会更新 Codex auth.json。";
+
+  React.useEffect(() => {
+    document.title = `${activePage.title} · Codex Companion`;
+  }, [activePage.title]);
+
+  React.useEffect(() => {
+    try {
+      window.localStorage.setItem(sidebarCollapsedStorageKey, String(isSidebarCollapsed));
+    } catch {
+      // The sidebar remains usable when WebView storage is unavailable.
+    }
+  }, [isSidebarCollapsed]);
+
   if (pendingProviderLaunch) {
     directLaunchDescription = `${providerAccountTitle(pendingProviderLaunch.provider)} 将把账号材料合并写入 Codex auth.json，并由 ChatGPT / Codex 重新载入。`;
   }
@@ -82,33 +139,52 @@ function App() {
     void actions.launchProvider(provider.id, mode);
   }
 
+  function handleSidebarToggle(): void {
+    setIsSidebarCollapsed((current) => !current);
+  }
+
   return (
     <Toast.Provider swipeDirection="right">
       <Tooltip.Provider delayDuration={180}>
         {status ? (
           <Tabs.Root className="tabs-root app-tabs-root" onValueChange={actions.setActiveTab} value={activeTab}>
-            <main className="app-shell">
-              <aside className="sidebar">
-                <Brand />
-                <Tabs.List className="tabs-list sidebar-tabs" aria-label="Codex Companion">
-                  <Tab value="dashboard" icon={<LayoutDashboard size={16} />} label="总览" />
-                  <Tab value="providers" icon={<Boxes size={16} />} label="账号" />
-                  <Tab value="groups" icon={<GitBranch size={16} />} label="分组" />
-                  <Tab value="relay" icon={<RadioTower size={16} />} label="转发" />
-                  <Tab value="token" icon={<Gauge size={16} />} label="用量" />
-                  <Tab value="sessions" icon={<History size={16} />} label="会话" />
-                  <Tab value="repair" icon={<Hammer size={16} />} label="修复" />
-                  <Tab value="settings" icon={<SettingsIcon size={16} />} label="设置" />
-                </Tabs.List>
+            <a className="skip-link" href="#main-content">跳到主内容</a>
+            <div className={appShellClassName}>
+              <aside className="sidebar" id="app-sidebar">
+                <SidebarHeader isCollapsed={isSidebarCollapsed} onToggle={handleSidebarToggle} />
+                <nav className="sidebar-navigation" id="sidebar-navigation" aria-label="主导航">
+                  <Tabs.List className="tabs-list sidebar-tabs" aria-label="Codex Companion 页面">
+                    <NavigationGroup label="工作区">
+                      <Tab value="dashboard" icon={<LayoutDashboard aria-hidden="true" size={16} />} label="总览" showTooltip={isSidebarCollapsed} />
+                      <Tab value="providers" icon={<Boxes aria-hidden="true" size={16} />} label="账号" showTooltip={isSidebarCollapsed} />
+                      <Tab value="groups" icon={<GitBranch aria-hidden="true" size={16} />} label="分组" showTooltip={isSidebarCollapsed} />
+                    </NavigationGroup>
+                    <NavigationGroup label="服务">
+                      <Tab value="relay" icon={<RadioTower aria-hidden="true" size={16} />} label="转发" showTooltip={isSidebarCollapsed} />
+                      <Tab value="token" icon={<Gauge aria-hidden="true" size={16} />} label="用量" showTooltip={isSidebarCollapsed} />
+                      <Tab value="sessions" icon={<History aria-hidden="true" size={16} />} label="会话" showTooltip={isSidebarCollapsed} />
+                    </NavigationGroup>
+                    <NavigationGroup label="系统">
+                      <Tab value="repair" icon={<Hammer aria-hidden="true" size={16} />} label="修复" showTooltip={isSidebarCollapsed} />
+                      <Tab value="settings" icon={<SettingsIcon aria-hidden="true" size={16} />} label="设置" showTooltip={isSidebarCollapsed} />
+                    </NavigationGroup>
+                  </Tabs.List>
+                </nav>
                 <div className="sidebar-status" aria-live="polite">
                   <span className={`status-dot ${busy === "idle" ? "status-dot-ok" : "status-dot-busy"}`} />
-                  <span>{busy === "idle" ? "本地服务正常" : "正在处理"}</span>
+                  <span>
+                    <strong>{busy === "idle" ? "本地服务在线" : "正在处理"}</strong>
+                    <small>LOCAL RELAY</small>
+                  </span>
                 </div>
               </aside>
 
-              <section className="workspace">
+              <main className="workspace" id="main-content" tabIndex={-1}>
                 <header className="topbar">
-                  <h1>{pageTitles[activeTab] ?? "Companion"}</h1>
+                  <div className="topbar-title">
+                    <h1>{activePage.title}</h1>
+                    <p>{activePage.description}</p>
+                  </div>
                   <div className="topbar-actions">
                     <IconButton
                       label={status.config.app.theme === "dark" ? "切换到亮色主题" : "切换到暗色主题"}
@@ -186,18 +262,18 @@ function App() {
                     onResetPreferences={actions.resetPreferences}
                   />
                 </Tabs.Content>
-              </section>
-            </main>
+              </main>
+            </div>
           </Tabs.Root>
         ) : (
-          <main className="app-shell">
-            <aside className="sidebar">
+          <div className={appShellClassName}>
+            <aside className="sidebar" id="app-sidebar">
               <Brand />
             </aside>
-            <section className="workspace">
+            <main className="workspace" id="main-content">
               <div className="loading-panel">正在加载 Companion 状态</div>
-            </section>
-          </main>
+            </main>
+          </div>
         )}
         <AppUpdatePrompt isBlocked={Boolean(pendingProviderLaunch)} updater={appUpdater} />
         <Dialog.Root open={Boolean(pendingProviderLaunch)} onOpenChange={(open) => !open && setPendingProviderLaunch(null)}>
@@ -263,12 +339,68 @@ function Brand() {
   );
 }
 
-function Tab({ value, icon, label }: { value: string; icon: React.ReactNode; label: string }) {
+function SidebarHeader({ isCollapsed, onToggle }: SidebarHeaderProps) {
+  const actionLabel = isCollapsed ? "展开侧栏" : "收起侧栏";
+  const actionIcon = isCollapsed
+    ? <PanelLeftOpen aria-hidden="true" size={15} />
+    : <PanelLeftClose aria-hidden="true" size={15} />;
+
   return (
-    <Tabs.Trigger className="tabs-trigger" value={value}>
+    <div className="sidebar-header">
+      <Brand />
+      <Tooltip.Root>
+        <Tooltip.Trigger asChild>
+          <button
+            aria-controls="sidebar-navigation"
+            aria-expanded={!isCollapsed}
+            aria-label={actionLabel}
+            className="sidebar-toggle"
+            onClick={onToggle}
+            type="button"
+          >
+            {actionIcon}
+          </button>
+        </Tooltip.Trigger>
+        <Tooltip.Portal>
+          <Tooltip.Content className="sidebar-tooltip" side="right" sideOffset={8}>
+            {actionLabel}
+          </Tooltip.Content>
+        </Tooltip.Portal>
+      </Tooltip.Root>
+    </div>
+  );
+}
+
+function NavigationGroup({ children, label }: { children: React.ReactNode; label: string }) {
+  return (
+    <>
+      <span className="navigation-label" aria-hidden="true">{label}</span>
+      {children}
+    </>
+  );
+}
+
+function Tab({ value, icon, label, showTooltip }: NavigationTabProps) {
+  const trigger = (
+    <Tabs.Trigger aria-label={label} className="tabs-trigger" value={value}>
       {icon}
       <span>{label}</span>
     </Tabs.Trigger>
+  );
+
+  if (!showTooltip) {
+    return trigger;
+  }
+
+  return (
+    <Tooltip.Root>
+      <Tooltip.Trigger asChild>{trigger}</Tooltip.Trigger>
+      <Tooltip.Portal>
+        <Tooltip.Content className="sidebar-tooltip" side="right" sideOffset={8}>
+          {label}
+        </Tooltip.Content>
+      </Tooltip.Portal>
+    </Tooltip.Root>
   );
 }
 

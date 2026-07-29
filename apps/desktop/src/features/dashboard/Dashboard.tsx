@@ -33,6 +33,7 @@ export function Dashboard({
     const health = status.config.health[provider.id]?.status;
     return health === "healthy" || health === "unknown";
   }).length;
+  const routeReady = application.kind !== "none" && application.providers.length > 0;
 
   function launchCurrentApplication() {
     if (application.kind === "group") {
@@ -48,24 +49,31 @@ export function Dashboard({
 
   return (
     <div className="dashboard-grid">
-      <Panel eyebrow="启动" title="启动 Codex">
+      <Panel eyebrow="当前路由" title="启动 Codex">
         <div className="launch-card">
-          <div>
-            <strong>{application.name}</strong>
-            <span>{application.description}</span>
+          <div className="launch-card-main">
+            <span className={`launch-readiness ${routeReady ? "launch-readiness-ready" : ""}`}>
+              <span className="status-dot" aria-hidden="true" />
+              {routeReady ? "路由就绪" : "等待配置"}
+            </span>
+            <div className="launch-context">
+              <strong>{application.name}</strong>
+              <span>{application.description}</span>
+            </div>
           </div>
-          <Button disabled={busy !== "idle" || application.kind === "none" || application.providers.length === 0} iconOnly label="启动当前应用" onClick={launchCurrentApplication}>
-            <Play size={16} />
+          <Button disabled={busy !== "idle" || !routeReady} onClick={launchCurrentApplication}>
+            <Play aria-hidden="true" size={15} />
+            启动 Codex
           </Button>
         </div>
         <div className="status-chip-grid">
-          <StatusChip icon={<RadioTower size={15} />} label="本地代理地址" value={status.relayBaseUrl} />
-          <StatusChip icon={<Router size={15} />} label="当前应用" value={application.name} />
-          <StatusChip icon={<CheckCircle2 size={15} />} label="可用账号" value={`${healthy}/${providers.length}`} />
+          <StatusChip icon={<RadioTower aria-hidden="true" size={15} />} label="本地代理地址" value={status.relayBaseUrl} />
+          <StatusChip icon={<Router aria-hidden="true" size={15} />} label="当前应用" value={application.name} />
+          <StatusChip icon={<CheckCircle2 aria-hidden="true" size={15} />} label="可用账号" value={`${healthy}/${providers.length}`} />
         </div>
       </Panel>
 
-      <Panel eyebrow="当前应用" title={application.kind === "group" ? "应用分组" : "应用账号"}>
+      <Panel eyebrow="路由成员" title={application.kind === "group" ? "应用分组" : "应用账号"}>
         {application.providers.length === 0 ? (
           <p className="empty">当前应用还没有账号。去账号页面添加账号后，再到分组里编排优先级。</p>
         ) : (
@@ -83,7 +91,7 @@ export function Dashboard({
         )}
       </Panel>
 
-      <Panel eyebrow="Codex" title="启动配置">
+      <Panel eyebrow="运行环境" title="Codex 配置">
         <dl className="details-grid">
           <dt>配置文件</dt>
           <dd>{compactPath(status.codex.configPath)}</dd>

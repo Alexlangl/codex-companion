@@ -345,6 +345,20 @@ pub struct ApiClientSecret {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ApiRequestAttemptLog {
+    pub attempt: u16,
+    pub provider_id: String,
+    pub route_reason: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub status_code: Option<u16>,
+    pub outcome: String,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiRequestLog {
     pub request_id: String,
     pub started_at: DateTime<Utc>,
@@ -359,6 +373,8 @@ pub struct ApiRequestLog {
     pub attempts: u16,
     pub latency_ms: Option<u64>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub attempt_log: Vec<ApiRequestAttemptLog>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

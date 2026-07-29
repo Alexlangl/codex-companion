@@ -55,11 +55,13 @@ export function ProviderCompactItem({
   const showQuota = hasQuotaInfo(quota);
   const usesAgentIdentity = providerUsesAgentIdentity(provider);
   const usesWebSocket = providerUsesWebSocket(provider);
+  const providerMark = provider.kind === "official_codex" ? "C" : "API";
   return (
     <div className={`provider-compact-item ${active ? "provider-compact-active" : ""}`}>
-      <span className="compact-check" aria-label={active ? "当前账号" : "可用账号"}>
-        {active ? <Check size={12} /> : null}
+      <span className="compact-check" aria-hidden="true">
+        {active ? <Check size={12} /> : providerMark}
       </span>
+      <span className="sr-only">{active ? "当前账号" : "可用账号"}</span>
       <strong>{providerAccountTitle(provider)}</strong>
       {showQuota ? <span className={`compact-dot compact-dot-${quota.tone}`} /> : null}
       {showQuota ? <span className="compact-quota">{quota.percentLabel}</span> : null}

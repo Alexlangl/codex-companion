@@ -12,6 +12,7 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
+    "@fontsource-variable/geologica": "^5.3.0",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-progress": "^1.1.8",
     "@radix-ui/react-scroll-area": "^1.2.10",

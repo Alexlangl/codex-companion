@@ -1,5 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import {
+  ArrowRight,
   CheckCircle2,
   Copy,
   Database,
@@ -14,8 +15,9 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Field, IconButton, Panel } from "../../components/ui";
+import type { BadgeTone } from "../../components/ui";
 import {
   apiServiceSelfTest,
   clearApiRequestLogs,
@@ -32,9 +34,16 @@ import { formatTime } from "../../lib/format";
 import { userFacingError } from "../../lib/errors";
 import { apiRequestLogsEqual, relayEventsEqual } from "../../lib/log-snapshot";
 import { providerAccountTitle, shortId } from "../../lib/provider-display";
+import {
+  groupRelayDiagnosticEvents,
+  relayEventMessageText,
+  type RelayDiagnosticGroup,
+  type RelayRequestEventGroup,
+} from "../../lib/relay-diagnostics";
 import type {
   ApiClient,
   ApiClientSecret,
+  ApiRequestAttemptLog,
   ApiRequestLog,
   ApiServiceSelfTest,
   ApiServiceSnapshot,
@@ -202,6 +211,12 @@ export function Relay({ active, status }: RelayProps) {
   const clients = snapshot?.clients ?? [];
   const requests = snapshot?.recentRequests ?? [];
   const cooldowns = snapshot?.modelCooldowns ?? [];
+  const diagnosticGroups = useMemo(() => groupRelayDiagnosticEvents(relayEvents), [relayEvents]);
+  const requestEvents = useMemo(() => requestEventMap(diagnosticGroups), [diagnosticGroups]);
+  const requestsById = useMemo(
+    () => new Map(requests.map((request) => [request.requestId, request])),
+    [requests],
+  );
   const secretForExample = revealedSecret?.apiKey ?? "YOUR_CODEX_COMPANION_API_KEY";
   const curlExample = [
     `curl ${status.relayBaseUrl}/responses \\`,
@@ -460,28 +475,31 @@ export function Relay({ active, status }: RelayProps) {
             <div className="api-request-head" role="row">
               <span>时间 / Client</span><span>请求</span><span>路由</span><span>结果</span>
             </div>
-            {requests.map((request) => <RequestRow key={request.requestId} request={request} status={status} />)}
+            {requests.map((request) => (
+              <RequestRow
+                events={requestEvents.get(request.requestId) ?? []}
+                key={request.requestId}
+                request={request}
+                status={status}
+              />
+            ))}
           </div>
         )}
       </Panel>
 
       <details className="advanced-details api-diagnostics">
-        <summary>查看底层转发诊断事件（{relayEvents.length}）</summary>
-        <div className="relay-event-list">
-          {relayEvents.length === 0 ? (
+        <summary>查看底层转发诊断（{diagnosticGroups.length} 组 / {relayEvents.length} 条事件）</summary>
+        <div className="relay-diagnostic-list">
+          {diagnosticGroups.length === 0 ? (
             <div className="api-compact-empty">暂无诊断事件</div>
           ) : (
-            relayEvents.map((event) => (
-              <div className={`relay-event-row relay-event-${event.kind}`} key={`${event.timestamp}-${event.message}`}>
-                <div>
-                  <strong>{relayEventTitle(status, event)}</strong>
-                  <span className="relay-event-message">{relayEventMessage(event.providerId, event.message)}</span>
-                </div>
-                <div className="relay-event-meta">
-                  <Badge tone={event.kind === "error" ? "danger" : event.kind === "fallback" ? "warn" : "info"}>{eventKindLabel(event.kind)}</Badge>
-                  <small>{formatTime(event.timestamp)}</small>
-                </div>
-              </div>
+            diagnosticGroups.map((group) => (
+              <RelayDiagnosticGroupRow
+                group={group}
+                key={diagnosticGroupKey(group)}
+                request={group.type === "request" ? requestsById.get(group.requestId) : undefined}
+                status={status}
+              />
             ))
           )}
         </div>
@@ -576,17 +594,156 @@ function NumberSetting(props: {
   );
 }
 
-function RequestRow({ request, status }: { request: ApiRequestLog; status: CompanionStatus }) {
-  const successful = request.outcome === "succeeded" || request.outcome === "local";
-  const tone = successful ? "ok" : request.outcome === "processing" ? "info" : "danger";
+function RequestRow(props: {
+  events: RelayEvent[];
+  request: ApiRequestLog;
+  status: CompanionStatus;
+}) {
+  const { events, request, status } = props;
+  const tone = requestOutcomeTone(request.outcome);
   const provider = request.providerId ? providerTitle(status, request.providerId) : "本地处理";
+  const attemptViews = requestAttemptViews(request, events);
+  const hasSwitch = request.attempts > 1 || attemptViews.some((attempt) => attempt.routeReason === "fallback");
+  const attemptSummary = requestAttemptSummary(request.attempts, hasSwitch);
+  const showTrace = shouldShowRequestTrace(request, attemptViews);
+
   return (
     <div className="api-request-row" role="row" title={request.error ?? undefined}>
-      <div><strong>{formatTime(request.startedAt)}</strong><span>{request.clientName ?? "本机兼容调用"}</span></div>
-      <div><strong>{request.method} {request.path}</strong><span>{request.model ?? "未指定模型"}</span></div>
-      <div><strong>{provider}</strong><span>{request.attempts > 0 ? `${request.attempts} 次尝试` : "未访问上游"}</span></div>
-      <div><Badge tone={tone}>{request.statusCode ?? "—"} · {outcomeLabel(request.outcome)}</Badge><span>{request.latencyMs ?? 0} ms</span></div>
+      <div role="cell"><strong>{formatTime(request.startedAt)}</strong><span>{request.clientName ?? "本机兼容调用"}</span></div>
+      <div role="cell"><strong>{request.method} {request.path}</strong><span>{request.model ?? "未指定模型"}</span></div>
+      <div role="cell"><strong>{provider}</strong><span>{attemptSummary}</span></div>
+      <div role="cell"><Badge tone={tone}>{request.statusCode ?? "—"} · {outcomeLabel(request.outcome)}</Badge><span>{request.latencyMs ?? 0} ms</span></div>
+      {showTrace ? (
+        <RequestAuditTrace attempts={attemptViews} request={request} status={status} />
+      ) : null}
     </div>
+  );
+}
+
+function RequestAuditTrace(props: {
+  attempts: ApiRequestAttemptLog[];
+  request: ApiRequestLog;
+  status: CompanionStatus;
+}) {
+  const { attempts, request, status } = props;
+  const traceStatus = requestTraceStatus(request, attempts);
+  const failedAttempts = attempts.filter((attempt) => attempt.outcome === "failed");
+  const detailUnavailable = request.attempts > 1 && attempts.length === 0;
+
+  return (
+    <div className="api-request-trace" role="cell">
+      <Badge tone={traceStatus.tone}>{traceStatus.label}</Badge>
+      <div className="api-request-trace-content">
+        {attempts.length > 0 ? (
+          <AttemptChain attempts={attempts} status={status} />
+        ) : (
+          <strong>检测到 {request.attempts} 次上游尝试</strong>
+        )}
+        {failedAttempts.length > 0 ? (
+          <ul className="api-request-failure-list">
+            {failedAttempts.map((attempt) => (
+              <li key={attempt.attempt}>
+                <span>{providerTitle(status, attempt.providerId)}</span>
+                <span>{attempt.error ?? attemptStatusSummary(attempt)}</span>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+        {detailUnavailable ? (
+          <span className="api-request-trace-note">这是升级前的历史记录，逐次失败明细未持久化。</span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function AttemptChain(props: {
+  attempts: ApiRequestAttemptLog[];
+  status: CompanionStatus;
+}) {
+  return (
+    <ol className="api-attempt-chain" aria-label="上游尝试链路">
+      {props.attempts.map((attempt, index) => (
+        <li className={`api-attempt api-attempt-${attempt.outcome}`} key={attempt.attempt}>
+          <div>
+            <strong>{providerTitle(props.status, attempt.providerId)}</strong>
+            <span>{attemptOutcomeLabel(attempt.outcome)} · {attemptRouteReasonLabel(attempt.routeReason)}</span>
+          </div>
+          {index < props.attempts.length - 1 ? <ArrowRight aria-hidden="true" size={14} /> : null}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function RelayDiagnosticGroupRow(props: {
+  group: RelayDiagnosticGroup;
+  request?: ApiRequestLog;
+  status: CompanionStatus;
+}) {
+  const { group, request, status } = props;
+  if (group.type === "standalone") {
+    return <StandaloneDiagnosticEvent event={group.event} status={status} />;
+  }
+
+  const groupStatus = diagnosticGroupStatus(group.events);
+  const requestEvent = group.events.find((event) => event.kind === "request");
+  const requestLabel = diagnosticRequestLabel(request, requestEvent);
+
+  return (
+    <article className={`relay-diagnostic-group relay-diagnostic-${groupStatus.tone}`}>
+      <header className="relay-diagnostic-header">
+        <div>
+          <strong>{requestLabel}</strong>
+          <code>{group.requestId}</code>
+        </div>
+        <div className="relay-diagnostic-meta">
+          <Badge tone={groupStatus.tone}>{groupStatus.label}</Badge>
+          <time dateTime={group.latestAt}>{formatDiagnosticTime(group.latestAt)}</time>
+        </div>
+      </header>
+      <ol className="relay-diagnostic-timeline" aria-label={`${requestLabel} 转发时间线`}>
+        {group.events.map((event) => (
+          <DiagnosticTimelineEvent event={event} key={`${event.timestamp}-${event.kind}-${event.message}`} status={status} />
+        ))}
+      </ol>
+    </article>
+  );
+}
+
+function DiagnosticTimelineEvent(props: { event: RelayEvent; status: CompanionStatus }) {
+  const { event, status } = props;
+  const provider = event.providerId ? providerTitle(status, event.providerId) : "Companion";
+  const tone = diagnosticEventTone(event.kind);
+  return (
+    <li className={`relay-diagnostic-step relay-diagnostic-step-${tone}`}>
+      <span aria-hidden="true" className="relay-diagnostic-dot" />
+      <div>
+        <strong>{eventKindLabel(event)} · {provider}</strong>
+        <span>{relayEventMessageText(event)}</span>
+      </div>
+      <time dateTime={event.timestamp}>{formatDiagnosticTime(event.timestamp)}</time>
+    </li>
+  );
+}
+
+function StandaloneDiagnosticEvent(props: { event: RelayEvent; status: CompanionStatus }) {
+  const { event, status } = props;
+  const tone = diagnosticEventTone(event.kind);
+  const provider = event.providerId ? providerTitle(status, event.providerId) : "Companion";
+  return (
+    <article className={`relay-diagnostic-group relay-diagnostic-${tone}`}>
+      <header className="relay-diagnostic-header">
+        <div>
+          <strong>{eventKindLabel(event)} · {provider}</strong>
+          <span>{relayEventMessageText(event)}</span>
+        </div>
+        <div className="relay-diagnostic-meta">
+          <Badge tone={tone}>{eventKindLabel(event)}</Badge>
+          <time dateTime={event.timestamp}>{formatDiagnosticTime(event.timestamp)}</time>
+        </div>
+      </header>
+    </article>
   );
 }
 
@@ -630,25 +787,218 @@ function outcomeLabel(outcome: string) {
   }
 }
 
-function relayEventTitle(status: CompanionStatus, event: RelayEvent) {
-  const provider = event.providerId ? providerTitle(status, event.providerId) : "Companion";
-  if (event.kind === "error") return `上游错误 · ${provider}`;
-  if (event.kind === "fallback") return `失败切换 · ${provider}`;
-  if (event.kind === "request") return `请求 · ${provider}`;
-  return provider;
+function requestOutcomeTone(outcome: string): BadgeTone {
+  if (outcome === "succeeded" || outcome === "local") return "ok";
+  if (outcome === "processing") return "info";
+  return "danger";
 }
 
-function relayEventMessage(providerId: string | null | undefined, message: string) {
-  const requestPrefix = message.match(/^\[[^\]]+\]\s*/)?.[0] ?? "";
-  const normalized = requestPrefix ? message.slice(requestPrefix.length) : message;
-  if (!providerId) return normalized || "Companion 本地代理事件";
-  return normalized.startsWith(providerId) ? normalized.slice(providerId.length).trimStart() : normalized;
+function requestAttemptSummary(attempts: number, hasSwitch: boolean): string {
+  if (attempts === 0) return "未访问上游";
+  if (hasSwitch) return `${attempts} 次尝试 · 发生失败切换`;
+  return `${attempts} 次尝试`;
 }
 
-function eventKindLabel(kind: string) {
-  if (kind === "fallback") return "失败切换";
-  if (kind === "error") return "错误";
-  if (kind === "request") return "请求";
-  if (kind === "health") return "健康检查";
-  return kind;
+function requestAttemptViews(
+  request: ApiRequestLog,
+  events: RelayEvent[],
+): ApiRequestAttemptLog[] {
+  if (request.attemptLog.length > 0) return request.attemptLog;
+
+  const fallbackEvents = events.filter((event) => event.kind === "fallback" && event.providerId);
+  const probeEvent = events.find((event) => event.kind === "failback" && event.providerId);
+  if (fallbackEvents.length === 0 && !probeEvent) return [];
+
+  const attempts: ApiRequestAttemptLog[] = fallbackEvents.map((event, index) => ({
+    attempt: index + 1,
+    providerId: event.providerId ?? "unknown",
+    routeReason: legacyRouteReason(index, event.providerId, probeEvent),
+    startedAt: event.timestamp,
+    finishedAt: event.timestamp,
+    statusCode: null,
+    outcome: "failed",
+    latencyMs: null,
+    error: relayEventMessageText(event),
+  }));
+
+  const terminalEvent = [...events]
+    .reverse()
+    .find((event) => event.kind === "stream" || (event.kind === "error" && event.providerId));
+  const terminalProviderId = request.providerId ?? terminalEvent?.providerId ?? probeEvent?.providerId;
+  if (!terminalProviderId) return attempts;
+
+  const terminalOutcome = requestTerminalOutcome(request.outcome);
+  const terminalError = requestTerminalError(request, terminalEvent, probeEvent);
+  attempts.push({
+    attempt: attempts.length + 1,
+    providerId: terminalProviderId,
+    routeReason: attempts.length > 0 ? "fallback" : legacyProbeReason(probeEvent),
+    startedAt: terminalEvent?.timestamp ?? request.startedAt,
+    finishedAt: terminalEvent?.timestamp ?? null,
+    statusCode: request.statusCode,
+    outcome: terminalOutcome,
+    latencyMs: request.latencyMs,
+    error: terminalError,
+  });
+  return attempts;
+}
+
+function requestTerminalOutcome(outcome: string): string {
+  if (outcome === "processing") return "processing";
+  if (outcome === "succeeded") return "succeeded";
+  return "failed";
+}
+
+function requestTerminalError(
+  request: ApiRequestLog,
+  terminalEvent: RelayEvent | undefined,
+  probeEvent: RelayEvent | undefined,
+): string | null {
+  if (request.outcome === "succeeded" || request.outcome === "processing") return null;
+  if (request.error) return request.error;
+  if (terminalEvent) return relayEventMessageText(terminalEvent);
+  if (probeEvent) return relayEventMessageText(probeEvent);
+  return "上游请求失败";
+}
+
+function legacyRouteReason(
+  index: number,
+  providerId: string | null | undefined,
+  probeEvent: RelayEvent | undefined,
+): string {
+  if (index > 0) return "fallback";
+  if (probeEvent?.providerId === providerId) return legacyProbeReason(probeEvent);
+  return "policy";
+}
+
+function legacyProbeReason(probeEvent: RelayEvent | undefined): string {
+  if (!probeEvent) return "policy";
+  return probeEvent.message.includes("自动") ? "automatic_failback" : "manual_failback";
+}
+
+function shouldShowRequestTrace(
+  request: ApiRequestLog,
+  attempts: ApiRequestAttemptLog[],
+): boolean {
+  if (request.attempts > 1) return true;
+  if (request.outcome === "failed" || request.outcome === "rejected") return true;
+  return attempts.some((attempt) => (
+    attempt.outcome !== "succeeded"
+      || attempt.routeReason === "manual_failback"
+      || attempt.routeReason === "automatic_failback"
+  ));
+}
+
+function requestTraceStatus(
+  request: ApiRequestLog,
+  attempts: ApiRequestAttemptLog[],
+): { label: string; tone: BadgeTone } {
+  if (request.outcome === "failed" || request.outcome === "rejected") {
+    return { label: "请求失败", tone: "danger" };
+  }
+  if (request.outcome === "processing" && (
+    attempts.some((attempt) => attempt.outcome === "failed") || request.attempts > 1
+  )) {
+    return { label: "失败后已切换，处理中", tone: "warn" };
+  }
+  if (attempts.some((attempt) => attempt.outcome === "failed") || request.attempts > 1) {
+    return { label: "失败切换后成功", tone: "warn" };
+  }
+  if (attempts.some((attempt) => attempt.routeReason === "manual_failback")) {
+    return { label: "手动向上探测", tone: "info" };
+  }
+  if (attempts.some((attempt) => attempt.routeReason === "automatic_failback")) {
+    return { label: "自动向上探测", tone: "info" };
+  }
+  return { label: "尝试明细", tone: "info" };
+}
+
+function attemptOutcomeLabel(outcome: string): string {
+  if (outcome === "succeeded") return "成功";
+  if (outcome === "failed") return "失败";
+  if (outcome === "processing") return "处理中";
+  return outcome;
+}
+
+function attemptRouteReasonLabel(reason: string): string {
+  if (reason === "policy") return "策略首选";
+  if (reason === "affinity") return "会话亲和";
+  if (reason === "fallback") return "失败后切换";
+  if (reason === "manual_failback") return "手动向上探测";
+  if (reason === "automatic_failback") return "自动向上探测";
+  return reason;
+}
+
+function attemptStatusSummary(attempt: ApiRequestAttemptLog): string {
+  const status = attempt.statusCode ? `HTTP ${attempt.statusCode}` : "未收到 HTTP 状态";
+  if (attempt.latencyMs === null || attempt.latencyMs === undefined) return status;
+  return `${status} · ${attempt.latencyMs} ms`;
+}
+
+function requestEventMap(groups: RelayDiagnosticGroup[]): Map<string, RelayEvent[]> {
+  const entries = groups
+    .filter((group): group is RelayRequestEventGroup => group.type === "request")
+    .map((group) => [group.requestId, group.events] as const);
+  return new Map(entries);
+}
+
+function diagnosticGroupKey(group: RelayDiagnosticGroup): string {
+  if (group.type === "request") return `request-${group.requestId}`;
+  return `event-${group.event.timestamp}-${group.event.kind}-${group.event.message}`;
+}
+
+function diagnosticRequestLabel(
+  request: ApiRequestLog | undefined,
+  requestEvent: RelayEvent | undefined,
+): string {
+  if (request) return `${request.method} ${request.path}`;
+  if (requestEvent) return relayEventMessageText(requestEvent);
+  return "上游请求";
+}
+
+function diagnosticGroupStatus(events: RelayEvent[]): { label: string; tone: BadgeTone } {
+  const hasFallback = events.some((event) => event.kind === "fallback");
+  const hasFailback = events.some((event) => event.kind === "failback");
+  const lastTerminalEvent = [...events]
+    .reverse()
+    .find((event) => event.kind === "stream" || event.kind === "error");
+
+  if (lastTerminalEvent?.kind === "error") return { label: "请求失败", tone: "danger" };
+  if (hasFallback && lastTerminalEvent?.kind === "stream") {
+    return { label: "失败切换后成功", tone: "warn" };
+  }
+  if (hasFallback) return { label: "失败后已切换，处理中", tone: "warn" };
+  if (hasFailback) return { label: "向上探测", tone: "info" };
+  if (lastTerminalEvent?.kind === "stream") return { label: "请求成功", tone: "ok" };
+  return { label: "处理中", tone: "info" };
+}
+
+function diagnosticEventTone(kind: string): BadgeTone {
+  if (kind === "fallback") return "warn";
+  if (kind === "error") return "danger";
+  if (kind === "stream") return "ok";
+  if (kind === "failback") return "info";
+  return "neutral";
+}
+
+function eventKindLabel(event: RelayEvent): string {
+  if (event.kind === "fallback") return "上游失败，切换下一账号";
+  if (event.kind === "error") return "请求失败";
+  if (event.kind === "request") return "请求开始";
+  if (event.kind === "stream") return "上游成功";
+  if (event.kind === "health") return "健康检查";
+  if (event.kind === "failback") {
+    return event.message.includes("自动") ? "自动向上探测" : "手动向上探测";
+  }
+  return event.kind;
+}
+
+function formatDiagnosticTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(date);
 }

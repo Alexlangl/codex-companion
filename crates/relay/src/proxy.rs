@@ -6,7 +6,7 @@ use crate::state::{apply_group_policy, AffinityBindContext, RelayState};
 use crate::upstream::{
     send_upstream, stream_response, text_response, upstream_url, UpstreamRequest,
 };
-use crate::{RequestLogFinish, RequestLogStart};
+use crate::{RequestAttemptFinish, RequestAttemptStart, RequestLogFinish, RequestLogStart};
 use axum::{
     body::Body,
     extract::{rejection::BytesRejection, State},
@@ -408,12 +408,33 @@ async fn proxy_dispatch(
     let candidate_count = candidates.len();
     let compact_request = method == Method::POST && uri.path().ends_with("/responses/compact");
     for (index, provider) in candidates.into_iter().enumerate() {
+        let attempt = (index + 1) as u16;
+        let attempt_started_at = Instant::now();
+        let route_reason = request_attempt_route_reason(
+            index,
+            &provider.id,
+            affinity_preference
+                .as_ref()
+                .map(|(_, preference)| preference.provider_id.as_str()),
+            priority_probe_provider.as_deref(),
+            priority_failback_claim.is_some_and(|claim| claim.manual),
+        );
+        record_request_attempt_start(&state, request_id, attempt, &provider.id, route_reason);
         if compact_request && provider_endpoint_is_chat_completions(&provider.base_url) {
             let message = format!(
                 "Provider {} 仅支持 Chat Completions，无法处理 Responses Compact API",
                 provider.name
             );
             last_error = Some(message.clone());
+            record_request_attempt_finish(
+                &state,
+                request_id,
+                attempt,
+                Some(StatusCode::NOT_IMPLEMENTED),
+                "failed",
+                attempt_started_at,
+                Some(&message),
+            );
             if index + 1 < candidate_count && group.fallback_enabled {
                 append_event(
                     &state.store,
@@ -462,6 +483,15 @@ async fn proxy_dispatch(
                         &message,
                     );
                     last_error = Some(message.clone());
+                    record_request_attempt_finish(
+                        &state,
+                        request_id,
+                        attempt,
+                        Some(StatusCode::BAD_GATEWAY),
+                        "failed",
+                        attempt_started_at,
+                        Some(&message),
+                    );
                     let can_retry = fallback_eligible(&failure)
                         && index + 1 < candidate_count
                         && group.fallback_enabled;
@@ -529,6 +559,15 @@ async fn proxy_dispatch(
                         Some(provider.id.clone()),
                         format!("[{request_id}] {method} {uri} -> {upstream_status}"),
                     );
+                    record_request_attempt_finish(
+                        &state,
+                        request_id,
+                        attempt,
+                        Some(downstream_status),
+                        "succeeded",
+                        attempt_started_at,
+                        None,
+                    );
                     record_request_finish(
                         &state,
                         request_id,
@@ -552,6 +591,15 @@ async fn proxy_dispatch(
                     requested_model.as_deref(),
                     &failure,
                     &message,
+                );
+                record_request_attempt_finish(
+                    &state,
+                    request_id,
+                    attempt,
+                    Some(downstream_status),
+                    "failed",
+                    attempt_started_at,
+                    Some(&message),
                 );
                 append_event(
                     &state.store,
@@ -611,6 +659,15 @@ async fn proxy_dispatch(
                     );
                 }
                 last_error = Some(message.clone());
+                record_request_attempt_finish(
+                    &state,
+                    request_id,
+                    attempt,
+                    Some(status),
+                    "failed",
+                    attempt_started_at,
+                    Some(&message),
+                );
                 let can_retry = (upstream_payload_too_large
                     || compact_unsupported
                     || fallback_eligible(&failure))
@@ -665,6 +722,15 @@ async fn proxy_dispatch(
                     &message,
                 );
                 last_error = Some(message.clone());
+                record_request_attempt_finish(
+                    &state,
+                    request_id,
+                    attempt,
+                    None,
+                    "failed",
+                    attempt_started_at,
+                    Some(&message),
+                );
                 let can_retry = fallback_eligible(&failure)
                     && index + 1 < candidate_count
                     && group.fallback_enabled;
@@ -923,6 +989,71 @@ fn record_request_start(
     });
 }
 
+fn request_attempt_route_reason(
+    index: usize,
+    provider_id: &str,
+    affinity_provider_id: Option<&str>,
+    priority_probe_provider_id: Option<&str>,
+    manual_priority_probe: bool,
+) -> &'static str {
+    if index > 0 {
+        return "fallback";
+    }
+    if priority_probe_provider_id == Some(provider_id) {
+        return if manual_priority_probe {
+            "manual_failback"
+        } else {
+            "automatic_failback"
+        };
+    }
+    if affinity_provider_id == Some(provider_id) {
+        return "affinity";
+    }
+    "policy"
+}
+
+fn record_request_attempt_start(
+    state: &RelayState,
+    request_id: &str,
+    attempt: u16,
+    provider_id: &str,
+    route_reason: &str,
+) {
+    let _ = state
+        .api_service
+        .record_request_attempt_start(RequestAttemptStart {
+            request_id,
+            attempt,
+            provider_id,
+            route_reason,
+        });
+}
+
+fn record_request_attempt_finish(
+    state: &RelayState,
+    request_id: &str,
+    attempt: u16,
+    status: Option<StatusCode>,
+    outcome: &str,
+    started_at: Instant,
+    error: Option<&str>,
+) {
+    let _ = state
+        .api_service
+        .record_request_attempt_finish(RequestAttemptFinish {
+            request_id,
+            attempt,
+            status_code: status.map(|status| status.as_u16()),
+            outcome,
+            latency_ms: started_at
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            error,
+        });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_request_finish(
     state: &RelayState,
@@ -1177,6 +1308,24 @@ mod tests {
         let events =
             std::fs::read_to_string(store.data_dir().join("relay/events.jsonl")).expect("events");
         assert!(events.contains("\"kind\":\"fallback\""));
+        let request = state
+            .api_service
+            .snapshot(10)
+            .expect("request snapshot")
+            .recent_requests
+            .into_iter()
+            .next()
+            .expect("request log");
+        assert_eq!(request.attempt_log.len(), 2);
+        assert_eq!(request.attempt_log[0].provider_id, "a");
+        assert_eq!(request.attempt_log[0].outcome, "failed");
+        assert!(request.attempt_log[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("500")));
+        assert_eq!(request.attempt_log[1].provider_id, "b");
+        assert_eq!(request.attempt_log[1].route_reason, "fallback");
+        assert_eq!(request.attempt_log[1].outcome, "succeeded");
     }
 
     #[tokio::test]
