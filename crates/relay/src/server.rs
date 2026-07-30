@@ -7,10 +7,11 @@ use axum::{
     routing::{any, get, post},
     Router,
 };
-use codex_companion_core::ConfigStore;
+use codex_companion_core::{ConfigStore, RelayConfig};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowOrigin, Any, CorsLayer};
+use url::{Host, Url};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +24,7 @@ pub struct BoundRelay {
     store: ConfigStore,
     listener: tokio::net::TcpListener,
     outcome: RelayStartOutcome,
+    enforce_api_key: bool,
 }
 
 impl BoundRelay {
@@ -31,7 +33,9 @@ impl BoundRelay {
         let bind_addr = config.relay.bind_addr();
         let base_url = config.relay.base_url();
         let addr: SocketAddr = bind_addr.parse()?;
+        validate_relay_bind_security(&config.relay, addr)?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        let enforce_api_key = !addr.ip().is_loopback();
         Ok(Self {
             store,
             listener,
@@ -39,6 +43,7 @@ impl BoundRelay {
                 bind_addr,
                 base_url,
             },
+            enforce_api_key,
         })
     }
 
@@ -47,7 +52,11 @@ impl BoundRelay {
     }
 
     pub async fn serve(self) -> anyhow::Result<RelayStartOutcome> {
-        let state = RelayState::new(self.store, reqwest::Client::new());
+        let state = RelayState::new_with_api_key_floor(
+            self.store,
+            reqwest::Client::new(),
+            self.enforce_api_key,
+        );
         let app = relay_router(state);
         axum::serve(self.listener, app).await?;
         Ok(self.outcome)
@@ -69,12 +78,41 @@ fn relay_router_with_body_limit(state: RelayState, body_limit: usize) -> Router 
         .route("/{*path}", any(proxy))
         .layer(
             CorsLayer::new()
-                .allow_origin(Any)
+                .allow_origin(AllowOrigin::predicate(|origin, _request| {
+                    browser_origin_is_loopback(origin)
+                }))
                 .allow_methods(Any)
-                .allow_headers(Any),
+                // `Authorization` is a CORS non-wildcard header, so `*` does not
+                // authorize it in browsers. Echo the requested header names for
+                // origins that passed the loopback predicate.
+                .allow_headers(AllowHeaders::mirror_request()),
         )
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
+}
+
+fn validate_relay_bind_security(relay: &RelayConfig, addr: SocketAddr) -> anyhow::Result<()> {
+    if !addr.ip().is_loopback() && !relay.require_api_key {
+        anyhow::bail!(
+            "refusing unauthenticated non-loopback relay bind at {addr}; enable require_api_key or bind to loopback"
+        );
+    }
+    Ok(())
+}
+
+fn browser_origin_is_loopback(origin: &axum::http::HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Ok(origin) = Url::parse(origin) else {
+        return false;
+    };
+    match origin.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -83,10 +121,102 @@ mod tests {
     use axum::http::{header, HeaderMap, StatusCode};
     use bytes::Bytes;
     use codex_companion_core::{
-        default_refresh_interval_seconds, ConfigStore, ProviderConfig, ProviderKind,
+        default_refresh_interval_seconds, ConfigStore, ProviderConfig, ProviderKind, RelayConfig,
         DEFAULT_GROUP_ID,
     };
     use std::collections::BTreeMap;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn non_loopback_bind_requires_api_key() {
+        let mut relay = RelayConfig {
+            host: "0.0.0.0".to_string(),
+            ..RelayConfig::default()
+        };
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), relay.port);
+
+        assert!(validate_relay_bind_security(&relay, addr).is_err());
+        relay.require_api_key = true;
+        assert!(validate_relay_bind_security(&relay, addr).is_ok());
+    }
+
+    #[test]
+    fn loopback_bind_does_not_require_api_key() {
+        let relay = RelayConfig::default();
+        let addr = relay.bind_addr().parse().expect("loopback address");
+
+        assert!(validate_relay_bind_security(&relay, addr).is_ok());
+    }
+
+    #[test]
+    fn cors_accepts_only_loopback_browser_origins() {
+        for origin in [
+            "http://localhost:1420",
+            "https://localhost",
+            "http://127.0.0.1:3000",
+            "http://[::1]:5173",
+            "tauri://localhost",
+        ] {
+            let origin = origin.parse().expect("origin header");
+            assert!(
+                browser_origin_is_loopback(&origin),
+                "loopback origin was rejected: {origin:?}"
+            );
+        }
+        for origin in ["https://evil.example", "null", "https://192.168.1.2"] {
+            let origin = origin.parse().expect("origin header");
+            assert!(
+                !browser_origin_is_loopback(&origin),
+                "non-loopback origin was accepted: {origin:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_echoes_authorization_for_loopback_origins() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("relay bind");
+        let relay_addr = listener.local_addr().expect("relay addr");
+        let app = relay_router(RelayState::new(store, reqwest::Client::new()));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{relay_addr}/v1/responses"),
+            )
+            .header(header::ORIGIN, "http://localhost:1420")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization,content-type",
+            )
+            .send()
+            .await
+            .expect("preflight");
+
+        assert!(response.status().is_success());
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:1420")
+        );
+        let allowed_headers = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .expect("allowed headers")
+            .to_ascii_lowercase();
+        assert!(allowed_headers.contains("authorization"));
+        assert!(allowed_headers.contains("content-type"));
+    }
 
     #[tokio::test]
     async fn serves_group_provider_over_real_http_listener() {

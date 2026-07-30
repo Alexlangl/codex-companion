@@ -329,6 +329,17 @@ fn import_provider_json_many(
 }
 
 #[tauri::command]
+fn review_provider_json_many(
+    json_text: String,
+    provider_id: Option<String>,
+    provider_name: Option<String>,
+) -> Result<codex_companion_provider::ProviderImportReviewReport, String> {
+    daemon()?
+        .review_provider_json_many(&json_text, provider_id, provider_name)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn import_api_key_provider(
     input: ApiKeyProviderImportRequest,
 ) -> Result<codex_companion_provider::ProviderImportOutcome, String> {
@@ -723,6 +734,7 @@ pub fn run() {
             export_provider_json,
             import_provider_json,
             import_provider_json_many,
+            review_provider_json_many,
             import_api_key_provider,
             import_local_codex_provider,
             remove_provider,

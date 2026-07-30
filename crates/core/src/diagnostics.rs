@@ -1,5 +1,6 @@
 use crate::{CompanionError, DiagnosticInfo, Result};
 use chrono::Utc;
+use regex::Regex;
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -28,7 +29,7 @@ pub fn append_diagnostic_log(
         "timestamp": Utc::now(),
         "level": level,
         "source": source,
-        "message": redact_text(message),
+        "message": redact_sensitive_text(message),
     });
     let text = serde_json::to_string(&entry).map_err(|source| {
         CompanionError::InvalidConfig(format!("diagnostic log serialize failed: {source}"))
@@ -91,18 +92,19 @@ pub fn redact_diagnostic_value(value: &Value) -> Value {
                 .iter()
                 .map(|(key, value)| {
                     let lower = key.to_ascii_lowercase();
-                    let sensitive = [
-                        "token",
-                        "authorization",
-                        "cookie",
-                        "secret",
-                        "private_key",
-                        "apikey",
-                        "api_key",
-                        "password",
-                    ]
-                    .iter()
-                    .any(|marker| lower.contains(marker));
+                    let sensitive = lower == "key"
+                        || [
+                            "token",
+                            "authorization",
+                            "cookie",
+                            "secret",
+                            "private_key",
+                            "apikey",
+                            "api_key",
+                            "password",
+                        ]
+                        .iter()
+                        .any(|marker| lower.contains(marker));
                     let value = if sensitive {
                         Value::String("[redacted]".to_string())
                     } else {
@@ -113,7 +115,7 @@ pub fn redact_diagnostic_value(value: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(items) => Value::Array(items.iter().map(redact_diagnostic_value).collect()),
-        Value::String(text) => Value::String(redact_text(text)),
+        Value::String(text) => Value::String(redact_sensitive_text(text)),
         _ => value.clone(),
     }
 }
@@ -143,27 +145,51 @@ fn rotate_if_needed(current_path: &Path) -> Result<()> {
     fs::rename(current_path, &first).map_err(|source| CompanionError::io(&first, source))
 }
 
-fn redact_text(text: &str) -> String {
-    let mut output = text.to_string();
-    for prefix in ["Bearer ", "AgentAssertion "] {
-        output = redact_after_prefix(&output, prefix);
-    }
-    output
-}
+pub fn redact_sensitive_text(text: &str) -> String {
+    static PRIVATE_KEY: OnceLock<Regex> = OnceLock::new();
+    static AUTH_SCHEME: OnceLock<Regex> = OnceLock::new();
+    static HEADER: OnceLock<Regex> = OnceLock::new();
+    static FIELD: OnceLock<Regex> = OnceLock::new();
+    static URL_USERINFO: OnceLock<Regex> = OnceLock::new();
+    static TOKEN: OnceLock<Regex> = OnceLock::new();
 
-fn redact_after_prefix(text: &str, prefix: &str) -> String {
-    let mut output = text.to_string();
-    let mut offset = 0;
-    while let Some(relative_start) = output[offset..].find(prefix) {
-        let value_start = offset + relative_start + prefix.len();
-        let end = output[value_start..]
-            .find(|character: char| character.is_ascii_whitespace() || "\"',}".contains(character))
-            .map(|end_offset| value_start + end_offset)
-            .unwrap_or(output.len());
-        output.replace_range(value_start..end, "[redacted]");
-        offset = value_start + "[redacted]".len();
-    }
-    output
+    let private_key = PRIVATE_KEY.get_or_init(|| {
+        Regex::new(
+            r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        )
+        .expect("private-key redaction regex")
+    });
+    let auth_scheme = AUTH_SCHEME.get_or_init(|| {
+        Regex::new(r"(?i)\b(Bearer|AgentAssertion)\s+[A-Za-z0-9._~+/=-]+")
+            .expect("authorization redaction regex")
+    });
+    let header = HEADER.get_or_init(|| {
+        Regex::new(
+            r"(?im)\b(authorization|(?:set-)?cookie|(?:[a-z0-9-]+-)?api-key|x-auth-token)\s*:\s*[^\r\n]+",
+        )
+            .expect("header redaction regex")
+    });
+    let field = FIELD.get_or_init(|| {
+        Regex::new(
+            r#"(?i)((?:^|[?&{,\s])["']?(?:(?:(?:access|refresh|id|session|auth)[_-]?)?token|(?:openai[_-]?)?api[_-]?key|key|authorization|cookie|client[_-]?secret|password|private[_-]?key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s,}&]+)"#,
+        )
+        .expect("credential-field redaction regex")
+    });
+    let url_userinfo = URL_USERINFO.get_or_init(|| {
+        Regex::new(r"(?i)\b(https?|wss?)://[^/\s:@]+:[^/\s@]+@")
+            .expect("URL userinfo redaction regex")
+    });
+    let token = TOKEN.get_or_init(|| {
+        Regex::new(r"\b(?:(?:sk|at)-[A-Za-z0-9][A-Za-z0-9._-]{7,}|cc_live_[A-Za-z0-9_-]{8,})\b")
+            .expect("standalone-token redaction regex")
+    });
+
+    let output = private_key.replace_all(text, "[redacted private key]");
+    let output = auth_scheme.replace_all(&output, "$1 [redacted]");
+    let output = header.replace_all(&output, "$1: [redacted]");
+    let output = field.replace_all(&output, "$1[redacted]");
+    let output = url_userinfo.replace_all(&output, "$1://[redacted]@");
+    token.replace_all(&output, "[redacted]").into_owned()
 }
 
 #[cfg(test)]
@@ -181,6 +207,49 @@ mod tests {
         assert_eq!(
             redacted.pointer("/nested/message").and_then(Value::as_str),
             Some("Authorization Bearer [redacted]")
+        );
+    }
+
+    #[test]
+    fn redacts_embedded_json_query_parameters_and_standalone_keys() {
+        let input = concat!(
+            "upstream failed: {\"api_key\":\"sk-secret1234\",",
+            "\"refresh_token\":\"refresh-secret\",",
+            "\"session_token\":\"session-secret\",",
+            "\"token\":\"generic-secret\"} ",
+            "https://example.test/v1?access_token=query-secret&model=gpt ",
+            "fallback sk-standalone1234 cc_live_abcdefghijklmnopqrstuvwxyz ",
+            "https://alice:password@example.test/v1 ",
+            "Anthropic-Api-Key: anthropic-secret\nX-Auth-Token: auth-secret"
+        );
+
+        let redacted = redact_sensitive_text(input);
+
+        for secret in [
+            "sk-secret1234",
+            "refresh-secret",
+            "session-secret",
+            "generic-secret",
+            "query-secret",
+            "sk-standalone1234",
+            "cc_live_abcdefghijklmnopqrstuvwxyz",
+            "alice:password",
+            "anthropic-secret",
+            "auth-secret",
+        ] {
+            assert!(
+                !redacted.contains(secret),
+                "secret was not redacted: {secret}"
+            );
+        }
+        assert!(redacted.contains("model=gpt"));
+    }
+
+    #[test]
+    fn does_not_redact_unrelated_words_containing_key() {
+        assert_eq!(
+            redact_sensitive_text("monkey=banana keyboard ready"),
+            "monkey=banana keyboard ready"
         );
     }
 

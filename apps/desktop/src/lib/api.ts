@@ -24,6 +24,8 @@ import type {
   ProviderHealth,
   ProviderImportOutcome,
   ProviderImportBatchReport,
+  ProviderImportReviewItem,
+  ProviderImportReviewReport,
   ProviderImportProgress,
   ProviderGroup,
   ProviderKind,
@@ -608,15 +610,29 @@ export function addEnvProvider(input: {
 export function importProviderJson(jsonText: string, providerId?: string, providerName?: string) {
   if (!isTauri()) {
     const value = JSON.parse(jsonText) as unknown;
-    if (isApiKeyJson(value)) {
+    const authMode = findString(value, ["auth_mode", "authMode"])?.toLowerCase();
+    const hasApiKeyShape = authMode === "apikey" || authMode === "api_key" || isApiKeyJson(value) || Boolean(findApiKey(value));
+    if (hasApiKeyShape) {
       return importApiKeyJsonMock(value, providerId, providerName);
+    }
+    const runtimeId = findString(value, ["agent_runtime_id", "agentRuntimeId"]);
+    const privateKey = findString(value, ["agent_private_key", "agentPrivateKey"]);
+    const hasAgentIdentityShape = authMode === "agentidentity" || Boolean(runtimeId && privateKey);
+    if (hasAgentIdentityShape && (!runtimeId || !privateKey)) {
+      return Promise.reject(new Error("Agent Identity 缺少 runtime id 或私钥"));
+    }
+    const oauthToken = findString(value, ["access_token", "accessToken", "refresh_token", "refreshToken", "id_token", "idToken"]);
+    if (!hasAgentIdentityShape && !oauthToken) {
+      return Promise.reject(new Error("仅支持 Codex OAuth、Agent Identity 或 API Key 账号 JSON"));
     }
     const explicitName = emptyToNull(providerName);
     const detectedName = findString(value, ["email", "name"]);
     const importedName = explicitName || (detectedName && !isGenericOfficialAccountName(detectedName) ? detectedName : null);
-    const accountId =
-      findString(value, ["chatgpt_account_id", "account_id", "workspace_id", "email"]) ||
-      `mock_${Date.now()}`;
+    const detectedAccountId = findString(value, ["chatgpt_account_id", "account_id", "workspace_id"]);
+    if (hasAgentIdentityShape && !detectedAccountId) {
+      return Promise.reject(new Error("Agent Identity 缺少 ChatGPT account id"));
+    }
+    const accountId = detectedAccountId || findString(value, ["email"]) || `mock_${Date.now()}`;
     const name = importedName || accountId;
     const userId = findString(value, ["chatgpt_user_id", "user_id", "userId", "user"]);
     const email = findString(value, ["email", "name"]);
@@ -646,7 +662,7 @@ export function importProviderJson(jsonText: string, providerId?: string, provid
     ]);
     const quotaResetAt = findString(value, ["quota_reset_at", "quotaResetAt", "reset_at", "resetAt"]);
     const quotaWindows = extractQuotaWindows(value);
-    const id = emptyToNull(providerId) || `codex_openai_${sanitizeProviderId(name)}_${accountIdHash(accountId)}`;
+    const id = normalizeMockProviderId(providerId) || `codex_openai_${sanitizeProviderId(name)}_${accountIdHash(accountId)}`;
     const provider: ProviderConfig = {
       id,
       name,
@@ -658,6 +674,7 @@ export function importProviderJson(jsonText: string, providerId?: string, provid
       enabled: true,
       refreshIntervalSeconds: 60,
       account: {
+        authMode: hasAgentIdentityShape ? "agentIdentity" : "oauth",
         displayName: name,
         email,
         teamName,
@@ -698,13 +715,18 @@ export function importProviderJson(jsonText: string, providerId?: string, provid
       },
     };
     mockStatus = syncMockDerived(mockStatus);
+    const importKind = hasAgentIdentityShape ? "agent_identity" : "openai_account";
+    let message = created ? "已导入 Codex 官方账号 provider" : "已更新 Codex 官方账号 provider";
+    if (hasAgentIdentityShape) {
+      message = created ? "已导入 Agent Identity provider" : "已更新 Agent Identity provider";
+    }
     return Promise.resolve<ProviderImportOutcome>({
       provider,
-      importKind: "openai_account",
+      importKind,
       accountId,
       authPath: `${mockStatus.dataDir}/auth/accounts/${id}.json`,
       created,
-      message: created ? "已导入 Codex 官方账号 provider" : "已更新 Codex 官方账号 provider",
+      message,
     });
   }
   return invoke<ProviderImportOutcome>("import_provider_json", {
@@ -722,21 +744,7 @@ export async function importProviderJsonMany(
 ): Promise<ProviderImportBatchReport> {
   if (!isTauri()) {
     const value = JSON.parse(jsonText) as unknown;
-    let items: unknown[] = [value];
-    if (Array.isArray(value) && value.length > 0) {
-      items = value;
-    } else {
-      const accounts =
-        value && typeof value === "object" && !Array.isArray(value)
-          ? (value as { accounts?: unknown }).accounts
-          : null;
-      if (Array.isArray(accounts) && accounts.length > 1) {
-        items = accounts.map((account) => ({
-          ...(value as Record<string, unknown>),
-          accounts: [account],
-        }));
-      }
-    }
+    const items = expandProviderJsonItems(value, providerId);
     const report: ProviderImportBatchReport = {
       total: items.length,
       succeeded: [],
@@ -774,6 +782,43 @@ export async function importProviderJsonMany(
     providerId: emptyToNull(providerId),
     providerName: emptyToNull(providerName),
     addToGroupId: emptyToNull(addToGroupId ?? undefined),
+  });
+}
+
+export async function reviewProviderJsonMany(
+  jsonText: string,
+  providerId?: string,
+  providerName?: string,
+): Promise<ProviderImportReviewReport> {
+  if (!isTauri()) {
+    const value = JSON.parse(jsonText) as unknown;
+    const items = expandProviderJsonItems(value, providerId);
+    const report: ProviderImportReviewReport = {
+      total: items.length,
+      ready: [],
+      failed: [],
+    };
+    const reviewedProviderIds = new Set<string>();
+    for (const [index, item] of items.entries()) {
+      try {
+        const reviewedItem = reviewProviderJsonMock(item, index, providerId, providerName);
+        reviewedItem.willOverwrite ||= reviewedProviderIds.has(reviewedItem.providerId);
+        reviewedProviderIds.add(reviewedItem.providerId);
+        report.ready.push(reviewedItem);
+      } catch (unknownError) {
+        report.failed.push({
+          index,
+          label: providerImportItemLabel(item, index),
+          message: userFacingError(unknownError),
+        });
+      }
+    }
+    return report;
+  }
+  return invoke<ProviderImportReviewReport>("review_provider_json_many", {
+    jsonText,
+    providerId: emptyToNull(providerId),
+    providerName: emptyToNull(providerName),
   });
 }
 
@@ -1304,6 +1349,142 @@ function emptyToNull(value?: string) {
   return value && value.trim() ? value.trim() : null;
 }
 
+function expandProviderJsonItems(value: unknown, providerId?: string): unknown[] {
+  if (Array.isArray(value) && value.length > 0) {
+    if (emptyToNull(providerId)) {
+      throw new Error("批量 provider JSON 不能同时指定单个 provider id");
+    }
+    return value;
+  }
+  const accounts =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as { accounts?: unknown }).accounts
+      : null;
+  if (!Array.isArray(accounts) || accounts.length <= 1) {
+    return [value];
+  }
+  if (emptyToNull(providerId)) {
+    throw new Error("批量账号 JSON 不能同时指定单个 provider id");
+  }
+  return accounts.map((account) => ({
+    ...(value as Record<string, unknown>),
+    accounts: [account],
+  }));
+}
+
+function reviewProviderJsonMock(
+  value: unknown,
+  index: number,
+  providerId?: string,
+  providerName?: string,
+): ProviderImportReviewItem {
+  const authMode = findString(value, ["auth_mode", "authMode"])?.toLowerCase();
+  const hasApiKeyShape = authMode === "apikey" || authMode === "api_key" || isNewApiChannelConnection(value) || Boolean(findApiKey(value));
+  if (hasApiKeyShape) {
+    return reviewApiKeyJsonMock(value, index, providerId, providerName);
+  }
+
+  const runtimeId = findString(value, ["agent_runtime_id", "agentRuntimeId"]);
+  const privateKey = findString(value, ["agent_private_key", "agentPrivateKey"]);
+  const hasAgentIdentityShape = authMode === "agentidentity" || Boolean(runtimeId && privateKey);
+  if (hasAgentIdentityShape && (!runtimeId || !privateKey)) {
+    throw new Error("Agent Identity 缺少 runtime id 或私钥");
+  }
+
+  const token = findString(value, ["access_token", "accessToken", "refresh_token", "refreshToken", "id_token", "idToken"]);
+  if (!hasAgentIdentityShape && !token) {
+    throw new Error("仅支持 Codex OAuth、Agent Identity 或 API Key 账号 JSON");
+  }
+  const accountId = findString(value, ["chatgpt_account_id", "account_id", "accountId", "workspace_id"]);
+  if (hasAgentIdentityShape && !accountId) {
+    throw new Error("Agent Identity 缺少 ChatGPT account id");
+  }
+  const name =
+    emptyToNull(providerName) ||
+    findString(value, ["email", "display_name", "displayName", "name"]) ||
+    "Codex 官方账号";
+  const identity = accountId || `mock_${accountIdHash(token || runtimeId || name)}`;
+  const id = normalizeMockProviderId(providerId) || `codex_openai_${sanitizeProviderId(name)}_${accountIdHash(identity)}`;
+  return {
+    index,
+    label: redactMockReviewText(providerImportItemLabel(value, index)),
+    providerId: id,
+    providerName: redactMockReviewText(name),
+    providerKind: "official_codex",
+    importKind: hasAgentIdentityShape ? "agent_identity" : "openai_account",
+    credentialKind: hasAgentIdentityShape ? "Agent Identity 私钥" : "OAuth tokens",
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    websocketUrl: null,
+    model: redactOptionalMockReviewText(findString(value, ["model", "defaultModel", "default_model"])),
+    willOverwrite: Boolean(mockStatus.config.providers[id]),
+  };
+}
+
+function reviewApiKeyJsonMock(
+  value: unknown,
+  index: number,
+  providerId?: string,
+  providerName?: string,
+): ProviderImportReviewItem {
+  const isNewApiConnection = isNewApiChannelConnection(value);
+  const apiKey = findApiKey(value);
+  if (!apiKey) {
+    throw new Error(isNewApiConnection ? "New API 连接 JSON 缺少 key" : "API Key JSON 缺少 OPENAI_API_KEY");
+  }
+  const detectedBaseUrl = findApiBaseUrl(value);
+  if (isNewApiConnection && !detectedBaseUrl) {
+    throw new Error("New API 连接 JSON 缺少 url");
+  }
+  const baseUrl = detectedBaseUrl ?? "https://api.openai.com/v1";
+  if (!/^https?:\/\//i.test(baseUrl)) {
+    throw new Error(`API Key JSON 的 api_base_url 无效: ${baseUrl}`);
+  }
+  const name =
+    emptyToNull(providerName) ||
+    findString(value, ["api_provider_name", "apiProviderName", "provider_name", "providerName", "name"]) ||
+    providerNameFromBaseUrl(baseUrl);
+  const id =
+    normalizeMockProviderId(providerId) ||
+    normalizeMockProviderId(findString(value, ["api_provider_id", "apiProviderId"])) ||
+    `${sanitizeProviderId(name)}_${accountIdHash(baseUrl)}`;
+  const providerHint = `${id} ${name}`.toLowerCase();
+  const usesRelay =
+    providerHint.includes("new_api") ||
+    providerHint.includes("new-api") ||
+    providerHint.includes("one-api") ||
+    !baseUrl.toLowerCase().startsWith("https://api.openai.com/");
+  return {
+    index,
+    label: redactMockReviewText(providerImportItemLabel(value, index)),
+    providerId: id,
+    providerName: redactMockReviewText(name),
+    providerKind: usesRelay ? "relay_provider" : "openai_compatible",
+    importKind: "api_key",
+    credentialKind: "API Key",
+    baseUrl: redactMockReviewText(baseUrl),
+    websocketUrl: redactOptionalMockReviewText(findString(value, ["websocket_url", "websocketUrl", "ws_url", "wsUrl"])),
+    model: redactOptionalMockReviewText(findString(value, ["model", "defaultModel", "default_model"])),
+    willOverwrite: Boolean(mockStatus.config.providers[id]),
+  };
+}
+
+function providerImportItemLabel(value: unknown, index: number): string {
+  return findString(value, ["email", "name", "chatgpt_user_id", "user_id", "chatgpt_account_id", "account_id"]) || `账号 ${index + 1}`;
+}
+
+function redactOptionalMockReviewText(value: string | null): string | null {
+  return value ? redactMockReviewText(value) : null;
+}
+
+function redactMockReviewText(value: string): string {
+  return value
+    .replace(/\b(Bearer|AgentAssertion)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [redacted]")
+    .replace(/\b(authorization|(?:set-)?cookie|(?:[a-z0-9-]+-)?api-key|x-auth-token)\s*:\s*[^\r\n]+/gi, "$1: [redacted]")
+    .replace(/((?:^|[?&{,\s])["']?(?:(?:(?:access|refresh|id|session|auth)[_-]?)?token|(?:openai[_-]?)?api[_-]?key|key|authorization|cookie|client[_-]?secret|password|private[_-]?key)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s,}&]+)/gi, "$1[redacted]")
+    .replace(/\b((?:https?|wss?):\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1[redacted]@")
+    .replace(/\b(?:(?:sk|at)-[A-Za-z0-9][A-Za-z0-9._-]{7,}|cc_live_[A-Za-z0-9_-]{8,})\b/g, "[redacted]");
+}
+
 function importApiKeyJsonMock(
   value: unknown,
   providerId?: string,
@@ -1327,8 +1508,8 @@ function importApiKeyJsonMock(
     findString(value, ["api_provider_name", "apiProviderName", "provider_name", "providerName", "name"]) ||
     providerNameFromBaseUrl(baseUrl);
   const id =
-    emptyToNull(providerId) ||
-    findString(value, ["api_provider_id", "apiProviderId"]) ||
+    normalizeMockProviderId(providerId) ||
+    normalizeMockProviderId(findString(value, ["api_provider_id", "apiProviderId"])) ||
     `${sanitizeProviderId(name)}_${accountIdHash(baseUrl)}`;
   const model = findString(value, ["model", "defaultModel", "default_model"]);
   const provider: ProviderConfig = {
@@ -1390,6 +1571,11 @@ function sanitizeProviderId(value: string) {
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "")
     .replace(/^([^a-z])/, "provider_$1") || "chatgpt";
+}
+
+function normalizeMockProviderId(value?: string | null): string | null {
+  const normalized = emptyToNull(value ?? undefined);
+  return normalized ? sanitizeProviderId(normalized) : null;
 }
 
 function accountIdHash(value: string) {

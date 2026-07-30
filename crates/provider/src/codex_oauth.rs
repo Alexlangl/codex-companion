@@ -167,18 +167,7 @@ fn write_auth_file(auth_file: &CodexAuthFile) -> Result<()> {
     let text = serde_json::to_string_pretty(&auth_file.value).map_err(|source| {
         CompanionError::InvalidConfig(format!("序列化 Codex auth 失败: {source}"))
     })?;
-    let file_name = auth_file
-        .path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("auth.json");
-    // 临时文件名带 pid：live-follow 模式下别的进程也可能同时写这个文件。
-    let tmp_path = auth_file
-        .path
-        .with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-    crate::write_private_auth_file(&tmp_path, &text)?;
-    fs::rename(&tmp_path, &auth_file.path)
-        .map_err(|source| CompanionError::io(&auth_file.path, source))
+    crate::write_private_auth_file(&auth_file.path, &format!("{text}\n"))
 }
 
 impl CodexAuthFile {

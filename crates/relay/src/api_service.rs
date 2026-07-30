@@ -1,9 +1,9 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, SecondsFormat, Utc};
 use codex_companion_core::{
-    ApiClient, ApiClientCreate, ApiClientHealth, ApiClientPeriodUsage, ApiClientSecret,
-    ApiClientUpdate, ApiClientUsage, ApiRequestAttemptLog, ApiRequestLog, ApiServiceSnapshot,
-    CompanionError, ConfigStore, ModelCooldown, Result,
+    redact_sensitive_text, ApiClient, ApiClientCreate, ApiClientHealth, ApiClientPeriodUsage,
+    ApiClientSecret, ApiClientUpdate, ApiClientUsage, ApiRequestAttemptLog, ApiRequestLog,
+    ApiServiceSnapshot, CompanionError, ConfigStore, ModelCooldown, Result,
 };
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -438,6 +438,7 @@ impl ApiServiceStore {
     }
 
     pub fn record_request_start(&self, input: RequestLogStart<'_>) -> Result<()> {
+        let path = redact_sensitive_text(input.path);
         let connection = self.connection()?;
         connection
             .execute(
@@ -448,7 +449,7 @@ impl ApiServiceStore {
                     input.request_id,
                     timestamp(Utc::now()),
                     input.method,
-                    input.path,
+                    path,
                     input.model,
                     input.client_id
                 ],
@@ -977,7 +978,8 @@ fn hash_key(api_key: &str) -> [u8; 32] {
 }
 
 fn compact_log_error(value: &str) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = redact_sensitive_text(value);
+    let compact = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
     compact.chars().take(MAX_LOG_ERROR_LEN).collect()
 }
 
@@ -1143,6 +1145,57 @@ mod tests {
         assert!(store
             .model_cooldown_active("provider-a", "gpt-test")
             .expect("active"));
+    }
+
+    #[test]
+    fn request_log_redacts_credentials_in_paths_and_errors() {
+        let (_temp, store) = test_store();
+        store
+            .record_request_start(RequestLogStart {
+                request_id: "secret-request",
+                method: "POST",
+                path: "/v1/responses?api_key=sk-path-secret&safe=value",
+                model: Some("gpt-test"),
+                client_id: None,
+            })
+            .expect("start");
+        store
+            .record_request_attempt_start(RequestAttemptStart {
+                request_id: "secret-request",
+                attempt: 1,
+                provider_id: "provider-a",
+                route_reason: "policy",
+            })
+            .expect("attempt start");
+        store
+            .record_request_attempt_finish(RequestAttemptFinish {
+                request_id: "secret-request",
+                attempt: 1,
+                status_code: Some(401),
+                outcome: "failed",
+                latency_ms: 2,
+                error: Some("Authorization: Bearer sk-attempt-secret"),
+            })
+            .expect("attempt finish");
+        store
+            .record_request_finish(RequestLogFinish {
+                request_id: "secret-request",
+                provider_id: Some("provider-a"),
+                status_code: Some(401),
+                outcome: "failed",
+                attempts: 1,
+                latency_ms: 3,
+                error: Some(r#"{"password":"database-secret"}"#),
+            })
+            .expect("finish");
+
+        let snapshot = store.snapshot(10).expect("snapshot");
+        let serialized = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        assert!(!serialized.contains("sk-path-secret"));
+        assert!(!serialized.contains("sk-attempt-secret"));
+        assert!(!serialized.contains("database-secret"));
+        assert!(serialized.contains("safe=value"));
+        assert!(serialized.contains("[redacted]"));
     }
 
     #[test]

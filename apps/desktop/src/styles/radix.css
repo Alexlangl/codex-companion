@@ -178,6 +178,10 @@
   width: min(760px, calc(100vw - 32px));
 }
 
+.provider-import-review-dialog {
+  width: min(780px, calc(100vw - 32px));
+}
+
 .direct-launch-confirm-dialog {
   width: min(520px, calc(100vw - 32px));
 }

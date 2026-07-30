@@ -109,6 +109,30 @@ pub struct ProviderImportFailure {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImportReviewItem {
+    pub index: usize,
+    pub label: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub provider_kind: ProviderKind,
+    pub import_kind: String,
+    pub credential_kind: String,
+    pub base_url: String,
+    pub websocket_url: Option<String>,
+    pub model: Option<String>,
+    pub will_overwrite: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImportReviewReport {
+    pub total: usize,
+    pub ready: Vec<ProviderImportReviewItem>,
+    pub failed: Vec<ProviderImportFailure>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderImportBatchReport {

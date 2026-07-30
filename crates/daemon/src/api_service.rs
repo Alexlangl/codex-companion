@@ -5,6 +5,7 @@ use codex_companion_core::{
     RelaySettingsUpdate, Result,
 };
 use codex_companion_relay::ApiServiceStore;
+use std::net::SocketAddr;
 use std::time::Instant;
 
 impl CompanionDaemon {
@@ -71,6 +72,7 @@ impl CompanionDaemon {
             ));
         }
         let relay = self.store.update(|config| {
+            validate_relay_auth_scope(&config.relay, input.require_api_key)?;
             config.relay.require_api_key = input.require_api_key;
             config.relay.retry_budget = input.retry_budget;
             config.relay.model_cooldown_seconds = input.model_cooldown_seconds;
@@ -108,9 +110,13 @@ impl CompanionDaemon {
             .timeout(std::time::Duration::from_secs(3))
             .send()
             .await;
-        let listener_ok = response
-            .as_ref()
-            .is_ok_and(|response| response.status().is_success());
+        let listener_ok = response.as_ref().is_ok_and(|response| {
+            response.status().is_success()
+                || (response.status() == reqwest::StatusCode::UNAUTHORIZED
+                    && response
+                        .headers()
+                        .contains_key("x-codex-companion-request-id"))
+        });
         let ok = database_ok && listener_ok;
         let message = if ok {
             "配置数据库与本地 HTTP 监听均可用；未消耗上游账号额度".to_string()
@@ -154,6 +160,21 @@ fn validate_relay_settings(input: &RelaySettingsUpdate) -> Result<()> {
     if !(1..=3650).contains(&input.request_log_retention_days) {
         return Err(CompanionError::InvalidConfig(
             "请求日志保留时间必须在 1 到 3650 天之间".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relay_auth_scope(relay: &RelayConfig, require_api_key: bool) -> Result<()> {
+    let addr = relay.bind_addr().parse::<SocketAddr>().map_err(|error| {
+        CompanionError::InvalidConfig(format!(
+            "无效的本地代理监听地址 {}: {error}",
+            relay.bind_addr()
+        ))
+    })?;
+    if !addr.ip().is_loopback() && !require_api_key {
+        return Err(CompanionError::InvalidConfig(
+            "非 loopback 监听必须启用 API client 密钥".into(),
         ));
     }
     Ok(())
@@ -208,5 +229,17 @@ mod tests {
             ..valid
         })
         .is_err());
+    }
+
+    #[test]
+    fn non_loopback_relay_cannot_disable_client_keys() {
+        let relay = RelayConfig {
+            host: "0.0.0.0".to_string(),
+            ..RelayConfig::default()
+        };
+
+        assert!(validate_relay_auth_scope(&relay, false).is_err());
+        assert!(validate_relay_auth_scope(&relay, true).is_ok());
+        assert!(validate_relay_auth_scope(&RelayConfig::default(), false).is_ok());
     }
 }

@@ -4,9 +4,9 @@ mod token_usage;
 
 use chrono::Local;
 use codex_companion_core::{
-    default_codex_dir, CodexInstallStatus, CompanionError, ProviderConfig, ProviderKind,
-    RelayConfig, RepairOptions, RepairOutcome, RepairPlan, Result, COMPANION_PROVIDER_ID,
-    COMPANION_PROVIDER_NAME,
+    atomic_write_private_file, default_codex_dir, CodexInstallStatus, CompanionError,
+    ProviderConfig, ProviderKind, RelayConfig, RepairOptions, RepairOutcome, RepairPlan, Result,
+    COMPANION_PROVIDER_ID, COMPANION_PROVIDER_NAME,
 };
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -619,8 +619,7 @@ fn write_codex_auth_json(codex_dir: &Path, material: &Value) -> Result<()> {
     let text = serde_json::to_string_pretty(&auth).map_err(|source| {
         CompanionError::InvalidConfig(format!("序列化 Codex auth.json 失败: {source}"))
     })?;
-    fs::write(&auth_path, format!("{text}\n"))
-        .map_err(|source| CompanionError::io(&auth_path, source))
+    atomic_write_private_file(&auth_path, format!("{text}\n").as_bytes())
 }
 
 fn merge_codex_auth(target: &mut Value, source: &Value) -> Result<()> {
@@ -786,8 +785,7 @@ impl AuthRollback {
     fn restore(&self, codex_dir: &Path) -> Result<()> {
         let auth_path = codex_dir.join("auth.json");
         match self.bytes.as_deref() {
-            Some(bytes) => fs::write(&auth_path, bytes)
-                .map_err(|source| CompanionError::io(&auth_path, source)),
+            Some(bytes) => atomic_write_private_file(&auth_path, bytes),
             None if auth_path.exists() => {
                 fs::remove_file(&auth_path).map_err(|source| CompanionError::io(&auth_path, source))
             }
@@ -1204,7 +1202,7 @@ fn write_optional_json(path: &Path, value: Option<&Value>) -> Result<()> {
         let text = serde_json::to_string_pretty(value).map_err(|source| {
             CompanionError::InvalidConfig(format!("序列化 Codex auth.json 失败: {source}"))
         })?;
-        fs::write(path, format!("{text}\n")).map_err(|source| CompanionError::io(path, source))
+        atomic_write_private_file(path, format!("{text}\n").as_bytes())
     } else if path.exists() {
         fs::remove_file(path).map_err(|source| CompanionError::io(path, source))
     } else {

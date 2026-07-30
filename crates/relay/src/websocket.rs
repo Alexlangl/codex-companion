@@ -108,7 +108,9 @@ fn authenticate_websocket_client(
         .map_err(|error| WebSocketAuthError::internal(error.to_string()))?
         .flatten();
     if api_client.is_none()
-        && (config.relay.require_api_key || headers.contains_key(header::ORIGIN))
+        && (config.relay.require_api_key
+            || state.enforce_api_key
+            || headers.contains_key(header::ORIGIN))
     {
         return Err(WebSocketAuthError::unauthorized(
             "WebSocket API key 无效或缺失",
@@ -510,6 +512,18 @@ mod tests {
                 .expect("header"),
         );
         authenticate_websocket_client(&state, &headers).expect("valid key");
+    }
+
+    #[test]
+    fn websocket_authentication_honors_the_runtime_api_key_floor() {
+        let state = state_with_group(Vec::new());
+        let state =
+            RelayState::new_with_api_key_floor(state.store.clone(), reqwest::Client::new(), true);
+        assert!(!state.store.load().expect("config").relay.require_api_key);
+
+        let missing =
+            authenticate_websocket_client(&state, &HeaderMap::new()).expect_err("missing key");
+        assert_eq!(missing.status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

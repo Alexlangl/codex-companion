@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{SecondsFormat, Utc};
-use codex_companion_core::{CompanionError, ProviderConfig, Result};
+use codex_companion_core::{atomic_write_private_file, CompanionError, ProviderConfig, Result};
 use crypto_box::SecretKey;
 use ed25519_dalek::{pkcs8::DecodePrivateKey, Signer, SigningKey};
 use serde::Deserialize;
@@ -316,39 +316,23 @@ fn decrypt_task_id(credential: &AgentIdentityCredential, encoded: &str) -> Resul
 }
 
 fn persist_task_id(credential: &AgentIdentityCredential, task_id: &str) -> Result<()> {
-    let mut value = read_auth_value(&credential.auth_path)?;
-    if json_string(&value, &["agent_runtime_id", "agentRuntimeId"]).as_deref()
-        != Some(credential.runtime_id.as_str())
-        || json_string(&value, &["agent_private_key", "agentPrivateKey"]).as_deref()
-            != Some(credential.encoded_private_key.as_str())
-    {
-        return Err(CompanionError::InvalidConfig(
-            "Agent Identity 凭据在 task 注册期间发生变化".to_string(),
-        ));
-    }
-    value["task_id"] = Value::String(task_id.to_string());
-    let text = serde_json::to_string_pretty(&value).map_err(|source| {
-        CompanionError::InvalidConfig(format!("Agent Identity task serialize failed: {source}"))
-    })?;
-    let temp_path = credential.auth_path.with_extension("json.tmp");
-    fs::write(&temp_path, format!("{text}\n"))
-        .map_err(|source| CompanionError::io(&temp_path, source))?;
-    harden_file_permissions(&temp_path)?;
-    fs::rename(&temp_path, &credential.auth_path)
-        .map_err(|source| CompanionError::io(&credential.auth_path, source))?;
-    harden_file_permissions(&credential.auth_path)
-}
-
-#[cfg(unix)]
-fn harden_file_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|source| CompanionError::io(path, source))
-}
-
-#[cfg(not(unix))]
-fn harden_file_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+    crate::with_private_auth_file_lock(&credential.auth_path, || {
+        let mut value = read_auth_value(&credential.auth_path)?;
+        if json_string(&value, &["agent_runtime_id", "agentRuntimeId"]).as_deref()
+            != Some(credential.runtime_id.as_str())
+            || json_string(&value, &["agent_private_key", "agentPrivateKey"]).as_deref()
+                != Some(credential.encoded_private_key.as_str())
+        {
+            return Err(CompanionError::InvalidConfig(
+                "Agent Identity 凭据在 task 注册期间发生变化".to_string(),
+            ));
+        }
+        value["task_id"] = Value::String(task_id.to_string());
+        let text = serde_json::to_string_pretty(&value).map_err(|source| {
+            CompanionError::InvalidConfig(format!("Agent Identity task serialize failed: {source}"))
+        })?;
+        atomic_write_private_file(&credential.auth_path, format!("{text}\n").as_bytes())
+    })
 }
 
 fn redact_assertions(body: &str) -> String {

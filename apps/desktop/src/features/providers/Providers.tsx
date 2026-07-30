@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import { Button, Field, Panel } from "../../components/ui";
-import { getProviderImportProgress, getProviderRefreshProgress } from "../../lib/api";
+import { getProviderImportProgress, getProviderRefreshProgress, reviewProviderJsonMany } from "../../lib/api";
 import { userFacingError } from "../../lib/errors";
 import { providerKindLabel } from "../../lib/format";
 import { providerAccountTitle, providerUsesAgentIdentity } from "../../lib/provider-display";
@@ -33,11 +33,19 @@ import type {
   ProviderLaunchMode,
   ProviderImportBatchReport,
   ProviderImportProgress,
+  ProviderImportReviewReport,
   ProviderRefreshProgress,
   ProviderViewMode,
 } from "../../types/domain";
 import { ProviderCard, ProviderCompactItem } from "./ProviderCards";
 import { emptyApiKeyForm, type ApiKeyForm, type ApiKeyKind, type JsonImportFile } from "./provider-types";
+
+interface PendingJsonImport {
+  sources: JsonImportFile[];
+  addToGroupId: string | null;
+  activeGroupName: string;
+  review: ProviderImportReviewReport;
+}
 
 export function Providers({
   busy,
@@ -93,9 +101,14 @@ export function Providers({
   const [refreshProgress, setRefreshProgress] = useState<ProviderRefreshProgress | null>(null);
   const [importProgress, setImportProgress] = useState<ProviderImportProgress | null>(null);
   const [importReport, setImportReport] = useState<ProviderImportBatchReport | null>(null);
+  const [importReviewError, setImportReviewError] = useState("");
+  const [importReviewing, setImportReviewing] = useState(false);
+  const [pendingJsonImport, setPendingJsonImport] = useState<PendingJsonImport | null>(null);
   const [addToCurrentGroup, setAddToCurrentGroup] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const exportRequestRef = useRef(0);
+  const importReviewRequestRef = useRef(0);
+  const importConfirmingRef = useRef(false);
   const disabled = busy !== "idle";
   const providers = Object.values(status.config.providers);
   const exportFormats = exportProvider ? exportFormatOptionsForProvider(exportProvider) : [];
@@ -173,18 +186,53 @@ export function Providers({
 
   async function submitJsonBatch(event: FormEvent) {
     event.preventDefault();
-    const report = await onImportJsonBatch(
-      jsonImportSources,
-      addToCurrentGroup ? status.config.relay.activeGroupId : null,
-    );
-    setImportReport(report);
-    if (report.failed.length === 0) {
-      setJsonFiles([]);
-      setPastedJson("");
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
+    const requestId = importReviewRequestRef.current + 1;
+    importReviewRequestRef.current = requestId;
+    const sources = jsonImportSources.map((source) => ({ ...source }));
+    const addToGroupId = addToCurrentGroup ? status.config.relay.activeGroupId : null;
+    setImportReviewing(true);
+    setImportReviewError("");
+    setImportReport(null);
+    try {
+      const review = await reviewJsonImportSources(sources);
+      if (importReviewRequestRef.current !== requestId) return;
+      setPendingJsonImport({
+        sources,
+        addToGroupId,
+        activeGroupName: status.activeGroup?.name ?? status.config.relay.activeGroupId,
+        review,
+      });
+    } catch (unknownError) {
+      if (importReviewRequestRef.current === requestId) {
+        setImportReviewError(userFacingError(unknownError));
       }
-      setAddOpen(false);
+    } finally {
+      if (importReviewRequestRef.current === requestId) {
+        setImportReviewing(false);
+      }
+    }
+  }
+
+  async function confirmJsonBatch() {
+    if (!pendingJsonImport || pendingJsonImport.review.ready.length === 0 || importConfirmingRef.current) return;
+    importConfirmingRef.current = true;
+    try {
+      const report = await onImportJsonBatch(
+        pendingJsonImport.sources,
+        pendingJsonImport.addToGroupId,
+      );
+      setImportReport(report);
+      setPendingJsonImport(null);
+      if (report.failed.length === 0) {
+        setJsonFiles([]);
+        setPastedJson("");
+        if (fileInputRef.current) {
+          fileInputRef.current.value = "";
+        }
+        setAddOpen(false);
+      }
+    } finally {
+      importConfirmingRef.current = false;
     }
   }
 
@@ -380,7 +428,13 @@ export function Providers({
 
       <Dialog.Root open={addOpen} onOpenChange={(open) => {
         setAddOpen(open);
-        if (!open) setImportReport(null);
+        if (!open) {
+          importReviewRequestRef.current += 1;
+          setImportReviewing(false);
+          setImportReviewError("");
+          setImportReport(null);
+          setPendingJsonImport(null);
+        }
       }}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
@@ -403,6 +457,8 @@ export function Providers({
               jsonImportSources={jsonImportSources}
               importProgress={importProgress}
               importReport={importReport}
+              importReviewError={importReviewError}
+              importReviewing={importReviewing}
               loadJsonFiles={loadJsonFiles}
               onImportLocal={importLocalAccount}
               apiKeyError={apiKeyError}
@@ -416,6 +472,38 @@ export function Providers({
               submitApiKey={submitApiKey}
               submitJsonBatch={submitJsonBatch}
             />
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root
+        open={Boolean(pendingJsonImport)}
+        onOpenChange={(open) => {
+          if (!open && !disabled) setPendingJsonImport(null);
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="dialog-content provider-import-review-dialog">
+            <div className="dialog-header">
+              <div>
+                <Dialog.Title className="dialog-title">确认导入目标</Dialog.Title>
+                <Dialog.Description className="dialog-description">
+                  请核对目标地址、凭据类型和覆盖行为。敏感值不会显示在预览中。
+                </Dialog.Description>
+              </div>
+              <Dialog.Close className="icon-button" aria-label="关闭导入确认" disabled={disabled}>
+                <X size={16} />
+              </Dialog.Close>
+            </div>
+            {pendingJsonImport ? (
+              <ProviderImportReview
+                disabled={disabled}
+                pendingImport={pendingJsonImport}
+                onCancel={() => setPendingJsonImport(null)}
+                onConfirm={() => void confirmJsonBatch()}
+              />
+            ) : null}
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
@@ -501,6 +589,140 @@ export function Providers({
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
+    </div>
+  );
+}
+
+async function reviewJsonImportSources(sources: JsonImportFile[]): Promise<ProviderImportReviewReport> {
+  const combined: ProviderImportReviewReport = {
+    total: 0,
+    ready: [],
+    failed: [],
+  };
+  const reviewedProviderIds = new Set<string>();
+  for (const source of sources) {
+    const offset = combined.total;
+    try {
+      const report = await reviewProviderJsonMany(source.text);
+      combined.total += report.total;
+      for (const item of report.ready) {
+        const willOverwrite = item.willOverwrite || reviewedProviderIds.has(item.providerId);
+        reviewedProviderIds.add(item.providerId);
+        combined.ready.push({
+          ...item,
+          index: item.index + offset,
+          label: `${source.name} · ${item.label}`,
+          willOverwrite,
+        });
+      }
+      combined.failed.push(
+        ...report.failed.map((failure) => ({
+          ...failure,
+          index: failure.index + offset,
+          label: `${source.name} · ${failure.label}`,
+        })),
+      );
+    } catch (unknownError) {
+      combined.total += 1;
+      combined.failed.push({
+        index: offset,
+        label: source.name,
+        message: userFacingError(unknownError),
+      });
+    }
+  }
+  return combined;
+}
+
+function ProviderImportReview({
+  disabled,
+  pendingImport,
+  onCancel,
+  onConfirm,
+}: {
+  disabled: boolean;
+  pendingImport: PendingJsonImport;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const { review } = pendingImport;
+  const overwriteCount = review.ready.filter((item) => item.willOverwrite).length;
+  const groupDescription = pendingImport.addToGroupId
+    ? `成功导入后加入当前分组“${pendingImport.activeGroupName}”`
+    : "成功导入后不会自动加入分组";
+
+  return (
+    <div className="provider-import-review">
+      <div className="provider-import-review-summary" aria-live="polite">
+        <strong>{review.ready.length} 项可导入</strong>
+        <span>{review.failed.length} 项无法导入</span>
+        {overwriteCount > 0 ? <span className="review-overwrite-summary">{overwriteCount} 项将覆盖现有 Provider</span> : null}
+      </div>
+
+      {review.ready.length > 0 ? (
+        <div className="provider-import-review-list" aria-label="可导入项目">
+          {review.ready.map((item) => (
+            <article className="provider-import-review-item" key={`${item.index}-${item.providerId}`}>
+              <div className="provider-import-review-item-header">
+                <div>
+                  <strong>{item.providerName}</strong>
+                  <span>{item.label}</span>
+                </div>
+                <div className="provider-import-review-badges">
+                  <span>{item.credentialKind}</span>
+                  {item.willOverwrite ? <span className="review-overwrite-badge">覆盖现有</span> : <span>新建</span>}
+                </div>
+              </div>
+              <dl className="provider-import-review-details">
+                <div>
+                  <dt>Provider ID</dt>
+                  <dd><code>{item.providerId}</code></dd>
+                </div>
+                <div>
+                  <dt>类型</dt>
+                  <dd>{providerKindLabel(item.providerKind)}</dd>
+                </div>
+                <div className="review-detail-wide">
+                  <dt>请求地址</dt>
+                  <dd><code>{item.baseUrl}</code></dd>
+                </div>
+                {item.websocketUrl ? (
+                  <div className="review-detail-wide">
+                    <dt>WebSocket</dt>
+                    <dd><code>{item.websocketUrl}</code></dd>
+                  </div>
+                ) : null}
+                {item.model ? (
+                  <div>
+                    <dt>模型</dt>
+                    <dd>{item.model}</dd>
+                  </div>
+                ) : null}
+              </dl>
+            </article>
+          ))}
+        </div>
+      ) : null}
+
+      {review.failed.length > 0 ? (
+        <div className="warning-box provider-import-review-failures" role="status">
+          <strong>{review.failed.length} 项不会导入</strong>
+          {review.failed.map((failure) => (
+            <p key={`${failure.index}-${failure.label}`}>{failure.label}：{failure.message}</p>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="provider-import-review-safety">
+        <p>{groupDescription}</p>
+        <p>OAuth token、API Key 与 Agent Identity 私钥均已隐藏；确认后才会写入本机私密文件。</p>
+      </div>
+      <div className="actions provider-import-review-actions">
+        <Button disabled={disabled} onClick={onCancel} variant="secondary">返回修改</Button>
+        <Button disabled={disabled || review.ready.length === 0} onClick={onConfirm}>
+          <Upload size={15} /> 确认导入 {review.ready.length} 项
+        </Button>
+      </div>
     </div>
   );
 }
@@ -670,6 +892,8 @@ function ProviderAddTabs({
   jsonImportSources,
   importProgress,
   importReport,
+  importReviewError,
+  importReviewing,
   loadJsonFiles,
   onImportLocal,
   apiKeyError,
@@ -689,6 +913,8 @@ function ProviderAddTabs({
   jsonImportSources: JsonImportFile[];
   importProgress: ProviderImportProgress | null;
   importReport: ProviderImportBatchReport | null;
+  importReviewError: string;
+  importReviewing: boolean;
   loadJsonFiles: (fileList: FileList | null) => Promise<void>;
   onImportLocal: () => Promise<void>;
   apiKeyError: string;
@@ -788,9 +1014,10 @@ function ProviderAddTabs({
               value={pastedJson}
             />
           </Field>
-          <button className="button button-default import-submit" disabled={disabled || jsonImportSources.length === 0} type="submit">
-            <Upload size={15} /> 导入
+          <button className="button button-default import-submit" disabled={disabled || importReviewing || jsonImportSources.length === 0} type="submit">
+            <Upload size={15} /> {importReviewing ? "正在检查..." : "预览导入"}
           </button>
+          {importReviewError ? <p className="field-error" role="alert">{importReviewError}</p> : null}
           <label className="check-row import-group-option">
             <input
               checked={addToCurrentGroup}

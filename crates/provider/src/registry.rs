@@ -1,6 +1,6 @@
+use crate::persist_with_private_auth_file;
 use crate::types::{ApiKeyProviderUpdate, ProviderUpsert};
 use crate::validate::{validate_base_url, validate_id};
-use crate::write_private_auth_file;
 use codex_companion_core::{
     CompanionError, ConfigStore, ProviderAccountInfo, ProviderConfig, ProviderGroup,
     ProviderHealth, ProviderKind, Result, DEFAULT_GROUP_ID,
@@ -80,6 +80,7 @@ pub fn update_api_key_provider(
 
     let mut auth_ref = existing.auth_ref.clone();
     let mut direct_auth_ref = existing.direct_auth_ref.clone();
+    let mut private_auth_write = None;
     if let Some(api_key) = new_api_key {
         let auth_path = store
             .data_dir()
@@ -100,9 +101,9 @@ pub fn update_api_key_provider(
         let text = serde_json::to_string_pretty(&auth).map_err(|source| {
             CompanionError::InvalidConfig(format!("provider API key serialize failed: {source}"))
         })?;
-        write_private_auth_file(&auth_path, &format!("{text}\n"))?;
         auth_ref = Some(format!("file:{}", auth_path.display()));
         direct_auth_ref = None;
+        private_auth_write = Some((auth_path, format!("{text}\n")));
     } else if let Some(env_var) = new_env_var {
         auth_ref = Some(format!("env:{env_var}"));
         direct_auth_ref = Some(format!("env:{env_var}"));
@@ -123,23 +124,27 @@ pub fn update_api_key_provider(
     account.display_name = Some(provider_name.clone());
     account.subscription_type = Some("API Key".to_string());
 
-    add_provider(
-        store,
-        ProviderUpsert {
-            id: input.id,
-            name: provider_name,
-            kind: input.kind,
-            base_url,
-            websocket_url: input.websocket_url,
-            auth_ref,
-            direct_auth_ref,
-            model_map: existing.model_map,
-            priority: existing.priority,
-            enabled: existing.enabled,
-            refresh_interval_seconds: input.refresh_interval_seconds,
-            account: Some(account),
-        },
-    )
+    let provider_input = ProviderUpsert {
+        id: input.id,
+        name: provider_name,
+        kind: input.kind,
+        base_url,
+        websocket_url: input.websocket_url,
+        auth_ref,
+        direct_auth_ref,
+        model_map: existing.model_map,
+        priority: existing.priority,
+        enabled: existing.enabled,
+        refresh_interval_seconds: input.refresh_interval_seconds,
+        account: Some(account),
+    };
+    let persist_provider = || add_provider(store, provider_input);
+    match private_auth_write {
+        Some((auth_path, contents)) => {
+            persist_with_private_auth_file(&auth_path, &contents, persist_provider)
+        }
+        None => persist_provider(),
+    }
 }
 
 pub fn remove_provider(store: &ConfigStore, id: &str) -> Result<bool> {

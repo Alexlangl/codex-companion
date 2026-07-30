@@ -445,6 +445,26 @@ export interface ProviderImportFailure {
   message: string;
 }
 
+export interface ProviderImportReviewItem {
+  index: number;
+  label: string;
+  providerId: string;
+  providerName: string;
+  providerKind: ProviderKind;
+  importKind: string;
+  credentialKind: string;
+  baseUrl: string;
+  websocketUrl?: string | null;
+  model?: string | null;
+  willOverwrite: boolean;
+}
+
+export interface ProviderImportReviewReport {
+  total: number;
+  ready: ProviderImportReviewItem[];
+  failed: ProviderImportFailure[];
+}
+
 export interface ProviderImportBatchReport {
   total: number;
   succeeded: ProviderImportOutcome[];

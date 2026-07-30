@@ -26,6 +26,7 @@ pub(crate) struct RelayState {
     pub store: ConfigStore,
     pub client: reqwest::Client,
     pub api_service: ApiServiceStore,
+    pub enforce_api_key: bool,
     session_affinity: Arc<Mutex<HashMap<String, SessionAffinityBinding>>>,
     priority_failback_baselines: Arc<HashMap<String, u64>>,
     provider_inflight: Arc<Mutex<HashMap<String, usize>>>,
@@ -71,7 +72,16 @@ impl Drop for ProviderRequestGuard {
 }
 
 impl RelayState {
+    #[cfg(test)]
     pub(crate) fn new(store: ConfigStore, client: reqwest::Client) -> Self {
+        Self::new_with_api_key_floor(store, client, false)
+    }
+
+    pub(crate) fn new_with_api_key_floor(
+        store: ConfigStore,
+        client: reqwest::Client,
+        enforce_api_key: bool,
+    ) -> Self {
         let api_service = ApiServiceStore::from_config_store(&store);
         let _ = api_service.initialize();
         let priority_failback_baselines = store
@@ -88,6 +98,7 @@ impl RelayState {
             store,
             client,
             api_service,
+            enforce_api_key,
             session_affinity: Arc::new(Mutex::new(HashMap::new())),
             priority_failback_baselines: Arc::new(priority_failback_baselines),
             provider_inflight: Arc::new(Mutex::new(HashMap::new())),

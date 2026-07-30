@@ -3,7 +3,7 @@ use codex_companion_core::{
     ProviderLaunchMode, RepairOptions, TokenUsageSummary,
 };
 use codex_companion_daemon::{provider_can_direct_connect, CompanionDaemon};
-use codex_companion_provider::GroupUpsert;
+use codex_companion_provider::{GroupUpsert, ProviderImportReviewReport};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -405,13 +405,29 @@ fn import_json(daemon: &CompanionDaemon, app: &mut TuiState) {
     let Some(path) = prompt("JSON 文件路径") else {
         return;
     };
-    match fs::read_to_string(PathBuf::from(path.trim()))
-        .map_err(|error| error.to_string())
-        .and_then(|text| {
-            daemon
-                .import_provider_json_many(&text, None, None, None)
-                .map_err(|error| error.to_string())
-        }) {
+    let text = match fs::read_to_string(PathBuf::from(path.trim())) {
+        Ok(text) => text,
+        Err(error) => {
+            app.message = format!("读取导入文件失败：{error}");
+            return;
+        }
+    };
+    let review = match daemon.review_provider_json_many(&text, None, None) {
+        Ok(review) => review,
+        Err(error) => {
+            app.message = format!("导入预览失败：{error}");
+            return;
+        }
+    };
+    if review.ready.is_empty() {
+        app.message = format!("没有可导入账号，{} 项检查失败。", review.failed.len());
+        return;
+    }
+    if !confirm_provider_import(&review) {
+        app.message = "已取消导入，未写入凭据。".to_string();
+        return;
+    }
+    match daemon.import_provider_json_many(&text, None, None, None) {
         Ok(outcomes) => {
             app.message = format!(
                 "已导入 {} 个账号，{} 个失败。",
@@ -421,6 +437,37 @@ fn import_json(daemon: &CompanionDaemon, app: &mut TuiState) {
         }
         Err(error) => app.message = format!("导入失败：{error}"),
     }
+}
+
+fn confirm_provider_import(review: &ProviderImportReviewReport) -> bool {
+    let mut message = format!(
+        "导入预览：{} 项可导入，{} 项失败",
+        review.ready.len(),
+        review.failed.len()
+    );
+    for item in &review.ready {
+        let action = if item.will_overwrite {
+            "覆盖"
+        } else {
+            "新建"
+        };
+        let websocket = item
+            .websocket_url
+            .as_deref()
+            .map(|url| format!(" · WebSocket {url}"))
+            .unwrap_or_default();
+        message.push_str(&format!(
+            "\n- {} · {} · {} · {} · {}{}",
+            item.provider_name,
+            item.credential_kind,
+            action,
+            item.provider_id,
+            item.base_url,
+            websocket
+        ));
+    }
+    message.push_str("\n输入 YES 确认导入");
+    matches!(prompt(&message).as_deref(), Some("YES"))
 }
 
 fn add_api_key(daemon: &CompanionDaemon, app: &mut TuiState) {

@@ -194,6 +194,9 @@ struct ProviderImportArgs {
     provider_id: Option<String>,
     #[arg(long)]
     provider_name: Option<String>,
+    /// 明确确认已核对导入目标并执行写入。
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -373,6 +376,21 @@ async fn main() -> anyhow::Result<()> {
             }
             ProviderCommand::Import(args) => {
                 let json_text = fs::read_to_string(&args.json_file)?;
+                let review = daemon.review_provider_json_many(
+                    &json_text,
+                    args.provider_id.clone(),
+                    args.provider_name.clone(),
+                )?;
+                if !args.yes {
+                    print_json(&review)?;
+                    anyhow::bail!(
+                        "导入预览已生成，尚未写入；核对目标地址、凭据类型和覆盖行为后，加 --yes 确认"
+                    );
+                }
+                if review.ready.is_empty() {
+                    print_json(&review)?;
+                    anyhow::bail!("没有可导入的 Provider，未写入任何凭据");
+                }
                 print_json(daemon.import_provider_json_many(
                     &json_text,
                     args.provider_id,

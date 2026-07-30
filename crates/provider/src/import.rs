@@ -1,24 +1,44 @@
+use crate::persist_with_private_auth_file;
 use crate::registry::add_provider;
 use crate::types::{
     ProviderImportBatchReport, ProviderImportDraft, ProviderImportFailure, ProviderImportOutcome,
-    ProviderUpsert, OFFICIAL_CODEX_BASE_URL,
+    ProviderImportReviewItem, ProviderImportReviewReport, ProviderUpsert, OFFICIAL_CODEX_BASE_URL,
 };
-use crate::write_private_auth_file;
 use base64::{engine::general_purpose, Engine as _};
 use codex_companion_core::{
-    default_codex_dir, default_refresh_interval_seconds, CompanionError, ConfigStore,
-    ProviderAccountInfo, ProviderImportProgress, ProviderKind, ProviderQuotaWindow, Result,
-    COMPANION_PROVIDER_ID,
+    default_codex_dir, default_refresh_interval_seconds, redact_sensitive_text, CompanionError,
+    ConfigStore, ProviderAccountInfo, ProviderImportProgress, ProviderKind, ProviderQuotaWindow,
+    Result, COMPANION_PROVIDER_ID,
 };
 use ed25519_dalek::{pkcs8::DecodePrivateKey, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use toml_edit::{DocumentMut, Item};
+
+enum ProviderImportPlan {
+    OAuth {
+        draft: ProviderImportDraft,
+        auth: serde_json::Value,
+        account: ProviderAccountInfo,
+    },
+    AgentIdentity {
+        auth: serde_json::Value,
+        account: ProviderAccountInfo,
+        account_id: String,
+        provider_id: String,
+        provider_name: String,
+    },
+    ApiKey {
+        input: ApiKeyProviderImportRequest,
+        provider_id: String,
+        account_email: Option<String>,
+    },
+}
 
 pub fn import_provider_json(
     store: &ConfigStore,
@@ -29,28 +49,117 @@ pub fn import_provider_json(
     let value = serde_json::from_str::<serde_json::Value>(json_text).map_err(|source| {
         CompanionError::InvalidConfig(format!("provider JSON parse failed: {source}"))
     })?;
-    if let Some(auth) = extract_agent_identity_auth(&value) {
-        return import_agent_identity_provider(store, &value, auth, provider_id, provider_name);
+    let plan = prepare_provider_import(
+        store,
+        &value,
+        provider_id.as_deref(),
+        provider_name.as_deref(),
+    )?;
+    execute_provider_import(store, plan)
+}
+
+fn prepare_provider_import(
+    store: &ConfigStore,
+    value: &serde_json::Value,
+    explicit_provider_id: Option<&str>,
+    explicit_provider_name: Option<&str>,
+) -> Result<ProviderImportPlan> {
+    if let Some(auth) = extract_agent_identity_auth(value) {
+        validate_agent_identity_auth(&auth)?;
+        let account = extract_provider_account_info(value, &auth);
+        let account_id = account.account_id.clone().ok_or_else(|| {
+            CompanionError::InvalidConfig("Agent Identity 缺少 ChatGPT account id".to_string())
+        })?;
+        let user_id = account.user_id.as_deref();
+        let provider_name = explicit_provider_name
+            .and_then(normalize_non_empty)
+            .or_else(|| account.email.clone())
+            .or_else(|| account.display_name.clone())
+            .unwrap_or_else(|| "Codex 官方账号".to_string());
+        let existing_provider_id = existing_provider_id_for_identity(store, &account_id, user_id)?;
+        let provider_id = explicit_provider_id
+            .and_then(sanitize_provider_id)
+            .or(existing_provider_id)
+            .unwrap_or_else(|| {
+                derive_oauth_provider_id(
+                    &provider_name,
+                    &account_identity_key(&account_id, user_id),
+                )
+            });
+        return Ok(ProviderImportPlan::AgentIdentity {
+            auth,
+            account,
+            account_id,
+            provider_id,
+            provider_name,
+        });
     }
-    if is_auth_mode_api_key(&value)
-        || is_newapi_channel_connection(&value)
-        || extract_api_key(&value).is_some()
+    if is_auth_mode_api_key(value)
+        || is_newapi_channel_connection(value)
+        || extract_api_key(value).is_some()
     {
-        return import_api_key_provider_from_json(store, &value, provider_id, provider_name);
+        return prepare_api_key_provider_from_json(
+            value,
+            explicit_provider_id,
+            explicit_provider_name,
+        );
     }
     let mut draft =
-        parse_provider_import_draft(&value, provider_id.as_deref(), provider_name.as_deref())?;
-    if provider_id
-        .as_deref()
-        .and_then(normalize_non_empty)
-        .is_none()
-    {
+        parse_provider_import_draft(value, explicit_provider_id, explicit_provider_name)?;
+    if explicit_provider_id.and_then(normalize_non_empty).is_none() {
         if let Some(existing_id) =
             existing_provider_id_for_identity(store, &draft.account_id, draft.user_id.as_deref())?
         {
             draft.provider_id = existing_id;
         }
     }
+    let auth = extract_codex_oauth_auth(value).ok_or_else(unsupported_import_error)?;
+    let account = extract_provider_account_info(value, &auth);
+    Ok(ProviderImportPlan::OAuth {
+        draft,
+        auth,
+        account,
+    })
+}
+
+fn execute_provider_import(
+    store: &ConfigStore,
+    plan: ProviderImportPlan,
+) -> Result<ProviderImportOutcome> {
+    match plan {
+        ProviderImportPlan::OAuth {
+            draft,
+            auth,
+            account,
+        } => import_oauth_provider(store, draft, auth, account),
+        ProviderImportPlan::AgentIdentity {
+            auth,
+            account,
+            account_id,
+            provider_id,
+            provider_name,
+        } => import_agent_identity_provider(
+            store,
+            auth,
+            account,
+            account_id,
+            provider_id,
+            provider_name,
+        ),
+        ProviderImportPlan::ApiKey {
+            input,
+            provider_id,
+            account_email,
+        } => import_api_key_provider_with_metadata(store, input, Some(provider_id), account_email),
+    }
+}
+
+fn import_oauth_provider(
+    store: &ConfigStore,
+    draft: ProviderImportDraft,
+    auth: serde_json::Value,
+    account: ProviderAccountInfo,
+) -> Result<ProviderImportOutcome> {
     let auth_path = store
         .data_dir()
         .join("auth")
@@ -60,35 +169,33 @@ pub fn import_provider_json(
         fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
     }
 
-    let auth = extract_codex_oauth_auth(&value).ok_or_else(unsupported_import_error)?;
-    let account = extract_provider_account_info(&value, &auth);
     let text = serde_json::to_string_pretty(&auth).map_err(|source| {
         CompanionError::InvalidConfig(format!("provider JSON serialize failed: {source}"))
     })?;
-    write_private_auth_file(&auth_path, &format!("{text}\n"))?;
+    let auth_contents = format!("{text}\n");
 
     let mut model_map = BTreeMap::new();
     if let Some(model) = draft.model.as_ref() {
         model_map.insert(model.clone(), model.clone());
     }
     let existed = store.load()?.providers.contains_key(&draft.provider_id);
-    let provider = add_provider(
-        store,
-        ProviderUpsert {
-            id: draft.provider_id,
-            name: draft.provider_name,
-            kind: ProviderKind::OfficialCodex,
-            base_url: draft.base_url,
-            websocket_url: None,
-            auth_ref: Some(format!("file:{}", auth_path.display())),
-            direct_auth_ref: None,
-            model_map,
-            priority: 50,
-            enabled: true,
-            refresh_interval_seconds: default_refresh_interval_seconds(),
-            account: Some(account),
-        },
-    )?;
+    let provider_input = ProviderUpsert {
+        id: draft.provider_id,
+        name: draft.provider_name,
+        kind: ProviderKind::OfficialCodex,
+        base_url: draft.base_url,
+        websocket_url: None,
+        auth_ref: Some(format!("file:{}", auth_path.display())),
+        direct_auth_ref: None,
+        model_map,
+        priority: 50,
+        enabled: true,
+        refresh_interval_seconds: default_refresh_interval_seconds(),
+        account: Some(account),
+    };
+    let provider = persist_with_private_auth_file(&auth_path, &auth_contents, || {
+        add_provider(store, provider_input)
+    })?;
 
     Ok(ProviderImportOutcome {
         provider,
@@ -106,35 +213,12 @@ pub fn import_provider_json(
 
 fn import_agent_identity_provider(
     store: &ConfigStore,
-    value: &serde_json::Value,
     auth: serde_json::Value,
-    explicit_provider_id: Option<String>,
-    explicit_provider_name: Option<String>,
+    account: ProviderAccountInfo,
+    account_id: String,
+    provider_id: String,
+    provider_name: String,
 ) -> Result<ProviderImportOutcome> {
-    validate_agent_identity_auth(&auth)?;
-    let account = extract_provider_account_info(value, &auth);
-    let account_id = account.account_id.clone().ok_or_else(|| {
-        CompanionError::InvalidConfig("Agent Identity 缺少 ChatGPT account id".to_string())
-    })?;
-    let user_id = account.user_id.clone();
-    let provider_name = explicit_provider_name
-        .as_deref()
-        .and_then(normalize_non_empty)
-        .or_else(|| account.email.clone())
-        .or_else(|| account.display_name.clone())
-        .unwrap_or_else(|| "Codex 官方账号".to_string());
-    let existing_provider_id =
-        existing_provider_id_for_identity(store, &account_id, user_id.as_deref())?;
-    let provider_id = explicit_provider_id
-        .as_deref()
-        .and_then(sanitize_provider_id)
-        .or(existing_provider_id)
-        .unwrap_or_else(|| {
-            derive_oauth_provider_id(
-                &provider_name,
-                &account_identity_key(&account_id, user_id.as_deref()),
-            )
-        });
     let auth_path = store
         .data_dir()
         .join("auth")
@@ -146,26 +230,26 @@ fn import_agent_identity_provider(
     let text = serde_json::to_string_pretty(&auth).map_err(|source| {
         CompanionError::InvalidConfig(format!("Agent Identity serialize failed: {source}"))
     })?;
-    write_private_auth_file(&auth_path, &format!("{text}\n"))?;
+    let auth_contents = format!("{text}\n");
 
     let existed = store.load()?.providers.contains_key(&provider_id);
-    let provider = add_provider(
-        store,
-        ProviderUpsert {
-            id: provider_id,
-            name: provider_name,
-            kind: ProviderKind::OfficialCodex,
-            base_url: OFFICIAL_CODEX_BASE_URL.to_string(),
-            websocket_url: None,
-            auth_ref: Some(format!("file:{}", auth_path.display())),
-            direct_auth_ref: None,
-            model_map: BTreeMap::new(),
-            priority: 50,
-            enabled: true,
-            refresh_interval_seconds: default_refresh_interval_seconds(),
-            account: Some(account),
-        },
-    )?;
+    let provider_input = ProviderUpsert {
+        id: provider_id,
+        name: provider_name,
+        kind: ProviderKind::OfficialCodex,
+        base_url: OFFICIAL_CODEX_BASE_URL.to_string(),
+        websocket_url: None,
+        auth_ref: Some(format!("file:{}", auth_path.display())),
+        direct_auth_ref: None,
+        model_map: BTreeMap::new(),
+        priority: 50,
+        enabled: true,
+        refresh_interval_seconds: default_refresh_interval_seconds(),
+        account: Some(account),
+    };
+    let provider = persist_with_private_auth_file(&auth_path, &auth_contents, || {
+        add_provider(store, provider_input)
+    })?;
 
     Ok(ProviderImportOutcome {
         provider,
@@ -198,50 +282,7 @@ pub fn import_provider_json_many(
     provider_name: Option<String>,
     add_to_group_id: Option<String>,
 ) -> Result<ProviderImportBatchReport> {
-    let value = serde_json::from_str::<serde_json::Value>(json_text).map_err(|source| {
-        CompanionError::InvalidConfig(format!("provider JSON parse failed: {source}"))
-    })?;
-    let items = if let Some(items) = value.as_array().filter(|items| !items.is_empty()) {
-        if provider_id
-            .as_deref()
-            .and_then(normalize_non_empty)
-            .is_some()
-        {
-            return Err(CompanionError::InvalidConfig(
-                "批量 provider JSON 不能同时指定单个 provider id".to_string(),
-            ));
-        }
-        items.clone()
-    } else if let Some(accounts) = value
-        .get("accounts")
-        .and_then(serde_json::Value::as_array)
-        .filter(|accounts| accounts.len() > 1)
-    {
-        if provider_id
-            .as_deref()
-            .and_then(normalize_non_empty)
-            .is_some()
-        {
-            return Err(CompanionError::InvalidConfig(
-                "批量账号 JSON 不能同时指定单个 provider id".to_string(),
-            ));
-        }
-        accounts
-            .iter()
-            .map(|account| {
-                let mut item = value.clone();
-                if let Some(object) = item.as_object_mut() {
-                    object.insert(
-                        "accounts".to_string(),
-                        serde_json::Value::Array(vec![account.clone()]),
-                    );
-                }
-                item
-            })
-            .collect()
-    } else {
-        vec![value]
-    };
+    let items = parse_provider_import_items(json_text, provider_id.as_deref())?;
 
     set_provider_import_progress(ProviderImportProgress {
         active: true,
@@ -267,7 +308,7 @@ pub fn import_provider_json_many(
             Err(error) => report.failed.push(ProviderImportFailure {
                 index,
                 label,
-                message: error.to_string(),
+                message: redact_sensitive_text(&error.to_string()),
             }),
         }
     }
@@ -277,6 +318,151 @@ pub fn import_provider_json_many(
     }
     finish_provider_import_progress(report.succeeded.len(), report.failed.len());
     Ok(report)
+}
+
+pub fn review_provider_json_many(
+    store: &ConfigStore,
+    json_text: &str,
+    provider_id: Option<String>,
+    provider_name: Option<String>,
+) -> Result<ProviderImportReviewReport> {
+    let items = parse_provider_import_items(json_text, provider_id.as_deref())?;
+    let config = store.load()?;
+    let mut report = ProviderImportReviewReport {
+        total: items.len(),
+        ..ProviderImportReviewReport::default()
+    };
+    let mut reviewed_provider_ids = BTreeSet::new();
+    for (index, item) in items.into_iter().enumerate() {
+        let label = import_item_label(&item, index);
+        let item_provider_id = (report.total == 1)
+            .then_some(provider_id.as_deref())
+            .flatten();
+        match prepare_provider_import(store, &item, item_provider_id, provider_name.as_deref()) {
+            Ok(plan) => {
+                let provider_id = provider_import_id(&plan);
+                let will_overwrite = config.providers.contains_key(provider_id)
+                    || !reviewed_provider_ids.insert(provider_id.to_string());
+                report.ready.push(provider_import_review_item(
+                    &plan,
+                    index,
+                    label,
+                    will_overwrite,
+                ));
+            }
+            Err(error) => report.failed.push(ProviderImportFailure {
+                index,
+                label,
+                message: redact_sensitive_text(&error.to_string()),
+            }),
+        }
+    }
+    Ok(report)
+}
+
+fn parse_provider_import_items(
+    json_text: &str,
+    explicit_provider_id: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    let value = serde_json::from_str::<serde_json::Value>(json_text).map_err(|source| {
+        CompanionError::InvalidConfig(format!("provider JSON parse failed: {source}"))
+    })?;
+    if let Some(items) = value.as_array().filter(|items| !items.is_empty()) {
+        if explicit_provider_id.and_then(normalize_non_empty).is_some() {
+            return Err(CompanionError::InvalidConfig(
+                "批量 provider JSON 不能同时指定单个 provider id".to_string(),
+            ));
+        }
+        return Ok(items.clone());
+    }
+    if let Some(accounts) = value
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .filter(|accounts| accounts.len() > 1)
+    {
+        if explicit_provider_id.and_then(normalize_non_empty).is_some() {
+            return Err(CompanionError::InvalidConfig(
+                "批量账号 JSON 不能同时指定单个 provider id".to_string(),
+            ));
+        }
+        return Ok(accounts
+            .iter()
+            .map(|account| {
+                let mut item = value.clone();
+                if let Some(object) = item.as_object_mut() {
+                    object.insert(
+                        "accounts".to_string(),
+                        serde_json::Value::Array(vec![account.clone()]),
+                    );
+                }
+                item
+            })
+            .collect());
+    }
+    Ok(vec![value])
+}
+
+fn provider_import_id(plan: &ProviderImportPlan) -> &str {
+    match plan {
+        ProviderImportPlan::OAuth { draft, .. } => &draft.provider_id,
+        ProviderImportPlan::AgentIdentity { provider_id, .. }
+        | ProviderImportPlan::ApiKey { provider_id, .. } => provider_id,
+    }
+}
+
+fn provider_import_review_item(
+    plan: &ProviderImportPlan,
+    index: usize,
+    label: String,
+    will_overwrite: bool,
+) -> ProviderImportReviewItem {
+    match plan {
+        ProviderImportPlan::OAuth { draft, .. } => ProviderImportReviewItem {
+            index,
+            label,
+            provider_id: draft.provider_id.clone(),
+            provider_name: redact_sensitive_text(&draft.provider_name),
+            provider_kind: ProviderKind::OfficialCodex,
+            import_kind: draft.import_kind.clone(),
+            credential_kind: "OAuth tokens".to_string(),
+            base_url: redact_sensitive_text(&draft.base_url),
+            websocket_url: None,
+            model: draft.model.as_deref().map(redact_sensitive_text),
+            will_overwrite,
+        },
+        ProviderImportPlan::AgentIdentity {
+            provider_id,
+            provider_name,
+            ..
+        } => ProviderImportReviewItem {
+            index,
+            label,
+            provider_id: provider_id.clone(),
+            provider_name: redact_sensitive_text(provider_name),
+            provider_kind: ProviderKind::OfficialCodex,
+            import_kind: "agent_identity".to_string(),
+            credential_kind: "Agent Identity 私钥".to_string(),
+            base_url: OFFICIAL_CODEX_BASE_URL.to_string(),
+            websocket_url: None,
+            model: None,
+            will_overwrite,
+        },
+        ProviderImportPlan::ApiKey {
+            input, provider_id, ..
+        } => ProviderImportReviewItem {
+            index,
+            label,
+            provider_id: provider_id.clone(),
+            provider_name: redact_sensitive_text(&input.provider_name),
+            provider_kind: input.kind.clone(),
+            import_kind: "api_key".to_string(),
+            credential_kind: "API Key".to_string(),
+            base_url: redact_sensitive_text(&input.base_url),
+            websocket_url: input.websocket_url.as_deref().map(redact_sensitive_text),
+            model: input.model.as_deref().map(redact_sensitive_text),
+            will_overwrite,
+        },
+    }
 }
 
 fn import_item_label(value: &serde_json::Value, index: usize) -> String {
@@ -292,6 +478,7 @@ fn import_item_label(value: &serde_json::Value, index: usize) -> String {
             &["credentials", "email"],
         ],
     )
+    .map(|label| redact_sensitive_text(&label))
     .unwrap_or_else(|| format!("账号 {}", index + 1))
 }
 
@@ -438,7 +625,7 @@ fn import_api_key_provider_with_metadata(
         .join("api-keys")
         .join(format!("{provider_id}.json"));
 
-    let auth_ref = if let Some(api_key) = api_key {
+    let (auth_ref, auth_contents) = if let Some(api_key) = api_key {
         if let Some(parent) = auth_path.parent() {
             fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
         }
@@ -448,10 +635,12 @@ fn import_api_key_provider_with_metadata(
         let text = serde_json::to_string_pretty(&auth).map_err(|source| {
             CompanionError::InvalidConfig(format!("provider API key serialize failed: {source}"))
         })?;
-        write_private_auth_file(&auth_path, &format!("{text}\n"))?;
-        Some(format!("file:{}", auth_path.display()))
+        (
+            Some(format!("file:{}", auth_path.display())),
+            Some(format!("{text}\n")),
+        )
     } else {
-        env_var.as_ref().map(|value| format!("env:{value}"))
+        (env_var.as_ref().map(|value| format!("env:{value}")), None)
     };
     let direct_auth_ref = env_var.as_ref().map(|value| format!("env:{value}"));
 
@@ -460,31 +649,35 @@ fn import_api_key_provider_with_metadata(
         model_map.insert(model.clone(), model);
     }
     let existed = store.load()?.providers.contains_key(&provider_id);
-    let provider = add_provider(
-        store,
-        ProviderUpsert {
-            id: provider_id,
-            name: provider_name.clone(),
-            kind,
-            base_url,
-            websocket_url,
-            auth_ref,
-            direct_auth_ref,
-            model_map,
-            priority: 100,
-            enabled: true,
-            refresh_interval_seconds: refresh_interval_seconds
-                .unwrap_or_else(default_refresh_interval_seconds),
-            account: Some(ProviderAccountInfo {
-                auth_mode: Some("apikey".to_string()),
-                display_name: Some(provider_name.clone()),
-                email: account_email,
-                subscription_type: Some("API Key".to_string()),
-                subscription_status: Some("待检查".to_string()),
-                ..ProviderAccountInfo::default()
-            }),
-        },
-    )?;
+    let provider_input = ProviderUpsert {
+        id: provider_id,
+        name: provider_name.clone(),
+        kind,
+        base_url,
+        websocket_url,
+        auth_ref,
+        direct_auth_ref,
+        model_map,
+        priority: 100,
+        enabled: true,
+        refresh_interval_seconds: refresh_interval_seconds
+            .unwrap_or_else(default_refresh_interval_seconds),
+        account: Some(ProviderAccountInfo {
+            auth_mode: Some("apikey".to_string()),
+            display_name: Some(provider_name.clone()),
+            email: account_email,
+            subscription_type: Some("API Key".to_string()),
+            subscription_status: Some("待检查".to_string()),
+            ..ProviderAccountInfo::default()
+        }),
+    };
+    let persist_provider = || add_provider(store, provider_input);
+    let provider = match auth_contents {
+        Some(auth_contents) => {
+            persist_with_private_auth_file(&auth_path, &auth_contents, persist_provider)
+        }
+        None => persist_provider(),
+    }?;
 
     Ok(ProviderImportOutcome {
         provider,
@@ -500,12 +693,11 @@ fn import_api_key_provider_with_metadata(
     })
 }
 
-fn import_api_key_provider_from_json(
-    store: &ConfigStore,
+fn prepare_api_key_provider_from_json(
     value: &serde_json::Value,
-    explicit_provider_id: Option<String>,
-    explicit_provider_name: Option<String>,
-) -> Result<ProviderImportOutcome> {
+    explicit_provider_id: Option<&str>,
+    explicit_provider_name: Option<&str>,
+) -> Result<ProviderImportPlan> {
     let api_key = extract_api_key(value).ok_or_else(|| {
         let message = if is_newapi_channel_connection(value) {
             "New API 连接 JSON 缺少 key"
@@ -532,22 +724,26 @@ fn import_api_key_provider_from_json(
         )));
     }
     let provider_name = explicit_provider_name
-        .as_deref()
         .and_then(normalize_non_empty)
         .or_else(|| pick_string(value, &[&["api_provider_name"], &["apiProviderName"]]))
         .or_else(|| pick_string(value, &[&["provider_name"], &["providerName"], &["name"]]))
         .or_else(|| Some(provider_name_from_base_url(Some(&base_url))))
         .unwrap_or_else(|| "OpenAI API Key".to_string());
     let provider_id = explicit_provider_id
-        .or_else(|| pick_string(value, &[&["api_provider_id"], &["apiProviderId"]]));
+        .and_then(sanitize_provider_id)
+        .or_else(|| {
+            pick_string(value, &[&["api_provider_id"], &["apiProviderId"]])
+                .as_deref()
+                .and_then(sanitize_provider_id)
+        })
+        .unwrap_or_else(|| derive_api_key_provider_id(&provider_name, &base_url));
     let email = pick_string(value, &[&["email"], &["account", "email"]]);
     let model = extract_model(value);
     let kind = infer_api_key_provider_kind(value, &base_url);
     let websocket_url = extract_websocket_url(value);
 
-    import_api_key_provider_with_metadata(
-        store,
-        ApiKeyProviderImportRequest {
+    Ok(ProviderImportPlan::ApiKey {
+        input: ApiKeyProviderImportRequest {
             provider_name,
             kind,
             base_url,
@@ -558,8 +754,8 @@ fn import_api_key_provider_from_json(
             refresh_interval_seconds: None,
         },
         provider_id,
-        email,
-    )
+        account_email: email,
+    })
 }
 
 fn infer_api_key_provider_kind(value: &serde_json::Value, base_url: &str) -> ProviderKind {
@@ -603,14 +799,14 @@ pub fn import_local_codex_provider(
     let value = serde_json::from_str::<serde_json::Value>(&text)
         .map_err(|source| CompanionError::json(&auth_path, source))?;
     let config_provider = read_codex_provider_config(&codex_dir);
-    if let Some(agent_identity_auth) = extract_agent_identity_auth(&value) {
-        let mut outcome = import_agent_identity_provider(
+    if extract_agent_identity_auth(&value).is_some() {
+        let plan = prepare_provider_import(
             store,
             &value,
-            agent_identity_auth,
             None,
-            config_provider.provider_name.clone(),
+            config_provider.provider_name.as_deref(),
         )?;
+        let mut outcome = execute_provider_import(store, plan)?;
         if let Some(model) = config_provider.model.as_ref() {
             let provider = store.update(|config| {
                 let provider = config
@@ -1959,6 +2155,122 @@ mod tests {
             config.groups[codex_companion_core::DEFAULT_GROUP_ID].provider_order,
             vec!["valid_provider".to_string()]
         );
+    }
+
+    #[test]
+    fn import_review_is_read_only_and_never_returns_credentials() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let value = serde_json::json!([
+            {
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": "sk-review-secret",
+                "api_base_url": "https://review.example.com/v1",
+                "api_provider_id": "review_provider",
+                "api_provider_name": "Review Provider",
+                "model": "review-model"
+            },
+            {
+                "auth_mode": "apikey",
+                "api_base_url": "https://invalid.example.com/v1"
+            }
+        ]);
+
+        let report =
+            review_provider_json_many(&store, &value.to_string(), None, None).expect("review");
+        let serialized = serde_json::to_string(&report).expect("serialize review");
+
+        assert_eq!(report.total, 2);
+        assert_eq!(report.ready.len(), 1);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.ready[0].provider_id, "review_provider");
+        assert_eq!(report.ready[0].credential_kind, "API Key");
+        assert_eq!(report.ready[0].model.as_deref(), Some("review-model"));
+        assert!(!report.ready[0].will_overwrite);
+        assert!(!serialized.contains("sk-review-secret"));
+        assert!(store.load().expect("config").providers.is_empty());
+        assert!(!store.data_dir().join("auth").exists());
+    }
+
+    #[test]
+    fn failed_provider_persistence_rolls_back_private_auth_file() {
+        let temp = tempfile::tempdir().expect("temp");
+        let existing_path = temp.path().join("existing-auth.json");
+        let new_path = temp.path().join("new-auth.json");
+        fs::write(&existing_path, b"old-secret").expect("seed existing auth");
+
+        let existing_result: Result<()> =
+            persist_with_private_auth_file(&existing_path, "new-secret", || {
+                Err(CompanionError::InvalidConfig("persist failed".to_string()))
+            });
+        let new_result: Result<()> =
+            persist_with_private_auth_file(&new_path, "new-secret", || {
+                Err(CompanionError::InvalidConfig("persist failed".to_string()))
+            });
+
+        assert!(existing_result.is_err());
+        assert!(new_result.is_err());
+        assert_eq!(
+            fs::read(&existing_path).expect("restored auth"),
+            b"old-secret"
+        );
+        assert!(!new_path.exists());
+    }
+
+    #[test]
+    fn import_review_resolves_the_same_existing_oauth_provider_as_import() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let original = serde_json::json!({
+            "access_token": "access-original",
+            "chatgpt_account_id": "shared-account",
+            "chatgpt_user_id": "shared-user",
+            "email": "person@example.com"
+        });
+        let imported = import_provider_json(&store, &original.to_string(), None, None)
+            .expect("initial import");
+        let replacement = serde_json::json!({
+            "access_token": "access-replacement",
+            "chatgpt_account_id": "shared-account",
+            "chatgpt_user_id": "shared-user",
+            "email": "renamed@example.com"
+        });
+
+        let report = review_provider_json_many(&store, &replacement.to_string(), None, None)
+            .expect("review");
+
+        assert_eq!(report.ready.len(), 1);
+        assert_eq!(report.ready[0].provider_id, imported.provider.id);
+        assert!(report.ready[0].will_overwrite);
+        assert!(!serde_json::to_string(&report)
+            .expect("serialize review")
+            .contains("access-replacement"));
+    }
+
+    #[test]
+    fn import_review_marks_later_duplicate_targets_as_overwrites() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let value = serde_json::json!([
+            {
+                "OPENAI_API_KEY": "sk-first-secret",
+                "api_provider_id": "duplicate-provider",
+                "api_provider_name": "First",
+            },
+            {
+                "OPENAI_API_KEY": "sk-second-secret",
+                "api_provider_id": "duplicate-provider",
+                "api_provider_name": "Second",
+            }
+        ]);
+
+        let report = review_provider_json_many(&store, &value.to_string(), None, None)
+            .expect("review duplicates");
+
+        assert_eq!(report.ready.len(), 2);
+        assert!(!report.ready[0].will_overwrite);
+        assert!(report.ready[1].will_overwrite);
+        assert_eq!(report.ready[0].provider_id, report.ready[1].provider_id);
     }
 
     #[test]

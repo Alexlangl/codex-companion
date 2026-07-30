@@ -15,8 +15,8 @@ use axum::{
 };
 use bytes::Bytes;
 use codex_companion_core::{
-    provider_endpoint_is_chat_completions, ApiClient, CompanionConfig, GroupPolicy,
-    HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderGroup, ProviderKind,
+    provider_endpoint_is_chat_completions, redact_sensitive_text, ApiClient, CompanionConfig,
+    GroupPolicy, HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderGroup, ProviderKind,
 };
 use codex_companion_health::{
     classify_failure, cooldown_active, mark_failure, mark_model_failure, normalize_expired_cooldown,
@@ -144,28 +144,8 @@ async fn proxy_dispatch(
     let _ = state
         .api_service
         .prune_request_logs(config.relay.request_log_retention_days);
-    if is_relay_root_probe(&method, &uri) {
-        record_request_start(
-            &state,
-            request_id,
-            &method,
-            &uri,
-            requested_model.as_deref(),
-            None,
-        );
-        record_request_finish(
-            &state,
-            request_id,
-            None,
-            Some(StatusCode::OK),
-            "local",
-            0,
-            started_at,
-            None,
-        );
-        return Ok(relay_root_response());
-    }
-    let client = match authenticate_client(&state, &config, &headers) {
+    let root_probe = is_relay_root_probe(&method, &uri);
+    let client = match authenticate_client(&state, &config, &headers, !root_probe) {
         Ok(client) => client,
         Err((status, message)) => {
             record_request_start(
@@ -205,6 +185,19 @@ async fn proxy_dispatch(
         requested_model.as_deref(),
         client.as_ref().map(|client| client.id.as_str()),
     );
+    if root_probe {
+        record_request_finish(
+            &state,
+            request_id,
+            None,
+            Some(StatusCode::OK),
+            "local",
+            0,
+            started_at,
+            None,
+        );
+        return Ok(relay_root_response());
+    }
     if let (Some(client), Some(model)) = (client.as_ref(), requested_model.as_deref()) {
         if !client_allows_model(client, model) {
             let message = format!("API client {} 无权使用模型 {model}", client.name);
@@ -875,6 +868,7 @@ fn authenticate_client(
     state: &RelayState,
     config: &CompanionConfig,
     headers: &HeaderMap,
+    enforce_config_key: bool,
 ) -> std::result::Result<Option<ApiClient>, (StatusCode, String)> {
     let token = client_api_key(headers);
     let client = token
@@ -889,7 +883,11 @@ fn authenticate_client(
         })?
         .flatten();
     let browser_origin = headers.contains_key(header::ORIGIN);
-    if client.is_none() && (config.relay.require_api_key || browser_origin) {
+    if client.is_none()
+        && (state.enforce_api_key
+            || (enforce_config_key && config.relay.require_api_key)
+            || browser_origin)
+    {
         let message = if token.is_some() {
             "API key 无效、已停用或已轮换".to_string()
         } else {
@@ -978,12 +976,13 @@ fn record_request_start(
     model: Option<&str>,
     client_id: Option<&str>,
 ) {
+    let path = uri
+        .path_and_query()
+        .map_or(uri.path(), |value| value.as_str());
     let _ = state.api_service.record_request_start(RequestLogStart {
         request_id,
         method: method.as_str(),
-        path: uri
-            .path_and_query()
-            .map_or(uri.path(), |value| value.as_str()),
+        path,
         model,
         client_id,
     });
@@ -1188,7 +1187,8 @@ fn normalize_health(config: &mut CompanionConfig) {
 }
 
 fn compact_error_body(body: &str) -> String {
-    let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = redact_sensitive_text(body);
+    let text = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
     if text.chars().count() > 280 {
         format!("{}...", text.chars().take(280).collect::<String>())
     } else if text.is_empty() {
@@ -1238,6 +1238,45 @@ mod tests {
         assert!(is_relay_root_probe(&Method::GET, &root));
         assert!(!is_relay_root_probe(&Method::POST, &root));
         assert!(!is_relay_root_probe(&Method::GET, &models));
+    }
+
+    #[tokio::test]
+    async fn browser_root_probe_requires_a_client_key_but_local_self_test_stays_public() {
+        let store = store_with_group(Vec::new());
+        store
+            .update(|config| {
+                config.relay.require_api_key = true;
+                Ok(())
+            })
+            .expect("strict mode");
+        let state = RelayState::new(store, reqwest::Client::new());
+
+        let local_response = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("local root probe");
+        assert_eq!(local_response.status(), StatusCode::OK);
+
+        let mut browser_headers = HeaderMap::new();
+        browser_headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:1420"),
+        );
+        let browser_response = proxy_inner(
+            state,
+            Method::GET,
+            "/v1".parse().expect("uri"),
+            browser_headers,
+            Bytes::new(),
+        )
+        .await
+        .expect("browser root probe");
+        assert_eq!(browser_response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -2072,6 +2111,54 @@ mod tests {
             .recent_requests
             .iter()
             .any(|request| request.client_name.as_deref() == Some("test client")));
+    }
+
+    #[test]
+    fn browser_origin_requires_a_valid_client_key_even_in_local_mode() {
+        let store = store_with_group(Vec::new());
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        let config = store.load().expect("config");
+        assert!(!config.relay.require_api_key);
+
+        let mut browser_headers = HeaderMap::new();
+        browser_headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:1420"),
+        );
+        let missing = authenticate_client(&state, &config, &browser_headers, false)
+            .expect_err("browser request without a key");
+        assert_eq!(missing.0, StatusCode::UNAUTHORIZED);
+
+        let secret = state
+            .api_service
+            .create_client(ApiClientCreate {
+                name: "browser client".to_string(),
+                allowed_models: Vec::new(),
+            })
+            .expect("client");
+        browser_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", secret.api_key)).expect("auth header"),
+        );
+        let authenticated = authenticate_client(&state, &config, &browser_headers, false)
+            .expect("authenticated browser request")
+            .expect("client");
+        assert_eq!(authenticated.id, secret.client.id);
+    }
+
+    #[test]
+    fn non_loopback_runtime_auth_floor_survives_config_changes() {
+        let store = store_with_group(Vec::new());
+        let state = RelayState::new_with_api_key_floor(store.clone(), reqwest::Client::new(), true);
+        let config = store.load().expect("config");
+        assert!(!config.relay.require_api_key);
+
+        let missing = authenticate_client(&state, &config, &HeaderMap::new(), true)
+            .expect_err("runtime floor must require a key");
+        assert_eq!(missing.0, StatusCode::UNAUTHORIZED);
+        let root_probe = authenticate_client(&state, &config, &HeaderMap::new(), false)
+            .expect_err("non-loopback root probe must require a key");
+        assert_eq!(root_probe.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

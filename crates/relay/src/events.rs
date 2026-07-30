@@ -1,5 +1,6 @@
 use codex_companion_core::{
-    append_diagnostic_log, now_event, ConfigStore, HealthStatusKind, RelayEvent,
+    append_diagnostic_log, now_event, redact_sensitive_text, ConfigStore, HealthStatusKind,
+    RelayEvent,
 };
 use codex_companion_health::mark_success;
 use std::{
@@ -139,6 +140,7 @@ pub(crate) fn append_event(
     provider_id: Option<String>,
     message: String,
 ) {
+    let message = redact_sensitive_text(&message);
     let diagnostic_level = if kind == "error" { "error" } else { "info" };
     let _ = append_diagnostic_log(&store.data_dir(), diagnostic_level, "relay", &message);
     let event = now_event(kind, provider_id, message);
@@ -233,6 +235,26 @@ fn read_tail_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_log_redacts_credentials_before_writing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+
+        append_event(
+            &store,
+            "error",
+            None,
+            "Authorization: Bearer sk-event-secret api_key=sk-query-secret".to_string(),
+        );
+
+        let contents =
+            fs::read_to_string(store.data_dir().join("relay/events.jsonl")).expect("event log");
+        assert!(!contents.contains("sk-event-secret"));
+        assert!(!contents.contains("sk-query-secret"));
+        assert!(contents.contains("[redacted]"));
+    }
+
     #[test]
     fn event_log_rotation_keeps_recent_events_and_bounds_file_sizes() {
         let temp = tempfile::tempdir().expect("temp dir");

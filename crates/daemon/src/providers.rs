@@ -4,9 +4,9 @@ use codex_companion_core::{ProviderConfig, ProviderHealth, ProviderImportProgres
 use codex_companion_provider::{
     add_provider, export_provider_json, import_api_key_provider, import_api_key_provider_request,
     import_local_codex_provider, import_provider_json, import_provider_json_many, list_providers,
-    refresh_provider_status, remove_provider, test_provider, ApiKeyProviderImportRequest,
-    ApiKeyProviderUpdate, ProviderExportFormat, ProviderExportOutput, ProviderImportBatchReport,
-    ProviderImportOutcome, ProviderUpsert,
+    refresh_provider_status, remove_provider, review_provider_json_many, test_provider,
+    ApiKeyProviderImportRequest, ApiKeyProviderUpdate, ProviderExportFormat, ProviderExportOutput,
+    ProviderImportBatchReport, ProviderImportOutcome, ProviderImportReviewReport, ProviderUpsert,
 };
 use std::path::PathBuf;
 
@@ -50,6 +50,15 @@ impl CompanionDaemon {
             provider_name,
             add_to_group_id,
         )
+    }
+
+    pub fn review_provider_json_many(
+        &self,
+        json_text: &str,
+        provider_id: Option<String>,
+        provider_name: Option<String>,
+    ) -> Result<ProviderImportReviewReport> {
+        review_provider_json_many(&self.store, json_text, provider_id, provider_name)
     }
 
     pub fn provider_import_progress(&self) -> ProviderImportProgress {

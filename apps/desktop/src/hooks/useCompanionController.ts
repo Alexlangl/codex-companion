@@ -231,18 +231,27 @@ export function useCompanionController() {
     };
     try {
       for (const file of jsonFiles) {
-        const report = await importProviderJsonMany(file.text, undefined, undefined, addToGroupId);
         const offset = combined.total;
-        combined.total += report.total;
-        combined.succeeded.push(...report.succeeded);
-        combined.failed.push(
-          ...report.failed.map((failure) => ({
-            ...failure,
-            index: failure.index + offset,
-            label: `${file.name} · ${failure.label}`,
-          })),
-        );
-        combined.addedToGroup.push(...report.addedToGroup);
+        try {
+          const report = await importProviderJsonMany(file.text, undefined, undefined, addToGroupId);
+          combined.total += report.total;
+          combined.succeeded.push(...report.succeeded);
+          combined.failed.push(
+            ...report.failed.map((failure) => ({
+              ...failure,
+              index: failure.index + offset,
+              label: `${file.name} · ${failure.label}`,
+            })),
+          );
+          combined.addedToGroup.push(...report.addedToGroup);
+        } catch (unknownError) {
+          combined.total += 1;
+          combined.failed.push({
+            index: offset,
+            label: file.name,
+            message: userFacingError(unknownError),
+          });
+        }
       }
       const message = combined.failed.length
         ? `导入完成：${combined.succeeded.length} 成功，${combined.failed.length} 失败`
