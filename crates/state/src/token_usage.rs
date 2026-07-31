@@ -9,12 +9,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-const TOKEN_USAGE_CACHE_VERSION: u32 = 5;
+const TOKEN_USAGE_CACHE_VERSION: u32 = 7;
+const TOKEN_USAGE_PREFIX_BYTES: u64 = 64 * 1024;
 
 static TOKEN_USAGE_SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TOKEN_USAGE_STATUS: OnceLock<Mutex<TokenUsageSyncStatus>> = OnceLock::new();
@@ -93,7 +94,7 @@ impl TokenUsageFilters {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct CumulativeTokens {
     input: u64,
     cached_input: u64,
@@ -131,6 +132,40 @@ struct FileParseState {
     current_model: String,
     current_provider_id: Option<String>,
     prev_total: Option<CumulativeTokens>,
+    replay_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedParseState {
+    session_id: Option<String>,
+    current_model: String,
+    current_provider_id: Option<String>,
+    prev_total: Option<CumulativeTokens>,
+    replay_sensitive: bool,
+}
+
+impl From<&FileParseState> for CachedParseState {
+    fn from(state: &FileParseState) -> Self {
+        Self {
+            session_id: state.session_id.clone(),
+            current_model: state.current_model.clone(),
+            current_provider_id: state.current_provider_id.clone(),
+            prev_total: state.prev_total.clone(),
+            replay_sensitive: state.replay_sensitive,
+        }
+    }
+}
+
+impl CachedParseState {
+    fn into_file_parse_state(self) -> FileParseState {
+        FileParseState {
+            session_id: self.session_id,
+            current_model: self.current_model,
+            current_provider_id: self.current_provider_id,
+            prev_total: self.prev_total,
+            replay_sensitive: self.replay_sensitive,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +190,7 @@ impl Default for FileParseState {
             current_model: "unknown".to_string(),
             current_provider_id: None,
             prev_total: None,
+            replay_sensitive: false,
         }
     }
 }
@@ -175,6 +211,16 @@ struct CachedTokenUsageFile {
     deferred: bool,
     #[serde(default)]
     suspected_duplicate: bool,
+    #[serde(default)]
+    parsed_bytes: u64,
+    #[serde(default)]
+    parsed_lines: usize,
+    #[serde(default)]
+    prefix_digest: String,
+    #[serde(default)]
+    parser_state: Option<CachedParseState>,
+    #[serde(default)]
+    replay_sensitive: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -182,6 +228,60 @@ struct ParsedTokenUsageFile {
     events: Vec<TokenUsageEvent>,
     deferred: bool,
     suspected_duplicate: bool,
+    parsed_bytes: u64,
+    parsed_lines: usize,
+    prefix_digest: String,
+    parser_state: Option<CachedParseState>,
+    replay_sensitive: bool,
+}
+
+#[derive(Debug)]
+struct ReplayParentCatalog {
+    files_by_thread: BTreeMap<String, Vec<PathBuf>>,
+    timelines: Mutex<BTreeMap<PathBuf, Option<Arc<ReplayParentTimeline>>>>,
+}
+
+#[derive(Debug, Default)]
+struct ReplayParentTimeline {
+    max_timestamp: Option<DateTime<Utc>>,
+    terminal_timestamps: Vec<DateTime<Utc>>,
+    signatures: Vec<(DateTime<Utc>, CumulativeTokens)>,
+}
+
+impl ReplayParentCatalog {
+    fn new(files: Vec<PathBuf>) -> Self {
+        let mut files_by_thread = BTreeMap::<String, Vec<PathBuf>>::new();
+        for path in files {
+            let Some(identity) = read_first_session_identity(&path).ok().flatten() else {
+                continue;
+            };
+            files_by_thread
+                .entry(identity.thread_id)
+                .or_default()
+                .push(path);
+        }
+        Self {
+            files_by_thread,
+            timelines: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn candidates_for(&self, thread_id: &str) -> Vec<PathBuf> {
+        self.files_by_thread
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn timeline_for(&self, path: &Path) -> Option<Arc<ReplayParentTimeline>> {
+        let mut timelines = self.timelines.lock().ok()?;
+        if let Some(cached) = timelines.get(path) {
+            return cached.clone();
+        }
+        let loaded = read_replay_parent_timeline(path).ok().map(Arc::new);
+        timelines.insert(path.to_path_buf(), loaded.clone());
+        loaded
+    }
 }
 
 struct TokenUsageSummaryInput {
@@ -202,11 +302,12 @@ enum ReplayResolution {
 
 pub fn collect_token_usage(codex_dir: PathBuf) -> Result<TokenUsageSummary> {
     let files = collect_codex_session_files(&codex_dir);
+    let replay_catalog = ReplayParentCatalog::new(files.clone());
     let mut all_events = Vec::new();
     let mut deferred_files = 0;
     let mut suspected_duplicates = 0;
     for file in &files {
-        let parsed = parse_session_file(file)?;
+        let parsed = parse_session_file(file, Some(&replay_catalog))?;
         deferred_files += usize::from(parsed.deferred);
         suspected_duplicates += usize::from(parsed.suspected_duplicate);
         all_events.extend(parsed.events);
@@ -281,42 +382,51 @@ fn collect_token_usage_cached_inner(
 ) -> Result<TokenUsageSummary> {
     let cache_path = cache_dir.join("token-usage-cache.json");
     let mut cache = read_token_usage_cache(&cache_path);
+    let previous_keys = cache.files.keys().cloned().collect::<BTreeSet<_>>();
+    let mut cache_changed = false;
     let mut next_files = BTreeMap::new();
     let mut all_events = Vec::new();
     let mut deferred_files = 0;
     let mut suspected_duplicates = 0;
+    let replay_catalog = ReplayParentCatalog::new(files.clone());
 
     for (file_index, file) in files.iter().enumerate() {
         let cache_key = file.to_string_lossy().to_string();
         let signature = file_signature(file);
-        let cached = signature.as_ref().and_then(|signature| {
-            cache
-                .files
-                .get(&cache_key)
-                .filter(|cached| {
-                    cached.matches(signature) && !cached.deferred && !cached.suspected_duplicate
-                })
-                .cloned()
-        });
-        let cached_file = match (cached, signature) {
-            (Some(cached), _) => cached,
-            (_, Some(signature)) => {
-                let parsed = parse_session_file(file)?;
-                CachedTokenUsageFile {
-                    len: signature.len,
-                    modified_secs: signature.modified_secs,
-                    modified_nanos: signature.modified_nanos,
-                    events: parsed.events,
-                    deferred: parsed.deferred,
-                    suspected_duplicate: parsed.suspected_duplicate,
-                }
+        let previous = cache.files.get(&cache_key).cloned();
+        let cached_file = match (previous, signature) {
+            (Some(cached), Some(signature))
+                if cached.matches(&signature)
+                    && !cached.deferred
+                    && !cached.suspected_duplicate =>
+            {
+                cached
             }
-            (None, None) => {
-                let parsed = parse_session_file(file)?;
+            (Some(cached), Some(signature)) => {
+                cache_changed = true;
+                let parsed = match parse_session_file_incremental(file, &cached, &signature)? {
+                    Some(parsed) => parsed,
+                    None => parse_session_file(file, Some(&replay_catalog))?,
+                };
+                cached_file_from_parsed(&signature, parsed)
+            }
+            (_, Some(signature)) => {
+                cache_changed = true;
+                let parsed = parse_session_file(file, Some(&replay_catalog))?;
+                cached_file_from_parsed(&signature, parsed)
+            }
+            (_, None) => {
+                cache_changed = true;
+                let parsed = parse_session_file(file, Some(&replay_catalog))?;
                 CachedTokenUsageFile {
                     events: parsed.events,
                     deferred: parsed.deferred,
                     suspected_duplicate: parsed.suspected_duplicate,
+                    parsed_bytes: parsed.parsed_bytes,
+                    parsed_lines: parsed.parsed_lines,
+                    prefix_digest: parsed.prefix_digest,
+                    parser_state: parsed.parser_state,
+                    replay_sensitive: parsed.replay_sensitive,
                     ..CachedTokenUsageFile::default()
                 }
             }
@@ -328,9 +438,16 @@ fn collect_token_usage_cached_inner(
         update_token_usage_progress(file_index + 1, deferred_files, suspected_duplicates);
     }
 
+    cache_changed = cache_changed
+        || previous_keys.len() != next_files.len()
+        || previous_keys
+            .iter()
+            .any(|cache_key| !next_files.contains_key(cache_key));
     cache.version = TOKEN_USAGE_CACHE_VERSION;
     cache.files = next_files;
-    let _ = write_token_usage_cache(&cache_path, &cache);
+    if cache_changed {
+        let _ = write_token_usage_cache(&cache_path, &cache);
+    }
 
     let pricing_path = default_pricing_override_path(&cache_dir);
     let catalog = PricingCatalog::builtin().load_override(&pricing_path)?;
@@ -580,69 +697,38 @@ fn local_boundary_to_utc(
     Ok(local.with_timezone(&Utc))
 }
 
-fn parse_session_file(path: &Path) -> Result<ParsedTokenUsageFile> {
-    let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
-    let reader = BufReader::new(file);
-    let lines = reader
-        .lines()
-        .map_while(std::result::Result::ok)
-        .collect::<Vec<_>>();
+fn parse_session_file(
+    path: &Path,
+    replay_catalog: Option<&ReplayParentCatalog>,
+) -> Result<ParsedTokenUsageFile> {
+    let (lines, parsed_bytes) = read_complete_lines(path)?;
     let identity = session_identity_from_lines(&lines);
     let fallback_boundary = history_replay_boundary(&lines, identity.as_ref());
     let mut state = FileParseState {
         session_id: identity.as_ref().map(|identity| identity.thread_id.clone()),
+        replay_sensitive: identity.as_ref().is_some_and(|identity| {
+            identity.parent_thread_id.is_some() || identity.carries_history_snapshot
+        }),
         ..FileParseState::default()
     };
-    let mut parsed_events = Vec::new();
-
-    for (line_index, line) in lines.into_iter().enumerate() {
-        if !line.contains("token_count")
-            && !line.contains("turn_context")
-            && !line.contains("session_meta")
-        {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let Some(kind) = value.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        match kind {
-            "session_meta" => apply_session_meta(&mut state, &value),
-            "turn_context" => apply_turn_context(&mut state, &value),
-            "event_msg" => {
-                if let Some(mut event) = parse_token_event(&mut state, &value) {
-                    event.event_id = Some(stable_event_id(&event, line_index));
-                    if let Some(signature) = token_usage_signature(&value) {
-                        parsed_events.push(ParsedTokenUsageEvent {
-                            event,
-                            signature,
-                            line_index,
-                        });
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let parsed_events = parse_token_lines(&lines, &mut state, 0);
+    let metadata = parsed_file_metadata(path, parsed_bytes, lines.len(), &state);
 
     let replay_resolution = identity
         .as_ref()
         .map_or(ReplayResolution::NotApplicable, |identity| {
-            replay_prefix_from_parent(path, identity, &parsed_events)
+            replay_prefix_from_parent(path, &lines, identity, &parsed_events, replay_catalog)
         });
     if matches!(replay_resolution, ReplayResolution::Deferred) {
         return Ok(ParsedTokenUsageFile {
             deferred: true,
-            ..ParsedTokenUsageFile::default()
+            ..metadata
         });
     }
     if matches!(replay_resolution, ReplayResolution::SuspectedDuplicate) {
         return Ok(ParsedTokenUsageFile {
-            deferred: true,
             suspected_duplicate: true,
-            ..ParsedTokenUsageFile::default()
+            ..metadata
         });
     }
     let events = parsed_events
@@ -657,25 +743,254 @@ fn parse_session_file(path: &Path) -> Result<ParsedTokenUsageFile> {
         })
         .map(|(_, parsed)| parsed.event)
         .collect();
-    Ok(ParsedTokenUsageFile {
-        events,
+    Ok(ParsedTokenUsageFile { events, ..metadata })
+}
+
+fn parse_token_lines(
+    lines: &[String],
+    state: &mut FileParseState,
+    line_offset: usize,
+) -> Vec<ParsedTokenUsageEvent> {
+    let mut parsed_events = Vec::new();
+    for (relative_line_index, line) in lines.iter().enumerate() {
+        if !line.contains("token_count")
+            && !line.contains("turn_context")
+            && !line.contains("session_meta")
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(kind) = value.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let line_index = line_offset + relative_line_index;
+        match kind {
+            "session_meta" => apply_session_meta(state, &value),
+            "turn_context" => apply_turn_context(state, &value),
+            "event_msg" => {
+                if let Some(mut event) = parse_token_event(state, &value) {
+                    event.event_id = Some(stable_event_id(&event, line_index));
+                    if let Some(signature) = token_usage_signature(&value) {
+                        parsed_events.push(ParsedTokenUsageEvent {
+                            event,
+                            signature,
+                            line_index,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    parsed_events
+}
+
+fn parsed_file_metadata(
+    path: &Path,
+    parsed_bytes: u64,
+    parsed_lines: usize,
+    state: &FileParseState,
+) -> ParsedTokenUsageFile {
+    ParsedTokenUsageFile {
+        parsed_bytes,
+        parsed_lines,
+        prefix_digest: file_prefix_digest(path).unwrap_or_default(),
+        parser_state: Some(CachedParseState::from(state)),
+        replay_sensitive: state.replay_sensitive,
         ..ParsedTokenUsageFile::default()
-    })
+    }
+}
+
+fn cached_file_from_parsed(
+    signature: &FileSignature,
+    parsed: ParsedTokenUsageFile,
+) -> CachedTokenUsageFile {
+    CachedTokenUsageFile {
+        len: signature.len,
+        modified_secs: signature.modified_secs,
+        modified_nanos: signature.modified_nanos,
+        events: parsed.events,
+        deferred: parsed.deferred,
+        suspected_duplicate: parsed.suspected_duplicate,
+        parsed_bytes: parsed.parsed_bytes,
+        parsed_lines: parsed.parsed_lines,
+        prefix_digest: parsed.prefix_digest,
+        parser_state: parsed.parser_state,
+        replay_sensitive: parsed.replay_sensitive,
+    }
+}
+
+fn parse_session_file_incremental(
+    path: &Path,
+    cached: &CachedTokenUsageFile,
+    signature: &FileSignature,
+) -> Result<Option<ParsedTokenUsageFile>> {
+    if cached.deferred
+        || cached.suspected_duplicate
+        || cached.replay_sensitive
+        || cached.parser_state.is_none()
+        || signature.len <= cached.parsed_bytes
+        || cached.prefix_digest.is_empty()
+    {
+        return Ok(None);
+    }
+    if file_prefix_digest(path).as_deref() != Some(cached.prefix_digest.as_str())
+        || !file_ends_with_newline(path)
+    {
+        return Ok(None);
+    }
+
+    let mut file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
+    file.seek(SeekFrom::Start(cached.parsed_bytes))
+        .map_err(|source| CompanionError::io(path, source))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| CompanionError::io(path, source))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut state = cached
+        .parser_state
+        .clone()
+        .expect("parser state checked above")
+        .into_file_parse_state();
+    let parsed_tail = parse_token_lines(&lines, &mut state, cached.parsed_lines);
+    let mut events = cached.events.clone();
+    events.extend(parsed_tail.into_iter().map(|parsed| parsed.event));
+    let parsed_bytes = cached.parsed_bytes + bytes.len() as u64;
+    let metadata = parsed_file_metadata(
+        path,
+        parsed_bytes,
+        cached.parsed_lines + lines.len(),
+        &state,
+    );
+    Ok(Some(ParsedTokenUsageFile { events, ..metadata }))
+}
+
+fn read_complete_lines(path: &Path) -> Result<(Vec<String>, u64)> {
+    let bytes = fs::read(path).map_err(|source| CompanionError::io(path, source))?;
+    let parsed_bytes = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index as u64 + 1);
+    let lines = String::from_utf8_lossy(&bytes[..parsed_bytes as usize])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    Ok((lines, parsed_bytes))
+}
+
+fn file_ends_with_newline(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() == 0 {
+        return false;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::End(-1)).is_err() {
+        return false;
+    }
+    let mut byte = [0_u8; 1];
+    file.read_exact(&mut byte).is_ok() && byte[0] == b'\n'
+}
+
+fn file_prefix_digest(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = fs::metadata(path).ok()?.len().min(TOKEN_USAGE_PREFIX_BYTES);
+    let mut bytes = vec![0_u8; len as usize];
+    file.read_exact(&mut bytes).ok()?;
+    Some(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn read_first_session_identity(path: &Path) -> Result<Option<CodexSessionIdentity>> {
+    let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|source| CompanionError::io(path, source))?;
+        if bytes_read == 0 || line.last() != Some(&b'\n') {
+            return Ok(None);
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        return Ok(value.get("payload").and_then(|payload| {
+            parse_codex_session_identity(payload, value.get("timestamp").and_then(Value::as_str))
+        }));
+    }
+}
+
+fn read_replay_parent_timeline(path: &Path) -> Result<ReplayParentTimeline> {
+    let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut timeline = ReplayParentTimeline::default();
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|source| CompanionError::io(path, source))?;
+        if bytes_read == 0 || line.last() != Some(&b'\n') {
+            break;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        if let Some(timestamp) = timestamp {
+            timeline.max_timestamp = Some(
+                timeline
+                    .max_timestamp
+                    .map_or(timestamp, |current| current.max(timestamp)),
+            );
+            if is_session_terminal_event(&value) {
+                timeline.terminal_timestamps.push(timestamp);
+            }
+            if let Some(signature) = token_usage_signature(&value) {
+                timeline.signatures.push((timestamp, signature));
+            }
+        }
+    }
+    Ok(timeline)
 }
 
 fn session_identity_from_lines(lines: &[String]) -> Option<CodexSessionIdentity> {
-    lines.iter().find_map(|line| {
-        if !line.contains("session_meta") {
-            return None;
-        }
-        let value = serde_json::from_str::<Value>(line).ok()?;
-        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-            return None;
-        }
-        value.get("payload").and_then(|payload| {
-            parse_codex_session_identity(payload, value.get("timestamp").and_then(Value::as_str))
+    session_identities_from_lines(lines).into_iter().next()
+}
+
+fn session_identities_from_lines(lines: &[String]) -> Vec<CodexSessionIdentity> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            if !line.contains("session_meta") {
+                return None;
+            }
+            let value = serde_json::from_str::<Value>(line).ok()?;
+            if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+                return None;
+            }
+            value.get("payload").and_then(|payload| {
+                parse_codex_session_identity(
+                    payload,
+                    value.get("timestamp").and_then(Value::as_str),
+                )
+            })
         })
-    })
+        .collect()
 }
 
 fn parse_codex_session_identity(
@@ -731,10 +1046,24 @@ fn token_usage_signature(value: &Value) -> Option<CumulativeTokens> {
         .and_then(parse_cumulative_tokens)
 }
 
+fn is_session_terminal_event(value: &Value) -> bool {
+    let event_type = match value.get("type").and_then(Value::as_str) {
+        Some("event_msg") => value.pointer("/payload/type").and_then(Value::as_str),
+        Some(event_type) => Some(event_type),
+        None => value.pointer("/payload/type").and_then(Value::as_str),
+    };
+    matches!(
+        event_type,
+        Some("task_complete") | Some("turn_aborted") | Some("thread_rolled_back")
+    )
+}
+
 fn replay_prefix_from_parent(
     child_path: &Path,
+    child_lines: &[String],
     identity: &CodexSessionIdentity,
     child_events: &[ParsedTokenUsageEvent],
+    replay_catalog: Option<&ReplayParentCatalog>,
 ) -> ReplayResolution {
     let Some(parent_id) = identity.parent_thread_id.as_deref() else {
         return ReplayResolution::NotApplicable;
@@ -752,22 +1081,32 @@ fn replay_prefix_from_parent(
     };
     let mut matching_parents = Vec::new();
     let mut found_parent = false;
-    for candidate in collect_codex_session_files(&codex_dir) {
+    let has_embedded_parent = session_identities_from_lines(child_lines)
+        .iter()
+        .any(|parent| parent.thread_id == parent_id);
+    let fallback_catalog;
+    let replay_catalog = match replay_catalog {
+        Some(catalog) => catalog,
+        None => {
+            fallback_catalog = ReplayParentCatalog::new(collect_codex_session_files(&codex_dir));
+            &fallback_catalog
+        }
+    };
+    for candidate in replay_catalog.candidates_for(parent_id) {
         if candidate == child_path {
             continue;
         }
-        let Ok(text) = fs::read_to_string(&candidate) else {
+        let Some(timeline) = replay_catalog.timeline_for(&candidate) else {
             continue;
         };
-        let lines = text.lines().map(str::to_string).collect::<Vec<_>>();
-        if session_identity_from_lines(&lines)
-            .as_ref()
-            .is_none_or(|parent| parent.thread_id != parent_id)
-        {
-            continue;
-        }
         found_parent = true;
-        if let Some(signatures) = parent_signatures_before(&lines, cutoff) {
+        if let Some(signatures) = parent_signatures_before_timeline(&timeline, cutoff) {
+            matching_parents.push(signatures);
+        }
+    }
+    if matching_parents.is_empty() && has_embedded_parent {
+        found_parent = true;
+        if let Some(signatures) = embedded_parent_signatures(child_lines, identity, cutoff) {
             matching_parents.push(signatures);
         }
     }
@@ -785,36 +1124,83 @@ fn replay_prefix_from_parent(
     ReplayResolution::Matched(matching_replay_prefix(child_events, first))
 }
 
+fn embedded_parent_signatures(
+    lines: &[String],
+    identity: &CodexSessionIdentity,
+    cutoff: DateTime<Utc>,
+) -> Option<Vec<CumulativeTokens>> {
+    let boundary = history_replay_boundary(lines, Some(identity))?;
+    Some(
+        lines
+            .iter()
+            .take(boundary)
+            .filter_map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|value| token_usage_signature(&value))
+            })
+            .collect::<Vec<CumulativeTokens>>(),
+    )
+    .filter(|signatures| !signatures.is_empty())
+    .or_else(|| parent_signatures_before(lines, cutoff))
+}
+
 fn parent_signatures_before(
     lines: &[String],
     cutoff: DateTime<Utc>,
 ) -> Option<Vec<CumulativeTokens>> {
-    let mut signatures = Vec::new();
-    let mut max_timestamp = None;
+    let timeline = replay_parent_timeline_from_lines(lines);
+    parent_signatures_before_timeline(&timeline, cutoff)
+}
+
+fn replay_parent_timeline_from_lines(lines: &[String]) -> ReplayParentTimeline {
+    let mut timeline = ReplayParentTimeline::default();
     for line in lines {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let timestamp = value
+        let Some(timestamp) = value
             .get("timestamp")
             .and_then(Value::as_str)
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc));
-        if let Some(timestamp) = timestamp {
-            max_timestamp = Some(
-                max_timestamp.map_or(timestamp, |current: DateTime<Utc>| current.max(timestamp)),
-            );
-        }
-        let Some(signature) = token_usage_signature(&value) else {
+            .map(|value| value.with_timezone(&Utc))
+        else {
             continue;
         };
-        if timestamp.is_some_and(|timestamp| timestamp <= cutoff) {
-            signatures.push(signature);
+        timeline.max_timestamp = Some(
+            timeline
+                .max_timestamp
+                .map_or(timestamp, |current| current.max(timestamp)),
+        );
+        if is_session_terminal_event(&value) {
+            timeline.terminal_timestamps.push(timestamp);
+        }
+        if let Some(signature) = token_usage_signature(&value) {
+            timeline.signatures.push((timestamp, signature));
         }
     }
-    max_timestamp
+    timeline
+}
+
+fn parent_signatures_before_timeline(
+    timeline: &ReplayParentTimeline,
+    cutoff: DateTime<Utc>,
+) -> Option<Vec<CumulativeTokens>> {
+    let covers_cutoff = timeline
+        .max_timestamp
         .is_some_and(|timestamp| timestamp >= cutoff)
-        .then_some(signatures)
+        || timeline
+            .terminal_timestamps
+            .iter()
+            .any(|timestamp| *timestamp <= cutoff);
+    covers_cutoff.then(|| {
+        timeline
+            .signatures
+            .iter()
+            .filter(|(timestamp, _)| *timestamp <= cutoff)
+            .map(|(_, signature)| signature.clone())
+            .collect()
+    })
 }
 
 fn matching_replay_prefix(child: &[ParsedTokenUsageEvent], parent: &[CumulativeTokens]) -> usize {
@@ -910,7 +1296,14 @@ fn write_token_usage_cache(path: &Path, cache: &TokenUsageCache) -> Result<()> {
     let text = serde_json::to_string(cache).map_err(|source| {
         CompanionError::InvalidConfig(format!("token usage cache serialize failed: {source}"))
     })?;
-    fs::write(path, text).map_err(|source| CompanionError::io(path, source))
+    let temporary_path = path.with_extension("tmp");
+    fs::write(&temporary_path, text)
+        .map_err(|source| CompanionError::io(&temporary_path, source))?;
+    if let Err(source) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(CompanionError::io(path, source));
+    }
+    Ok(())
 }
 
 fn apply_session_meta(state: &mut FileParseState, value: &Value) {
@@ -1320,6 +1713,7 @@ fn pick_u64(value: &Value, paths: &[&[&str]]) -> Option<u64> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::io::Write;
 
     #[test]
     fn validates_and_applies_inclusive_date_ranges() {
@@ -1551,6 +1945,40 @@ mod tests {
     }
 
     #[test]
+    fn replay_catalog_indexes_metadata_and_caches_only_compact_timelines() {
+        let temp = tempfile::tempdir().expect("temp");
+        let parent_path = temp.path().join("parent.jsonl");
+        let child_path = temp.path().join("child.jsonl");
+        fs::write(
+            &parent_path,
+            r#"{"timestamp":"2026-07-10T03:00:00Z","type":"session_meta","payload":{"id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:02Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("parent");
+        fs::write(
+            &child_path,
+            r#"{"timestamp":"2026-07-10T03:00:03Z","type":"session_meta","payload":{"id":"child","forked_from_id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:00Z","type":"session_meta","payload":{"id":"parent"}}"#
+                + "\n",
+        )
+        .expect("child");
+
+        let catalog = ReplayParentCatalog::new(vec![child_path, parent_path.clone()]);
+
+        assert_eq!(catalog.candidates_for("parent"), vec![parent_path.clone()]);
+        assert!(catalog.timelines.lock().expect("timelines").is_empty());
+        let timeline = catalog.timeline_for(&parent_path).expect("timeline");
+        assert_eq!(timeline.signatures.len(), 1);
+        assert_eq!(timeline.terminal_timestamps.len(), 1);
+        assert_eq!(catalog.timelines.lock().expect("timelines").len(), 1);
+    }
+
+    #[test]
     fn subagent_history_replay_only_establishes_cumulative_baseline() {
         let temp = tempfile::tempdir().expect("temp");
         let day = temp
@@ -1637,6 +2065,84 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn completed_parent_before_fork_is_accepted() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        fs::write(
+            day.join("parent.jsonl"),
+            r#"{"timestamp":"2026-07-10T03:00:00Z","type":"session_meta","payload":{"id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:03Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("parent");
+        fs::write(
+            day.join("child.jsonl"),
+            r#"{"timestamp":"2026-07-10T03:00:04Z","type":"session_meta","payload":{"id":"child","forked_from_id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"output_tokens":15}}}}"#
+                + "\n",
+        )
+        .expect("child");
+
+        let summary = collect_token_usage(temp.path().to_path_buf()).expect("summary");
+        assert_eq!(summary.deferred_files, 0);
+        assert_eq!(summary.suspected_duplicates, 0);
+        assert_eq!(summary.events, 2);
+        assert_eq!(summary.total_tokens, 165);
+        assert_eq!(
+            summary
+                .recent_events
+                .iter()
+                .filter(|event| event.session_id.as_deref() == Some("child"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn embedded_parent_history_resolves_without_a_separate_parent_file() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        fs::write(
+            day.join("child.jsonl"),
+            r#"{"timestamp":"2026-07-10T03:00:04Z","type":"session_meta","payload":{"id":"child","forked_from_id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:04Z","type":"session_meta","payload":{"id":"parent"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n"
+                + r#"{"type":"event_msg","payload":{"type":"thread_settings_applied"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"output_tokens":15}}}}"#
+                + "\n",
+        )
+        .expect("child");
+
+        let summary = collect_token_usage(temp.path().to_path_buf()).expect("summary");
+        assert_eq!(summary.deferred_files, 0);
+        assert_eq!(summary.suspected_duplicates, 0);
+        assert_eq!(summary.events, 1);
+        assert_eq!(summary.total_tokens, 55);
     }
 
     #[test]
@@ -1730,7 +2236,7 @@ mod tests {
 
         let summary = collect_token_usage(temp.path().to_path_buf()).expect("summary");
 
-        assert_eq!(summary.deferred_files, 1);
+        assert_eq!(summary.deferred_files, 0);
         assert_eq!(summary.suspected_duplicates, 1);
         assert!(summary
             .recent_events
@@ -1789,11 +2295,23 @@ mod tests {
         let cache_dir = temp.path().join("cache");
         let first = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir.clone())
             .expect("first");
+        let cache_path = cache_dir.join("token-usage-cache.json");
+        let cache_modified = fs::metadata(&cache_path)
+            .expect("cache metadata")
+            .modified()
+            .expect("cache modified");
+        std::thread::sleep(std::time::Duration::from_millis(20));
         let second = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir.clone())
             .expect("second");
         assert_eq!(first.total_tokens, 110);
         assert_eq!(second.total_tokens, first.total_tokens);
-        assert!(cache_dir.join("token-usage-cache.json").exists());
+        assert_eq!(
+            fs::metadata(&cache_path)
+                .expect("unchanged cache metadata")
+                .modified()
+                .expect("unchanged cache modified"),
+            cache_modified
+        );
 
         fs::write(
             &session,
@@ -1805,6 +2323,145 @@ mod tests {
             collect_token_usage_cached(temp.path().to_path_buf(), cache_dir).expect("third");
         assert_eq!(third.events, 2);
         assert_eq!(third.total_tokens, 135);
+    }
+
+    #[test]
+    fn cached_scan_replays_only_appended_cumulative_usage() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("08");
+        fs::create_dir_all(&day).expect("mkdir");
+        let session = day.join("session.jsonl");
+        fs::write(
+            &session,
+            r#"{"type":"session_meta","payload":{"id":"s1"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-08T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n",
+        )
+        .expect("write");
+        let cache_dir = temp.path().join("cache");
+        let first = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir.clone())
+            .expect("first scan");
+        assert_eq!(first.total_tokens, 110);
+
+        let appended = r#"{"timestamp":"2026-06-08T01:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"output_tokens":15}}}}"#
+            .to_string()
+            + "\n";
+        let mut handle = fs::OpenOptions::new()
+            .append(true)
+            .open(&session)
+            .expect("open");
+        handle.write_all(appended.as_bytes()).expect("append");
+
+        let second = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir.clone())
+            .expect("second scan");
+        assert_eq!(second.events, 2);
+        assert_eq!(second.total_tokens, 145);
+        let cache = read_token_usage_cache(&cache_dir.join("token-usage-cache.json"));
+        let cached = cache.files.values().next().expect("cached file");
+        assert_eq!(cached.parsed_lines, 3);
+        assert_eq!(
+            cached.parsed_bytes,
+            fs::metadata(&session).expect("metadata").len()
+        );
+    }
+
+    #[test]
+    fn incomplete_appended_line_is_not_counted_until_terminated() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("09");
+        fs::create_dir_all(&day).expect("mkdir");
+        let session = day.join("session.jsonl");
+        fs::write(
+            &session,
+            r#"{"type":"session_meta","payload":{"id":"s1"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-06-09T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n",
+        )
+        .expect("write");
+        let cache_dir = temp.path().join("cache");
+        let first = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir.clone())
+            .expect("first scan");
+        assert_eq!(first.total_tokens, 110);
+
+        let complete_line = r#"{"timestamp":"2026-06-09T01:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"output_tokens":5}}}}"#;
+        let split_at = complete_line.len() / 2;
+        let mut handle = fs::OpenOptions::new()
+            .append(true)
+            .open(&session)
+            .expect("open");
+        handle
+            .write_all(&complete_line.as_bytes()[..split_at])
+            .expect("partial append");
+        drop(handle);
+
+        let partial = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir.clone())
+            .expect("partial scan");
+        assert_eq!(partial.events, 1);
+        assert_eq!(partial.total_tokens, 110);
+
+        let mut handle = fs::OpenOptions::new()
+            .append(true)
+            .open(&session)
+            .expect("open");
+        handle
+            .write_all(&complete_line.as_bytes()[split_at..])
+            .expect("finish append");
+        handle.write_all(b"\n").expect("newline");
+
+        let complete = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir)
+            .expect("complete scan");
+        assert_eq!(complete.events, 2);
+        assert_eq!(complete.total_tokens, 135);
+    }
+
+    #[test]
+    fn changed_file_prefix_falls_back_to_a_full_parse() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        let session = day.join("session.jsonl");
+        let token_line = r#"{"timestamp":"2026-06-10T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#;
+        fs::write(
+            &session,
+            r#"{"type":"session_meta","payload":{"id":"s1"}}"#.to_string()
+                + "\n"
+                + token_line
+                + "\n",
+        )
+        .expect("write");
+        let cache_dir = temp.path().join("cache");
+        collect_token_usage_cached(temp.path().to_path_buf(), cache_dir.clone()).expect("first");
+
+        fs::write(
+            &session,
+            r#"{"type":"session_meta","payload":{"id":"s2"}}"#.to_string()
+                + "\n"
+                + token_line
+                + "\n",
+        )
+        .expect("rewrite");
+        let rebuilt = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir)
+            .expect("rewritten scan");
+        assert_eq!(rebuilt.total_tokens, 110);
+        assert_eq!(rebuilt.sessions, 1);
+        assert_eq!(rebuilt.recent_events[0].session_id.as_deref(), Some("s2"));
     }
 
     #[test]

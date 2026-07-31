@@ -5,6 +5,7 @@ use codex_companion_core::{
     RelaySettingsUpdate, Result,
 };
 use codex_companion_relay::ApiServiceStore;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -56,6 +57,64 @@ impl CompanionDaemon {
 
     pub fn clear_api_request_logs(&self) -> Result<usize> {
         self.api_service_store()?.clear_request_logs()
+    }
+
+    pub fn session_provider_preferences(
+        &self,
+        session_ids: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        if session_ids.len() > 100 {
+            return Err(CompanionError::InvalidConfig(
+                "单次最多查询 100 个会话的 Provider 首选项".into(),
+            ));
+        }
+        self.api_service_store()?
+            .list_session_provider_preferences(session_ids)
+    }
+
+    pub fn set_session_provider_preference(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+    ) -> Result<String> {
+        let provider_id = provider_id.trim();
+        let config = self.store.load()?;
+        let group = config
+            .groups
+            .get(&config.relay.active_group_id)
+            .ok_or_else(|| {
+                CompanionError::InvalidConfig(format!(
+                    "当前分组不存在: {}",
+                    config.relay.active_group_id
+                ))
+            })?;
+        if !group
+            .provider_order
+            .iter()
+            .any(|candidate| candidate == provider_id)
+        {
+            return Err(CompanionError::InvalidConfig(format!(
+                "Provider {provider_id} 不在当前分组 {} 中",
+                group.name
+            )));
+        }
+        if !config
+            .providers
+            .get(provider_id)
+            .is_some_and(|provider| provider.enabled)
+        {
+            return Err(CompanionError::InvalidConfig(format!(
+                "Provider {provider_id} 不存在或已停用"
+            )));
+        }
+        self.api_service_store()?
+            .set_session_provider_preference(session_id, provider_id)?;
+        Ok(provider_id.to_string())
+    }
+
+    pub fn clear_session_provider_preference(&self, session_id: &str) -> Result<bool> {
+        self.api_service_store()?
+            .clear_session_provider_preference(session_id)
     }
 
     pub fn update_relay_settings(&self, input: RelaySettingsUpdate) -> Result<RelayConfig> {
@@ -208,6 +267,8 @@ fn elapsed_ms(started_at: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_companion_core::{ConfigStore, ProviderConfig, ProviderKind};
+    use std::collections::BTreeMap;
 
     #[test]
     fn rejects_dangerous_or_unbounded_settings() {
@@ -241,5 +302,67 @@ mod tests {
         assert!(validate_relay_auth_scope(&relay, false).is_err());
         assert!(validate_relay_auth_scope(&relay, true).is_ok());
         assert!(validate_relay_auth_scope(&RelayConfig::default(), false).is_ok());
+    }
+
+    #[test]
+    fn session_preference_requires_an_enabled_provider_in_the_active_group() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                config.relay.active_group_id = "default".to_string();
+                config
+                    .providers
+                    .insert("enabled".to_string(), test_provider("enabled", true));
+                config
+                    .providers
+                    .insert("disabled".to_string(), test_provider("disabled", false));
+                let group = config.groups.get_mut("default").expect("default group");
+                group.provider_order = vec!["enabled".to_string(), "disabled".to_string()];
+                Ok(())
+            })
+            .expect("config");
+        let daemon = CompanionDaemon::new(store);
+
+        assert_eq!(
+            daemon
+                .set_session_provider_preference("session-a", "enabled")
+                .expect("preference"),
+            "enabled"
+        );
+        assert!(daemon
+            .set_session_provider_preference("session-a", "disabled")
+            .is_err());
+        assert!(daemon
+            .set_session_provider_preference("session-a", "outside")
+            .is_err());
+        assert_eq!(
+            daemon
+                .session_provider_preferences(&["session-a".to_string()])
+                .expect("preferences")
+                .get("session-a")
+                .map(String::as_str),
+            Some("enabled")
+        );
+        assert!(daemon
+            .clear_session_provider_preference("session-a")
+            .expect("clear"));
+    }
+
+    fn test_provider(id: &str, enabled: bool) -> ProviderConfig {
+        ProviderConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: format!("https://{id}.example.com/v1"),
+            websocket_url: None,
+            auth_ref: None,
+            direct_auth_ref: None,
+            model_map: BTreeMap::new(),
+            priority: 0,
+            enabled,
+            refresh_interval_seconds: 60,
+            account: None,
+        }
     }
 }

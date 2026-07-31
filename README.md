@@ -183,12 +183,14 @@ Tauri 自动更新包使用 `.sig` 校验，但它不能替代 macOS Developer I
 | 来源 | 导入方式 | 结果 |
 | --- | --- | --- |
 | 本机 Codex 登录 | `导入本机 Codex 账号` | 读取现有 `~/.codex/auth.json` 与 provider 配置 |
-| 官方 Codex / ChatGPT OAuth | Token / JSON | 创建官方账号 provider |
+| 官方 Codex / ChatGPT OAuth | OAuth 授权链接、手动粘贴回调、Token / JSON | 创建或更新官方账号 provider |
 | Codex Companion / CPA / sub2api | 单个 JSON、`accounts[]` 或多文件 | 提取账号身份、token 与可用元数据 |
 | Agent Identity | Token / JSON | 保存私有凭据，请求时动态生成 `AgentAssertion` |
 | API Key provider | 表单或 API Key JSON | 创建 OpenAI-compatible 或中转 provider |
 | New API 连接信息 | `_type: "newapi_channel_conn"` JSON | 将 `key` / `url` 映射为 API Key provider |
 | 自定义 provider | 手动填写 Base URL、Key、环境变量与模型 | 创建可直连或代理的 provider |
+
+OAuth 添加账号时，Companion 会显示可复制的授权地址；授权完成后可自动接收回调，也可以把浏览器地址栏中的完整回调地址粘贴回来。需要添加多个官方账号时，完成一次授权后重新发起下一次授权即可，账号会按 OpenAI 返回的账号身份自动区分并去重。
 
 <details>
 <summary><strong>API Key 与 New API JSON 示例</strong></summary>

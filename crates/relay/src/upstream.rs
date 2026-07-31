@@ -1643,41 +1643,85 @@ fn append_response_input_messages(
     tool_context: &ChatToolContext,
 ) {
     let mut pending_tool_calls = Vec::new();
+    let mut pending_tool_media = Vec::new();
+    let mut pending_reasoning = None;
+    let mut last_assistant_index = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("assistant"));
     match input {
         Some(Value::String(text)) => {
             messages.push(json!({ "role": "user", "content": text }));
+            last_assistant_index = None;
         }
         Some(Value::Array(items)) => {
             for item in items {
-                append_response_input_item(item, messages, &mut pending_tool_calls, tool_context);
+                append_response_input_item(
+                    item,
+                    messages,
+                    &mut pending_tool_calls,
+                    &mut pending_tool_media,
+                    &mut pending_reasoning,
+                    &mut last_assistant_index,
+                    tool_context,
+                );
             }
         }
         Some(Value::Object(_)) => append_response_input_item(
             input.expect("object input"),
             messages,
             &mut pending_tool_calls,
+            &mut pending_tool_media,
+            &mut pending_reasoning,
+            &mut last_assistant_index,
             tool_context,
         ),
         _ => {}
     }
-    flush_pending_tool_calls(messages, &mut pending_tool_calls);
+    flush_pending_tool_calls(
+        messages,
+        &mut pending_tool_calls,
+        &mut pending_reasoning,
+        &mut last_assistant_index,
+    );
+    flush_pending_tool_media(messages, &mut pending_tool_media);
+    attach_pending_reasoning_to_previous_assistant(
+        messages,
+        last_assistant_index,
+        &mut pending_reasoning,
+    );
 }
 
 fn append_response_input_item(
     item: &Value,
     messages: &mut Vec<Value>,
     pending_tool_calls: &mut Vec<Value>,
+    pending_tool_media: &mut Vec<Value>,
+    pending_reasoning: &mut Option<String>,
+    last_assistant_index: &mut Option<usize>,
     tool_context: &ChatToolContext,
 ) {
     let Some(object) = item.as_object() else {
-        flush_pending_tool_calls(messages, pending_tool_calls);
+        flush_pending_tool_calls(
+            messages,
+            pending_tool_calls,
+            pending_reasoning,
+            last_assistant_index,
+        );
+        flush_pending_tool_media(messages, pending_tool_media);
+        attach_pending_reasoning_to_previous_assistant(
+            messages,
+            *last_assistant_index,
+            pending_reasoning,
+        );
         if let Some(text) = value_text(item) {
             messages.push(json!({ "role": "user", "content": text }));
+            *last_assistant_index = None;
         }
         return;
     };
     match object.get("type").and_then(Value::as_str) {
         Some("function_call") => {
+            flush_pending_tool_media(messages, pending_tool_media);
             let call_id = response_call_id(object);
             let name = object
                 .get("name")
@@ -1694,6 +1738,7 @@ fn append_response_input_item(
             }));
         }
         Some("custom_tool_call") => {
+            flush_pending_tool_media(messages, pending_tool_media);
             let input = object
                 .get("input")
                 .cloned()
@@ -1709,6 +1754,7 @@ fn append_response_input_item(
             }));
         }
         Some("tool_search_call") => {
+            flush_pending_tool_media(messages, pending_tool_media);
             pending_tool_calls.push(json!({
                 "id": response_call_id(object),
                 "type": "function",
@@ -1718,8 +1764,17 @@ fn append_response_input_item(
                 }
             }));
         }
+        Some("reasoning") => {
+            append_pending_reasoning(pending_reasoning, response_reasoning_item_text(item));
+        }
         Some("message") | None => {
-            flush_pending_tool_calls(messages, pending_tool_calls);
+            flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                pending_reasoning,
+                last_assistant_index,
+            );
+            flush_pending_tool_media(messages, pending_tool_media);
             let role = object.get("role").and_then(Value::as_str).unwrap_or("user");
             let role = match role {
                 "assistant" => "assistant",
@@ -1731,44 +1786,445 @@ fn append_response_input_item(
                 .get("content")
                 .and_then(message_content_text)
                 .unwrap_or_default();
-            messages.push(json!({ "role": role, "content": content }));
+            let mut message = json!({ "role": role, "content": content });
+            if role == "assistant" {
+                append_pending_reasoning(pending_reasoning, response_message_reasoning_text(item));
+                attach_pending_reasoning_to_assistant(&mut message, pending_reasoning);
+                *last_assistant_index = Some(messages.len());
+            } else {
+                attach_pending_reasoning_to_previous_assistant(
+                    messages,
+                    *last_assistant_index,
+                    pending_reasoning,
+                );
+                *last_assistant_index = None;
+            }
+            messages.push(message);
         }
         Some("function_call_output")
         | Some("custom_tool_call_output")
         | Some("tool_search_output") => {
-            flush_pending_tool_calls(messages, pending_tool_calls);
-            let content = object
+            flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                pending_reasoning,
+                last_assistant_index,
+            );
+            let output = object
                 .get("output")
                 .or_else(|| object.get("content"))
-                .map(json_value_string)
-                .unwrap_or_else(|| json_value_string(item));
+                .unwrap_or(item);
+            let (content, media) = tool_output_content_and_media(output);
             let mut message = json!({ "role": "tool", "content": content });
             if let Some(call_id) = object.get("call_id").and_then(Value::as_str) {
                 message["tool_call_id"] = Value::String(call_id.to_string());
             }
             messages.push(message);
+            pending_tool_media.extend(media);
         }
         Some("input_text") | Some("output_text") => {
-            flush_pending_tool_calls(messages, pending_tool_calls);
+            flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                pending_reasoning,
+                last_assistant_index,
+            );
+            flush_pending_tool_media(messages, pending_tool_media);
+            attach_pending_reasoning_to_previous_assistant(
+                messages,
+                *last_assistant_index,
+                pending_reasoning,
+            );
             if let Some(text) = object.get("text").and_then(Value::as_str) {
                 messages.push(json!({ "role": "user", "content": text }));
+                *last_assistant_index = None;
             }
         }
         _ => {
-            flush_pending_tool_calls(messages, pending_tool_calls);
+            flush_pending_tool_calls(
+                messages,
+                pending_tool_calls,
+                pending_reasoning,
+                last_assistant_index,
+            );
+            flush_pending_tool_media(messages, pending_tool_media);
         }
     }
 }
 
-fn flush_pending_tool_calls(messages: &mut Vec<Value>, pending_tool_calls: &mut Vec<Value>) {
+fn flush_pending_tool_calls(
+    messages: &mut Vec<Value>,
+    pending_tool_calls: &mut Vec<Value>,
+    pending_reasoning: &mut Option<String>,
+    last_assistant_index: &mut Option<usize>,
+) {
     if pending_tool_calls.is_empty() {
         return;
     }
-    messages.push(json!({
+    let mut message = json!({
         "role": "assistant",
         "content": null,
         "tool_calls": std::mem::take(pending_tool_calls)
-    }));
+    });
+    attach_pending_reasoning_to_assistant(&mut message, pending_reasoning);
+    *last_assistant_index = Some(messages.len());
+    messages.push(message);
+}
+
+fn response_reasoning_item_text(value: &Value) -> Option<String> {
+    for field in ["reasoning_content", "content", "text", "summary"] {
+        if let Some(text) = value.get(field).and_then(reasoning_text) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn response_message_reasoning_text(value: &Value) -> Option<String> {
+    for field in ["reasoning_content", "reasoning", "reasoning_details"] {
+        if let Some(text) = value.get(field).and_then(reasoning_text) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn reasoning_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(reasoning_text)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (!text.is_empty()).then_some(text)
+        }
+        Value::Object(object) => {
+            for field in ["text", "content", "summary", "summary_text", "parts"] {
+                if let Some(text) = object.get(field).and_then(reasoning_text) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn append_pending_reasoning(pending: &mut Option<String>, reasoning: Option<String>) {
+    let Some(reasoning) = reasoning
+        .as_deref()
+        .map(str::trim)
+        .filter(|reasoning| !reasoning.is_empty())
+    else {
+        return;
+    };
+    match pending {
+        Some(existing) if !existing.is_empty() => {
+            existing.push_str("\n\n");
+            existing.push_str(reasoning);
+        }
+        _ => *pending = Some(reasoning.to_string()),
+    }
+}
+
+fn attach_pending_reasoning_to_assistant(
+    message: &mut Value,
+    pending_reasoning: &mut Option<String>,
+) {
+    let Some(reasoning) = pending_reasoning.take() else {
+        return;
+    };
+    if let Some(object) = message.as_object_mut() {
+        append_reasoning_content(object, &reasoning);
+    }
+}
+
+fn attach_pending_reasoning_to_previous_assistant(
+    messages: &mut [Value],
+    last_assistant_index: Option<usize>,
+    pending_reasoning: &mut Option<String>,
+) {
+    let Some(reasoning) = pending_reasoning.take() else {
+        return;
+    };
+    let Some(message) = last_assistant_index.and_then(|index| messages.get_mut(index)) else {
+        return;
+    };
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    if let Some(object) = message.as_object_mut() {
+        append_reasoning_content(object, &reasoning);
+    }
+}
+
+fn append_reasoning_content(object: &mut serde_json::Map<String, Value>, reasoning: &str) {
+    let reasoning = reasoning.trim();
+    if reasoning.is_empty() {
+        return;
+    }
+    match object.get_mut("reasoning_content") {
+        Some(Value::String(existing)) if !existing.trim().is_empty() => {
+            existing.push_str("\n\n");
+            existing.push_str(reasoning);
+        }
+        _ => {
+            object.insert(
+                "reasoning_content".to_string(),
+                Value::String(reasoning.to_string()),
+            );
+        }
+    }
+}
+
+fn flush_pending_tool_media(messages: &mut Vec<Value>, pending_tool_media: &mut Vec<Value>) {
+    if pending_tool_media.is_empty() {
+        return;
+    }
+    let mut content = vec![json!({
+        "type": "text",
+        "text": "Images returned by tool calls are attached below."
+    })];
+    content.append(pending_tool_media);
+    messages.push(json!({ "role": "user", "content": content }));
+}
+
+const TOOL_RESULT_IMAGE_MARKER: &str = "[image attached separately]";
+const WHOLE_IMAGE_DATA_URL_MIN_BYTES: usize = 8 * 1024;
+const BASE64ISH_MIN_BYTES: usize = 16 * 1024;
+const MAX_TOOL_MEDIA_DEPTH: usize = 32;
+
+fn tool_output_content_and_media(value: &Value) -> (String, Vec<Value>) {
+    let mut media = Vec::new();
+    let mut sanitized = sanitize_tool_output_media(value, &mut media, 0);
+    if media.is_empty() {
+        return (json_value_string(value), media);
+    }
+    clamp_residual_tool_media_payloads(&mut sanitized);
+    (json_value_string(&sanitized), media)
+}
+
+fn sanitize_tool_output_media(value: &Value, media: &mut Vec<Value>, depth: usize) -> Value {
+    if depth > MAX_TOOL_MEDIA_DEPTH {
+        return value.clone();
+    }
+    match value {
+        Value::String(text) => {
+            if let Some(part) = whole_string_tool_image(text) {
+                push_tool_image(media, part);
+                Value::String(TOOL_RESULT_IMAGE_MARKER.to_string())
+            } else if matches!(text.trim().chars().next(), Some('{') | Some('[')) {
+                let before = media.len();
+                let Some(parsed) = serde_json::from_str::<Value>(text).ok() else {
+                    return value.clone();
+                };
+                let mut sanitized = sanitize_tool_output_media(&parsed, media, depth + 1);
+                if media.len() == before {
+                    value.clone()
+                } else {
+                    clamp_residual_tool_media_payloads(&mut sanitized);
+                    Value::String(
+                        serde_json::to_string(&sanitized).unwrap_or_else(|_| {
+                            "[tool output media attached separately]".to_string()
+                        }),
+                    )
+                }
+            } else {
+                value.clone()
+            }
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| sanitize_tool_output_media(item, media, depth + 1))
+                .collect(),
+        ),
+        Value::Object(object) => {
+            if let Some(part) = structured_tool_image(value) {
+                push_tool_image(media, part);
+                return json!({
+                    "type": "text",
+                    "text": TOOL_RESULT_IMAGE_MARKER
+                });
+            }
+            let mut sanitized = object.clone();
+            if let Some(content) = sanitized.get_mut("content") {
+                *content = sanitize_tool_output_media(content, media, depth + 1);
+            }
+            Value::Object(sanitized)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn whole_string_tool_image(value: &str) -> Option<Value> {
+    let value = value.trim();
+    if value.len() < WHOLE_IMAGE_DATA_URL_MIN_BYTES || !is_image_base64_data_url(value) {
+        return None;
+    }
+    Some(chat_image_part(value, None))
+}
+
+fn structured_tool_image(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let image_type = object.get("type").and_then(Value::as_str);
+    match image_type {
+        Some("input_image" | "output_image" | "image_url") => {
+            let image_url = object.get("image_url").or_else(|| object.get("imageUrl"))?;
+            let (url, nested_detail) = image_url_value(image_url)?;
+            let detail = object.get("detail").cloned().or(nested_detail);
+            supported_tool_image_url(&url).then(|| chat_image_part(&url, detail))
+        }
+        Some("image") => typed_tool_image(object),
+        None => {
+            let image_url = object.get("image_url").or_else(|| object.get("imageUrl"))?;
+            let (url, nested_detail) = image_url_value(image_url)?;
+            is_image_base64_data_url(&url)
+                .then(|| chat_image_part(&url, object.get("detail").cloned().or(nested_detail)))
+        }
+        _ => None,
+    }
+}
+
+fn typed_tool_image(object: &serde_json::Map<String, Value>) -> Option<Value> {
+    if let Some(source) = object.get("source").and_then(Value::as_object) {
+        let mime_type = source
+            .get("media_type")
+            .or_else(|| source.get("mime_type"))
+            .or_else(|| source.get("mimeType"))
+            .and_then(Value::as_str)
+            .unwrap_or("image/png");
+        if !mime_type
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+        {
+            return None;
+        }
+        if let Some(url) = source
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| supported_tool_image_url(url))
+        {
+            return Some(chat_image_part(url, object.get("detail").cloned()));
+        }
+        if let Some(data) = source.get("data").and_then(Value::as_str) {
+            let url = if is_image_base64_data_url(data) {
+                data.to_string()
+            } else {
+                format!("data:{mime_type};base64,{data}")
+            };
+            return Some(chat_image_part(&url, object.get("detail").cloned()));
+        }
+    }
+
+    let mime_type = object
+        .get("mimeType")
+        .or_else(|| object.get("mime_type"))
+        .and_then(Value::as_str)?;
+    if !mime_type
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    {
+        return None;
+    }
+    let data = object.get("data").and_then(Value::as_str)?;
+    let url = if is_image_base64_data_url(data) {
+        data.to_string()
+    } else {
+        format!("data:{mime_type};base64,{data}")
+    };
+    Some(chat_image_part(&url, object.get("detail").cloned()))
+}
+
+fn image_url_value(value: &Value) -> Option<(String, Option<Value>)> {
+    match value {
+        Value::String(url) if !url.trim().is_empty() => Some((url.trim().to_string(), None)),
+        Value::Object(object) => object
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.trim().is_empty())
+            .map(|url| (url.trim().to_string(), object.get("detail").cloned())),
+        _ => None,
+    }
+}
+
+fn chat_image_part(url: &str, detail: Option<Value>) -> Value {
+    let mut image_url = serde_json::Map::new();
+    image_url.insert("url".to_string(), Value::String(url.to_string()));
+    if let Some(detail) = detail {
+        image_url.insert("detail".to_string(), detail);
+    }
+    json!({
+        "type": "image_url",
+        "image_url": image_url
+    })
+}
+
+fn supported_tool_image_url(value: &str) -> bool {
+    is_image_base64_data_url(value)
+        || value
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        || value
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+}
+
+fn is_image_base64_data_url(value: &str) -> bool {
+    let Some(comma_index) = value.find(',') else {
+        return false;
+    };
+    let header = value[..comma_index].to_ascii_lowercase();
+    header.starts_with("data:image/") && header.ends_with(";base64")
+}
+
+fn push_tool_image(media: &mut Vec<Value>, part: Value) {
+    let url = part.pointer("/image_url/url").and_then(Value::as_str);
+    let duplicate = media
+        .iter()
+        .any(|existing| existing.pointer("/image_url/url").and_then(Value::as_str) == url);
+    if !duplicate {
+        media.push(part);
+    }
+}
+
+fn clamp_residual_tool_media_payloads(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            let is_large_data_url = trimmed.len() >= WHOLE_IMAGE_DATA_URL_MIN_BYTES
+                && trimmed
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"));
+            let is_large_base64 = trimmed.len() >= BASE64ISH_MIN_BYTES
+                && trimmed.bytes().all(|byte| {
+                    matches!(
+                        byte,
+                        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'+' | b'/' | b'='
+                    )
+                });
+            if is_large_data_url || is_large_base64 {
+                let byte_len = text.len();
+                *text = format!("[omitted {byte_len} bytes of tool media]");
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                clamp_residual_tool_media_payloads(item);
+            }
+        }
+        Value::Object(object) => {
+            for item in object.values_mut() {
+                clamp_residual_tool_media_payloads(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn response_call_id(object: &serde_json::Map<String, Value>) -> String {
@@ -3393,6 +3849,249 @@ mod tests {
                 .lookup("github__search_issues")
                 .map(|spec| &spec.kind),
             Some(&ChatToolKind::Namespace)
+        );
+    }
+
+    #[test]
+    fn attaches_responses_reasoning_to_the_following_assistant_message() {
+        let (body, _, _) = responses_body_to_chat_completions(
+            Bytes::from_static(
+                br#"{
+                    "model":"thinking-model",
+                    "input":[
+                        {"type":"reasoning","summary":[{"type":"summary_text","text":"first thought"}]},
+                        {"type":"message","role":"assistant","content":"First answer."},
+                        {"type":"reasoning","summary":[{"type":"summary_text","text":"second thought"}]},
+                        {"type":"message","role":"assistant","content":"Second answer."},
+                        {"type":"message","role":"user","content":"Continue"}
+                    ]
+                }"#,
+            ),
+            "p",
+            false,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        let messages = value["messages"].as_array().expect("messages");
+
+        assert_eq!(messages[0]["reasoning_content"], "first thought");
+        assert_eq!(messages[1]["reasoning_content"], "second thought");
+        assert!(messages[2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn preserves_object_and_detail_array_reasoning_fields() {
+        let (body, _, _) = responses_body_to_chat_completions(
+            Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"message","role":"assistant","content":"First","reasoning":{"summary":"object thought"}},
+                        {"type":"message","role":"assistant","content":"Second","reasoning_details":[{"type":"reasoning.text","text":"detail thought"}]}
+                    ]
+                }"#,
+            ),
+            "p",
+            false,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        let messages = value["messages"].as_array().expect("messages");
+
+        assert_eq!(messages[0]["reasoning_content"], "object thought");
+        assert_eq!(messages[1]["reasoning_content"], "detail thought");
+    }
+
+    #[test]
+    fn keeps_reasoning_with_tool_calls_and_the_final_answer() {
+        let (body, _, _) = responses_body_to_chat_completions(
+            Bytes::from_static(
+                br#"{
+                    "model":"thinking-model",
+                    "input":[
+                        {"type":"reasoning","summary":[{"type":"summary_text","text":"need a tool"}]},
+                        {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},
+                        {"type":"function_call_output","call_id":"call_1","output":"result"},
+                        {"type":"reasoning","summary":[{"type":"summary_text","text":"now answer"}]},
+                        {"type":"message","role":"assistant","content":"Done."}
+                    ]
+                }"#,
+            ),
+            "p",
+            false,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        let messages = value["messages"].as_array().expect("messages");
+
+        assert_eq!(messages[0]["reasoning_content"], "need a tool");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[2]["reasoning_content"], "now answer");
+    }
+
+    #[test]
+    fn appends_trailing_reasoning_before_a_user_turn_boundary() {
+        let (body, _, _) = responses_body_to_chat_completions(
+            Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"message","role":"assistant","content":"Done.","reasoning_content":"embedded"},
+                        {"type":"reasoning","summary":[{"type":"summary_text","text":"trailing"}]},
+                        {"type":"message","role":"user","content":"Continue"}
+                    ]
+                }"#,
+            ),
+            "p",
+            false,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        let messages = value["messages"].as_array().expect("messages");
+
+        assert_eq!(messages[0]["reasoning_content"], "embedded\n\ntrailing");
+        assert!(messages[1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn forwards_tool_result_images_as_native_chat_media() {
+        let (body, _, _) = responses_body_to_chat_completions(
+            Bytes::from_static(
+                br#"{
+                    "model":"gpt-5.6-sol",
+                    "input":[
+                        {"type":"function_call","call_id":"call_image","name":"view_image","arguments":"{}"},
+                        {"type":"function_call_output","call_id":"call_image","output":[
+                            {"type":"image","mimeType":"image/png","data":"aGVsbG8="},
+                            {"type":"text","text":"preview ready"}
+                        ]}
+                    ]
+                }"#,
+            ),
+            "p",
+            false,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        let messages = value["messages"].as_array().expect("messages");
+
+        assert_eq!(messages[1]["role"], "tool");
+        assert!(!messages[1]["content"]
+            .as_str()
+            .expect("tool content")
+            .contains("aGVsbG8="));
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(
+            messages[2].pointer("/content/1/image_url/url"),
+            Some(&Value::String("data:image/png;base64,aGVsbG8=".to_string()))
+        );
+    }
+
+    #[test]
+    fn forwards_json_encoded_and_remote_tool_result_images() {
+        let output = json!({
+            "content": [{
+                "type": "input_image",
+                "image_url": {
+                    "url": "https://example.com/preview.png",
+                    "detail": "high"
+                }
+            }]
+        })
+        .to_string();
+        let (content, media) = tool_output_content_and_media(&Value::String(output));
+
+        assert!(!content.contains("https://example.com/preview.png"));
+        assert_eq!(media.len(), 1);
+        assert_eq!(
+            media[0].pointer("/image_url/url"),
+            Some(&Value::String(
+                "https://example.com/preview.png".to_string()
+            ))
+        );
+        assert_eq!(
+            media[0].pointer("/image_url/detail"),
+            Some(&Value::String("high".to_string()))
+        );
+    }
+
+    #[test]
+    fn forwards_large_whole_string_tool_image_data_url() {
+        let data_url = format!("data:image/png;base64,{}", "aGVsbG8=".repeat(1_100));
+        let (content, media) = tool_output_content_and_media(&Value::String(data_url.clone()));
+
+        assert_eq!(content, TOOL_RESULT_IMAGE_MARKER);
+        assert_eq!(
+            media[0].pointer("/image_url/url").and_then(Value::as_str),
+            Some(data_url.as_str())
+        );
+    }
+
+    #[test]
+    fn media_tool_outputs_clamp_residual_base64_but_text_only_outputs_are_stable() {
+        let text_only = r#"{ "content": [{"type":"text","text":"ordinary result"}] }"#;
+        let (content, media) = tool_output_content_and_media(&Value::String(text_only.to_string()));
+        assert_eq!(content, text_only);
+        assert!(media.is_empty());
+
+        let bare_base64 = "A".repeat(BASE64ISH_MIN_BYTES);
+        let (content, media) = tool_output_content_and_media(&Value::String(bare_base64.clone()));
+        assert_eq!(content, bare_base64);
+        assert!(media.is_empty());
+
+        let (content, media) = tool_output_content_and_media(&json!({
+            "content": [
+                {"type":"image","mimeType":"image/png","data":"aGVsbG8="},
+                {"type":"text","text":"caption"}
+            ],
+            "raw": "A".repeat(BASE64ISH_MIN_BYTES)
+        }));
+        assert_eq!(media.len(), 1);
+        assert!(content.contains("omitted"));
+        assert!(!content.contains(&"A".repeat(BASE64ISH_MIN_BYTES)));
+    }
+
+    #[test]
+    fn flushes_parallel_tool_media_after_the_complete_tool_batch() {
+        let (body, _, _) = responses_body_to_chat_completions(
+            Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"function_call","call_id":"call_1","name":"first","arguments":"{}"},
+                        {"type":"function_call","call_id":"call_2","name":"second","arguments":"{}"},
+                        {"type":"function_call_output","call_id":"call_1","output":{"type":"image","mimeType":"image/png","data":"aGVsbG8="}},
+                        {"type":"function_call_output","call_id":"call_2","output":"done"},
+                        {"type":"message","role":"user","content":"continue"}
+                    ]
+                }"#,
+            ),
+            "p",
+            false,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        let messages = value["messages"].as_array().expect("messages");
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"].as_array().map(Vec::len), Some(2));
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"][1]["type"], "image_url");
+        assert_eq!(messages[4]["role"], "user");
+        assert_eq!(messages[4]["content"], "continue");
+    }
+
+    #[test]
+    fn forwards_anthropic_shaped_tool_images() {
+        let (content, media) = tool_output_content_and_media(&json!({
+            "content": [{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": "YWJj"
+                }
+            }]
+        }));
+
+        assert!(!content.contains("YWJj"));
+        assert_eq!(
+            media[0].pointer("/image_url/url"),
+            Some(&Value::String("data:image/jpeg;base64,YWJj".to_string()))
         );
     }
 

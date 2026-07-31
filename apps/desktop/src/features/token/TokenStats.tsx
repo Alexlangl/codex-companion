@@ -69,6 +69,8 @@ export function TokenStats({
     model: model || undefined,
   }), [dateRange, model, providerId]);
   const queryKey = `${codexDir.trim()}|${query.startDate ?? ""}|${query.endDate ?? ""}|${providerId}|${model}`;
+  const latestQueryKeyRef = useRef(queryKey);
+  latestQueryKeyRef.current = queryKey;
   const rangeLabel = usageRangeLabel(rangePreset, customStartTime, customEndTime);
   const refreshIntervalSeconds = status.config.app.tokenUsageRefreshIntervalSeconds;
 
@@ -84,7 +86,8 @@ export function TokenStats({
     }
     inFlightRef.current = true;
     requestedQueryRef.current = queryKey;
-    const showFullLoading = mode !== "silent" || !hasStats;
+    const requestQueryKey = queryKey;
+    const showFullLoading = !hasStats;
     if (showFullLoading) {
       setLoading(true);
     } else {
@@ -93,25 +96,35 @@ export function TokenStats({
     setError(null);
     try {
       const nextStats = await onLoad(codexDir, { ...query, rebuild: mode === "rebuild" });
-      setAvailableProviders(nextStats.availableProviders);
-      setAvailableModels(nextStats.availableModels);
-      setStats(nextStats);
+      if (latestQueryKeyRef.current !== requestQueryKey) return;
+      setAvailableProviders((current) =>
+        sameStringArray(current, nextStats.availableProviders) ? current : nextStats.availableProviders,
+      );
+      setAvailableModels((current) =>
+        sameStringArray(current, nextStats.availableModels) ? current : nextStats.availableModels,
+      );
+      setStats((current) =>
+        current && tokenUsageSummaryKey(current) === tokenUsageSummaryKey(nextStats) ? current : nextStats,
+      );
     } catch (unknownError) {
-      setError(userFacingError(unknownError));
+      if (latestQueryKeyRef.current === requestQueryKey) {
+        setError(userFacingError(unknownError));
+      }
     } finally {
       inFlightRef.current = false;
       setLoading(false);
       setRefreshing(false);
+      setSyncStatus(null);
     }
   }, [codexDir, dateRangeError, hasStats, onLoad, query, queryKey]);
 
   useEffect(() => {
-    if (!active || loading || requestedQueryRef.current === queryKey) return;
+    if (!active || loading || refreshing || requestedQueryRef.current === queryKey) return;
     const timer = window.setTimeout(() => {
       void load("silent");
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [active, load, loading, queryKey]);
+  }, [active, load, loading, queryKey, refreshing]);
 
   useEffect(() => {
     if (!active || refreshIntervalSeconds <= 0) return;
@@ -127,13 +140,19 @@ export function TokenStats({
     const poll = async (): Promise<void> => {
       try {
         const nextStatus = await getTokenUsageSyncStatus();
-        if (!cancelled) setSyncStatus(nextStatus);
+        if (!cancelled) {
+          setSyncStatus((current) =>
+            current && tokenUsageSyncStatusKey(current) === tokenUsageSyncStatusKey(nextStatus)
+              ? current
+              : nextStatus,
+          );
+        }
       } catch {
-        if (!cancelled) setSyncStatus(null);
+        if (!cancelled) setSyncStatus((current) => (current === null ? current : null));
       }
     };
     void poll();
-    const timer = window.setInterval(() => void poll(), 250);
+    const timer = window.setInterval(() => void poll(), 750);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -147,6 +166,7 @@ export function TokenStats({
   const rangeCostLabel = stats?.unpricedEvents ? "范围内已定价成本" : "范围内估算成本";
   const providerOptions = includeSelectedOption(availableProviders, providerId);
   const modelOptions = includeSelectedOption(availableModels, model);
+  const integrityIssueCount = (stats?.deferredFiles ?? 0) + (stats?.suspectedDuplicates ?? 0);
 
   function handleRefresh(): void {
     void load();
@@ -159,7 +179,6 @@ export function TokenStats({
   function handleRangeChange(event: ChangeEvent<HTMLInputElement>): void {
     const nextRange = event.target.value as UsageRangePreset;
     setFilters((current) => ({ ...current, rangePreset: nextRange }));
-    setStats(null);
     setError(null);
   }
 
@@ -173,28 +192,24 @@ export function TokenStats({
   function handleCustomStartDateChange(event: ChangeEvent<HTMLInputElement>): void {
     const nextStartTime = event.target.value;
     setFilters((current) => ({ ...current, customStartTime: nextStartTime }));
-    setStats(null);
     setError(null);
   }
 
   function handleCustomEndDateChange(event: ChangeEvent<HTMLInputElement>): void {
     const nextEndTime = event.target.value;
     setFilters((current) => ({ ...current, customEndTime: nextEndTime }));
-    setStats(null);
     setError(null);
   }
 
   function handleProviderChange(event: ChangeEvent<HTMLSelectElement>): void {
     const nextProviderId = event.target.value;
     setFilters((current) => ({ ...current, providerId: nextProviderId, model: "" }));
-    setStats(null);
     setError(null);
   }
 
   function handleModelChange(event: ChangeEvent<HTMLSelectElement>): void {
     const nextModel = event.target.value;
     setFilters((current) => ({ ...current, model: nextModel }));
-    setStats(null);
     setError(null);
   }
 
@@ -211,7 +226,7 @@ export function TokenStats({
               <label key={option.value}>
                 <input
                   checked={rangePreset === option.value}
-                  disabled={loading || refreshing}
+                  disabled={loading}
                   name="usage-range"
                   onChange={handleRangeChange}
                   type="radio"
@@ -228,7 +243,7 @@ export function TokenStats({
               <input
                 aria-describedby={dateRangeError ? "usage-date-error" : undefined}
                 aria-invalid={Boolean(dateRangeError)}
-                disabled={loading || refreshing}
+                disabled={loading}
                 max={customEndTime || undefined}
                 onChange={handleCustomStartDateChange}
                 step={1}
@@ -240,7 +255,7 @@ export function TokenStats({
               <input
                 aria-describedby={dateRangeError ? "usage-date-error" : undefined}
                 aria-invalid={Boolean(dateRangeError)}
-                disabled={loading || refreshing}
+                disabled={loading}
                 min={customStartTime || undefined}
                 onChange={handleCustomEndDateChange}
                 step={1}
@@ -253,7 +268,7 @@ export function TokenStats({
         {dateRangeError ? <p className="field-error" id="usage-date-error">{dateRangeError}</p> : null}
         <div className="usage-dimension-filters">
           <Field label="Provider">
-            <select disabled={loading || refreshing} onChange={handleProviderChange} value={providerId}>
+            <select disabled={loading} onChange={handleProviderChange} value={providerId}>
               <option value="">全部 Provider</option>
               {providerOptions.map((provider) => (
                 <option key={provider} value={provider}>{usageProviderLabel(status, provider)}</option>
@@ -261,7 +276,7 @@ export function TokenStats({
             </select>
           </Field>
           <Field label="模型">
-            <select disabled={loading || refreshing} onChange={handleModelChange} value={model}>
+            <select disabled={loading} onChange={handleModelChange} value={model}>
               <option value="">全部模型</option>
               {modelOptions.map((availableModel) => (
                 <option key={availableModel} value={availableModel}>{availableModel}</option>
@@ -298,12 +313,11 @@ export function TokenStats({
             </p>
           </div>
         ) : null}
-        {stats && (stats.deferredFiles > 0 || stats.suspectedDuplicates > 0) ? (
-          <div className="warning-box usage-integrity-warning">
-            <strong>有 {stats.deferredFiles + stats.suspectedDuplicates} 个文件需要确认归属</strong>
-            <p>
-              {stats.deferredFiles} 个子任务文件正在等待父会话出现，暂不计入统计；{stats.suspectedDuplicates} 个文件存在父记录冲突，已标记为疑似重复。
-            </p>
+        {stats && integrityIssueCount > 0 ? (
+          <div aria-live="polite" className="warning-box usage-integrity-warning" role="status">
+            <strong>有 {integrityIssueCount} 个文件未纳入统计</strong>
+            {stats.deferredFiles > 0 ? <p>{stats.deferredFiles} 个子任务文件尚未找到可验证的父会话，暂不计入统计。</p> : null}
+            {stats.suspectedDuplicates > 0 ? <p>{stats.suspectedDuplicates} 个文件存在父记录冲突，暂不计入统计。</p> : null}
           </div>
         ) : null}
         <div className="metric-grid details-top">
@@ -412,6 +426,27 @@ function tokenEventKey(event: TokenUsageEvent): string {
     event.cachedInputTokens,
     event.cacheWriteInputTokens,
     event.outputTokens,
+  ].join("|");
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function tokenUsageSummaryKey(summary: TokenUsageSummary): string {
+  return JSON.stringify(summary);
+}
+
+function tokenUsageSyncStatusKey(status: TokenUsageSyncStatus): string {
+  return [
+    status.active,
+    status.scannedFiles,
+    status.totalFiles,
+    status.deferredFiles,
+    status.suspectedDuplicates,
+    status.phase,
+    status.startedAt ?? "",
+    status.finishedAt ?? "",
   ].join("|");
 }
 

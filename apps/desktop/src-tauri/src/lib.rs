@@ -1,6 +1,8 @@
+mod codex_oauth;
+
 use codex_companion_core::{
-    default_codex_dir, ApiClientCreate, ApiClientUpdate, HealthStatusKind, ProviderLaunchMode,
-    ProviderViewMode, RelaySettingsUpdate, RepairOptions, ThemeMode,
+    default_codex_dir, ApiClientCreate, ApiClientUpdate, HealthStatusKind, ProviderConfig,
+    ProviderLaunchMode, ProviderViewMode, RelaySettingsUpdate, RepairOptions, ThemeMode,
 };
 use codex_companion_daemon::CompanionDaemon;
 use codex_companion_provider::{
@@ -20,6 +22,7 @@ const TRAY_ICON_ID: &str = "main-tray";
 const TRAY_ACTION_EVENT: &str = "tray-action";
 const TRAY_STATUS_ID: &str = "tray-status";
 const TRAY_ROUTE_ID: &str = "tray-route";
+const TRAY_QUOTA_ID: &str = "tray-quota";
 const TRAY_OPEN_ID: &str = "tray-open";
 const TRAY_HIDE_ID: &str = "tray-hide";
 const TRAY_QUIT_ID: &str = "tray-quit";
@@ -38,6 +41,8 @@ const TRAY_SETTINGS_ID: &str = "tray-settings";
 struct TrayMenuLabels {
     runtime: String,
     route: String,
+    quota: String,
+    quota_title: Option<String>,
     launch: String,
     can_launch: bool,
 }
@@ -48,6 +53,8 @@ fn tray_menu_labels() -> TrayMenuLabels {
         return TrayMenuLabels {
             runtime: "● Companion 正在启动".to_string(),
             route: "当前分组：读取中".to_string(),
+            quota: "额度：读取中".to_string(),
+            quota_title: None,
             launch: "启动 Codex（读取配置中）".to_string(),
             can_launch: false,
         };
@@ -72,6 +79,8 @@ fn tray_menu_labels() -> TrayMenuLabels {
         return TrayMenuLabels {
             runtime: format!("● Companion 正在运行 · {}", status.relay_base_url),
             route: "当前分组：未配置".to_string(),
+            quota: "额度：暂无可监控账号".to_string(),
+            quota_title: None,
             launch: "启动 Codex（需先配置分组）".to_string(),
             can_launch: false,
         };
@@ -82,12 +91,182 @@ fn tray_menu_labels() -> TrayMenuLabels {
     } else {
         "启动 Codex（分组暂无账号）".to_string()
     };
+    let (quota, quota_title) = tray_quota_summary(&status.active_providers);
 
     TrayMenuLabels {
         runtime: format!("● Companion 正在运行 · {}", status.relay_base_url),
         route: format!("当前分组：{} · 可用账号 {available}/{total}", group.name),
+        quota,
+        quota_title,
         launch,
         can_launch,
+    }
+}
+
+fn tray_quota_summary(providers: &[ProviderConfig]) -> (String, Option<String>) {
+    for provider in providers {
+        let Some(account) = provider.account.as_ref() else {
+            continue;
+        };
+        let details = account
+            .quota_windows
+            .iter()
+            .filter_map(|window| {
+                tray_percent(window.remaining_percent).map(|percent| {
+                    format!(
+                        "{} {}%",
+                        tray_text_label(&window.label, 16, "周期"),
+                        format_tray_number(percent)
+                    )
+                })
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        if !details.is_empty() {
+            let title = details.first().cloned();
+            return (
+                format!(
+                    "额度：{} · {}",
+                    tray_provider_label(provider),
+                    details.join(" · ")
+                ),
+                title,
+            );
+        }
+        if let Some(percent) = account.quota_percent.and_then(tray_percent) {
+            let percent = format_tray_number(percent);
+            return (
+                format!("额度：{} · 剩余 {percent}%", tray_provider_label(provider)),
+                Some(format!("{percent}%")),
+            );
+        }
+        if let Some(available) = account.usage_available.filter(|value| value.is_finite()) {
+            let available = format_tray_number(available);
+            return (
+                format!("额度：{} · 剩余 {available}", tray_provider_label(provider)),
+                Some(available),
+            );
+        }
+    }
+    ("额度：暂无可监控数据".to_string(), None)
+}
+
+fn tray_provider_label(provider: &ProviderConfig) -> String {
+    let label = provider
+        .account
+        .as_ref()
+        .and_then(|account| account.email.as_deref().or(account.display_name.as_deref()))
+        .unwrap_or(&provider.name)
+        .trim();
+    tray_text_label(label, 24, "未命名账号")
+}
+
+fn tray_text_label(value: &str, max_chars: usize, fallback: &str) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let value = if value.is_empty() { fallback } else { &value };
+    let mut chars = value.chars();
+    let shortened = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{shortened}...")
+    } else {
+        shortened
+    }
+}
+
+fn tray_percent(value: f64) -> Option<f64> {
+    value.is_finite().then(|| value.clamp(0.0, 100.0))
+}
+
+fn format_tray_number(value: f64) -> String {
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use super::*;
+    use codex_companion_core::{ProviderAccountInfo, ProviderKind, ProviderQuotaWindow};
+    use std::collections::BTreeMap;
+
+    fn provider(account: ProviderAccountInfo) -> ProviderConfig {
+        ProviderConfig {
+            id: "provider".to_string(),
+            name: "Fallback Provider".to_string(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://example.com/v1".to_string(),
+            websocket_url: None,
+            auth_ref: None,
+            direct_auth_ref: None,
+            model_map: BTreeMap::new(),
+            priority: 0,
+            enabled: true,
+            refresh_interval_seconds: 60,
+            account: Some(account),
+        }
+    }
+
+    #[test]
+    fn quota_summary_uses_bounded_valid_windows() {
+        let provider = provider(ProviderAccountInfo {
+            email: Some("person@example.com\nextra".to_string()),
+            quota_windows: vec![
+                ProviderQuotaWindow {
+                    label: "invalid".to_string(),
+                    remaining_percent: f64::NAN,
+                    ..ProviderQuotaWindow::default()
+                },
+                ProviderQuotaWindow {
+                    label: "Week".to_string(),
+                    remaining_percent: 120.0,
+                    ..ProviderQuotaWindow::default()
+                },
+                ProviderQuotaWindow {
+                    label: "5h".to_string(),
+                    remaining_percent: 42.25,
+                    ..ProviderQuotaWindow::default()
+                },
+            ],
+            ..ProviderAccountInfo::default()
+        });
+
+        let (menu, title) = tray_quota_summary(&[provider]);
+
+        assert_eq!(
+            menu,
+            "额度：person@example.com extra · Week 100% · 5h 42.2%"
+        );
+        assert_eq!(title.as_deref(), Some("Week 100%"));
+    }
+
+    #[test]
+    fn quota_summary_falls_back_to_percent_and_available_balance() {
+        let percent_provider = provider(ProviderAccountInfo {
+            display_name: Some("Account".to_string()),
+            quota_percent: Some(-3.0),
+            ..ProviderAccountInfo::default()
+        });
+        assert_eq!(
+            tray_quota_summary(&[percent_provider]),
+            (
+                "额度：Account · 剩余 0%".to_string(),
+                Some("0%".to_string())
+            )
+        );
+
+        let balance_provider = provider(ProviderAccountInfo {
+            usage_available: Some(12.75),
+            ..ProviderAccountInfo::default()
+        });
+        assert_eq!(
+            tray_quota_summary(&[balance_provider]),
+            (
+                "额度：Fallback Provider · 剩余 12.8".to_string(),
+                Some("12.8".to_string())
+            )
+        );
     }
 }
 
@@ -358,6 +537,44 @@ fn import_local_codex_provider(
 }
 
 #[tauri::command]
+fn start_codex_oauth() -> Result<codex_oauth::OAuthStartResponse, String> {
+    let daemon = daemon()?;
+    codex_oauth::start(daemon.store().data_dir())
+}
+
+#[tauri::command]
+fn get_codex_oauth_status() -> Result<Option<codex_oauth::OAuthStatusResponse>, String> {
+    let daemon = daemon()?;
+    codex_oauth::status(&daemon.store().data_dir())
+}
+
+#[tauri::command]
+fn open_codex_oauth(login_id: String) -> Result<(), String> {
+    let daemon = daemon()?;
+    codex_oauth::open_browser(&daemon.store().data_dir(), &login_id)
+}
+
+#[tauri::command]
+fn submit_codex_oauth_callback(login_id: String, callback_url: String) -> Result<(), String> {
+    let daemon = daemon()?;
+    codex_oauth::submit_callback(&daemon.store().data_dir(), &login_id, &callback_url)
+}
+
+#[tauri::command]
+fn cancel_codex_oauth(login_id: Option<String>) -> Result<(), String> {
+    let daemon = daemon()?;
+    codex_oauth::cancel(&daemon.store().data_dir(), login_id.as_deref())
+}
+
+#[tauri::command]
+async fn complete_codex_oauth(
+    login_id: String,
+) -> Result<codex_companion_provider::ProviderImportOutcome, String> {
+    let daemon = daemon()?;
+    codex_oauth::complete(&daemon, &login_id).await
+}
+
+#[tauri::command]
 fn remove_provider(id: String) -> Result<bool, String> {
     daemon()?
         .remove_provider(&id)
@@ -580,16 +797,50 @@ async fn get_session_page(
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+fn get_session_provider_preferences(
+    session_ids: Vec<String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    daemon()?
+        .session_provider_preferences(&session_ids)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_session_provider_preference(
+    session_id: String,
+    provider_id: String,
+) -> Result<String, String> {
+    daemon()?
+        .set_session_provider_preference(&session_id, &provider_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_session_provider_preference(session_id: String) -> Result<bool, String> {
+    daemon()?
+        .clear_session_provider_preference(&session_id)
+        .map_err(|error| error.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            if let Ok(daemon) = daemon() {
+                if let Err(error) = codex_oauth::restore_listener(daemon.store().data_dir()) {
+                    eprintln!("Codex OAuth pending state restore failed: {error}");
+                }
+            }
             let labels = tray_menu_labels();
             let tray_runtime_status = MenuItemBuilder::with_id(TRAY_STATUS_ID, &labels.runtime)
                 .enabled(false)
                 .build(app)?;
             let tray_route_status = MenuItemBuilder::with_id(TRAY_ROUTE_ID, &labels.route)
+                .enabled(false)
+                .build(app)?;
+            let tray_quota_status = MenuItemBuilder::with_id(TRAY_QUOTA_ID, &labels.quota)
                 .enabled(false)
                 .build(app)?;
             let tray_launch = MenuItemBuilder::with_id(TRAY_LAUNCH_ID, &labels.launch)
@@ -608,6 +859,7 @@ pub fn run() {
             let tray_menu = MenuBuilder::new(app)
                 .item(&tray_runtime_status)
                 .item(&tray_route_status)
+                .item(&tray_quota_status)
                 .separator()
                 .text(TRAY_OPEN_ID, "打开 Codex Companion")
                 .item(&page_menu)
@@ -657,18 +909,25 @@ pub fn run() {
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
             }
-            tray.build(app)?;
+            if let Some(title) = labels.quota_title.as_deref() {
+                tray = tray.title(title);
+            }
+            let tray_icon = tray.build(app)?;
 
             let runtime_status_for_refresh = tray_runtime_status.clone();
             let route_status_for_refresh = tray_route_status.clone();
+            let quota_status_for_refresh = tray_quota_status.clone();
             let launch_for_refresh = tray_launch.clone();
+            let tray_icon_for_refresh = tray_icon.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     let labels = tray_menu_labels();
                     let _ = runtime_status_for_refresh.set_text(labels.runtime);
                     let _ = route_status_for_refresh.set_text(labels.route);
+                    let _ = quota_status_for_refresh.set_text(labels.quota);
                     let _ = launch_for_refresh.set_text(labels.launch);
                     let _ = launch_for_refresh.set_enabled(labels.can_launch);
+                    let _ = tray_icon_for_refresh.set_title(labels.quota_title.as_deref());
                     tokio::time::sleep(Duration::from_secs(15)).await;
                 }
             });
@@ -737,6 +996,12 @@ pub fn run() {
             review_provider_json_many,
             import_api_key_provider,
             import_local_codex_provider,
+            start_codex_oauth,
+            get_codex_oauth_status,
+            open_codex_oauth,
+            submit_codex_oauth_callback,
+            cancel_codex_oauth,
+            complete_codex_oauth,
             remove_provider,
             test_provider,
             refresh_provider,
@@ -757,7 +1022,10 @@ pub fn run() {
             reset_app_settings,
             get_token_usage,
             get_token_usage_sync_status,
-            get_session_page
+            get_session_page,
+            get_session_provider_preferences,
+            set_session_provider_preference,
+            clear_session_provider_preference
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex Companion");

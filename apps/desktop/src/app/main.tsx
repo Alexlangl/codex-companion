@@ -286,6 +286,7 @@ function App() {
                     onViewModeChange={actions.changeProviderViewMode}
                     onExport={actions.exportProvider}
                     onImportApiKey={actions.importApiKey}
+                    onImportCodexOAuth={actions.importCodexOAuth}
                     onImportJsonBatch={actions.importJsonBatch}
                     onImportLocal={actions.importLocal}
                     onRemove={actions.removeProvider}

@@ -9,7 +9,7 @@ use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use subtle::ConstantTimeEq;
 
@@ -30,6 +30,8 @@ pub struct RequestLogStart<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub model: Option<&'a str>,
+    pub reasoning_effort: Option<&'a str>,
+    pub service_tier: Option<&'a str>,
     pub client_id: Option<&'a str>,
 }
 
@@ -93,6 +95,8 @@ impl ApiServiceStore {
                     method TEXT NOT NULL,
                     path TEXT NOT NULL,
                     model TEXT,
+                    reasoning_effort TEXT,
+                    service_tier TEXT,
                     client_id TEXT,
                     provider_id TEXT,
                     status_code INTEGER,
@@ -129,6 +133,13 @@ impl ApiServiceStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_affinity_updated_at
                     ON session_affinity(updated_at DESC);
+                CREATE TABLE IF NOT EXISTS session_provider_preferences (
+                    session_id TEXT PRIMARY KEY,
+                    provider_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_provider_preferences_updated_at
+                    ON session_provider_preferences(updated_at DESC);
                 CREATE TABLE IF NOT EXISTS chat_history (
                     provider_id TEXT NOT NULL,
                     response_id TEXT NOT NULL,
@@ -151,6 +162,7 @@ impl ApiServiceStore {
                 "#,
             )
             .map_err(database_error)?;
+        ensure_request_metadata_columns(&connection)?;
         Ok(())
     }
 
@@ -323,6 +335,85 @@ impl ApiServiceStore {
         Ok(())
     }
 
+    pub fn set_session_provider_preference(
+        &self,
+        session_id: &str,
+        provider_id: &str,
+    ) -> Result<()> {
+        let session_id = session_id.trim();
+        let provider_id = provider_id.trim();
+        if session_id.is_empty() || session_id.len() > 256 {
+            return Err(CompanionError::InvalidConfig(
+                "Session ID 不能为空且不能超过 256 个字符".into(),
+            ));
+        }
+        if provider_id.is_empty() || provider_id.len() > 160 {
+            return Err(CompanionError::InvalidConfig(
+                "Provider ID 不能为空且不能超过 160 个字符".into(),
+            ));
+        }
+        let session_key = session_provider_preference_key(session_id);
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO session_provider_preferences (session_id, provider_id, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(session_id) DO UPDATE SET provider_id = excluded.provider_id, updated_at = excluded.updated_at",
+                params![session_key, provider_id, timestamp(Utc::now())],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn session_provider_preference(&self, session_id: &str) -> Result<Option<String>> {
+        let session_key = session_provider_preference_key(session_id.trim());
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT provider_id FROM session_provider_preferences WHERE session_id = ?1",
+                params![session_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(database_error)
+    }
+
+    pub fn list_session_provider_preferences(
+        &self,
+        session_ids: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        let connection = self.connection()?;
+        let mut preferences = BTreeMap::new();
+        let mut statement = connection
+            .prepare("SELECT provider_id FROM session_provider_preferences WHERE session_id = ?1")
+            .map_err(database_error)?;
+        for session_id in session_ids.iter().map(String::as_str).map(str::trim) {
+            if session_id.is_empty() {
+                continue;
+            }
+            let session_key = session_provider_preference_key(session_id);
+            if let Some(provider_id) = statement
+                .query_row(params![session_key], |row| row.get::<_, String>(0))
+                .optional()
+                .map_err(database_error)?
+            {
+                preferences.insert(session_id.to_string(), provider_id);
+            }
+        }
+        Ok(preferences)
+    }
+
+    pub fn clear_session_provider_preference(&self, session_id: &str) -> Result<bool> {
+        let session_key = session_provider_preference_key(session_id.trim());
+        let connection = self.connection()?;
+        let deleted = connection
+            .execute(
+                "DELETE FROM session_provider_preferences WHERE session_id = ?1",
+                params![session_key],
+            )
+            .map_err(database_error)?;
+        Ok(deleted > 0)
+    }
+
     pub fn preferred_affinity(
         &self,
         affinity_key: &str,
@@ -443,14 +534,16 @@ impl ApiServiceStore {
         connection
             .execute(
                 "INSERT OR REPLACE INTO api_requests \
-                 (request_id, started_at, method, path, model, client_id, outcome) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'processing')",
+                 (request_id, started_at, method, path, model, reasoning_effort, service_tier, client_id, outcome) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'processing')",
                 params![
                     input.request_id,
                     timestamp(Utc::now()),
                     input.method,
                     path,
                     input.model,
+                    input.reasoning_effort,
+                    input.service_tier,
                     input.client_id
                 ],
             )
@@ -551,8 +644,9 @@ impl ApiServiceStore {
         let limit = limit.clamp(1, 500) as i64;
         let mut statement = connection
             .prepare(
-                "SELECT r.request_id, r.started_at, r.method, r.path, r.model, r.client_id, \
-                 c.name, r.provider_id, r.status_code, r.outcome, r.attempts, r.latency_ms, r.error \
+                "SELECT r.request_id, r.started_at, r.method, r.path, r.model, \
+                 r.reasoning_effort, r.service_tier, r.client_id, c.name, r.provider_id, \
+                 r.status_code, r.outcome, r.attempts, r.latency_ms, r.error \
                  FROM api_requests r LEFT JOIN api_clients c ON c.id = r.client_id \
                  ORDER BY r.started_at DESC LIMIT ?1",
             )
@@ -720,7 +814,8 @@ impl ApiServiceStore {
                 "SELECT COUNT(*), \
                     COALESCE(SUM(CASE WHEN outcome IN ('succeeded', 'local') THEN 1 ELSE 0 END), 0), \
                     COALESCE(SUM(CASE WHEN outcome NOT IN ('succeeded', 'local', 'processing') THEN 1 ELSE 0 END), 0), \
-                    AVG(latency_ms) FROM api_requests WHERE client_id = ?1 AND started_at >= ?2",
+                    AVG(CASE WHEN outcome IN ('succeeded', 'local') THEN latency_ms END) \
+                    FROM api_requests WHERE client_id = ?1 AND started_at >= ?2",
                 params![client_id, start],
                 |row| {
                     Ok((
@@ -867,16 +962,48 @@ fn api_request_from_row(row: &Row<'_>) -> rusqlite::Result<ApiRequestLog> {
         method: row.get(2)?,
         path: row.get(3)?,
         model: row.get(4)?,
-        client_id: row.get(5)?,
-        client_name: row.get(6)?,
-        provider_id: row.get(7)?,
-        status_code: row.get(8)?,
-        outcome: row.get(9)?,
-        attempts: row.get(10)?,
-        latency_ms: row.get(11)?,
-        error: row.get(12)?,
+        reasoning_effort: row.get(5)?,
+        service_tier: row.get(6)?,
+        client_id: row.get(7)?,
+        client_name: row.get(8)?,
+        provider_id: row.get(9)?,
+        status_code: row.get(10)?,
+        outcome: row.get(11)?,
+        attempts: row.get(12)?,
+        latency_ms: row.get(13)?,
+        error: row.get(14)?,
         attempt_log: Vec::new(),
     })
+}
+
+fn ensure_request_metadata_columns(connection: &Connection) -> Result<()> {
+    for column in ["reasoning_effort", "service_tier"] {
+        if api_requests_has_column(connection, column)? {
+            continue;
+        }
+        connection
+            .execute(
+                &format!("ALTER TABLE api_requests ADD COLUMN {column} TEXT"),
+                [],
+            )
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn api_requests_has_column(connection: &Connection, column: &str) -> Result<bool> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(api_requests)")
+        .map_err(database_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(database_error)?;
+    for value in columns {
+        if value.map_err(database_error)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn request_attempts(
@@ -977,6 +1104,10 @@ fn hash_key(api_key: &str) -> [u8; 32] {
     Sha256::digest(api_key.as_bytes()).into()
 }
 
+fn session_provider_preference_key(session_id: &str) -> String {
+    format!("{:x}", Sha256::digest(session_id.as_bytes()))
+}
+
 fn compact_log_error(value: &str) -> String {
     let redacted = redact_sensitive_text(value);
     let compact = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1019,6 +1150,54 @@ mod tests {
         let store = ApiServiceStore::from_config_store(&config);
         store.initialize().expect("initialize");
         (temp, store)
+    }
+
+    #[test]
+    fn initializes_request_metadata_columns_on_an_existing_database() {
+        let temp = tempfile::tempdir().expect("temp");
+        let config = ConfigStore::new(temp.path().join("config.json"));
+        let store = ApiServiceStore::from_config_store(&config);
+        std::fs::create_dir_all(store.path.parent().expect("parent")).expect("relay directory");
+        let connection = Connection::open(&store.path).expect("legacy database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE api_requests (
+                    request_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    model TEXT,
+                    client_id TEXT,
+                    provider_id TEXT,
+                    status_code INTEGER,
+                    outcome TEXT NOT NULL DEFAULT 'processing',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    latency_ms INTEGER,
+                    error TEXT
+                );
+                INSERT INTO api_requests (
+                    request_id, started_at, method, path, model, outcome
+                ) VALUES (
+                    'legacy-request', '2026-07-01T00:00:00Z', 'POST', '/v1/responses',
+                    'gpt-legacy', 'succeeded'
+                );
+                "#,
+            )
+            .expect("legacy schema");
+        drop(connection);
+
+        store.initialize().expect("migrate");
+        let snapshot = store.snapshot(10).expect("snapshot");
+
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(snapshot.recent_requests[0].request_id, "legacy-request");
+        assert_eq!(
+            snapshot.recent_requests[0].model.as_deref(),
+            Some("gpt-legacy")
+        );
+        assert_eq!(snapshot.recent_requests[0].reasoning_effort, None);
+        assert_eq!(snapshot.recent_requests[0].service_tier, None);
     }
 
     #[test]
@@ -1071,6 +1250,8 @@ mod tests {
                 method: "POST",
                 path: "/v1/responses",
                 model: Some("gpt-test"),
+                reasoning_effort: Some("high"),
+                service_tier: Some("priority"),
                 client_id: None,
             })
             .expect("start");
@@ -1127,6 +1308,14 @@ mod tests {
 
         let snapshot = store.snapshot(100).expect("snapshot");
         assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(
+            snapshot.recent_requests[0].reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            snapshot.recent_requests[0].service_tier.as_deref(),
+            Some("priority")
+        );
         assert_eq!(snapshot.recent_requests[0].attempts, 2);
         assert_eq!(snapshot.recent_requests[0].attempt_log.len(), 2);
         assert_eq!(
@@ -1156,6 +1345,8 @@ mod tests {
                 method: "POST",
                 path: "/v1/responses?api_key=sk-path-secret&safe=value",
                 model: Some("gpt-test"),
+                reasoning_effort: None,
+                service_tier: None,
                 client_id: None,
             })
             .expect("start");
@@ -1207,7 +1398,10 @@ mod tests {
                 allowed_models: Vec::new(),
             })
             .expect("client");
-        for (index, outcome) in ["succeeded", "failed", "local"].iter().enumerate() {
+        for (index, (outcome, latency_ms)) in [("succeeded", 20), ("failed", 900), ("local", 40)]
+            .iter()
+            .enumerate()
+        {
             let request_id = format!("period-{index}");
             store
                 .record_request_start(RequestLogStart {
@@ -1215,6 +1409,8 @@ mod tests {
                     method: "POST",
                     path: "/v1/responses",
                     model: Some("gpt-test"),
+                    reasoning_effort: None,
+                    service_tier: None,
                     client_id: Some(&created.client.id),
                 })
                 .expect("start");
@@ -1225,7 +1421,7 @@ mod tests {
                     status_code: Some(if *outcome == "failed" { 500 } else { 200 }),
                     outcome,
                     attempts: 1,
-                    latency_ms: 30,
+                    latency_ms: *latency_ms,
                     error: None,
                 })
                 .expect("finish");
@@ -1233,6 +1429,9 @@ mod tests {
         store
             .bind_affinity("session-hash", "provider-a")
             .expect("affinity");
+        store
+            .set_session_provider_preference("session-id", "provider-b")
+            .expect("explicit preference");
 
         let reopened = ApiServiceStore {
             path: store.path.clone(),
@@ -1243,6 +1442,7 @@ mod tests {
         assert_eq!(client.usage.today.succeeded, 2);
         assert_eq!(client.usage.today.failed, 1);
         assert_eq!(client.usage.today.success_rate, 66);
+        assert_eq!(client.usage.today.average_latency_ms, Some(30));
         assert_eq!(snapshot.affinity_bindings, 1);
         assert_eq!(
             reopened
@@ -1251,6 +1451,31 @@ mod tests {
                 .as_deref(),
             Some("provider-a")
         );
+        assert_eq!(
+            reopened
+                .session_provider_preference("session-id")
+                .expect("session preference")
+                .as_deref(),
+            Some("provider-b")
+        );
+        assert_eq!(
+            reopened
+                .list_session_provider_preferences(&[
+                    "session-id".to_string(),
+                    "missing".to_string(),
+                ])
+                .expect("preferences")
+                .get("session-id")
+                .map(String::as_str),
+            Some("provider-b")
+        );
+        assert!(reopened
+            .clear_session_provider_preference("session-id")
+            .expect("clear preference"));
+        assert!(reopened
+            .session_provider_preference("session-id")
+            .expect("cleared preference")
+            .is_none());
     }
 
     #[test]

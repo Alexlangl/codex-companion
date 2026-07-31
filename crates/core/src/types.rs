@@ -365,6 +365,8 @@ pub struct ApiRequestLog {
     pub method: String,
     pub path: String,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
     pub client_id: Option<String>,
     pub client_name: Option<String>,
     pub provider_id: Option<String>,

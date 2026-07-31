@@ -19,12 +19,19 @@ path = "src/main.rs"
 tauri-build.workspace = true
 
 [dependencies]
+base64.workspace = true
+chrono.workspace = true
 codex-companion-core.workspace = true
 codex-companion-daemon.workspace = true
 codex-companion-provider.workspace = true
+rand.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-process.workspace = true
 tauri-plugin-updater.workspace = true
+tiny_http.workspace = true
 tokio.workspace = true
+url.workspace = true

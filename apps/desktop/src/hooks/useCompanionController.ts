@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  completeCodexOAuth,
   exportProviderJson,
   getStatus,
   getTokenUsage,
@@ -101,7 +102,12 @@ export function useCompanionController() {
     }
   }, [status]);
 
-  async function run(label: string, state: BusyState, action: () => Promise<void | string>) {
+  async function run(
+    label: string,
+    state: BusyState,
+    action: () => Promise<void | string>,
+    options: { propagateError?: boolean } = {},
+  ) {
     setBusy(state);
     setError(null);
     try {
@@ -110,6 +116,9 @@ export function useCompanionController() {
       await refresh();
     } catch (unknownError) {
       setError(userFacingError(unknownError));
+      if (options.propagateError) {
+        throw unknownError;
+      }
     } finally {
       setBusy("idle");
     }
@@ -318,6 +327,11 @@ export function useCompanionController() {
           await updateApiKeyProvider(input);
         }),
       exportProvider,
+      importCodexOAuth: (loginId: string) =>
+        run("OAuth 账号已添加", "saving", async () => {
+          const outcome = await completeCodexOAuth(loginId);
+          return outcome.message;
+        }, { propagateError: true }),
       importJsonBatch,
       importLocal: () =>
         run("已导入本地 Codex 账号", "saving", async () => {

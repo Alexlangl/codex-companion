@@ -136,7 +136,9 @@ async fn proxy_dispatch(
         format!("[{request_id}] {method} {uri}"),
     );
     let affinity_key = request_affinity_key(&headers, &body);
-    let requested_model = request_model(&body);
+    let session_id = request_session_id(&headers, &body);
+    let request_metadata = request_metadata(&body);
+    let requested_model = request_metadata.model.clone();
     let mut config = state
         .store
         .load()
@@ -148,14 +150,7 @@ async fn proxy_dispatch(
     let client = match authenticate_client(&state, &config, &headers, !root_probe) {
         Ok(client) => client,
         Err((status, message)) => {
-            record_request_start(
-                &state,
-                request_id,
-                &method,
-                &uri,
-                requested_model.as_deref(),
-                None,
-            );
+            record_request_start(&state, request_id, &method, &uri, &request_metadata, None);
             record_request_finish(
                 &state,
                 request_id,
@@ -182,7 +177,7 @@ async fn proxy_dispatch(
         request_id,
         &method,
         &uri,
-        requested_model.as_deref(),
+        &request_metadata,
         client.as_ref().map(|client| client.id.as_str()),
     );
     if root_probe {
@@ -242,10 +237,36 @@ async fn proxy_dispatch(
         .get(&config.relay.active_group_id)
         .cloned()
         .ok_or_else(|| format!("active group not found: {}", config.relay.active_group_id))?;
-    let selected = selected_providers_for_group(&config, &group)
+    let explicit_preferred_provider = session_id
+        .as_deref()
+        .and_then(|session_id| {
+            state
+                .api_service
+                .session_provider_preference(session_id)
+                .ok()
+                .flatten()
+        })
+        .filter(|provider_id| {
+            group
+                .provider_order
+                .iter()
+                .any(|candidate| candidate == provider_id)
+                && config
+                    .providers
+                    .get(provider_id.as_str())
+                    .is_some_and(|provider| provider.enabled)
+        });
+    let mut selected = selected_providers_for_group(&config, &group)
         .into_iter()
         .filter(|provider| provider.enabled)
         .collect::<Vec<_>>();
+    if let Some(preferred_provider) = explicit_preferred_provider
+        .as_deref()
+        .and_then(|provider_id| config.providers.get(provider_id))
+        .filter(|provider| !selected.iter().any(|candidate| candidate.id == provider.id))
+    {
+        selected.push(preferred_provider.clone());
+    }
     if method == Method::GET
         && uri.path() == "/v1/models"
         && selected
@@ -278,9 +299,14 @@ async fn proxy_dispatch(
             .preferred_provider(key, config.relay.session_affinity_ttl_seconds, &group)
             .map(|provider| (key, provider))
     });
-    let priority_failback_claim = affinity_preference
-        .as_ref()
-        .and_then(|(key, _)| state.claim_priority_failback_probe(key, &group));
+    let priority_failback_claim = explicit_preferred_provider
+        .is_none()
+        .then(|| {
+            affinity_preference
+                .as_ref()
+                .and_then(|(key, _)| state.claim_priority_failback_probe(key, &group))
+        })
+        .flatten();
     let manually_requested_provider = priority_failback_claim
         .filter(|claim| claim.manual)
         .and_then(|_| {
@@ -343,7 +369,9 @@ async fn proxy_dispatch(
             })
             .or(automatic_probe_provider)
     });
-    if let Some((_, preference)) = affinity_preference.as_ref() {
+    if let Some(preferred_provider) = explicit_preferred_provider.as_deref() {
+        prioritize_session_affinity(&mut candidates, preferred_provider, None);
+    } else if let Some((_, preference)) = affinity_preference.as_ref() {
         prioritize_session_affinity(
             &mut candidates,
             &preference.provider_id,
@@ -406,6 +434,7 @@ async fn proxy_dispatch(
         let route_reason = request_attempt_route_reason(
             index,
             &provider.id,
+            explicit_preferred_provider.as_deref(),
             affinity_preference
                 .as_ref()
                 .map(|(_, preference)| preference.provider_id.as_str()),
@@ -522,25 +551,27 @@ async fn proxy_dispatch(
                 .await;
                 let downstream_status = downstream.status();
                 if downstream_status.is_success() {
-                    if let Some(affinity_key) = affinity_key.as_deref() {
-                        let priority_probe_generation = priority_probe_provider
-                            .as_deref()
-                            .filter(|provider_id| *provider_id == provider.id.as_str())
-                            .and_then(|_| {
-                                priority_failback_claim.map(|claim| claim.probe_generation)
-                            });
-                        state.bind_provider(
-                            affinity_key,
-                            &provider.id,
-                            config.relay.session_affinity_ttl_seconds,
-                            &group,
-                            AffinityBindContext {
-                                expected_route_generation: affinity_preference
-                                    .as_ref()
-                                    .map(|(_, preference)| preference.route_generation),
-                                priority_probe_generation,
-                            },
-                        );
+                    if explicit_preferred_provider.is_none() {
+                        if let Some(affinity_key) = affinity_key.as_deref() {
+                            let priority_probe_generation = priority_probe_provider
+                                .as_deref()
+                                .filter(|provider_id| *provider_id == provider.id.as_str())
+                                .and_then(|_| {
+                                    priority_failback_claim.map(|claim| claim.probe_generation)
+                                });
+                            state.bind_provider(
+                                affinity_key,
+                                &provider.id,
+                                config.relay.session_affinity_ttl_seconds,
+                                &group,
+                                AffinityBindContext {
+                                    expected_route_generation: affinity_preference
+                                        .as_ref()
+                                        .map(|(_, preference)| preference.route_generation),
+                                    priority_probe_generation,
+                                },
+                            );
+                        }
                     }
                     if let Some(model) = requested_model.as_deref() {
                         let _ = state.api_service.clear_model_cooldown(&provider.id, model);
@@ -926,14 +957,37 @@ fn client_allows_model(client: &ApiClient, model: &str) -> bool {
     client.allowed_models.is_empty() || client.allowed_models.iter().any(|allowed| allowed == model)
 }
 
-fn request_model(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(body)
-        .ok()?
-        .get("model")?
-        .as_str()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(ToOwned::to_owned)
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RequestMetadata {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+}
+
+fn request_metadata(body: &[u8]) -> RequestMetadata {
+    const MAX_METADATA_CHARS: usize = 160;
+
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return RequestMetadata::default();
+    };
+    RequestMetadata {
+        model: bounded_request_string(value.get("model"), MAX_METADATA_CHARS),
+        reasoning_effort: bounded_request_string(
+            value
+                .pointer("/reasoning/effort")
+                .or_else(|| value.get("reasoning_effort")),
+            MAX_METADATA_CHARS,
+        ),
+        service_tier: bounded_request_string(value.get("service_tier"), MAX_METADATA_CHARS),
+    }
+}
+
+fn bounded_request_string(value: Option<&Value>, max_chars: usize) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(max_chars).collect())
 }
 
 fn is_model_scoped_failure(kind: &HealthFailureKind) -> bool {
@@ -973,7 +1027,7 @@ fn record_request_start(
     request_id: &str,
     method: &Method,
     uri: &Uri,
-    model: Option<&str>,
+    metadata: &RequestMetadata,
     client_id: Option<&str>,
 ) {
     let path = uri
@@ -983,7 +1037,9 @@ fn record_request_start(
         request_id,
         method: method.as_str(),
         path,
-        model,
+        model: metadata.model.as_deref(),
+        reasoning_effort: metadata.reasoning_effort.as_deref(),
+        service_tier: metadata.service_tier.as_deref(),
         client_id,
     });
 }
@@ -991,6 +1047,7 @@ fn record_request_start(
 fn request_attempt_route_reason(
     index: usize,
     provider_id: &str,
+    explicit_preferred_provider_id: Option<&str>,
     affinity_provider_id: Option<&str>,
     priority_probe_provider_id: Option<&str>,
     manual_priority_probe: bool,
@@ -1004,6 +1061,9 @@ fn request_attempt_route_reason(
         } else {
             "automatic_failback"
         };
+    }
+    if explicit_preferred_provider_id == Some(provider_id) {
+        return "session_preference";
     }
     if affinity_provider_id == Some(provider_id) {
         return "affinity";
@@ -1162,6 +1222,42 @@ fn request_affinity_key(headers: &HeaderMap, body: &[u8]) -> Option<String> {
     None
 }
 
+fn request_session_id(headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    for header in ["session_id", "x-session-id", "x-amp-thread-id"] {
+        if let Some(value) = headers
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        for path in [
+            &["metadata", "session_id"][..],
+            &["conversation_id"][..],
+            &["thread_id"][..],
+            &["prompt_cache_key"][..],
+        ] {
+            if let Some(value) = json_string_at_path(&value, path)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(value.to_string());
+            }
+        }
+    }
+    headers
+        .get("x-client-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn json_string_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     let mut cursor = value;
     for key in path {
@@ -1229,6 +1325,24 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[test]
+    fn request_metadata_reads_observability_fields() {
+        assert_eq!(
+            request_metadata(
+                br#"{"model":"gpt-5.6-sol","reasoning":{"effort":"high"},"service_tier":"priority"}"#,
+            ),
+            RequestMetadata {
+                model: Some("gpt-5.6-sol".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                service_tier: Some("priority".to_string()),
+            }
+        );
+        assert_eq!(
+            request_metadata(br#"{"reasoning_effort":"xhigh"}"#).reasoning_effort,
+            Some("xhigh".to_string())
+        );
+    }
 
     #[test]
     fn relay_root_probe_is_handled_locally() {
@@ -1852,6 +1966,31 @@ mod tests {
             request_affinity_key(&HeaderMap::new(), br#"{"previous_response_id":"resp-1"}"#,)
                 .is_none()
         );
+        assert_eq!(
+            request_session_id(
+                &HeaderMap::new(),
+                br#"{"metadata":{"session_id":"session-123"}}"#,
+            )
+            .as_deref(),
+            Some("session-123")
+        );
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            "x-client-request-id",
+            HeaderValue::from_static("request-456"),
+        );
+        assert_eq!(
+            request_session_id(
+                &request_headers,
+                br#"{"metadata":{"session_id":"session-123"}}"#,
+            )
+            .as_deref(),
+            Some("session-123")
+        );
+        assert_eq!(
+            request_session_id(&request_headers, b"").as_deref(),
+            Some("request-456")
+        );
     }
 
     #[test]
@@ -1941,6 +2080,141 @@ mod tests {
         );
         assert_eq!(provider_a_hits.load(Ordering::SeqCst), 2);
         assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_session_preference_overrides_policy_order() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let provider_a_url =
+            spawn_mock_server(StatusCode::OK, "from a", Some(provider_a_hits.clone())).await;
+        let provider_b_url =
+            spawn_mock_server(StatusCode::OK, "from b", Some(provider_b_hits.clone())).await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+        store
+            .update(|config| {
+                config.groups.get_mut("test").expect("group").policy = GroupPolicy::Manual;
+                Ok(())
+            })
+            .expect("manual policy");
+        let state = RelayState::new(store, reqwest::Client::new());
+        state
+            .api_service
+            .set_session_provider_preference("thread-preferred", "b")
+            .expect("preference");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("thread-preferred"));
+
+        let response = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            headers.clone(),
+            Bytes::new(),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("b")
+        );
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+        let requests = state.api_service.list_requests(1).expect("request log");
+        assert_eq!(
+            requests[0].attempt_log[0].route_reason,
+            "session_preference"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_session_preference_falls_back_without_being_overwritten() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let provider_a_url =
+            spawn_mock_server(StatusCode::OK, "from a", Some(provider_a_hits.clone())).await;
+        let provider_b_url = spawn_mock_server(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "b unavailable",
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+        let state = RelayState::new(store, reqwest::Client::new());
+        state
+            .api_service
+            .set_session_provider_preference("thread-fallback", "b")
+            .expect("preference");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("thread-fallback"));
+
+        let response = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            headers.clone(),
+            Bytes::new(),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("a")
+        );
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .api_service
+                .session_provider_preference("thread-fallback")
+                .expect("stored preference")
+                .as_deref(),
+            Some("b")
+        );
+        let requests = state.api_service.list_requests(1).expect("request log");
+        assert_eq!(
+            requests[0].attempt_log[0].route_reason,
+            "session_preference"
+        );
+        assert_eq!(requests[0].attempt_log[1].route_reason, "fallback");
+
+        let second_response = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            headers,
+            Bytes::new(),
+        )
+        .await
+        .expect("second proxy");
+
+        assert_eq!(second_response.status(), StatusCode::OK);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state
+                .api_service
+                .session_provider_preference("thread-fallback")
+                .expect("stored preference")
+                .as_deref(),
+            Some("b")
+        );
     }
 
     #[tokio::test]

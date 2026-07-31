@@ -28,7 +28,14 @@ pub(crate) async fn responses_websocket(
     let allowed_models = api_client
         .map(|api_client| api_client.allowed_models)
         .unwrap_or_default();
-    let candidates = match websocket_candidates(&state) {
+    let preferred_provider = websocket_session_id(&headers).and_then(|session_id| {
+        state
+            .api_service
+            .session_provider_preference(&session_id)
+            .ok()
+            .flatten()
+    });
+    let candidates = match websocket_candidates(&state, preferred_provider.as_deref()) {
         Ok(candidates) if !candidates.is_empty() => candidates,
         Ok(_) => {
             return (
@@ -119,7 +126,10 @@ fn authenticate_websocket_client(
     Ok(api_client)
 }
 
-fn websocket_candidates(state: &RelayState) -> Result<Vec<ProviderConfig>, String> {
+fn websocket_candidates(
+    state: &RelayState,
+    preferred_provider: Option<&str>,
+) -> Result<Vec<ProviderConfig>, String> {
     let config = state.store.load().map_err(|error| error.to_string())?;
     let group = config
         .groups
@@ -129,11 +139,55 @@ fn websocket_candidates(state: &RelayState) -> Result<Vec<ProviderConfig>, Strin
         .into_iter()
         .filter(|provider| provider.enabled && provider.websocket_url.is_some())
         .collect::<Vec<_>>();
+    if let Some(preferred) = preferred_provider
+        .filter(|provider_id| {
+            group
+                .provider_order
+                .iter()
+                .any(|candidate| candidate == provider_id)
+        })
+        .and_then(|provider_id| config.providers.get(provider_id))
+        .filter(|provider| {
+            provider.enabled
+                && provider.websocket_url.is_some()
+                && !candidates
+                    .iter()
+                    .any(|candidate| candidate.id == provider.id)
+        })
+    {
+        candidates.push(preferred.clone());
+    }
     apply_group_policy(state, group, &mut candidates);
+    if let Some(index) = preferred_provider.and_then(|provider_id| {
+        candidates
+            .iter()
+            .position(|provider| provider.id == provider_id)
+    }) {
+        let preferred = candidates.remove(index);
+        candidates.insert(0, preferred);
+    }
     if !group.fallback_enabled {
         candidates.truncate(1);
     }
     Ok(candidates)
+}
+
+fn websocket_session_id(headers: &HeaderMap) -> Option<String> {
+    [
+        "session_id",
+        "x-session-id",
+        "x-amp-thread-id",
+        "x-client-request-id",
+    ]
+    .into_iter()
+    .find_map(|header| {
+        headers
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
 }
 
 async fn connect_provider_websocket(
@@ -526,6 +580,39 @@ mod tests {
         assert_eq!(missing.status, StatusCode::UNAUTHORIZED);
     }
 
+    #[test]
+    fn websocket_session_preference_prioritizes_a_group_candidate() {
+        let state = state_with_group(vec![
+            provider("a", Some("ws://127.0.0.1:1/a".to_string())),
+            provider("b", Some("ws://127.0.0.1:1/b".to_string())),
+        ]);
+        let candidates = websocket_candidates(&state, Some("b")).expect("candidates");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("thread-b"));
+        assert_eq!(websocket_session_id(&headers).as_deref(), Some("thread-b"));
+
+        headers.insert("x-amp-thread-id", HeaderValue::from_static("thread-amp"));
+        headers.insert(
+            "x-client-request-id",
+            HeaderValue::from_static("request-id"),
+        );
+        assert_eq!(websocket_session_id(&headers).as_deref(), Some("thread-b"));
+
+        headers.remove("x-session-id");
+        assert_eq!(
+            websocket_session_id(&headers).as_deref(),
+            Some("thread-amp")
+        );
+    }
+
     #[tokio::test]
     async fn websocket_connection_falls_back_to_the_next_candidate() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -544,7 +631,7 @@ mod tests {
             ),
             provider("healthy", Some(format!("ws://{addr}/v1/responses"))),
         ]);
-        let candidates = websocket_candidates(&state).expect("candidates");
+        let candidates = websocket_candidates(&state, None).expect("candidates");
 
         let (selected, mut upstream) = connect_candidate_websocket(&state, candidates)
             .await

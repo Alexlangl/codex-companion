@@ -10,6 +10,8 @@ export function apiRequestLogsEqual(left: ApiRequestLog[], right: ApiRequestLog[
       && request.method === candidate.method
       && request.path === candidate.path
       && request.model === candidate.model
+      && request.reasoningEffort === candidate.reasoningEffort
+      && request.serviceTier === candidate.serviceTier
       && request.clientId === candidate.clientId
       && request.clientName === candidate.clientName
       && request.providerId === candidate.providerId

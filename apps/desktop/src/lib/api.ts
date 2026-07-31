@@ -10,6 +10,8 @@ import type {
   ApiServiceSnapshot,
   CliLaunchOutcome,
   CliLaunchRequest,
+  CodexOAuthStartResponse,
+  CodexOAuthStatus,
   DiagnosticInfo,
   ProviderRefreshProgress,
   ApiKeyProviderUpdate,
@@ -61,6 +63,8 @@ const MOCK_CODEX_DIR = `${MOCK_HOME_DIR}/.codex`;
 
 let mockStatus = createMockStatus();
 let mockApiService = createMockApiServiceSnapshot();
+let mockOAuthPending: (CodexOAuthStartResponse & { callbackReceived: boolean }) | null = null;
+let mockSessionProviderPreferences: Record<string, string> = {};
 
 export function getStatus() {
   if (!isTauri()) return Promise.resolve(mockStatus);
@@ -207,6 +211,35 @@ export function getSessionPage(
     limit: options.limit ?? 50,
     rebuild: options.rebuild ?? false,
   });
+}
+
+export function getSessionProviderPreferences(sessionIds: string[]) {
+  if (!isTauri()) {
+    return Promise.resolve(Object.fromEntries(
+      sessionIds.flatMap((sessionId) => {
+        const providerId = mockSessionProviderPreferences[sessionId];
+        return providerId ? [[sessionId, providerId]] : [];
+      }),
+    ));
+  }
+  return invoke<Record<string, string>>("get_session_provider_preferences", { sessionIds });
+}
+
+export function setSessionProviderPreference(sessionId: string, providerId: string) {
+  if (!isTauri()) {
+    mockSessionProviderPreferences = { ...mockSessionProviderPreferences, [sessionId]: providerId };
+    return Promise.resolve(providerId);
+  }
+  return invoke<string>("set_session_provider_preference", { sessionId, providerId });
+}
+
+export function clearSessionProviderPreference(sessionId: string) {
+  if (!isTauri()) {
+    const { [sessionId]: _removed, ...remaining } = mockSessionProviderPreferences;
+    mockSessionProviderPreferences = remaining;
+    return Promise.resolve(Boolean(_removed));
+  }
+  return invoke<boolean>("clear_session_provider_preference", { sessionId });
 }
 
 export function createApiClient(input: ApiClientCreate) {
@@ -849,6 +882,110 @@ export function importLocalCodexProvider(codexDir?: string) {
   return invoke<ProviderImportOutcome>("import_local_codex_provider", {
     codexDir: emptyToNull(codexDir),
   });
+}
+
+export function startCodexOAuth() {
+  if (!isTauri()) {
+    const now = Math.floor(Date.now() / 1000);
+    if (mockOAuthPending && mockOAuthPending.expiresAt > now) {
+      return Promise.resolve<CodexOAuthStartResponse>(structuredClone(mockOAuthPending));
+    }
+    const loginId = `mock-login-${Date.now()}`;
+    const callbackUrl = "http://localhost:1455/auth/callback";
+    mockOAuthPending = {
+      loginId,
+      authUrl: `https://auth.openai.com/oauth/authorize?response_type=code&state=${encodeURIComponent(loginId)}`,
+      callbackUrl,
+      expiresAt: now + 300,
+      callbackServerReady: true,
+      callbackReceived: false,
+    };
+    return Promise.resolve<CodexOAuthStartResponse>(structuredClone(mockOAuthPending));
+  }
+  return invoke<CodexOAuthStartResponse>("start_codex_oauth");
+}
+
+export function getCodexOAuthStatus() {
+  if (!isTauri()) {
+    if (!mockOAuthPending || mockOAuthPending.expiresAt <= Math.floor(Date.now() / 1000)) {
+      mockOAuthPending = null;
+      return Promise.resolve<CodexOAuthStatus | null>(null);
+    }
+    return Promise.resolve<CodexOAuthStatus>({
+      loginId: mockOAuthPending.loginId,
+      authUrl: mockOAuthPending.authUrl,
+      callbackUrl: mockOAuthPending.callbackUrl,
+      expiresAt: mockOAuthPending.expiresAt,
+      callbackReceived: mockOAuthPending.callbackReceived,
+      callbackServerReady: mockOAuthPending.callbackServerReady,
+      error: null,
+    });
+  }
+  return invoke<CodexOAuthStatus | null>("get_codex_oauth_status");
+}
+
+export function openCodexOAuth(loginId: string) {
+  if (!isTauri()) {
+    if (!mockOAuthPending || mockOAuthPending.loginId !== loginId) {
+      return Promise.reject(new Error("OAuth 授权会话已失效，请重新开始"));
+    }
+    window.setTimeout(() => {
+      if (mockOAuthPending?.loginId === loginId) {
+        mockOAuthPending.callbackReceived = true;
+      }
+    }, 800);
+    return Promise.resolve();
+  }
+  return invoke<void>("open_codex_oauth", { loginId });
+}
+
+export function submitCodexOAuthCallback(loginId: string, callbackUrl: string) {
+  if (!isTauri()) {
+    if (!mockOAuthPending || mockOAuthPending.loginId !== loginId) {
+      return Promise.reject(new Error("OAuth 授权会话已失效，请重新开始"));
+    }
+    if (!callbackUrl.includes("code=") || !callbackUrl.includes("state=")) {
+      return Promise.reject(new Error("回调地址缺少 code 或 state 参数"));
+    }
+    mockOAuthPending.callbackReceived = true;
+    return Promise.resolve();
+  }
+  return invoke<void>("submit_codex_oauth_callback", { loginId, callbackUrl });
+}
+
+export function cancelCodexOAuth(loginId?: string) {
+  if (!isTauri()) {
+    if (!loginId || mockOAuthPending?.loginId === loginId) {
+      mockOAuthPending = null;
+    }
+    return Promise.resolve();
+  }
+  return invoke<void>("cancel_codex_oauth", { loginId: emptyToNull(loginId) });
+}
+
+export async function completeCodexOAuth(loginId: string): Promise<ProviderImportOutcome> {
+  if (!isTauri()) {
+    if (!mockOAuthPending || mockOAuthPending.loginId !== loginId || !mockOAuthPending.callbackReceived) {
+      throw new Error("尚未收到 OAuth 回调，请先完成浏览器授权");
+    }
+    const providerName = "oauth-user@example.com";
+    const accountId = mockOAuthPending.loginId;
+    mockOAuthPending = null;
+    return importProviderJson(
+      JSON.stringify({
+        tokens: {
+          access_token: "mock-oauth-access-token",
+          id_token: "mock-oauth-id-token",
+          refresh_token: "mock-oauth-refresh-token",
+          email: providerName,
+          chatgpt_account_id: accountId,
+        },
+      }),
+      undefined,
+      providerName,
+    );
+  }
+  return invoke<ProviderImportOutcome>("complete_codex_oauth", { loginId });
 }
 
 export function removeProvider(id: string) {
@@ -1828,6 +1965,8 @@ function createMockApiServiceSnapshot(): ApiServiceSnapshot {
         method: "POST",
         path: "/v1/responses",
         model: "gpt-5.6-codex",
+        reasoningEffort: "high",
+        serviceTier: "priority",
         clientId: "client_local_cli",
         clientName: "本地开发 CLI",
         providerId: "official-team",
@@ -1856,6 +1995,8 @@ function createMockApiServiceSnapshot(): ApiServiceSnapshot {
         method: "POST",
         path: "/v1/responses",
         model: "gpt-5.6",
+        reasoningEffort: "medium",
+        serviceTier: "default",
         clientId: "client_local_cli",
         clientName: "本地开发 CLI",
         providerId: "backup-api",

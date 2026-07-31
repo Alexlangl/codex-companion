@@ -605,12 +605,13 @@ function RequestRow(props: {
   const attemptViews = requestAttemptViews(request, events);
   const hasSwitch = request.attempts > 1 || attemptViews.some((attempt) => attempt.routeReason === "fallback");
   const attemptSummary = requestAttemptSummary(request.attempts, hasSwitch);
+  const parameterSummary = requestParameterSummary(request);
   const showTrace = shouldShowRequestTrace(request, attemptViews);
 
   return (
     <div className="api-request-row" role="row" title={request.error ?? undefined}>
       <div role="cell"><strong>{formatTime(request.startedAt)}</strong><span>{request.clientName ?? "本机兼容调用"}</span></div>
-      <div role="cell"><strong>{request.method} {request.path}</strong><span>{request.model ?? "未指定模型"}</span></div>
+      <div role="cell"><strong>{request.method} {request.path}</strong><span>{parameterSummary}</span></div>
       <div role="cell"><strong>{provider}</strong><span>{attemptSummary}</span></div>
       <div role="cell"><Badge tone={tone}>{request.statusCode ?? "—"} · {outcomeLabel(request.outcome)}</Badge><span>{request.latencyMs ?? 0} ms</span></div>
       {showTrace ? (
@@ -618,6 +619,15 @@ function RequestRow(props: {
       ) : null}
     </div>
   );
+}
+
+function requestParameterSummary(request: ApiRequestLog): string {
+  const parameters = [
+    request.model ?? "未指定模型",
+    request.reasoningEffort ? `推理 ${request.reasoningEffort}` : null,
+    request.serviceTier ? `服务 ${request.serviceTier}` : null,
+  ].filter((value): value is string => value !== null);
+  return parameters.join(" · ");
 }
 
 function RequestAuditTrace(props: {

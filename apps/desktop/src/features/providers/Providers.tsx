@@ -3,29 +3,45 @@ import * as Select from "@radix-ui/react-select";
 import * as Tabs from "@radix-ui/react-tabs";
 import {
   Check,
+  CircleCheck,
   Copy,
   Download,
   Eye,
   EyeOff,
+  ExternalLink,
   FileJson,
   FolderInput,
+  Globe2,
   KeyRound,
   LayoutGrid,
   List,
+  LoaderCircle,
   Plus,
   RefreshCw,
+  ShieldCheck,
   Upload,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import { Button, Field, Panel } from "../../components/ui";
-import { getProviderImportProgress, getProviderRefreshProgress, reviewProviderJsonMany } from "../../lib/api";
+import {
+  cancelCodexOAuth,
+  getCodexOAuthStatus,
+  getProviderImportProgress,
+  getProviderRefreshProgress,
+  openCodexOAuth,
+  reviewProviderJsonMany,
+  startCodexOAuth,
+  submitCodexOAuthCallback,
+} from "../../lib/api";
 import { userFacingError } from "../../lib/errors";
 import { providerKindLabel } from "../../lib/format";
 import { providerAccountTitle, providerUsesAgentIdentity } from "../../lib/provider-display";
 import type {
   ApiKeyProviderUpdate,
   BusyState,
+  CodexOAuthStartResponse,
+  CodexOAuthStatus,
   CompanionStatus,
   ProviderConfig,
   ProviderExportFormat,
@@ -51,6 +67,7 @@ export function Providers({
   busy,
   status,
   onImportApiKey,
+  onImportCodexOAuth,
   onImportJsonBatch,
   onImportLocal,
   onExport,
@@ -68,6 +85,7 @@ export function Providers({
   status: CompanionStatus;
   launchModes: Record<string, ProviderLaunchMode>;
   onImportApiKey: (input: ApiKeyForm) => Promise<void>;
+  onImportCodexOAuth: (loginId: string) => Promise<void>;
   onImportJsonBatch: (
     jsonFiles: JsonImportFile[],
     addToGroupId?: string | null,
@@ -238,6 +256,11 @@ export function Providers({
 
   async function importLocalAccount() {
     await onImportLocal();
+    setAddOpen(false);
+  }
+
+  async function importCodexOAuthAccount(loginId: string) {
+    await onImportCodexOAuth(loginId);
     setAddOpen(false);
   }
 
@@ -443,7 +466,7 @@ export function Providers({
               <div>
                 <Dialog.Title className="dialog-title">添加账号</Dialog.Title>
                 <Dialog.Description className="dialog-description">
-                  选择 API Key、Token / JSON，或导入本机已有 Codex 账号。
+                  选择 OAuth、API Key、Token / JSON，或导入本机已有 Codex 账号。
                 </Dialog.Description>
               </div>
               <Dialog.Close className="icon-button" aria-label="关闭">
@@ -461,6 +484,7 @@ export function Providers({
               importReviewing={importReviewing}
               loadJsonFiles={loadJsonFiles}
               onImportLocal={importLocalAccount}
+              onImportCodexOAuth={importCodexOAuthAccount}
               apiKeyError={apiKeyError}
               pastedJson={pastedJson}
               addToCurrentGroup={addToCurrentGroup}
@@ -885,6 +909,268 @@ function maskSecretString(value: string) {
   return `${value.slice(0, 2)}***${value.slice(-2)}`;
 }
 
+type OAuthFlowState =
+  | { phase: "idle" }
+  | { phase: "starting" }
+  | { phase: "waiting"; session: CodexOAuthStartResponse }
+  | { phase: "ready"; session: CodexOAuthStartResponse }
+  | { phase: "completing"; session: CodexOAuthStartResponse };
+
+function oauthSessionFromStatus(
+  status: CodexOAuthStatus,
+): CodexOAuthStartResponse {
+  return {
+    loginId: status.loginId,
+    authUrl: status.authUrl,
+    callbackUrl: status.callbackUrl,
+    expiresAt: status.expiresAt,
+    callbackServerReady: status.callbackServerReady,
+  };
+}
+
+function CodexOAuthPanel({
+  disabled,
+  onComplete,
+}: {
+  disabled: boolean;
+  onComplete: (loginId: string) => Promise<void>;
+}) {
+  const [flow, setFlow] = useState<OAuthFlowState>({ phase: "idle" });
+  const [callbackUrl, setCallbackUrl] = useState("");
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+  const statusRevisionRef = useRef(0);
+  const session = "session" in flow ? flow.session : null;
+  const isWorking = flow.phase === "starting" || flow.phase === "completing";
+  const callbackReceived = flow.phase === "ready" || flow.phase === "completing";
+
+  useEffect(() => {
+    let disposed = false;
+    let requestActive = false;
+
+    async function pollStatus(): Promise<void> {
+      if (requestActive) return;
+      requestActive = true;
+      const revision = statusRevisionRef.current;
+      try {
+        const status = await getCodexOAuthStatus();
+        if (disposed || revision !== statusRevisionRef.current) return;
+        if (status?.error) {
+          setError(status.error);
+        }
+        setFlow((current) => {
+          if (current.phase === "starting" || current.phase === "completing") {
+            return current;
+          }
+          if (!status) {
+            return current.phase === "idle" ? current : { phase: "idle" };
+          }
+          const nextSession = oauthSessionFromStatus(status);
+          return status.callbackReceived
+            ? { phase: "ready", session: nextSession }
+            : { phase: "waiting", session: nextSession };
+        });
+      } catch (unknownError) {
+        if (!disposed) {
+          setError(userFacingError(unknownError));
+        }
+      } finally {
+        requestActive = false;
+      }
+    }
+
+    void pollStatus();
+    const timer = window.setInterval(() => void pollStatus(), 500);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  async function handleStart(): Promise<void> {
+    statusRevisionRef.current += 1;
+    setError("");
+    setCopied(false);
+    setFlow({ phase: "starting" });
+    try {
+      const nextSession = await startCodexOAuth();
+      setFlow({ phase: "waiting", session: nextSession });
+    } catch (unknownError) {
+      setFlow({ phase: "idle" });
+      setError(userFacingError(unknownError));
+    } finally {
+      statusRevisionRef.current += 1;
+    }
+  }
+
+  async function handleOpenBrowser(): Promise<void> {
+    if (!session) return;
+    setError("");
+    try {
+      await openCodexOAuth(session.loginId);
+    } catch (unknownError) {
+      setError(userFacingError(unknownError));
+    }
+  }
+
+  async function handleCopyUrl(): Promise<void> {
+    if (!session) return;
+    setError("");
+    try {
+      await copyText(session.authUrl);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch (unknownError) {
+      setCopied(false);
+      setError(userFacingError(unknownError));
+    }
+  }
+
+  async function handleSubmitCallback(): Promise<void> {
+    if (!session || !callbackUrl.trim()) return;
+    statusRevisionRef.current += 1;
+    setError("");
+    try {
+      await submitCodexOAuthCallback(session.loginId, callbackUrl);
+      setFlow({ phase: "ready", session });
+      setCallbackUrl("");
+    } catch (unknownError) {
+      setError(userFacingError(unknownError));
+    } finally {
+      statusRevisionRef.current += 1;
+    }
+  }
+
+  async function handleComplete(): Promise<void> {
+    if (!session || !callbackReceived) return;
+    statusRevisionRef.current += 1;
+    setError("");
+    setFlow({ phase: "completing", session });
+    try {
+      await onComplete(session.loginId);
+    } catch (unknownError) {
+      setFlow({ phase: "ready", session });
+      setError(userFacingError(unknownError));
+    } finally {
+      statusRevisionRef.current += 1;
+    }
+  }
+
+  async function handleCancel(): Promise<void> {
+    statusRevisionRef.current += 1;
+    setError("");
+    try {
+      await cancelCodexOAuth(session?.loginId);
+      setFlow({ phase: "idle" });
+      setCallbackUrl("");
+      setCopied(false);
+    } catch (unknownError) {
+      setError(userFacingError(unknownError));
+    } finally {
+      statusRevisionRef.current += 1;
+    }
+  }
+
+  if (!session) {
+    return (
+      <div className="oauth-flow">
+        <div className="oauth-security-note">
+          <ShieldCheck aria-hidden="true" size={19} />
+          <div>
+            <strong>OpenAI 官方 OAuth</strong>
+            <span>使用 PKCE 授权，凭据只写入本机私密文件。</span>
+          </div>
+        </div>
+        <p className="field-hint oauth-account-hint">
+          授权后会从 OpenAI 返回的账号信息中读取邮箱和账号 ID；需要添加另一个账号时，重新发起一次授权即可。
+        </p>
+        {error ? <p className="field-error" role="alert">{error}</p> : null}
+        <div className="actions oauth-primary-action">
+          <Button disabled={disabled || isWorking} onClick={handleStart}>
+            {flow.phase === "starting"
+              ? <LoaderCircle aria-hidden="true" className="spin-icon" size={15} />
+              : <Globe2 aria-hidden="true" size={15} />}
+            {flow.phase === "starting" ? "正在准备..." : "开始 OAuth 授权"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="oauth-flow">
+      <div className={callbackReceived ? "oauth-status oauth-status-ready" : "oauth-status"} aria-live="polite">
+        {callbackReceived
+          ? <CircleCheck aria-hidden="true" size={19} />
+          : <LoaderCircle aria-hidden="true" className="spin-icon" size={19} />}
+        <div>
+          <strong>{callbackReceived ? "授权回调已收到" : "等待浏览器授权"}</strong>
+          <span>{callbackReceived ? "可以保存这个账号。" : "授权会话将在 5 分钟后失效。"}</span>
+        </div>
+      </div>
+
+      <Field label="授权链接">
+        <div className="oauth-url-row">
+          <input aria-label="OAuth 授权链接" readOnly value={session.authUrl} />
+          <button
+            aria-label="复制 OAuth 授权链接"
+            className="icon-button"
+            disabled={disabled || isWorking}
+            onClick={handleCopyUrl}
+            title={copied ? "已复制" : "复制授权链接"}
+            type="button"
+          >
+            {copied ? <Check aria-hidden="true" size={16} /> : <Copy aria-hidden="true" size={16} />}
+          </button>
+        </div>
+      </Field>
+
+      <Button disabled={disabled || isWorking} onClick={handleOpenBrowser} variant="secondary">
+        <ExternalLink aria-hidden="true" size={15} /> 在浏览器中打开
+      </Button>
+
+      {!session.callbackServerReady ? (
+        <p className="field-error" role="alert">本地回调端口不可用，请使用下方手动回调。</p>
+      ) : null}
+
+      <div className="oauth-manual-callback">
+        <Field label="手动输入回调地址">
+          <div className="oauth-callback-row">
+            <input
+              aria-label="OAuth 回调地址"
+              disabled={disabled || isWorking}
+              onChange={(event) => setCallbackUrl(event.currentTarget.value)}
+              placeholder={`${session.callbackUrl}?code=...&state=...`}
+              value={callbackUrl}
+            />
+            <Button
+              disabled={disabled || isWorking || !callbackUrl.trim()}
+              onClick={handleSubmitCallback}
+              variant="secondary"
+            >
+              <Check aria-hidden="true" size={15} /> 我已授权，继续
+            </Button>
+          </div>
+        </Field>
+      </div>
+
+      {error ? <p className="field-error" role="alert">{error}</p> : null}
+
+      <div className="actions oauth-actions">
+        <Button disabled={disabled || isWorking || !callbackReceived} onClick={handleComplete}>
+          {flow.phase === "completing"
+            ? <LoaderCircle aria-hidden="true" className="spin-icon" size={15} />
+            : <ShieldCheck aria-hidden="true" size={15} />}
+          {flow.phase === "completing" ? "正在保存..." : "完成并添加账号"}
+        </Button>
+        <Button disabled={disabled || isWorking} onClick={handleCancel} variant="secondary">
+          取消授权
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function ProviderAddTabs({
   apiKeyForm,
   disabled,
@@ -895,6 +1181,7 @@ function ProviderAddTabs({
   importReviewError,
   importReviewing,
   loadJsonFiles,
+  onImportCodexOAuth,
   onImportLocal,
   apiKeyError,
   pastedJson,
@@ -916,6 +1203,7 @@ function ProviderAddTabs({
   importReviewError: string;
   importReviewing: boolean;
   loadJsonFiles: (fileList: FileList | null) => Promise<void>;
+  onImportCodexOAuth: (loginId: string) => Promise<void>;
   onImportLocal: () => Promise<void>;
   apiKeyError: string;
   pastedJson: string;
@@ -934,8 +1222,11 @@ function ProviderAddTabs({
   }
 
   return (
-    <Tabs.Root className="add-tabs" defaultValue="api-key">
+    <Tabs.Root className="add-tabs" defaultValue="oauth">
       <Tabs.List className="add-tabs-list" aria-label="添加账号方式">
+        <Tabs.Trigger className="add-tabs-trigger" value="oauth">
+          <Globe2 aria-hidden="true" size={15} /> OAuth
+        </Tabs.Trigger>
         <Tabs.Trigger className="add-tabs-trigger" value="api-key">
           <KeyRound size={15} /> API Key
         </Tabs.Trigger>
@@ -943,6 +1234,10 @@ function ProviderAddTabs({
           <Upload size={15} /> Token / JSON
         </Tabs.Trigger>
       </Tabs.List>
+
+      <Tabs.Content className="add-tabs-content" value="oauth">
+        <CodexOAuthPanel disabled={disabled} onComplete={onImportCodexOAuth} />
+      </Tabs.Content>
 
       <Tabs.Content className="add-tabs-content" value="api-key">
         <form onSubmit={submitApiKey}>

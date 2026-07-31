@@ -650,6 +650,8 @@ fn apply_api_key_usage_to_account(account: &mut ProviderAccountInfo, value: &ser
             &["quota_total"],
             &["total_usd_granted"],
             &["limit"],
+            &["quota_limit"],
+            &["quotaLimit"],
         ],
     );
     let used = pick_first_number(
@@ -671,6 +673,7 @@ fn apply_api_key_usage_to_account(account: &mut ProviderAccountInfo, value: &ser
             &["remaining"],
             &["remaining_quota"],
             &["quota_remaining"],
+            &["quotaRemaining"],
             &["total_usd_available"],
             &["limit_remaining"],
             &["limitRemaining"],
@@ -702,6 +705,8 @@ fn apply_api_key_usage_to_account(account: &mut ProviderAccountInfo, value: &ser
             &["expiresAt"],
             &["expire_at"],
             &["expireAt"],
+            &["access_until"],
+            &["accessUntil"],
         ],
     );
 
@@ -758,6 +763,9 @@ fn apply_public_key_usage_to_account(
         || value.get("balance").is_some()
         || value.get("remaining").is_some()
         || value.get("quota").is_some()
+        || value.get("quotaLimit").is_some()
+        || value.get("quotaRemaining").is_some()
+        || value.get("accessUntil").is_some()
         || value.get("rate_limits").is_some()
         || value.get("daily_usage").is_some()
         || value
@@ -800,6 +808,8 @@ fn apply_public_key_usage_to_account(
             &["quota", "total"],
             &["quota", "total_granted"],
             &["limit"],
+            &["quota_limit"],
+            &["quotaLimit"],
         ],
     );
     let quota_used = pick_first_number(
@@ -822,6 +832,8 @@ fn apply_public_key_usage_to_account(
             &["expiresAt"],
             &["subscription", "expires_at"],
             &["subscription", "expiresAt"],
+            &["access_until"],
+            &["accessUntil"],
         ],
     );
 
@@ -1528,6 +1540,24 @@ mod tests {
         assert_eq!(account.usage_available, Some(75.0));
         assert_eq!(account.quota_percent, Some(75.0));
         assert_eq!(account.quota_label.as_deref(), Some("剩余额度"));
+    }
+
+    #[test]
+    fn parses_new_api_camel_case_quota_fields() {
+        let value = serde_json::json!({
+            "data": {
+                "quotaLimit": 200.0,
+                "quotaRemaining": 50.0,
+                "accessUntil": 1_800_000_000
+            }
+        });
+        let mut account = ProviderAccountInfo::default();
+        apply_api_key_usage_to_account(&mut account, &value);
+
+        assert_eq!(account.usage_total, Some(200.0));
+        assert_eq!(account.usage_available, Some(50.0));
+        assert_eq!(account.quota_percent, Some(25.0));
+        assert!(account.valid_until.is_some());
     }
 
     #[test]

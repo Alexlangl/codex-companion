@@ -92,6 +92,8 @@ export interface ApiRequestLog {
   method: string;
   path: string;
   model?: string | null;
+  reasoningEffort?: string | null;
+  serviceTier?: string | null;
   clientId?: string | null;
   clientName?: string | null;
   providerId?: string | null;
@@ -437,6 +439,24 @@ export interface ProviderImportOutcome {
   authPath: string;
   created: boolean;
   message: string;
+}
+
+export interface CodexOAuthStartResponse {
+  loginId: string;
+  authUrl: string;
+  callbackUrl: string;
+  expiresAt: number;
+  callbackServerReady: boolean;
+}
+
+export interface CodexOAuthStatus {
+  loginId: string;
+  authUrl: string;
+  callbackUrl: string;
+  expiresAt: number;
+  callbackReceived: boolean;
+  callbackServerReady: boolean;
+  error?: string | null;
 }
 
 export interface ProviderImportFailure {

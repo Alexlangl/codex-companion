@@ -1,7 +1,13 @@
 import { Copy, History, Play, RefreshCw, RotateCcw, Search } from "lucide-react";
 import { useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
 import { Badge, Button, Field, IconButton, Panel } from "../../components/ui";
-import { getSessionPage, launchCli } from "../../lib/api";
+import {
+  clearSessionProviderPreference,
+  getSessionPage,
+  getSessionProviderPreferences,
+  launchCli,
+  setSessionProviderPreference,
+} from "../../lib/api";
 import { userFacingError } from "../../lib/errors";
 import { compactPath, formatTime } from "../../lib/format";
 import type { CompanionStatus, SessionPage, SessionSummary } from "../../types/domain";
@@ -19,8 +25,13 @@ export function Sessions({ active, status }: SessionsProps) {
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [launchingId, setLaunchingId] = useState<string | null>(null);
+  const [savingPreferenceIds, setSavingPreferenceIds] = useState<Set<string>>(() => new Set());
+  const [providerPreferences, setProviderPreferences] = useState<Record<string, string>>({});
   const [launchMessage, setLaunchMessage] = useState("");
   const loadRequestRef = useRef(0);
+  const preferenceRequestRef = useRef(0);
+  const preferenceMutationVersionsRef = useRef(new Map<string, number>());
+  const pendingPreferenceMutationsRef = useRef(new Set<string>());
   const deferredQuery = useDeferredValue(query);
 
   const load = useCallback(async (rebuild = false): Promise<void> => {
@@ -54,6 +65,49 @@ export function Sessions({ active, status }: SessionsProps) {
     return () => window.clearTimeout(timer);
   }, [active, deferredQuery, load]);
 
+  useEffect(() => {
+    if (!active || !page?.sessions.length) {
+      preferenceRequestRef.current += 1;
+      setProviderPreferences({});
+      return;
+    }
+    const requestId = preferenceRequestRef.current + 1;
+    preferenceRequestRef.current = requestId;
+    const sessions = page.sessions;
+    const mutationVersions = new Map(
+      sessions.map((session) => [
+        session.id,
+        preferenceMutationVersionsRef.current.get(session.id) ?? 0,
+      ]),
+    );
+    void getSessionProviderPreferences(page.sessions.map((session) => session.id))
+      .then((preferences) => {
+        if (preferenceRequestRef.current === requestId) {
+          setProviderPreferences((current) => {
+            const merged: Record<string, string> = {};
+            for (const session of sessions) {
+              const sessionId = session.id;
+              const mutationChanged =
+                (preferenceMutationVersionsRef.current.get(sessionId) ?? 0)
+                !== mutationVersions.get(sessionId);
+              const preserveLocalValue =
+                mutationChanged || pendingPreferenceMutationsRef.current.has(sessionId);
+              const providerId = preserveLocalValue ? current[sessionId] : preferences[sessionId];
+              if (providerId) {
+                merged[sessionId] = providerId;
+              }
+            }
+            return merged;
+          });
+        }
+      })
+      .catch((unknownError) => {
+        if (preferenceRequestRef.current === requestId) {
+          setError(userFacingError(unknownError));
+        }
+      });
+  }, [active, page]);
+
   async function handleCopyResume(session: SessionSummary): Promise<void> {
     const command = `codex resume ${shellQuote(session.id)}`;
     await navigator.clipboard.writeText(command);
@@ -85,8 +139,55 @@ export function Sessions({ active, status }: SessionsProps) {
     }
   }
 
+  async function handleProviderPreference(sessionId: string, providerId: string): Promise<void> {
+    const previousProviderId = providerPreferences[sessionId];
+    preferenceMutationVersionsRef.current.set(
+      sessionId,
+      (preferenceMutationVersionsRef.current.get(sessionId) ?? 0) + 1,
+    );
+    pendingPreferenceMutationsRef.current.add(sessionId);
+    setSavingPreferenceIds((current) => new Set(current).add(sessionId));
+    setProviderPreferences((current) => {
+      if (providerId) return { ...current, [sessionId]: providerId };
+      const remaining = { ...current };
+      delete remaining[sessionId];
+      return remaining;
+    });
+    try {
+      if (providerId) {
+        await setSessionProviderPreference(sessionId, providerId);
+      } else {
+        await clearSessionProviderPreference(sessionId);
+      }
+      setError(null);
+    } catch (unknownError) {
+      setProviderPreferences((current) => {
+        if (previousProviderId) return { ...current, [sessionId]: previousProviderId };
+        const remaining = { ...current };
+        delete remaining[sessionId];
+        return remaining;
+      });
+      setError(userFacingError(unknownError));
+    } finally {
+      preferenceMutationVersionsRef.current.set(
+        sessionId,
+        (preferenceMutationVersionsRef.current.get(sessionId) ?? 0) + 1,
+      );
+      pendingPreferenceMutationsRef.current.delete(sessionId);
+      setSavingPreferenceIds((current) => {
+        const remaining = new Set(current);
+        remaining.delete(sessionId);
+        return remaining;
+      });
+    }
+  }
+
   const rootIsIsolated = status.dataRoots.companionIsolated || status.dataRoots.codexIsolated;
   const sessions = page?.sessions ?? [];
+  const activeGroup = status.activeGroup ?? status.config.groups[status.config.relay.activeGroupId];
+  const groupProviders = (activeGroup?.providerOrder ?? [])
+    .map((providerId) => status.config.providers[providerId])
+    .filter((provider) => provider?.enabled);
 
   return (
     <div className="content-grid sessions-stack">
@@ -145,6 +246,26 @@ export function Sessions({ active, status }: SessionsProps) {
             <div className="session-row-meta">
               <span>{formatTime(session.modifiedAt)}</span>
               <span>{formatBytes(session.bytes)}</span>
+              <label className="session-provider-preference">
+                <span>首选 Provider</span>
+                <select
+                  aria-label={`${session.title} 的首选 Provider`}
+                  disabled={savingPreferenceIds.has(session.id) || groupProviders.length === 0}
+                  onChange={(event) => void handleProviderPreference(session.id, event.target.value)}
+                  value={providerPreferences[session.id] ?? ""}
+                >
+                  <option value="">跟随分组策略</option>
+                  {providerPreferences[session.id]
+                    && !groupProviders.some((provider) => provider.id === providerPreferences[session.id]) ? (
+                      <option disabled value={providerPreferences[session.id]}>
+                        {providerPreferences[session.id]}（当前不可用）
+                      </option>
+                    ) : null}
+                  {groupProviders.map((provider) => (
+                    <option key={provider.id} value={provider.id}>{provider.name}</option>
+                  ))}
+                </select>
+              </label>
               <IconButton
                 label={copiedId === session.id ? "恢复命令已复制" : `复制 ${session.title} 的恢复命令`}
                 onClick={() => void handleCopyResume(session)}
