@@ -226,6 +226,8 @@ impl ProviderGroup {
 pub struct ProviderHealth {
     pub status: HealthStatusKind,
     pub last_checked: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_refresh_attempt: Option<DateTime<Utc>>,
     pub last_success: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub last_failure_kind: Option<HealthFailureKind>,
@@ -238,6 +240,7 @@ impl Default for ProviderHealth {
         Self {
             status: HealthStatusKind::Unknown,
             last_checked: None,
+            last_refresh_attempt: None,
             last_success: None,
             last_error: None,
             last_failure_kind: None,

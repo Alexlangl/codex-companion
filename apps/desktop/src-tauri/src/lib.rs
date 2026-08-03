@@ -2,7 +2,8 @@ mod codex_oauth;
 
 use codex_companion_core::{
     default_codex_dir, ApiClientCreate, ApiClientUpdate, HealthStatusKind, ProviderConfig,
-    ProviderLaunchMode, ProviderViewMode, RelaySettingsUpdate, RepairOptions, ThemeMode,
+    ProviderLaunchMode, ProviderViewMode, RelayEvent, RelaySettingsUpdate, RepairOptions,
+    ThemeMode,
 };
 use codex_companion_daemon::CompanionDaemon;
 use codex_companion_provider::{
@@ -91,7 +92,10 @@ fn tray_menu_labels() -> TrayMenuLabels {
     } else {
         "启动 Codex（分组暂无账号）".to_string()
     };
-    let (quota, quota_title) = tray_quota_summary(&status.active_providers);
+    let recent_provider_id =
+        tray_recent_provider_id(&status.active_providers, &status.recent_events);
+    let (quota, quota_title) =
+        tray_quota_summary(&status.active_providers, recent_provider_id.as_deref());
 
     TrayMenuLabels {
         runtime: format!("● Companion 正在运行 · {}", status.relay_base_url),
@@ -103,52 +107,80 @@ fn tray_menu_labels() -> TrayMenuLabels {
     }
 }
 
-fn tray_quota_summary(providers: &[ProviderConfig]) -> (String, Option<String>) {
+fn tray_recent_provider_id(providers: &[ProviderConfig], events: &[RelayEvent]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        (event.kind == "stream")
+            .then_some(event.provider_id.as_deref())
+            .flatten()
+            .filter(|provider_id| providers.iter().any(|provider| provider.id == *provider_id))
+            .map(str::to_string)
+    })
+}
+
+fn tray_quota_summary(
+    providers: &[ProviderConfig],
+    preferred_provider_id: Option<&str>,
+) -> (String, Option<String>) {
+    if let Some(provider) = preferred_provider_id
+        .and_then(|provider_id| providers.iter().find(|provider| provider.id == provider_id))
+    {
+        return tray_provider_quota_summary(provider).unwrap_or_else(|| {
+            (
+                format!("额度：{} · 暂无可监控数据", tray_provider_label(provider)),
+                None,
+            )
+        });
+    }
     for provider in providers {
-        let Some(account) = provider.account.as_ref() else {
-            continue;
-        };
-        let details = account
-            .quota_windows
-            .iter()
-            .filter_map(|window| {
-                tray_percent(window.remaining_percent).map(|percent| {
-                    format!(
-                        "{} {}%",
-                        tray_text_label(&window.label, 16, "周期"),
-                        format_tray_number(percent)
-                    )
-                })
-            })
-            .take(2)
-            .collect::<Vec<_>>();
-        if !details.is_empty() {
-            let title = details.first().cloned();
-            return (
-                format!(
-                    "额度：{} · {}",
-                    tray_provider_label(provider),
-                    details.join(" · ")
-                ),
-                title,
-            );
-        }
-        if let Some(percent) = account.quota_percent.and_then(tray_percent) {
-            let percent = format_tray_number(percent);
-            return (
-                format!("额度：{} · 剩余 {percent}%", tray_provider_label(provider)),
-                Some(format!("{percent}%")),
-            );
-        }
-        if let Some(available) = account.usage_available.filter(|value| value.is_finite()) {
-            let available = format_tray_number(available);
-            return (
-                format!("额度：{} · 剩余 {available}", tray_provider_label(provider)),
-                Some(available),
-            );
+        if let Some(summary) = tray_provider_quota_summary(provider) {
+            return summary;
         }
     }
     ("额度：暂无可监控数据".to_string(), None)
+}
+
+fn tray_provider_quota_summary(provider: &ProviderConfig) -> Option<(String, Option<String>)> {
+    let account = provider.account.as_ref()?;
+    let details = account
+        .quota_windows
+        .iter()
+        .filter_map(|window| {
+            tray_percent(window.remaining_percent).map(|percent| {
+                format!(
+                    "{} {}%",
+                    tray_text_label(&window.label, 16, "周期"),
+                    format_tray_number(percent)
+                )
+            })
+        })
+        .take(2)
+        .collect::<Vec<_>>();
+    if !details.is_empty() {
+        let title = details.first().cloned();
+        return Some((
+            format!(
+                "额度：{} · {}",
+                tray_provider_label(provider),
+                details.join(" · ")
+            ),
+            title,
+        ));
+    }
+    if let Some(percent) = account.quota_percent.and_then(tray_percent) {
+        let percent = format_tray_number(percent);
+        return Some((
+            format!("额度：{} · 剩余 {percent}%", tray_provider_label(provider)),
+            Some(format!("{percent}%")),
+        ));
+    }
+    if let Some(available) = account.usage_available.filter(|value| value.is_finite()) {
+        let available = format_tray_number(available);
+        return Some((
+            format!("额度：{} · 剩余 {available}", tray_provider_label(provider)),
+            Some(available),
+        ));
+    }
+    None
 }
 
 fn tray_provider_label(provider: &ProviderConfig) -> String {
@@ -232,7 +264,7 @@ mod tray_tests {
             ..ProviderAccountInfo::default()
         });
 
-        let (menu, title) = tray_quota_summary(&[provider]);
+        let (menu, title) = tray_quota_summary(&[provider], None);
 
         assert_eq!(
             menu,
@@ -249,7 +281,7 @@ mod tray_tests {
             ..ProviderAccountInfo::default()
         });
         assert_eq!(
-            tray_quota_summary(&[percent_provider]),
+            tray_quota_summary(&[percent_provider], None),
             (
                 "额度：Account · 剩余 0%".to_string(),
                 Some("0%".to_string())
@@ -261,10 +293,67 @@ mod tray_tests {
             ..ProviderAccountInfo::default()
         });
         assert_eq!(
-            tray_quota_summary(&[balance_provider]),
+            tray_quota_summary(&[balance_provider], None),
             (
                 "额度：Fallback Provider · 剩余 12.8".to_string(),
                 Some("12.8".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn quota_summary_prefers_the_most_recent_provider_used_by_the_active_group() {
+        let mut configured_first = provider(ProviderAccountInfo {
+            display_name: Some("AL".to_string()),
+            usage_available: Some(-0.1),
+            ..ProviderAccountInfo::default()
+        });
+        configured_first.id = "al".to_string();
+        let mut recently_used = provider(ProviderAccountInfo {
+            email: Some("official@example.com".to_string()),
+            quota_percent: Some(73.0),
+            ..ProviderAccountInfo::default()
+        });
+        recently_used.id = "official".to_string();
+        let providers = vec![configured_first, recently_used];
+        let events = vec![RelayEvent {
+            timestamp: chrono::Utc::now(),
+            kind: "stream".to_string(),
+            provider_id: Some("official".to_string()),
+            message: "POST /v1/responses -> 200 OK".to_string(),
+        }];
+
+        let recent_provider_id = tray_recent_provider_id(&providers, &events);
+
+        assert_eq!(recent_provider_id.as_deref(), Some("official"));
+        assert_eq!(
+            tray_quota_summary(&providers, recent_provider_id.as_deref()),
+            (
+                "额度：official@example.com · 剩余 73%".to_string(),
+                Some("73%".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn recent_provider_without_quota_does_not_borrow_another_account_balance() {
+        let mut configured_first = provider(ProviderAccountInfo {
+            display_name: Some("AL".to_string()),
+            usage_available: Some(-0.1),
+            ..ProviderAccountInfo::default()
+        });
+        configured_first.id = "al".to_string();
+        let mut recently_used = provider(ProviderAccountInfo {
+            email: Some("current@example.com".to_string()),
+            ..ProviderAccountInfo::default()
+        });
+        recently_used.id = "current".to_string();
+
+        assert_eq!(
+            tray_quota_summary(&[configured_first, recently_used], Some("current")),
+            (
+                "额度：current@example.com · 暂无可监控数据".to_string(),
+                None
             )
         );
     }

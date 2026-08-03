@@ -99,6 +99,7 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
     store.update(|config| {
         let now = Utc::now();
         let health = config.health.entry(id.to_string()).or_default();
+        health.last_refresh_attempt = Some(now);
         match result {
             Ok(()) => {
                 mark_success(health);
@@ -231,6 +232,7 @@ mod tests {
             health.last_failure_kind,
             Some(HealthFailureKind::AuthFailed)
         );
+        assert!(health.last_refresh_attempt.is_some());
     }
 
     #[test]

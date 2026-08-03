@@ -1,5 +1,5 @@
 use chrono::Utc;
-use codex_companion_core::{ConfigStore, ProviderRefreshProgress};
+use codex_companion_core::{ConfigStore, ProviderHealth, ProviderRefreshProgress};
 use codex_companion_provider::refresh_provider_status;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -191,14 +191,11 @@ async fn refresh_due_providers(store: &ConfigStore) {
         .values()
         .filter(|provider| provider.enabled)
         .filter(|provider| {
-            config
-                .health
-                .get(&provider.id)
-                .and_then(|health| health.last_checked)
-                .is_none_or(|last_checked| {
-                    now.signed_duration_since(last_checked).num_seconds()
-                        >= provider.refresh_interval_seconds as i64
-                })
+            provider_refresh_due(
+                provider.refresh_interval_seconds,
+                config.health.get(&provider.id),
+                now,
+            )
         })
         .map(|provider| provider.id.clone())
         .collect::<Vec<_>>();
@@ -218,9 +215,22 @@ async fn refresh_due_providers(store: &ConfigStore) {
     progress.finish(first_error);
 }
 
+fn provider_refresh_due(
+    refresh_interval_seconds: u64,
+    health: Option<&ProviderHealth>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    health
+        .and_then(|health| health.last_refresh_attempt)
+        .is_none_or(|last_attempt| {
+            now.signed_duration_since(last_attempt).num_seconds() >= refresh_interval_seconds as i64
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
 
     #[tokio::test]
     async fn scoped_loop_unregisters_when_stopped() {
@@ -253,5 +263,21 @@ mod tests {
         let progress = refresh_progress(&store);
         assert!(!progress.active);
         assert_eq!(progress.last_error.as_deref(), Some("Provider 刷新已取消"));
+    }
+
+    #[test]
+    fn relay_health_success_does_not_postpone_scheduled_account_refresh() {
+        let now = Utc::now();
+        let mut health = ProviderHealth {
+            last_checked: Some(now),
+            last_refresh_attempt: Some(now - ChronoDuration::seconds(61)),
+            ..ProviderHealth::default()
+        };
+
+        assert!(provider_refresh_due(60, Some(&health), now));
+
+        health.last_refresh_attempt = Some(now);
+        assert!(!provider_refresh_due(60, Some(&health), now));
+        assert!(provider_refresh_due(60, None, now));
     }
 }

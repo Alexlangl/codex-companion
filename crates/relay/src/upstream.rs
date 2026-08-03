@@ -413,13 +413,24 @@ fn normalize_official_responses_input(
         || method != Method::POST
         || !uri
             .path_and_query()
-            .is_some_and(|value| is_responses_generation_url(value.as_str()))
+            .is_some_and(|value| is_responses_url(value.as_str()))
     {
         return body;
     }
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
         return body;
     };
+    let normalized_ids = normalize_official_input_item_ids(&mut value);
+    if !uri
+        .path_and_query()
+        .is_some_and(|value| is_responses_generation_url(value.as_str()))
+    {
+        return if normalized_ids {
+            serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
+        } else {
+            body
+        };
+    }
     value["store"] = Value::Bool(false);
     value["stream"] = Value::Bool(true);
     if let Some(object) = value.as_object_mut() {
@@ -485,6 +496,49 @@ fn normalize_official_responses_input(
         }
     }
     serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
+}
+
+pub(crate) fn normalize_official_input_item_ids(value: &mut Value) -> bool {
+    let mut changed = false;
+    if let Some(items) = value.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items {
+            changed |= normalize_official_input_item_id(item);
+        }
+    }
+    if let Some(items) = value
+        .pointer_mut("/response/input")
+        .and_then(Value::as_array_mut)
+    {
+        for item in items {
+            changed |= normalize_official_input_item_id(item);
+        }
+    }
+    changed
+}
+
+fn normalize_official_input_item_id(item: &mut Value) -> bool {
+    let Some(object) = item.as_object_mut() else {
+        return false;
+    };
+    let expected_prefix = match object.get("type").and_then(Value::as_str) {
+        Some("custom_tool_call") => "ctc_",
+        Some("reasoning") => "rs_",
+        Some("function_call") => "fc_",
+        Some("message") => "msg_",
+        _ => return false,
+    };
+    let Some(id) = object.get("id").and_then(Value::as_str) else {
+        return false;
+    };
+    if id.starts_with(expected_prefix) {
+        return false;
+    }
+    let suffix = id.split_once('_').map_or(id, |(_, suffix)| suffix);
+    object.insert(
+        "id".to_string(),
+        Value::String(format!("{expected_prefix}{suffix}")),
+    );
+    true
 }
 
 fn official_codex_session_identity(
@@ -3449,6 +3503,36 @@ mod tests {
     }
 
     #[test]
+    fn official_codex_normalizes_cross_provider_input_item_id_prefixes() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let uri: Uri = "/v1/responses".parse().expect("uri");
+        let body = normalize_official_responses_input(
+            &provider,
+            &Method::POST,
+            &uri,
+            Bytes::from_static(
+                br#"{"model":"gpt-test","input":[
+                    {"type":"custom_tool_call","id":"item_custom","call_id":"call_1","name":"exec","input":""},
+                    {"type":"reasoning","id":"item_reasoning","summary":[]},
+                    {"type":"function_call","id":"item_function","call_id":"call_2","name":"lookup","arguments":"{}"},
+                    {"type":"message","id":"item_message","role":"assistant","content":[]},
+                    {"type":"custom_tool_call","id":"ctc_already_valid","call_id":"call_3","name":"exec","input":""},
+                    {"type":"custom_tool_call_output","id":"ctco_output","call_id":"call_1","output":"ok"}
+                ]}"#,
+            ),
+            None,
+        );
+
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["input"][0]["id"], "ctc_custom");
+        assert_eq!(value["input"][1]["id"], "rs_reasoning");
+        assert_eq!(value["input"][2]["id"], "fc_function");
+        assert_eq!(value["input"][3]["id"], "msg_message");
+        assert_eq!(value["input"][4]["id"], "ctc_already_valid");
+        assert_eq!(value["input"][5]["id"], "ctco_output");
+    }
+
+    #[test]
     fn official_codex_compact_request_preserves_standalone_compaction_semantics() {
         let provider = official_provider("https://chatgpt.com/backend-api/codex");
         let uri: Uri = "/v1/responses/compact".parse().expect("uri");
@@ -3466,6 +3550,26 @@ mod tests {
 
         assert_eq!(body, original);
         let value: Value = serde_json::from_slice(&body).expect("json");
+        assert!(value.get("stream").is_none());
+        assert!(value.get("store").is_none());
+    }
+
+    #[test]
+    fn official_codex_compact_normalizes_cross_provider_input_item_ids() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let uri: Uri = "/v1/responses/compact".parse().expect("uri");
+        let body = normalize_official_responses_input(
+            &provider,
+            &Method::POST,
+            &uri,
+            Bytes::from_static(
+                br#"{"model":"gpt-test","input":[{"type":"custom_tool_call","id":"item_99fb83474df510b04e475dc5","call_id":"call_1","name":"exec","input":""}]}"#,
+            ),
+            None,
+        );
+
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["input"][0]["id"], "ctc_99fb83474df510b04e475dc5");
         assert!(value.get("stream").is_none());
         assert!(value.get("store").is_none());
     }

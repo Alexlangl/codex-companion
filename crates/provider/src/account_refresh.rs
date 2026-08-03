@@ -710,13 +710,17 @@ fn apply_api_key_usage_to_account(account: &mut ProviderAccountInfo, value: &ser
         ],
     );
 
-    account.usage_total = total;
+    account.usage_total = if unlimited { None } else { total };
     account.usage_used = used;
-    account.usage_available = available;
+    account.usage_available = if unlimited { None } else { available };
     account.valid_until = expires_at.clone().or_else(|| account.valid_until.clone());
-    account.quota_reset_at = expires_at
-        .clone()
-        .or_else(|| account.quota_reset_at.clone());
+    account.quota_reset_at = if unlimited {
+        expires_at.clone()
+    } else {
+        expires_at
+            .clone()
+            .or_else(|| account.quota_reset_at.clone())
+    };
 
     let remaining_percent = if unlimited {
         Some(100.0)
@@ -731,23 +735,30 @@ fn apply_api_key_usage_to_account(account: &mut ProviderAccountInfo, value: &ser
     };
     if let Some(percent) = remaining_percent {
         account.quota_percent = Some(percent);
-        account.quota_windows = vec![ProviderQuotaWindow {
-            label: "API".to_string(),
-            remaining_percent: percent,
-            reset_at: expires_at,
-            window_minutes: None,
-        }];
+        account.quota_windows = if unlimited {
+            Vec::new()
+        } else {
+            vec![ProviderQuotaWindow {
+                label: "API".to_string(),
+                remaining_percent: percent,
+                reset_at: expires_at,
+                window_minutes: None,
+            }]
+        };
     }
-    account.quota_label = summary.or_else(|| match (available, total) {
-        (Some(available), Some(total)) if total > 0.0 => Some(format!(
-            "{} / {}",
-            compact_number(available),
-            compact_number(total)
-        )),
-        (Some(available), _) => Some(format!("剩余 {}", compact_number(available))),
-        _ if unlimited => Some("不限量".to_string()),
-        _ => account.quota_label.clone(),
-    });
+    account.quota_label = if unlimited {
+        Some("不限量".to_string())
+    } else {
+        summary.or_else(|| match (available, total) {
+            (Some(available), Some(total)) if total > 0.0 => Some(format!(
+                "{} / {}",
+                compact_number(available),
+                compact_number(total)
+            )),
+            (Some(available), _) => Some(format!("剩余 {}", compact_number(available))),
+            _ => account.quota_label.clone(),
+        })
+    };
     account.subscription_status = Some(if unlimited || remaining_percent.unwrap_or(0.0) > 0.0 {
         "可用".to_string()
     } else {
@@ -1490,6 +1501,30 @@ mod tests {
         assert_eq!(account.usage_used, Some(25.0));
         assert_eq!(account.usage_available, Some(75.0));
         assert_eq!(account.quota_percent, Some(75.0));
+    }
+
+    #[test]
+    fn unlimited_api_key_usage_does_not_expose_negative_remaining_quota() {
+        let value = serde_json::json!({
+            "code": true,
+            "data": {
+                "total_granted": 12_456_524,
+                "total_used": 13_077_025,
+                "total_available": -620_501,
+                "unlimited_quota": true
+            }
+        });
+        let mut account = ProviderAccountInfo::default();
+
+        apply_api_key_usage_to_account(&mut account, &value);
+
+        assert_eq!(account.subscription_status.as_deref(), Some("可用"));
+        assert_eq!(account.quota_label.as_deref(), Some("不限量"));
+        assert_eq!(account.quota_percent, Some(100.0));
+        assert!(account.quota_windows.is_empty());
+        assert_eq!(account.usage_total, None);
+        assert_eq!(account.usage_used, Some(13_077_025.0));
+        assert_eq!(account.usage_available, None);
     }
 
     #[test]

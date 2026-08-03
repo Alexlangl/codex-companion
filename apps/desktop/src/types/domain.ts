@@ -238,6 +238,7 @@ export interface ProviderQuotaWindow {
 export interface ProviderHealth {
   status: string;
   lastChecked?: string | null;
+  lastRefreshAttempt?: string | null;
   lastSuccess?: string | null;
   lastError?: string | null;
   lastFailureKind?: string | null;

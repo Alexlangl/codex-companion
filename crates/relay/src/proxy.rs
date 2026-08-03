@@ -652,6 +652,7 @@ async fn proxy_dispatch(
                 let body_text = response.text().await.unwrap_or_default();
                 let failure = classify_failure(Some(status.as_u16()), &body_text);
                 let upstream_payload_too_large = status == StatusCode::PAYLOAD_TOO_LARGE;
+                let request_incompatible = is_upstream_request_incompatibility(status, &body_text);
                 let compact_unsupported = compact_request
                     && matches!(
                         status,
@@ -672,7 +673,7 @@ async fn proxy_dispatch(
                 } else {
                     format!("上游返回 {}: {}", status, compact_error_body(&body_text))
                 };
-                if !upstream_payload_too_large && !compact_unsupported {
+                if !upstream_payload_too_large && !request_incompatible && !compact_unsupported {
                     record_provider_failure(
                         &state,
                         &config,
@@ -693,6 +694,7 @@ async fn proxy_dispatch(
                     Some(&message),
                 );
                 let can_retry = (upstream_payload_too_large
+                    || request_incompatible
                     || compact_unsupported
                     || fallback_eligible(&failure))
                     && index + 1 < candidate_count
@@ -726,6 +728,8 @@ async fn proxy_dispatch(
                     status,
                     if upstream_payload_too_large {
                         "upstream_request_too_large"
+                    } else if request_incompatible {
+                        "upstream_request_incompatible"
                     } else if compact_unsupported {
                         "responses_compact_unsupported"
                     } else {
@@ -881,6 +885,16 @@ fn prioritize_session_affinity(
 
 fn fallback_eligible(failure: &codex_companion_health::FailureClassification) -> bool {
     failure.retryable || failure.kind == HealthFailureKind::AuthFailed
+}
+
+fn is_upstream_request_incompatibility(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("expected an id that begins with")
+        && lower.contains("input[")
+        && lower.contains("].id")
 }
 
 fn failure_error_code(kind: &HealthFailureKind) -> &'static str {
@@ -1479,6 +1493,93 @@ mod tests {
         assert_eq!(request.attempt_log[1].provider_id, "b");
         assert_eq!(request.attempt_log[1].route_reason, "fallback");
         assert_eq!(request.attempt_log[1].outcome, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn falls_back_when_provider_rejects_a_response_item_id_prefix() {
+        let incompatible_hits = Arc::new(AtomicUsize::new(0));
+        let compatible_hits = Arc::new(AtomicUsize::new(0));
+        let incompatible_url = spawn_mock_server(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"Invalid 'input[154].id': 'item_99fb83474df510b04e475dc5'. Expected an ID that begins with 'ctc'.","type":"invalid_request_error","param":"input[154].id","code":"invalid_value"}}"#,
+            Some(incompatible_hits.clone()),
+        )
+        .await;
+        let compatible_url = spawn_mock_server(
+            StatusCode::OK,
+            r#"{"id":"resp_b","status":"completed","output":[]}"#,
+            Some(compatible_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("incompatible", &incompatible_url),
+            provider("compatible", &compatible_url),
+        ]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+
+        let response = proxy_inner(
+            state.clone(),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"model":"gpt-test","input":[{"type":"custom_tool_call","id":"item_99fb83474df510b04e475dc5","call_id":"call_1","name":"exec","input":""}]}"#,
+            ),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("compatible")
+        );
+        assert_eq!(incompatible_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(compatible_hits.load(Ordering::SeqCst), 1);
+        assert!(!store
+            .load()
+            .expect("config")
+            .health
+            .contains_key("incompatible"));
+        let events =
+            std::fs::read_to_string(store.data_dir().join("relay/events.jsonl")).expect("events");
+        assert!(events.contains("Expected an ID that begins with 'ctc'"));
+        assert!(events.contains("\"kind\":\"fallback\""));
+        let request = state
+            .api_service
+            .snapshot(10)
+            .expect("request snapshot")
+            .recent_requests
+            .into_iter()
+            .next()
+            .expect("request log");
+        assert_eq!(request.attempt_log.len(), 2);
+        assert_eq!(request.attempt_log[0].provider_id, "incompatible");
+        assert_eq!(request.attempt_log[0].status_code, Some(400));
+        assert_eq!(request.attempt_log[1].provider_id, "compatible");
+        assert_eq!(request.attempt_log[1].route_reason, "fallback");
+        assert_eq!(request.attempt_log[1].outcome, "succeeded");
+    }
+
+    #[test]
+    fn recognizes_only_response_item_id_prefix_bad_requests_as_incompatible() {
+        let response_item_error = r#"{"error":{"message":"Invalid 'input[146].id': 'item_13ac92c3844b3c3b87fa512f'. Expected an ID that begins with 'rs'."}}"#;
+
+        assert!(is_upstream_request_incompatibility(
+            StatusCode::BAD_REQUEST,
+            response_item_error
+        ));
+        assert!(!is_upstream_request_incompatibility(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"model is required"}}"#
+        ));
+        assert!(!is_upstream_request_incompatibility(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            response_item_error
+        ));
     }
 
     #[tokio::test]

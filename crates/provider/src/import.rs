@@ -1123,8 +1123,12 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
         &[
             &["access_token"],
             &["accessToken"],
+            &["personal_access_token"],
+            &["personalAccessToken"],
             &["tokens", "access_token"],
             &["tokens", "accessToken"],
+            &["tokens", "personal_access_token"],
+            &["tokens", "personalAccessToken"],
             &["token"],
         ],
     );
@@ -1176,11 +1180,16 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
         &identity_sources,
         &[
             &["chatgpt_account_id"],
+            &["chatgptAccountId"],
             &["account_id"],
             &["accountId"],
             &["tokens", "chatgpt_account_id"],
+            &["tokens", "chatgptAccountId"],
             &["tokens", "account_id"],
             &["workspace_id"],
+            &["headers", "ChatGPT-Account-Id"],
+            &["custom_headers", "ChatGPT-Account-Id"],
+            &["customHeaders", "ChatGPT-Account-Id"],
         ],
     );
     let user_id = pick_first_string(
@@ -1559,9 +1568,6 @@ fn extract_provider_account_info(
         &[
             &["valid_until"],
             &["validUntil"],
-            &["expires_at"],
-            &["expiresAt"],
-            &["expired"],
             &["subscription_expires_at"],
             &["subscriptionExpiresAt"],
             &["subscription_active_until"],
@@ -1571,6 +1577,9 @@ fn extract_provider_account_info(
             &["activeUntil"],
             &["entitlement", "subscription_active_until"],
             &["entitlement", "expires_at"],
+            &["expires_at"],
+            &["expiresAt"],
+            &["expired"],
         ],
     );
     let quota_windows = extract_quota_windows(&sources);
@@ -2068,6 +2077,63 @@ mod tests {
         let draft = parse_provider_import_draft(&value, None, None).expect("draft");
         assert_eq!(draft.account_id, "chatgpt-account-id");
         assert_eq!(draft.provider_name, "mark@example.com");
+    }
+
+    #[test]
+    fn imports_cockpit_personal_access_token_with_workspace_header() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let value = serde_json::json!({
+            "personal_access_token": "at-cockpit-token",
+            "email": "team@example.com",
+            "customHeaders": {
+                "ChatGPT-Account-Id": "workspace-from-header"
+            }
+        });
+
+        let outcome = import_provider_json(&store, &value.to_string(), None, None)
+            .expect("personal access token import");
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&outcome.auth_path).expect("auth file"))
+                .expect("auth json");
+
+        assert_eq!(outcome.provider.kind, ProviderKind::OfficialCodex);
+        assert_eq!(outcome.account_id, "workspace-from-header");
+        assert_eq!(
+            outcome
+                .provider
+                .account
+                .as_ref()
+                .and_then(|account| account.account_id.as_deref()),
+            Some("workspace-from-header")
+        );
+        assert_eq!(auth["tokens"]["access_token"], "at-cockpit-token");
+        assert_eq!(
+            auth["tokens"]["chatgpt_account_id"],
+            "workspace-from-header"
+        );
+    }
+
+    #[test]
+    fn sub2api_subscription_expiry_wins_over_access_token_expiry() {
+        let value = serde_json::json!({
+            "accounts": [{
+                "name": "team@example.com",
+                "platform": "openai",
+                "type": "oauth",
+                "credentials": {
+                    "access_token": "at-team-token",
+                    "chatgpt_account_id": "workspace-id",
+                    "expires_at": "2026-08-04T00:00:00Z",
+                    "subscription_expires_at": "2027-01-02T03:04:05Z"
+                }
+            }]
+        });
+        let auth = extract_codex_oauth_auth(&value).expect("oauth auth");
+
+        let account = extract_provider_account_info(&value, &auth);
+
+        assert_eq!(account.valid_until.as_deref(), Some("2027-01-02T03:04:05Z"));
     }
 
     #[test]

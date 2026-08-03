@@ -1,4 +1,5 @@
 use crate::state::{apply_group_policy, RelayState};
+use crate::upstream::normalize_official_input_item_ids;
 use axum::{
     extract::{ws::Message as ClientMessage, State, WebSocketUpgrade},
     http::{header, HeaderMap, StatusCode},
@@ -51,8 +52,9 @@ pub(crate) async fn responses_websocket(
         Err(error) => return (StatusCode::BAD_GATEWAY, error).into_response(),
     };
     let provider_id = provider.id.clone();
+    let provider_kind = provider.kind.clone();
     let mut response = websocket
-        .on_upgrade(move |client| bridge_websocket(client, upstream, allowed_models))
+        .on_upgrade(move |client| bridge_websocket(client, upstream, allowed_models, provider_kind))
         .into_response();
     if let Ok(value) = axum::http::HeaderValue::from_str(&provider_id) {
         response
@@ -299,6 +301,7 @@ async fn bridge_websocket(
     client: axum::extract::ws::WebSocket,
     upstream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     allowed_models: Vec<String>,
+    provider_kind: ProviderKind,
 ) {
     let (mut client_sink, mut client_stream) = client.split();
     let (mut upstream_sink, mut upstream_stream) = upstream.split();
@@ -319,7 +322,7 @@ async fn bridge_websocket(
                     break;
                 }
                 let close = matches!(message, ClientMessage::Close(_));
-                if upstream_sink.send(client_to_upstream(message)).await.is_err() || close {
+                if upstream_sink.send(client_to_upstream(message, &provider_kind)).await.is_err() || close {
                     break;
                 }
             }
@@ -373,13 +376,44 @@ fn frame_disallowed_model(message: &ClientMessage, allowed_models: &[String]) ->
     None
 }
 
-fn client_to_upstream(message: ClientMessage) -> UpstreamMessage {
+fn client_to_upstream(message: ClientMessage, provider_kind: &ProviderKind) -> UpstreamMessage {
+    let message = if *provider_kind == ProviderKind::OfficialCodex {
+        normalize_official_client_frame(message)
+    } else {
+        message
+    };
     match message {
         ClientMessage::Text(text) => UpstreamMessage::Text(text.to_string().into()),
         ClientMessage::Binary(bytes) => UpstreamMessage::Binary(bytes),
         ClientMessage::Ping(bytes) => UpstreamMessage::Ping(bytes),
         ClientMessage::Pong(bytes) => UpstreamMessage::Pong(bytes),
         ClientMessage::Close(_) => UpstreamMessage::Close(None),
+    }
+}
+
+fn normalize_official_client_frame(message: ClientMessage) -> ClientMessage {
+    match message {
+        ClientMessage::Text(text) => {
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return ClientMessage::Text(text);
+            };
+            if !normalize_official_input_item_ids(&mut value) {
+                return ClientMessage::Text(text);
+            }
+            ClientMessage::Text(value.to_string().into())
+        }
+        ClientMessage::Binary(bytes) => {
+            let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return ClientMessage::Binary(bytes);
+            };
+            if !normalize_official_input_item_ids(&mut value) {
+                return ClientMessage::Binary(bytes);
+            }
+            serde_json::to_vec(&value)
+                .map(|value| ClientMessage::Binary(value.into()))
+                .unwrap_or(ClientMessage::Binary(bytes))
+        }
+        message => message,
     }
 }
 
@@ -535,6 +569,37 @@ mod tests {
         );
         assert_eq!(frame_disallowed_model(&no_model, &allowed), None);
         assert_eq!(frame_disallowed_model(&blocked, &[]), None);
+    }
+
+    #[test]
+    fn official_websocket_frames_normalize_cross_provider_input_item_ids() {
+        let message = ClientMessage::Text(
+            r#"{"type":"response.create","response":{"model":"gpt-test","input":[{"type":"custom_tool_call","id":"item_99fb83474df510b04e475dc5","call_id":"call_1","name":"exec","input":""}]}}"#
+                .into(),
+        );
+
+        let UpstreamMessage::Text(text) = client_to_upstream(message, &ProviderKind::OfficialCodex)
+        else {
+            panic!("expected text frame");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(
+            value["response"]["input"][0]["id"],
+            "ctc_99fb83474df510b04e475dc5"
+        );
+    }
+
+    #[test]
+    fn compatible_websocket_frames_preserve_provider_specific_item_ids() {
+        let original = r#"{"type":"response.create","response":{"input":[{"type":"custom_tool_call","id":"item_custom"}]}}"#;
+        let message = ClientMessage::Text(original.into());
+
+        let UpstreamMessage::Text(text) =
+            client_to_upstream(message, &ProviderKind::OpenAiCompatible)
+        else {
+            panic!("expected text frame");
+        };
+        assert_eq!(text.as_str(), original);
     }
 
     #[test]
