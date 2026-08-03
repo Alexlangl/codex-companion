@@ -18,6 +18,9 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
         return class(HealthFailureKind::AuthFailed, false, true);
     }
     if lower.contains("insufficient_quota")
+        || lower.contains("usage_limit_reached")
+        || lower.contains("usage limit has been reached")
+        || lower.contains("usage limit reached")
         || lower.contains("quota exceeded")
         || lower.contains("billing")
         || lower.contains("额度耗尽")
@@ -28,8 +31,10 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
         return class(HealthFailureKind::QuotaExhausted, true, true);
     }
     if matches!(status, Some(429))
+        || lower.contains("rate_limit_exceeded")
         || lower.contains("rate limit")
         || lower.contains("too many requests")
+        || lower.contains("concurrency limit exceeded")
     {
         return class(HealthFailureKind::RateLimited, true, true);
     }
@@ -163,6 +168,22 @@ mod tests {
         assert_eq!(
             classify_failure(Some(400), "insufficient_quota").kind,
             HealthFailureKind::QuotaExhausted
+        );
+        assert_eq!(
+            classify_failure(
+                Some(429),
+                r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#
+            )
+            .kind,
+            HealthFailureKind::QuotaExhausted
+        );
+        assert_eq!(
+            classify_failure(
+                None,
+                r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Concurrency limit exceeded for account, please retry later"}}}"#
+            )
+            .kind,
+            HealthFailureKind::RateLimited
         );
         assert_eq!(
             classify_failure(None, "额度不足").kind,

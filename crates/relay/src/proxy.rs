@@ -321,24 +321,25 @@ async fn proxy_dispatch(
         });
     // AuthFailed(key 被吊销/凭证失效)必须无条件排除：它不会随冷却到期恢复，
     // 只有刷新成功(mark_success)才解除；单账号/关闭 fallback 时也不能拿它无
-    // 限重试。临时冷却(429/5xx)则只在有其他候选时跳过——只剩一个账号时拒绝
-    // 尝试会把瞬时故障放大成全量 503。
+    // 限重试。临时冷却(429/5xx)优先跳过，但保留一个最久未尝试的账号作为
+    // 最后探测，避免全部临时冷却时直接放大成全量 503。
     let has_alternatives = group.fallback_enabled && selected.len() > 1;
+    let mut cooldown_probes = Vec::new();
     let mut candidates = selected
         .into_iter()
-        .filter(|provider| {
+        .filter_map(|provider| {
             let health = config.health.get(&provider.id);
             if health.is_some_and(|health| matches!(health.status, HealthStatusKind::AuthFailed)) {
-                return false;
+                return None;
             }
             if manually_requested_provider
                 .as_deref()
                 .is_some_and(|provider_id| provider_id == provider.id)
             {
-                return true;
+                return Some(provider);
             }
             if !has_alternatives {
-                return true;
+                return Some(provider);
             }
             let globally_available = health.is_none_or(|health| !cooldown_active(health));
             let model_available = requested_model.as_deref().is_none_or(|model| {
@@ -347,7 +348,24 @@ async fn proxy_dispatch(
                     .model_cooldown_active(&provider.id, model)
                     .unwrap_or(false)
             });
-            globally_available && model_available
+            if globally_available && model_available {
+                return Some(provider);
+            }
+            let transient_failure = health
+                .and_then(|health| health.last_failure_kind.as_ref())
+                .is_none_or(|kind| {
+                    matches!(
+                        kind,
+                        HealthFailureKind::RateLimited
+                            | HealthFailureKind::UpstreamFailed
+                            | HealthFailureKind::NetworkFailed
+                            | HealthFailureKind::Unknown
+                    )
+                });
+            if transient_failure {
+                cooldown_probes.push(provider);
+            }
+            None
         })
         .collect::<Vec<_>>();
 
@@ -392,6 +410,20 @@ async fn proxy_dispatch(
                 Some(provider_id.clone()),
                 format!("[{request_id}] 会话{trigger}向上探测 Provider {provider_id}"),
             );
+        }
+    }
+    if group.fallback_enabled {
+        cooldown_probes.sort_by_key(|provider| {
+            (
+                state.provider_inflight_count(&provider.id),
+                config
+                    .health
+                    .get(&provider.id)
+                    .and_then(|health| health.last_checked),
+            )
+        });
+        if let Some(provider) = cooldown_probes.into_iter().next() {
+            candidates.push(provider);
         }
     }
     if !group.fallback_enabled {
@@ -1904,14 +1936,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_when_sse_fails_before_any_output() {
+    async fn falls_back_when_sse_rate_limit_happens_before_any_output() {
         let provider_a_hits = Arc::new(AtomicUsize::new(0));
         let provider_b_hits = Arc::new(AtomicUsize::new(0));
         let provider_a_url = spawn_sse_mock_server(
             concat!(
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\n",
                 "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
-                "\"error\":{\"message\":\"overloaded before output\"}}}\n\n"
+                "\"error\":{\"code\":\"rate_limit_exceeded\",",
+                "\"message\":\"Concurrency limit exceeded for account, please retry later\"}}}\n\n"
             ),
             Some(provider_a_hits.clone()),
         )
@@ -1929,9 +1962,10 @@ mod tests {
             provider("a", &provider_a_url),
             provider("b", &provider_b_url),
         ]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
 
         let response = proxy_inner(
-            RelayState::new(store, reqwest::Client::new()),
+            state.clone(),
             Method::POST,
             "/v1/responses".parse().expect("uri"),
             HeaderMap::new(),
@@ -1954,6 +1988,19 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("ok from b"));
         assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
         assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+        assert!(state
+            .api_service
+            .model_cooldown_active("a", "gpt-test")
+            .expect("rate limit cooldown"));
+        assert_eq!(
+            store
+                .load()
+                .expect("config")
+                .health
+                .get("a")
+                .and_then(|health| health.last_failure_kind.clone()),
+            Some(HealthFailureKind::RateLimited)
+        );
     }
 
     #[tokio::test]
@@ -2620,6 +2667,114 @@ mod tests {
             .api_service
             .model_cooldown_active("a", "gpt-two")
             .expect("gpt-two cooldown"));
+    }
+
+    #[tokio::test]
+    async fn usage_limit_429_falls_back_to_the_next_provider() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let url_a = spawn_mock_server(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_in_seconds":447522}}"#,
+            Some(hits_a.clone()),
+        )
+        .await;
+        let url_b = spawn_mock_server(StatusCode::OK, "ok from b", Some(hits_b.clone())).await;
+        let store = store_with_group(vec![provider("a", &url_a), provider("b", &url_b)]);
+
+        let response = proxy_inner(
+            RelayState::new(store.clone(), reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.expect("body");
+        assert_eq!(&body[..], b"ok from b");
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .load()
+                .expect("config")
+                .health
+                .get("a")
+                .and_then(|health| health.last_failure_kind.clone()),
+            Some(HealthFailureKind::QuotaExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn all_rate_limited_providers_are_probed_in_oldest_failure_order() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let hits_c = Arc::new(AtomicUsize::new(0));
+        let url_a = spawn_mock_server(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"retry later"}}"#,
+            Some(hits_a.clone()),
+        )
+        .await;
+        let url_b = spawn_mock_server(StatusCode::OK, "ok from b", Some(hits_b.clone())).await;
+        let url_c = spawn_mock_server(StatusCode::OK, "ok from c", Some(hits_c.clone())).await;
+        let store = store_with_group(vec![
+            provider("a", &url_a),
+            provider("b", &url_b),
+            provider("c", &url_c),
+        ]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        let failure = classify_failure(Some(429), "rate_limit_exceeded");
+        let now = Utc::now();
+        store
+            .update(|config| {
+                for (provider_id, age_seconds) in [("a", 30), ("b", 20), ("c", 10)] {
+                    let health = config
+                        .health
+                        .entry(provider_id.to_string())
+                        .or_insert_with(ProviderHealth::default);
+                    mark_model_failure(health, &failure, "seed rate limit".to_string());
+                    health.last_checked = Some(now - ChronoDuration::seconds(age_seconds));
+                }
+                Ok(())
+            })
+            .expect("seed health cooldowns");
+        for provider_id in ["a", "b", "c"] {
+            state
+                .api_service
+                .set_model_cooldown(provider_id, "gpt-test", "seed rate limit", 300)
+                .expect("seed model cooldown");
+        }
+
+        let first = proxy_inner(
+            state.clone(),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+        )
+        .await
+        .expect("first probe");
+        assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let second = proxy_inner(
+            state,
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+        )
+        .await
+        .expect("second probe");
+        assert_eq!(second.status(), StatusCode::OK);
+        let body = to_bytes(second.into_body(), 1024).await.expect("body");
+        assert_eq!(&body[..], b"ok from b");
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_c.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
