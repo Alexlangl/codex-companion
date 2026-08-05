@@ -65,6 +65,8 @@ interface PendingJsonImport {
 
 export function Providers({
   busy,
+  refreshingAllProviders,
+  refreshingProviderIds,
   status,
   onImportApiKey,
   onImportCodexOAuth,
@@ -82,6 +84,8 @@ export function Providers({
   viewMode,
 }: {
   busy: BusyState;
+  refreshingAllProviders: boolean;
+  refreshingProviderIds: ReadonlySet<string>;
   status: CompanionStatus;
   launchModes: Record<string, ProviderLaunchMode>;
   onImportApiKey: (input: ApiKeyForm) => Promise<void>;
@@ -129,6 +133,7 @@ export function Providers({
   const importConfirmingRef = useRef(false);
   const disabled = busy !== "idle";
   const providers = Object.values(status.config.providers);
+  const isRefreshingProviders = refreshingAllProviders || refreshingProviderIds.size > 0;
   const exportFormats = exportProvider ? exportFormatOptionsForProvider(exportProvider) : [];
   const maskedExportJson = useMemo(() => (exportOutput ? maskJsonPreviewContent(exportOutput.jsonContent) : ""), [exportOutput]);
   const exportPreviewText = exportOutput ? (exportHidden ? maskedExportJson : exportOutput.jsonContent) : "";
@@ -138,7 +143,7 @@ export function Providers({
   ];
 
   useEffect(() => {
-    if (busy !== "testing") {
+    if (!isRefreshingProviders) {
       setRefreshProgress(null);
       return;
     }
@@ -157,7 +162,7 @@ export function Providers({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [busy]);
+  }, [isRefreshingProviders]);
 
   useEffect(() => {
     if (busy !== "saving" || !addOpen) {
@@ -385,8 +390,8 @@ export function Providers({
             <Button disabled={disabled} onClick={() => setAddOpen(true)}>
               <Plus size={15} /> 添加账号
             </Button>
-            <Button disabled={disabled || providers.length === 0} onClick={() => void onRefreshAll()} variant="secondary">
-              <RefreshCw size={15} /> 刷新全部
+            <Button disabled={disabled || providers.length === 0 || isRefreshingProviders} onClick={() => void onRefreshAll()} variant="secondary">
+              <RefreshCw aria-hidden="true" className={refreshingAllProviders ? "spin-icon" : undefined} size={15} /> 刷新全部
             </Button>
           </div>
           <div className="segmented-control" aria-label="Provider 展示方式">
@@ -417,6 +422,7 @@ export function Providers({
                 disabled={disabled}
                 key={provider.id}
                 provider={provider}
+                refreshing={refreshingAllProviders || refreshingProviderIds.has(provider.id)}
                 status={status}
                 launchMode={launchModes[provider.id]}
                 onLaunch={onLaunch}
@@ -435,6 +441,7 @@ export function Providers({
                 disabled={disabled}
                 key={provider.id}
                 provider={provider}
+                refreshing={refreshingAllProviders || refreshingProviderIds.has(provider.id)}
                 status={status}
                 launchMode={launchModes[provider.id]}
                 onLaunch={onLaunch}

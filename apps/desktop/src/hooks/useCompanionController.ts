@@ -12,8 +12,8 @@ import {
   launchProvider,
   removeProvider,
   repair,
-  refreshAllProviders,
-  refreshProvider,
+  refreshAllProviders as refreshAllProvidersApi,
+  refreshProvider as refreshProviderApi,
   requestPriorityFailback,
   resetAppSettings,
   setPreserveOfficialCodexAuth,
@@ -50,13 +50,19 @@ export function useCompanionController() {
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState("");
   const [activeTab, setActiveTab] = useState("dashboard");
+  const [refreshingAllProviders, setRefreshingAllProviders] = useState(false);
+  const [refreshingProviderIds, setRefreshingProviderIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const refreshInFlightRef = useRef<Promise<void> | null>(null);
+  const refreshAllProvidersInFlightRef = useRef<Promise<void> | null>(null);
+  const providerRefreshesInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
   const hasLoadedStatusRef = useRef(false);
   const appUpdater = useAppUpdater(setToast);
 
-  const refresh = useCallback(async (options: { silent?: boolean } = {}) => {
+  const refresh = useCallback(async (options: { silent?: boolean; waitForInFlight?: boolean } = {}) => {
     while (refreshInFlightRef.current) {
-      if (options.silent) return;
+      if (options.silent && !options.waitForInFlight) return;
       await refreshInFlightRef.current;
     }
     const refreshTask = (async (): Promise<void> => {
@@ -301,6 +307,77 @@ export function useCompanionController() {
     await changeTheme(current === "dark" ? "light" : "dark");
   }
 
+  async function performProviderRefresh(id: string): Promise<void> {
+    setRefreshingProviderIds((current) => new Set(current).add(id));
+    setError(null);
+    try {
+      await refreshProviderApi(id);
+      setToast("Provider 状态已刷新");
+      await refresh({ silent: true, waitForInFlight: true });
+    } catch (unknownError) {
+      setError(userFacingError(unknownError));
+    } finally {
+      setRefreshingProviderIds((current) => {
+        if (!current.has(id)) {
+          return current;
+        }
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
+
+  async function refreshProviderAccount(id: string): Promise<void> {
+    const existing = providerRefreshesInFlightRef.current.get(id);
+    if (existing) {
+      await existing;
+      return;
+    }
+
+    const task = performProviderRefresh(id);
+    providerRefreshesInFlightRef.current.set(id, task);
+    try {
+      await task;
+    } finally {
+      if (providerRefreshesInFlightRef.current.get(id) === task) {
+        providerRefreshesInFlightRef.current.delete(id);
+      }
+    }
+  }
+
+  async function performAllProvidersRefresh(): Promise<void> {
+    setRefreshingAllProviders(true);
+    setError(null);
+    try {
+      await refreshAllProvidersApi();
+      setToast("Provider 状态已全部刷新");
+      await refresh({ silent: true, waitForInFlight: true });
+    } catch (unknownError) {
+      setError(userFacingError(unknownError));
+    } finally {
+      setRefreshingAllProviders(false);
+    }
+  }
+
+  async function refreshAllProviderAccounts(): Promise<void> {
+    const existing = refreshAllProvidersInFlightRef.current;
+    if (existing) {
+      await existing;
+      return;
+    }
+
+    const task = performAllProvidersRefresh();
+    refreshAllProvidersInFlightRef.current = task;
+    try {
+      await task;
+    } finally {
+      if (refreshAllProvidersInFlightRef.current === task) {
+        refreshAllProvidersInFlightRef.current = null;
+      }
+    }
+  }
+
   const progress = busy === "idle" ? 0 : busy === "loading" ? 34 : busy === "repairing" ? 78 : busy === "launching" ? 88 : 58;
 
   return {
@@ -309,6 +386,8 @@ export function useCompanionController() {
     busy,
     error,
     progress,
+    refreshingAllProviders,
+    refreshingProviderIds,
     repairOutcome,
     status,
     toast,
@@ -352,14 +431,8 @@ export function useCompanionController() {
           return outcome.message;
         }),
       loadTokenUsage: getTokenUsage,
-      refreshAllProviders: () =>
-        run("Provider 状态已全部刷新", "testing", async () => {
-          await refreshAllProviders();
-        }),
-      refreshProvider: (id: string) =>
-        run("Provider 状态已刷新", "testing", async () => {
-          await refreshProvider(id);
-        }),
+      refreshAllProviders: refreshAllProviderAccounts,
+      refreshProvider: refreshProviderAccount,
       removeProvider: (id: string) =>
         run("Provider 已删除", "saving", async () => {
           await removeProvider(id);

@@ -99,7 +99,19 @@ if (!root) {
 }
 
 function App() {
-  const { activeTab, actions, appUpdater, busy, error, progress, repairOutcome, status, toast } = useCompanionController();
+  const {
+    activeTab,
+    actions,
+    appUpdater,
+    busy,
+    error,
+    progress,
+    refreshingAllProviders,
+    refreshingProviderIds,
+    repairOutcome,
+    status,
+    toast,
+  } = useCompanionController();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = React.useState(readSidebarCollapsed);
   const [pendingProviderLaunch, setPendingProviderLaunch] = React.useState<{
     mode: ProviderLaunchMode;
@@ -279,6 +291,8 @@ function App() {
                 <Tabs.Content className="tabs-content" value="providers">
                   <Providers
                     busy={busy}
+                    refreshingAllProviders={refreshingAllProviders}
+                    refreshingProviderIds={refreshingProviderIds}
                     status={status}
                     viewMode={status.config.app.providerViewMode}
                     launchModes={status.config.app.providerLaunchModes}

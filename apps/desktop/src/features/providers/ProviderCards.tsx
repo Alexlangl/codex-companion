@@ -27,6 +27,7 @@ export function ProviderCompactItem({
   disabled,
   launchMode,
   provider,
+  refreshing,
   status,
   onLaunch,
   onLaunchModeChange,
@@ -38,6 +39,7 @@ export function ProviderCompactItem({
   disabled: boolean;
   launchMode?: ProviderLaunchMode;
   provider: ProviderConfig;
+  refreshing: boolean;
   status: CompanionStatus;
   onLaunch: (id: string, mode?: ProviderLaunchMode) => Promise<void>;
   onLaunchModeChange: (providerId: string, mode: ProviderLaunchMode) => Promise<void>;
@@ -56,8 +58,9 @@ export function ProviderCompactItem({
   const usesAgentIdentity = providerUsesAgentIdentity(provider);
   const usesWebSocket = providerUsesWebSocket(provider);
   const providerMark = provider.kind === "official_codex" ? "C" : "API";
+  const mutationDisabled = disabled || refreshing;
   return (
-    <div className={`provider-compact-item ${active ? "provider-compact-active" : ""}`}>
+    <div aria-busy={refreshing} className={`provider-compact-item ${active ? "provider-compact-active" : ""}`}>
       <span className="compact-check" aria-hidden="true">
         {active ? <Check size={12} /> : providerMark}
       </span>
@@ -79,21 +82,21 @@ export function ProviderCompactItem({
         provider={provider}
         onChange={(mode) => void onLaunchModeChange(provider.id, mode)}
       />
-      <IconButton disabled={disabled} label="刷新账号状态" onClick={() => void onRefresh(provider.id)}>
-        <RefreshCw size={14} />
+      <IconButton disabled={mutationDisabled} label="刷新账号状态" onClick={() => void onRefresh(provider.id)}>
+        <RefreshCw aria-hidden="true" className={refreshing ? "spin-icon" : undefined} size={14} />
       </IconButton>
       <IconButton disabled={disabled} label={`启动账号：${launchModeLabel(effectiveLaunchMode)}`} onClick={() => void onLaunch(provider.id, effectiveLaunchMode)}>
         <Play size={14} />
       </IconButton>
       {canEdit ? (
-        <IconButton disabled={disabled} label="编辑 Provider" onClick={() => onEdit(provider)}>
+        <IconButton disabled={mutationDisabled} label="编辑 Provider" onClick={() => onEdit(provider)}>
           <Pencil size={14} />
         </IconButton>
       ) : null}
       <IconButton disabled={disabled} label="导出 JSON" onClick={() => onExport(provider)}>
         <Download size={14} />
       </IconButton>
-      <IconButton disabled={disabled} label="删除账号" onClick={() => void onRemove(provider.id)}>
+      <IconButton disabled={mutationDisabled} label="删除账号" onClick={() => void onRemove(provider.id)}>
         <Trash2 size={14} />
       </IconButton>
     </div>
@@ -104,6 +107,7 @@ export function ProviderCard({
   disabled,
   launchMode,
   provider,
+  refreshing,
   status,
   onLaunch,
   onLaunchModeChange,
@@ -115,6 +119,7 @@ export function ProviderCard({
   disabled: boolean;
   launchMode?: ProviderLaunchMode;
   provider: ProviderConfig;
+  refreshing: boolean;
   status: CompanionStatus;
   onLaunch: (id: string, mode?: ProviderLaunchMode) => Promise<void>;
   onLaunchModeChange: (providerId: string, mode: ProviderLaunchMode) => Promise<void>;
@@ -148,8 +153,9 @@ export function ProviderCard({
           ? `重置 ${resetAt}`
           : null
       : null;
+  const mutationDisabled = disabled || refreshing;
   return (
-    <div className={`provider-card-row ${active ? "provider-card-active" : ""}`}>
+    <div aria-busy={refreshing} className={`provider-card-row ${active ? "provider-card-active" : ""}`}>
       <div className="provider-card-top">
         <div className="provider-account-cell">
           <div className="provider-name-line">
@@ -167,18 +173,18 @@ export function ProviderCard({
           <IconButton disabled={disabled} label={`启动账号：${launchModeLabel(effectiveLaunchMode)}`} onClick={() => void onLaunch(provider.id, effectiveLaunchMode)}>
             <Play size={16} />
           </IconButton>
-          <IconButton disabled={disabled} label="刷新账号状态" onClick={() => void onRefresh(provider.id)}>
-            <RefreshCw size={16} />
+          <IconButton disabled={mutationDisabled} label="刷新账号状态" onClick={() => void onRefresh(provider.id)}>
+            <RefreshCw aria-hidden="true" className={refreshing ? "spin-icon" : undefined} size={16} />
           </IconButton>
           {canEdit ? (
-            <IconButton disabled={disabled} label="编辑 Provider" onClick={() => onEdit(provider)}>
+            <IconButton disabled={mutationDisabled} label="编辑 Provider" onClick={() => onEdit(provider)}>
               <Pencil size={16} />
             </IconButton>
           ) : null}
           <IconButton disabled={disabled} label="导出 JSON" onClick={() => onExport(provider)}>
             <Download size={16} />
           </IconButton>
-          <IconButton disabled={disabled} label="删除账号" onClick={() => void onRemove(provider.id)}>
+          <IconButton disabled={mutationDisabled} label="删除账号" onClick={() => void onRemove(provider.id)}>
             <Trash2 size={16} />
           </IconButton>
         </div>

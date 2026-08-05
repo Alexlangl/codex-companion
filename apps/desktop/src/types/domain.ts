@@ -544,4 +544,4 @@ export interface RepairOutcome {
   skippedReason?: string | null;
 }
 
-export type BusyState = "idle" | "loading" | "saving" | "testing" | "repairing" | "launching";
+export type BusyState = "idle" | "loading" | "saving" | "repairing" | "launching";
