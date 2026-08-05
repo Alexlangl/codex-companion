@@ -474,9 +474,14 @@ function groupProviderMeta(provider: ProviderConfig, quotaLabel?: string) {
     const quota = quotaLabel && quotaLabel !== "待刷新" ? ` · 剩余额度 ${quotaLabel}` : "";
     return `${providerName}${plan}${quota}`;
   }
-  const status = provider.account?.subscriptionStatus ?? "连接待检查";
+  const status = groupProviderConnectionStatus(provider.account?.subscriptionStatus);
   const quota = quotaLabel && quotaLabel !== "待刷新" ? ` · 余量 ${quotaLabel}` : "";
   return `${providerName}${status}${quota}`;
+}
+
+function groupProviderConnectionStatus(status?: string | null): string {
+  if (!status) return "连接待检查";
+  return status.split("；额度刷新失败：", 1)[0];
 }
 
 function isSuccessfulProviderRequest(request: ApiRequestLog): boolean {

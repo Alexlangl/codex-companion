@@ -4,8 +4,8 @@ use crate::account_refresh::{
 use crate::auth::resolve_auth_token;
 use chrono::Utc;
 use codex_companion_core::{
-    provider_api_base_url, CompanionError, ConfigStore, ProviderConfig, ProviderHealth,
-    ProviderKind, Result,
+    append_diagnostic_log, provider_api_base_url, CompanionError, ConfigStore, ProviderConfig,
+    ProviderHealth, ProviderKind, Result,
 };
 use codex_companion_health::{classify_failure, mark_failure, mark_success};
 
@@ -96,6 +96,14 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
     } else {
         test_provider_detailed(&provider).await
     };
+    if let Some(error) = api_usage_error.as_deref() {
+        let _ = append_diagnostic_log(
+            &store.data_dir(),
+            "warn",
+            "provider",
+            &format!("Provider {id} 额度刷新失败: {error}"),
+        );
+    }
     store.update(|config| {
         let now = Utc::now();
         let health = config.health.entry(id.to_string()).or_default();
@@ -106,9 +114,9 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
                 if let Some(provider) = config.providers.get_mut(id) {
                     if let Some(Ok(account)) = account_result {
                         provider.account = Some(account);
-                    } else if let Some(error) = api_usage_error {
+                    } else if api_usage_error.is_some() {
                         let mut account = provider.account.clone().unwrap_or_default();
-                        apply_usage_refresh_failure(&mut account, &provider.name, &error, now);
+                        apply_usage_refresh_failure(&mut account, &provider.name, now);
                         provider.account = Some(account);
                     } else if let Some(account) = provider.account.as_mut() {
                         if provider.kind != ProviderKind::OfficialCodex {
@@ -131,7 +139,6 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
 fn apply_usage_refresh_failure(
     account: &mut codex_companion_core::ProviderAccountInfo,
     provider_name: &str,
-    error: &str,
     now: chrono::DateTime<Utc>,
 ) {
     account.display_name = account
@@ -143,11 +150,16 @@ fn apply_usage_refresh_failure(
         .clone()
         .or_else(|| Some("API Key".to_string()));
     if has_usage_snapshot(account) {
-        account.subscription_status = Some(format!("连接正常；额度刷新失败：{error}"));
+        if account
+            .subscription_status
+            .as_deref()
+            .is_none_or(|status| status.contains("额度刷新失败"))
+        {
+            account.subscription_status = Some("连接正常".to_string());
+        }
     } else {
-        account.subscription_status = Some("连接正常".to_string());
         clear_api_key_usage(account);
-        account.quota_label = Some(error.to_string());
+        account.subscription_status = Some("连接正常".to_string());
         account.last_refresh_at = Some(now.to_rfc3339());
     }
 }
@@ -254,12 +266,7 @@ mod tests {
             ..ProviderAccountInfo::default()
         };
 
-        apply_usage_refresh_failure(
-            &mut account,
-            "Provider",
-            "429 Too Many Requests",
-            Utc::now(),
-        );
+        apply_usage_refresh_failure(&mut account, "Provider", Utc::now());
 
         assert_eq!(account.usage_available, Some(75.0));
         assert_eq!(account.quota_percent, Some(75.0));
@@ -269,18 +276,15 @@ mod tests {
             account.last_refresh_at.as_deref(),
             Some(refreshed_at.as_str())
         );
-        assert!(account
-            .subscription_status
-            .as_deref()
-            .is_some_and(|status| status.contains("额度刷新失败")));
+        assert_eq!(account.subscription_status.as_deref(), Some("连接正常"));
     }
 
     #[test]
-    fn first_usage_failure_exposes_error_without_inventing_snapshot() {
+    fn first_usage_failure_does_not_invent_a_snapshot() {
         let mut account = ProviderAccountInfo::default();
-        apply_usage_refresh_failure(&mut account, "Provider", "timeout", Utc::now());
+        apply_usage_refresh_failure(&mut account, "Provider", Utc::now());
 
-        assert_eq!(account.quota_label.as_deref(), Some("timeout"));
+        assert_eq!(account.quota_label, None);
         assert!(account.last_refresh_at.is_some());
         assert!(!has_usage_snapshot(&account));
     }

@@ -275,7 +275,7 @@ pub(crate) async fn send_upstream(
     .body(body.clone())
     .send()
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| format_upstream_request_error(&error, &upstream))?;
     let mut buffered_error = None;
     if agent_identity_task_id.is_some() && response.status() == reqwest::StatusCode::UNAUTHORIZED {
         let task_id = agent_identity_task_id
@@ -307,7 +307,7 @@ pub(crate) async fn send_upstream(
             .body(body.clone())
             .send()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format_upstream_request_error(&error, &upstream))?;
         } else {
             let redacted = redact_agent_identity_body(provider, &error_text);
             buffered_error = Some(Bytes::from(redacted));
@@ -357,6 +357,20 @@ pub(crate) async fn send_upstream(
         tool_context,
         chat_messages,
     })
+}
+
+fn format_upstream_request_error(error: &reqwest::Error, upstream: &str) -> String {
+    let endpoint = reqwest::Url::parse(upstream)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "上游服务".to_string());
+    if error.is_timeout() {
+        return format!("上游网络连接超时（{endpoint}）");
+    }
+    if error.is_connect() {
+        return format!("上游网络连接失败（{endpoint}）");
+    }
+    format!("上游网络请求失败（{endpoint}）")
 }
 
 fn build_upstream_request(
@@ -3318,6 +3332,27 @@ mod tests {
     use super::*;
     use codex_companion_core::{default_refresh_interval_seconds, ProviderKind};
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn upstream_connection_error_has_a_user_facing_network_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        drop(listener);
+        let upstream = format!("http://{address}/v1/responses");
+        let error = reqwest::Client::new()
+            .post(&upstream)
+            .send()
+            .await
+            .expect_err("closed port should reject the connection");
+
+        let message = format_upstream_request_error(&error, &upstream);
+
+        assert!(message.starts_with("上游网络连接失败"));
+        assert!(message.contains("127.0.0.1"));
+        assert!(!message.contains("error sending request"));
+    }
 
     fn official_provider(base_url: &str) -> ProviderConfig {
         ProviderConfig {

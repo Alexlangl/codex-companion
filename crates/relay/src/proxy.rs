@@ -321,8 +321,8 @@ async fn proxy_dispatch(
         });
     // AuthFailed(key 被吊销/凭证失效)必须无条件排除：它不会随冷却到期恢复，
     // 只有刷新成功(mark_success)才解除；单账号/关闭 fallback 时也不能拿它无
-    // 限重试。临时冷却(429/5xx)优先跳过，但保留一个最久未尝试的账号作为
-    // 最后探测，避免全部临时冷却时直接放大成全量 503。
+    // 限重试。临时冷却(429/5xx/网络故障)排在健康账号之后，但仍保留完整
+    // 后备链，避免所有账号短暂冷却时只尝试一个账号就结束对话。
     let has_alternatives = group.fallback_enabled && selected.len() > 1;
     let mut cooldown_probes = Vec::new();
     let mut candidates = selected
@@ -422,9 +422,7 @@ async fn proxy_dispatch(
                     .and_then(|health| health.last_checked),
             )
         });
-        if let Some(provider) = cooldown_probes.into_iter().next() {
-            candidates.push(provider);
-        }
+        candidates.extend(cooldown_probes);
     }
     if !group.fallback_enabled {
         candidates.truncate(1);
@@ -772,7 +770,7 @@ async fn proxy_dispatch(
             }
             Err(error) => {
                 let failure = classify_failure(None, &error);
-                let message = format!("stream 开始前请求失败: {}", compact_error_body(&error));
+                let message = compact_error_body(&error);
                 record_provider_failure(
                     &state,
                     &config,
@@ -2709,7 +2707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_rate_limited_providers_are_probed_in_oldest_failure_order() {
+    async fn cooled_providers_fallback_within_the_same_request() {
         let hits_a = Arc::new(AtomicUsize::new(0));
         let hits_b = Arc::new(AtomicUsize::new(0));
         let hits_c = Arc::new(AtomicUsize::new(0));
@@ -2749,18 +2747,7 @@ mod tests {
                 .expect("seed model cooldown");
         }
 
-        let first = proxy_inner(
-            state.clone(),
-            Method::POST,
-            "/v1/responses".parse().expect("uri"),
-            HeaderMap::new(),
-            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
-        )
-        .await
-        .expect("first probe");
-        assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
-
-        let second = proxy_inner(
+        let response = proxy_inner(
             state,
             Method::POST,
             "/v1/responses".parse().expect("uri"),
@@ -2768,9 +2755,9 @@ mod tests {
             Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
         )
         .await
-        .expect("second probe");
-        assert_eq!(second.status(), StatusCode::OK);
-        let body = to_bytes(second.into_body(), 1024).await.expect("body");
+        .expect("fallback request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.expect("body");
         assert_eq!(&body[..], b"ok from b");
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
         assert_eq!(hits_b.load(Ordering::SeqCst), 1);
