@@ -58,7 +58,7 @@ export function ProviderCompactItem({
   const usesAgentIdentity = providerUsesAgentIdentity(provider);
   const usesWebSocket = providerUsesWebSocket(provider);
   const providerMark = provider.kind === "official_codex" ? "C" : "API";
-  const mutationDisabled = disabled || refreshing;
+  const refreshDisabled = disabled || refreshing;
   return (
     <div aria-busy={refreshing} className={`provider-compact-item ${active ? "provider-compact-active" : ""}`}>
       <span className="compact-check" aria-hidden="true">
@@ -82,21 +82,21 @@ export function ProviderCompactItem({
         provider={provider}
         onChange={(mode) => void onLaunchModeChange(provider.id, mode)}
       />
-      <IconButton disabled={mutationDisabled} label="刷新账号状态" onClick={() => void onRefresh(provider.id)}>
+      <IconButton disabled={refreshDisabled} label="刷新账号状态" onClick={() => void onRefresh(provider.id)}>
         <RefreshCw aria-hidden="true" className={refreshing ? "spin-icon" : undefined} size={14} />
       </IconButton>
       <IconButton disabled={disabled} label={`启动账号：${launchModeLabel(effectiveLaunchMode)}`} onClick={() => void onLaunch(provider.id, effectiveLaunchMode)}>
         <Play size={14} />
       </IconButton>
       {canEdit ? (
-        <IconButton disabled={mutationDisabled} label="编辑 Provider" onClick={() => onEdit(provider)}>
+        <IconButton disabled={disabled} label="编辑 Provider" onClick={() => onEdit(provider)}>
           <Pencil size={14} />
         </IconButton>
       ) : null}
       <IconButton disabled={disabled} label="导出 JSON" onClick={() => onExport(provider)}>
         <Download size={14} />
       </IconButton>
-      <IconButton disabled={mutationDisabled} label="删除账号" onClick={() => void onRemove(provider.id)}>
+      <IconButton disabled={disabled} label="删除账号" onClick={() => void onRemove(provider.id)}>
         <Trash2 size={14} />
       </IconButton>
     </div>
@@ -142,7 +142,7 @@ export function ProviderCard({
   const lastRefreshAt = account?.lastRefreshAt ? formatTime(account.lastRefreshAt) : null;
   const usesAgentIdentity = providerUsesAgentIdentity(provider);
   const usesWebSocket = providerUsesWebSocket(provider);
-  const balanceTitle = providerBalanceTitle(quotaIsBalance, showQuota, quota.label);
+  const balanceTitle = providerBalanceTitle(quotaIsBalance, quota.label);
   const balanceValue = showQuota ? quota.percentLabel : null;
   const balanceDetail = providerBalanceDetail({
     isBalance: quotaIsBalance,
@@ -152,7 +152,7 @@ export function ProviderCard({
     resetAt: quota.resetAt ? resetAt : null,
     validity,
   });
-  const mutationDisabled = disabled || refreshing;
+  const refreshDisabled = disabled || refreshing;
   return (
     <div aria-busy={refreshing} className={`provider-card-row ${active ? "provider-card-active" : ""}`}>
       <div className="provider-card-top">
@@ -172,29 +172,31 @@ export function ProviderCard({
           <IconButton disabled={disabled} label={`启动账号：${launchModeLabel(effectiveLaunchMode)}`} onClick={() => void onLaunch(provider.id, effectiveLaunchMode)}>
             <Play size={16} />
           </IconButton>
-          <IconButton disabled={mutationDisabled} label="刷新账号状态" onClick={() => void onRefresh(provider.id)}>
+          <IconButton disabled={refreshDisabled} label="刷新账号状态" onClick={() => void onRefresh(provider.id)}>
             <RefreshCw aria-hidden="true" className={refreshing ? "spin-icon" : undefined} size={16} />
           </IconButton>
           {canEdit ? (
-            <IconButton disabled={mutationDisabled} label="编辑 Provider" onClick={() => onEdit(provider)}>
+            <IconButton disabled={disabled} label="编辑 Provider" onClick={() => onEdit(provider)}>
               <Pencil size={16} />
             </IconButton>
           ) : null}
           <IconButton disabled={disabled} label="导出 JSON" onClick={() => onExport(provider)}>
             <Download size={16} />
           </IconButton>
-          <IconButton disabled={mutationDisabled} label="删除账号" onClick={() => void onRemove(provider.id)}>
+          <IconButton disabled={disabled} label="删除账号" onClick={() => void onRemove(provider.id)}>
             <Trash2 size={16} />
           </IconButton>
         </div>
       </div>
 
-      <div className="provider-card-bottom">
-        <div className="provider-status-cell">
-          <strong>{balanceTitle}</strong>
-          {balanceValue ? <span className={`provider-quota-value provider-quota-${quota.tone}`}>{balanceValue}</span> : null}
-          {balanceDetail ? <small>{balanceDetail}</small> : null}
-        </div>
+      <div className={`provider-card-bottom${showQuota ? "" : " provider-card-bottom-no-quota"}`}>
+        {showQuota ? (
+          <div className="provider-status-cell">
+            <strong>{balanceTitle}</strong>
+            {balanceValue ? <span className={`provider-quota-value provider-quota-${quota.tone}`}>{balanceValue}</span> : null}
+            {balanceDetail ? <small>{balanceDetail}</small> : null}
+          </div>
+        ) : null}
 
         <div className="provider-mode-cell">
           <LaunchModeControl
@@ -213,10 +215,9 @@ export function ProviderCard({
   );
 }
 
-function providerBalanceTitle(isBalance: boolean, isVisible: boolean, quotaLabel: string): string {
+function providerBalanceTitle(isBalance: boolean, quotaLabel: string): string {
   if (isBalance) return "账户余额";
-  if (isVisible) return quotaLabel;
-  return "无法刷新余额";
+  return quotaLabel;
 }
 
 function providerBalanceDetail({
@@ -266,7 +267,7 @@ function LaunchModeControl({
   } else if (provider.kind === "official_codex") {
     directTitle = "直连会把官方账号 OAuth token 合并写入 Codex auth.json，启动后需要重启 ChatGPT / Codex";
   } else if (canDirect && preserveOfficialCodexAuth) {
-    directTitle = "直连会把 API key 写入 provider-scoped config.toml，并保留官方 ChatGPT OAuth auth.json";
+    directTitle = "直连只把 API key 写入 provider-scoped config.toml，不改现有 Codex auth.json";
   } else if (canDirect) {
     directTitle = "直连会写入 Codex 配置；API key 文件会合并进 auth.json，并可能影响官方登录态";
   }

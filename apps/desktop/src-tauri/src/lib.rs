@@ -8,7 +8,7 @@ use codex_companion_core::{
 use codex_companion_daemon::CompanionDaemon;
 use codex_companion_provider::{
     ApiKeyProviderImportRequest, ApiKeyProviderUpdate, GroupUpsert, ProviderExportFormat,
-    ProviderUpsert,
+    ProviderUpsert, ProviderUsageQueryTestInput,
 };
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -96,10 +96,15 @@ fn tray_menu_labels() -> TrayMenuLabels {
         tray_recent_provider_id(&status.active_providers, &status.recent_events);
     let (quota, quota_title) =
         tray_quota_summary(&status.active_providers, recent_provider_id.as_deref());
+    let route = if status.codex.installed {
+        format!("当前分组：{} · 可用账号 {available}/{total}", group.name)
+    } else {
+        format!("Codex 未连接 Companion · 待启动分组：{}", group.name)
+    };
 
     TrayMenuLabels {
         runtime: format!("● Companion 正在运行 · {}", status.relay_base_url),
-        route: format!("当前分组：{} · 可用账号 {available}/{total}", group.name),
+        route,
         quota,
         quota_title,
         launch,
@@ -713,6 +718,16 @@ async fn test_provider(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn test_usage_query(
+    input: ProviderUsageQueryTestInput,
+) -> Result<codex_companion_core::ProviderAccountInfo, String> {
+    daemon()?
+        .test_usage_query(input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn refresh_provider(id: String) -> Result<codex_companion_core::ProviderHealth, String> {
     daemon()?
         .refresh_provider(&id)
@@ -1130,6 +1145,7 @@ pub fn run() {
             complete_codex_oauth,
             remove_provider,
             test_provider,
+            test_usage_query,
             refresh_provider,
             refresh_all_providers,
             upsert_group,

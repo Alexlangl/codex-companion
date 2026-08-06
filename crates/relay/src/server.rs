@@ -52,11 +52,10 @@ impl BoundRelay {
     }
 
     pub async fn serve(self) -> anyhow::Result<RelayStartOutcome> {
-        let state = RelayState::new_with_api_key_floor(
-            self.store,
-            reqwest::Client::new(),
-            self.enforce_api_key,
-        );
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let state = RelayState::new_with_api_key_floor(self.store, client, self.enforce_api_key);
         let app = relay_router(state);
         axum::serve(self.listener, app).await?;
         Ok(self.outcome)
@@ -126,6 +125,7 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn non_loopback_bind_requires_api_key() {
@@ -406,6 +406,119 @@ mod tests {
             .expect("relay request");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sends_official_max_for_ultra_to_native_responses_upstream() {
+        let received = Arc::new(Mutex::new(None));
+        let received_by_upstream = received.clone();
+        let upstream = Router::new().route(
+            "/{*path}",
+            any(move |body: Bytes| {
+                let received = received_by_upstream.clone();
+                async move {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&body).expect("upstream request json");
+                    *received.lock().expect("received lock") = Some(payload);
+                    (StatusCode::OK, r#"{"status":"ok"}"#)
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream bind");
+        let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream).await;
+        });
+        let store = relay_store_for_upstream(format!("http://{upstream_addr}/v1"));
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("relay bind");
+        let relay_addr = relay_listener.local_addr().expect("relay addr");
+        let app = relay_router(RelayState::new(store, reqwest::Client::new()));
+        tokio::spawn(async move {
+            let _ = axum::serve(relay_listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{relay_addr}/v1/responses"))
+            .json(&serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "input": "hello",
+                "reasoning": { "effort": "ultra" },
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("relay request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = received
+            .lock()
+            .expect("received lock")
+            .clone()
+            .expect("captured upstream request");
+        assert_eq!(payload["reasoning"]["effort"], "max");
+    }
+
+    #[tokio::test]
+    async fn sends_official_max_for_ultra_to_chat_completions_upstream() {
+        let received = Arc::new(Mutex::new(None));
+        let received_by_upstream = received.clone();
+        let upstream = Router::new().route(
+            "/{*path}",
+            any(move |body: Bytes| {
+                let received = received_by_upstream.clone();
+                async move {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&body).expect("upstream request json");
+                    *received.lock().expect("received lock") = Some(payload);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"id":"chatcmpl-ultra","object":"chat.completion","created":1,"model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                    )
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream bind");
+        let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream).await;
+        });
+        let store = relay_store_for_upstream(format!("http://{upstream_addr}/v1/chat/completions"));
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("relay bind");
+        let relay_addr = relay_listener.local_addr().expect("relay addr");
+        let app = relay_router(RelayState::new(store, reqwest::Client::new()));
+        tokio::spawn(async move {
+            let _ = axum::serve(relay_listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{relay_addr}/v1/responses"))
+            .json(&serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "input": "hello",
+                "reasoning": { "effort": "ultra" },
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("relay request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = received
+            .lock()
+            .expect("received lock")
+            .clone()
+            .expect("captured upstream request");
+        assert_eq!(payload["reasoning_effort"], "max");
+        assert!(payload.get("reasoning").is_none());
     }
 
     fn relay_store_for_upstream(base_url: String) -> ConfigStore {

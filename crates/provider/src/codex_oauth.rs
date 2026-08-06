@@ -13,6 +13,8 @@ use std::{
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 300;
+const TOKEN_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const TOKEN_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct CodexAuthSnapshot {
@@ -92,7 +94,13 @@ pub async fn ensure_codex_auth_snapshot(provider: &ProviderConfig) -> Result<Cod
 }
 
 async fn refresh_tokens(refresh_token: &str) -> Result<TokenRefreshResponse> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(TOKEN_REFRESH_TIMEOUT)
+        .connect_timeout(TOKEN_CONNECT_TIMEOUT)
+        .build()
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("创建 Codex OAuth 客户端失败: {source}"))
+        })?;
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),

@@ -1,6 +1,6 @@
 use codex_companion_core::{
-    default_refresh_interval_seconds, GroupPolicy, ProviderAccountInfo, ProviderConfig,
-    ProviderKind, ProviderUsageQueryTemplate,
+    default_refresh_interval_seconds, default_usage_query_timeout_seconds, GroupPolicy,
+    ProviderAccountInfo, ProviderConfig, ProviderKind, ProviderUsageQueryTemplate,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -38,9 +38,26 @@ pub struct ProviderUsageQueryUpdate {
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
+    pub script: Option<String>,
+    #[serde(default = "default_usage_query_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
     pub access_token: Option<String>,
     #[serde(default)]
     pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUsageQueryTestInput {
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    pub provider_base_url: String,
+    #[serde(default)]
+    pub provider_api_key: Option<String>,
+    pub usage_query: ProviderUsageQueryUpdate,
 }
 
 fn default_usage_query_template() -> ProviderUsageQueryTemplate {

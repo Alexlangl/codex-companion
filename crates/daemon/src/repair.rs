@@ -1,13 +1,18 @@
-use crate::launch::direct_repair_target_provider_id;
+use crate::launch::{
+    direct_repair_target_provider_id, relay_model_slugs, relay_official_auth_provider,
+    restart_codex_if_running,
+};
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
-    AppSettings, CodexLaunchMode, CompanionConfig, ProviderLaunchMode, ProviderViewMode,
-    RepairOptions, RepairOutcome, Result, ThemeMode, TokenUsageSummary, TokenUsageSyncStatus,
-    COMPANION_PROVIDER_ID,
+    default_codex_dir, AppSettings, CodexLaunchMode, CompanionConfig, CompanionError,
+    ProviderLaunchMode, ProviderViewMode, RepairOptions, RepairOutcome, Result, ThemeMode,
+    TokenUsageSummary, TokenUsageSyncStatus, COMPANION_PROVIDER_ID,
 };
+use codex_companion_provider::selected_providers;
 use codex_companion_state::{
-    collect_token_usage_cached, collect_token_usage_cached_with_filters,
-    rebuild_token_usage_cached_with_filters, repair_state, TokenUsageDateRange, TokenUsageFilters,
+    collect_token_usage_cached, collect_token_usage_cached_with_filters, doctor,
+    install_companion_provider_for_relay, rebuild_token_usage_cached_with_filters, repair_state,
+    CodexInstallSnapshot, TokenUsageDateRange, TokenUsageFilters,
 };
 use std::path::PathBuf;
 
@@ -44,10 +49,58 @@ impl CompanionDaemon {
     }
 
     pub fn set_preserve_official_codex_auth(&self, preserve: bool) -> Result<bool> {
-        self.store.update(|config| {
+        let codex_dir = default_codex_dir()?;
+        self.set_preserve_official_codex_auth_in_dir(preserve, codex_dir)
+    }
+
+    fn set_preserve_official_codex_auth_in_dir(
+        &self,
+        preserve: bool,
+        codex_dir: PathBuf,
+    ) -> Result<bool> {
+        let config = self.store.load()?;
+        let relay_active = matches!(
+            config.app.last_codex_launch_mode,
+            Some(CodexLaunchMode::GroupRelay | CodexLaunchMode::ProviderRelay)
+        ) && doctor(codex_dir.clone(), &config.relay)?.installed;
+        let mut install_snapshot = None;
+        let relay_reinstalled = if preserve && relay_active {
+            let selected = selected_providers(&config);
+            let source = relay_official_auth_provider(&config, &selected);
+            let models = relay_model_slugs(&selected);
+            let snapshot = CodexInstallSnapshot::capture(&codex_dir)?;
+            install_companion_provider_for_relay(
+                Some(codex_dir.clone()),
+                &config.relay,
+                Some("Companion relay with preserved official Codex OAuth"),
+                &models,
+                source.as_ref(),
+                true,
+            )?;
+            install_snapshot = Some(snapshot);
+            true
+        } else {
+            false
+        };
+
+        if let Err(error) = self.store.update(|config| {
             config.app.preserve_official_codex_auth = preserve;
             Ok(preserve)
-        })
+        }) {
+            if let Some(snapshot) = install_snapshot {
+                return match snapshot.restore() {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(CompanionError::InvalidConfig(format!(
+                        "保存官方登录保护设置失败: {error}；恢复 Codex 配置也失败: {rollback_error}"
+                    ))),
+                };
+            }
+            return Err(error);
+        }
+        if relay_reinstalled {
+            restart_codex_if_running();
+        }
+        Ok(preserve)
     }
 
     pub fn set_token_usage_refresh_interval(&self, seconds: u64) -> Result<u64> {
@@ -246,5 +299,139 @@ mod tests {
                 .preserve_official_codex_auth
         );
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn enabling_auth_protection_restores_oauth_for_an_active_relay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_dir = temp.path().join("codex");
+        std::fs::create_dir_all(&codex_dir).expect("codex dir");
+        std::fs::write(
+            codex_dir.join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-third-party"}"#,
+        )
+        .expect("api key auth");
+        let source_path = temp.path().join("official-auth.json");
+        std::fs::write(
+            &source_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "official-access",
+                    "refresh_token": "official-refresh"
+                }
+            })
+            .to_string(),
+        )
+        .expect("official auth");
+        let mut official = provider(ProviderKind::OfficialCodex);
+        official.auth_ref = Some(format!("file:{}", source_path.display()));
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .insert(official.id.clone(), official.clone());
+                config.app.last_codex_launch_mode = Some(CodexLaunchMode::GroupRelay);
+                Ok(())
+            })
+            .expect("config");
+        install_companion_provider_for_relay(
+            Some(codex_dir.clone()),
+            &codex_companion_core::RelayConfig::default(),
+            None,
+            &[],
+            None,
+            false,
+        )
+        .expect("install relay");
+        let daemon = CompanionDaemon::new(store);
+
+        daemon
+            .set_preserve_official_codex_auth_in_dir(true, codex_dir.clone())
+            .expect("enable protection");
+
+        let auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(codex_dir.join("auth.json")).expect("live auth"))
+                .expect("auth json");
+        assert_eq!(auth["auth_mode"], "chatgpt");
+        assert_eq!(auth["OPENAI_API_KEY"], serde_json::Value::Null);
+        assert_eq!(auth["tokens"]["access_token"], "official-access");
+        assert!(
+            daemon
+                .store()
+                .load()
+                .expect("stored config")
+                .app
+                .preserve_official_codex_auth
+        );
+    }
+
+    #[test]
+    fn enabling_auth_protection_does_not_restore_oauth_for_a_stale_relay_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_dir = temp.path().join("codex");
+        std::fs::create_dir_all(&codex_dir).expect("codex dir");
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            r#"model_provider = "other"
+
+[model_providers.other]
+name = "Other"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+"#,
+        )
+        .expect("other provider config");
+        std::fs::write(
+            codex_dir.join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-third-party"}"#,
+        )
+        .expect("api key auth");
+        let source_path = temp.path().join("official-auth.json");
+        std::fs::write(
+            &source_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "official-access",
+                    "refresh_token": "official-refresh"
+                }
+            })
+            .to_string(),
+        )
+        .expect("official auth");
+        let mut official = provider(ProviderKind::OfficialCodex);
+        official.auth_ref = Some(format!("file:{}", source_path.display()));
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                config.providers.insert(official.id.clone(), official);
+                config.app.last_codex_launch_mode = Some(CodexLaunchMode::GroupRelay);
+                Ok(())
+            })
+            .expect("config");
+        let daemon = CompanionDaemon::new(store);
+        let config_before = std::fs::read(codex_dir.join("config.toml")).expect("config before");
+        let auth_before = std::fs::read(codex_dir.join("auth.json")).expect("auth before");
+
+        daemon
+            .set_preserve_official_codex_auth_in_dir(true, codex_dir.clone())
+            .expect("enable protection");
+
+        assert_eq!(
+            std::fs::read(codex_dir.join("config.toml")).expect("config after"),
+            config_before
+        );
+        assert_eq!(
+            std::fs::read(codex_dir.join("auth.json")).expect("auth after"),
+            auth_before
+        );
+        assert!(
+            daemon
+                .store()
+                .load()
+                .expect("stored config")
+                .app
+                .preserve_official_codex_auth
+        );
     }
 }

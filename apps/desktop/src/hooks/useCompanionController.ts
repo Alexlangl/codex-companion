@@ -400,11 +400,11 @@ export function useCompanionController() {
       importApiKey: (input: ApiKeyForm) =>
         run("API Key Provider 已添加", "saving", async () => {
           await importApiKeyProvider(input);
-        }),
+        }, { propagateError: true }),
       updateApiKeyProvider: (input: ApiKeyProviderUpdate) =>
         run("API Key Provider 已更新", "saving", async () => {
           await updateApiKeyProvider(input);
-        }),
+        }, { propagateError: true }),
       exportProvider,
       importCodexOAuth: (loginId: string) =>
         run("OAuth 账号已添加", "saving", async () => {
@@ -415,7 +415,7 @@ export function useCompanionController() {
       importLocal: () =>
         run("已导入本地 Codex 账号", "saving", async () => {
           await importLocalCodexProvider();
-        }),
+        }, { propagateError: true }),
       install: () =>
         run("已写入 Codex 启动配置", "saving", async () => {
           await install();
@@ -462,7 +462,7 @@ export function useCompanionController() {
       saveGroup: (group: GroupUpsert) =>
         run("分组已保存", "saving", async () => {
           await upsertGroup(group);
-        }),
+        }, { propagateError: true }),
       setActiveTab,
       setToast,
       toggleTheme,

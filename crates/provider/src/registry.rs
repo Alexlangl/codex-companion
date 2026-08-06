@@ -1,6 +1,6 @@
-use crate::persist_with_private_auth_file;
 use crate::types::{ApiKeyProviderUpdate, ProviderUpsert, ProviderUsageQueryUpdate};
 use crate::validate::{validate_base_url, validate_id};
+use crate::{persist_with_private_auth_file, persist_with_private_auth_file_removal};
 use codex_companion_core::{
     CompanionError, ConfigStore, ProviderAccountInfo, ProviderConfig, ProviderGroup,
     ProviderHealth, ProviderKind, ProviderUsageQuery, Result, DEFAULT_GROUP_ID,
@@ -65,6 +65,18 @@ pub fn update_api_key_provider(
     let base_url = input.base_url.trim().trim_end_matches('/').to_string();
     let new_api_key = input.api_key.as_deref().and_then(normalize_non_empty);
     let new_env_var = input.env_var.as_deref().and_then(normalize_non_empty);
+    let api_key_updated = new_api_key.is_some();
+    let usage_credentials_updated = input.usage_query.as_ref().is_some_and(|query| {
+        query.enabled
+            && [
+                query.api_key.as_deref(),
+                query.access_token.as_deref(),
+                query.user_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| normalize_non_empty(value).is_some())
+    });
 
     let existing = store
         .load()?
@@ -80,14 +92,11 @@ pub fn update_api_key_provider(
 
     let mut auth_ref = existing.auth_ref.clone();
     let mut direct_auth_ref = existing.direct_auth_ref.clone();
-    let mut private_auth_write = None;
+    let api_key_credential_path = managed_api_key_credential_path(store, &input.id);
+    let account_credential_path = managed_account_credential_path(store, &input.id);
+    let mut api_key_credential_change = PrivateCredentialChange::None;
     if let Some(api_key) = new_api_key {
-        let auth_path = store
-            .data_dir()
-            .join("auth")
-            .join("api-keys")
-            .join(format!("{}.json", input.id));
-        if let Some(parent) = auth_path.parent() {
+        if let Some(parent) = api_key_credential_path.parent() {
             fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
         }
         let auth = serde_json::json!({
@@ -101,12 +110,14 @@ pub fn update_api_key_provider(
         let text = serde_json::to_string_pretty(&auth).map_err(|source| {
             CompanionError::InvalidConfig(format!("provider API key serialize failed: {source}"))
         })?;
-        auth_ref = Some(format!("file:{}", auth_path.display()));
+        auth_ref = Some(format!("file:{}", api_key_credential_path.display()));
         direct_auth_ref = None;
-        private_auth_write = Some((auth_path, format!("{text}\n")));
+        api_key_credential_change =
+            PrivateCredentialChange::Write(api_key_credential_path, format!("{text}\n"));
     } else if let Some(env_var) = new_env_var {
         auth_ref = Some(format!("env:{env_var}"));
         direct_auth_ref = Some(format!("env:{env_var}"));
+        api_key_credential_change = PrivateCredentialChange::Remove(api_key_credential_path);
     }
 
     if auth_ref.as_deref().and_then(normalize_non_empty).is_none() {
@@ -114,6 +125,11 @@ pub fn update_api_key_provider(
             "API Key provider 缺少 API Key 文件或环境变量".to_string(),
         ));
     }
+    let usage_source_changed = api_key_updated
+        || auth_ref != existing.auth_ref
+        || base_url != existing.base_url
+        || input.kind != existing.kind
+        || usage_credentials_updated;
 
     let mut account = existing
         .account
@@ -129,14 +145,14 @@ pub fn update_api_key_provider(
         .account
         .as_ref()
         .and_then(|account| account.usage_query.as_ref());
-    let (usage_query, usage_query_private_write) = prepare_usage_query_update(
+    let (usage_query, usage_query_credential_change) = prepare_usage_query_update(
         store,
         &input.id,
         &base_url,
         existing_usage_query,
         input.usage_query.as_ref(),
     )?;
-    if existing_usage_query != usage_query.as_ref() {
+    if existing_usage_query != usage_query.as_ref() || usage_source_changed {
         clear_usage_snapshot(&mut account);
     }
     account.usage_query = usage_query;
@@ -156,20 +172,14 @@ pub fn update_api_key_provider(
         account: Some(account),
     };
     let persist_provider = || add_provider(store, provider_input);
-    match (private_auth_write, usage_query_private_write) {
-        (Some((auth_path, auth_contents)), Some((usage_path, usage_contents))) => {
-            persist_with_private_auth_file(&usage_path, &usage_contents, || {
-                persist_with_private_auth_file(&auth_path, &auth_contents, persist_provider)
-            })
-        }
-        (Some((auth_path, contents)), None) => {
-            persist_with_private_auth_file(&auth_path, &contents, persist_provider)
-        }
-        (None, Some((usage_path, contents))) => {
-            persist_with_private_auth_file(&usage_path, &contents, persist_provider)
-        }
-        (None, None) => persist_provider(),
-    }
+    persist_private_credential_change(usage_query_credential_change, || {
+        persist_private_credential_change(api_key_credential_change, || {
+            persist_private_credential_change(
+                PrivateCredentialChange::Remove(account_credential_path),
+                persist_provider,
+            )
+        })
+    })
 }
 
 fn clear_usage_snapshot(account: &mut ProviderAccountInfo) {
@@ -189,15 +199,16 @@ pub(crate) fn prepare_usage_query_update(
     provider_base_url: &str,
     existing: Option<&ProviderUsageQuery>,
     update: Option<&ProviderUsageQueryUpdate>,
-) -> Result<(
-    Option<ProviderUsageQuery>,
-    Option<(std::path::PathBuf, String)>,
-)> {
+) -> Result<(Option<ProviderUsageQuery>, PrivateCredentialChange)> {
+    let credential_path = usage_query_credential_path(store, provider_id);
     let Some(update) = update else {
-        return Ok((existing.cloned(), None));
+        return Ok(match existing {
+            Some(existing) => (Some(existing.clone()), PrivateCredentialChange::None),
+            None => (None, PrivateCredentialChange::Remove(credential_path)),
+        });
     };
     if !update.enabled {
-        return Ok((None, None));
+        return Ok((None, PrivateCredentialChange::Remove(credential_path)));
     }
 
     let base_url = update
@@ -206,12 +217,16 @@ pub(crate) fn prepare_usage_query_update(
         .and_then(normalize_non_empty)
         .unwrap_or_else(|| provider_base_url.to_string());
     validate_base_url(&base_url)?;
-    let credential_path = store
-        .data_dir()
-        .join("auth")
-        .join("usage-queries")
-        .join(format!("{provider_id}.json"));
     let existing_credentials = read_usage_query_credentials(&credential_path);
+    let api_key = update
+        .api_key
+        .as_deref()
+        .and_then(normalize_non_empty)
+        .or_else(|| {
+            existing_credentials
+                .as_ref()
+                .and_then(|value| json_string(value, "api_key"))
+        });
     let access_token = update
         .access_token
         .as_deref()
@@ -220,8 +235,7 @@ pub(crate) fn prepare_usage_query_update(
             existing_credentials
                 .as_ref()
                 .and_then(|value| json_string(value, "access_token"))
-        })
-        .ok_or_else(|| CompanionError::InvalidConfig("余量查询缺少访问令牌".to_string()))?;
+        });
     let user_id = update
         .user_id
         .as_deref()
@@ -230,9 +244,23 @@ pub(crate) fn prepare_usage_query_update(
             existing_credentials
                 .as_ref()
                 .and_then(|value| json_string(value, "user_id"))
-        })
-        .ok_or_else(|| CompanionError::InvalidConfig("余量查询缺少用户 ID".to_string()))?;
+        });
+    if matches!(
+        update.template,
+        codex_companion_core::ProviderUsageQueryTemplate::NewApi
+    ) && (access_token.is_none() || user_id.is_none())
+    {
+        return Err(CompanionError::InvalidConfig(
+            "NewAPI 余量查询缺少访问令牌或用户 ID".to_string(),
+        ));
+    }
+    let script = update
+        .script
+        .as_deref()
+        .and_then(normalize_non_empty)
+        .unwrap_or_else(|| crate::account_refresh::usage_query_preset(update.template));
     let credentials = serde_json::to_string_pretty(&serde_json::json!({
+        "api_key": api_key,
         "access_token": access_token,
         "user_id": user_id,
     }))
@@ -241,9 +269,43 @@ pub(crate) fn prepare_usage_query_update(
         Some(ProviderUsageQuery {
             template: update.template,
             base_url: base_url.trim().trim_end_matches('/').to_string(),
+            script,
+            timeout_seconds: update.timeout_seconds.clamp(2, 30),
         }),
-        Some((credential_path, format!("{credentials}\n"))),
+        PrivateCredentialChange::Write(credential_path, format!("{credentials}\n")),
     ))
+}
+
+pub(crate) enum PrivateCredentialChange {
+    None,
+    Write(std::path::PathBuf, String),
+    Remove(std::path::PathBuf),
+}
+
+pub(crate) fn persist_private_credential_change<T>(
+    change: PrivateCredentialChange,
+    persist: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    match change {
+        PrivateCredentialChange::None => persist(),
+        PrivateCredentialChange::Write(path, contents) => {
+            persist_with_private_auth_file(&path, &contents, persist)
+        }
+        PrivateCredentialChange::Remove(path) => {
+            persist_with_private_auth_file_removal(&path, persist)
+        }
+    }
+}
+
+pub(crate) fn usage_query_credential_path(
+    store: &ConfigStore,
+    provider_id: &str,
+) -> std::path::PathBuf {
+    store
+        .data_dir()
+        .join("auth")
+        .join("usage-queries")
+        .join(format!("{provider_id}.json"))
 }
 
 fn read_usage_query_credentials(path: &std::path::Path) -> Option<serde_json::Value> {
@@ -259,18 +321,54 @@ fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 pub fn remove_provider(store: &ConfigStore, id: &str) -> Result<bool> {
-    store.update(|config| {
-        let removed = config.providers.remove(id).is_some();
-        config.health.remove(id);
-        for group in config.groups.values_mut() {
-            group.provider_order.retain(|provider_id| provider_id != id);
-            group.provider_weights.remove(id);
-            if group.priority_failback_target_provider_id.as_deref() == Some(id) {
-                group.priority_failback_target_provider_id = None;
-            }
-        }
-        Ok(removed)
+    validate_id(id)?;
+    if !store.load()?.providers.contains_key(id) {
+        return Ok(false);
+    }
+    let [usage_credential_path, api_key_path, account_path] =
+        managed_provider_credential_paths(store, id);
+    persist_with_private_auth_file_removal(&usage_credential_path, || {
+        persist_with_private_auth_file_removal(&api_key_path, || {
+            persist_with_private_auth_file_removal(&account_path, || {
+                store.update(|config| {
+                    let removed = config.providers.remove(id).is_some();
+                    config.health.remove(id);
+                    for group in config.groups.values_mut() {
+                        group.provider_order.retain(|provider_id| provider_id != id);
+                        group.provider_weights.remove(id);
+                        if group.priority_failback_target_provider_id.as_deref() == Some(id) {
+                            group.priority_failback_target_provider_id = None;
+                        }
+                    }
+                    Ok(removed)
+                })
+            })
+        })
     })
+}
+
+fn managed_provider_credential_paths(store: &ConfigStore, id: &str) -> [std::path::PathBuf; 3] {
+    [
+        usage_query_credential_path(store, id),
+        managed_api_key_credential_path(store, id),
+        managed_account_credential_path(store, id),
+    ]
+}
+
+pub(crate) fn managed_api_key_credential_path(store: &ConfigStore, id: &str) -> std::path::PathBuf {
+    store
+        .data_dir()
+        .join("auth")
+        .join("api-keys")
+        .join(format!("{id}.json"))
+}
+
+pub(crate) fn managed_account_credential_path(store: &ConfigStore, id: &str) -> std::path::PathBuf {
+    store
+        .data_dir()
+        .join("auth")
+        .join("accounts")
+        .join(format!("{id}.json"))
 }
 
 pub fn list_providers(store: &ConfigStore) -> Result<Vec<ProviderConfig>> {
@@ -401,6 +499,57 @@ mod tests {
                 .and_then(|account| account.email.as_deref()),
             Some("api-key-demo")
         );
+        store
+            .update(|config| {
+                let account = config
+                    .providers
+                    .get_mut("api-key-provider")
+                    .expect("provider")
+                    .account
+                    .as_mut()
+                    .expect("account");
+                account.usage_available = Some(12.5);
+                account.last_refresh_at = Some("2026-08-06T08:00:00Z".to_string());
+                Ok(())
+            })
+            .expect("seed usage snapshot");
+
+        let switched = update_api_key_provider(
+            &store,
+            ApiKeyProviderUpdate {
+                id: "api-key-provider".to_string(),
+                provider_display_name: Some("api-key-demo".to_string()),
+                provider_name: "PPTOKEN".to_string(),
+                kind: ProviderKind::RelayProvider,
+                base_url: "https://cn.pptoken.cc/v1".to_string(),
+                websocket_url: None,
+                api_key: None,
+                env_var: Some("PPTOKEN_API_KEY".to_string()),
+                refresh_interval_seconds: 30,
+                usage_query: None,
+            },
+        )
+        .expect("switch to environment variable");
+        assert_eq!(switched.auth_ref.as_deref(), Some("env:PPTOKEN_API_KEY"));
+        assert_eq!(
+            switched.direct_auth_ref.as_deref(),
+            Some("env:PPTOKEN_API_KEY")
+        );
+        assert_eq!(
+            switched
+                .account
+                .as_ref()
+                .and_then(|account| account.usage_available),
+            None
+        );
+        assert_eq!(
+            switched
+                .account
+                .as_ref()
+                .and_then(|account| account.last_refresh_at.as_deref()),
+            None
+        );
+        assert!(!std::path::Path::new(path).exists());
     }
 
     #[test]
@@ -425,6 +574,9 @@ mod tests {
                     enabled: true,
                     template: ProviderUsageQueryTemplate::NewApi,
                     base_url: Some("https://balance.example.com".to_string()),
+                    script: None,
+                    timeout_seconds: 10,
+                    api_key: None,
                     access_token: Some("access-test".to_string()),
                     user_id: Some("user-test".to_string()),
                 }),
@@ -490,6 +642,9 @@ mod tests {
                     enabled: true,
                     template: ProviderUsageQueryTemplate::NewApi,
                     base_url: Some("https://balance.example.com".to_string()),
+                    script: None,
+                    timeout_seconds: 10,
+                    api_key: None,
                     access_token: None,
                     user_id: None,
                 }),
@@ -520,6 +675,9 @@ mod tests {
                     enabled: false,
                     template: ProviderUsageQueryTemplate::NewApi,
                     base_url: None,
+                    script: None,
+                    timeout_seconds: 10,
+                    api_key: None,
                     access_token: None,
                     user_id: None,
                 }),
@@ -531,5 +689,39 @@ mod tests {
         assert_eq!(disabled_account.quota_label, None);
         assert_eq!(disabled_account.usage_available, None);
         assert_eq!(disabled_account.last_refresh_at, None);
+        assert!(!credential_path.exists());
+    }
+
+    #[test]
+    fn remove_provider_deletes_managed_credentials_but_preserves_external_auth() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let external_auth_path = temp.path().join("external-auth.json");
+        fs::write(&external_auth_path, r#"{"api_key":"external-secret"}"#).expect("external auth");
+        let mut configured = provider("configured-usage");
+        configured.auth_ref = Some(format!("file:{}", external_auth_path.display()));
+        add_provider(&store, configured).expect("add");
+        let credential_paths = managed_provider_credential_paths(&store, "configured-usage");
+        for credential_path in &credential_paths {
+            fs::create_dir_all(credential_path.parent().expect("parent")).expect("directory");
+            fs::write(credential_path, r#"{"secret":"managed"}"#).expect("credentials");
+        }
+
+        assert!(remove_provider(&store, "configured-usage").expect("remove"));
+        assert!(credential_paths.iter().all(|path| !path.exists()));
+        assert!(external_auth_path.exists());
+    }
+
+    #[test]
+    fn remove_unknown_provider_preserves_orphaned_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let credential_path = usage_query_credential_path(&store, "unknown");
+        fs::create_dir_all(credential_path.parent().expect("parent")).expect("directory");
+        fs::write(&credential_path, r#"{"access_token":"secret"}"#).expect("credentials");
+
+        assert!(!remove_provider(&store, "unknown").expect("remove"));
+        assert!(credential_path.exists());
+        assert!(remove_provider(&store, "../outside").is_err());
     }
 }

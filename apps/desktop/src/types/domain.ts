@@ -229,19 +229,31 @@ export interface ProviderAccountInfo {
   lastRefreshAt?: string | null;
 }
 
-export type ProviderUsageQueryTemplate = "new_api";
+export type ProviderUsageQueryTemplate = "general" | "new_api" | "open_router" | "custom";
 
 export interface ProviderUsageQuery {
   template: ProviderUsageQueryTemplate;
   baseUrl: string;
+  script: string;
+  timeoutSeconds: number;
 }
 
 export interface ProviderUsageQueryUpdate {
   enabled: boolean;
   template: ProviderUsageQueryTemplate;
   baseUrl?: string | null;
+  script?: string | null;
+  timeoutSeconds?: number;
+  apiKey?: string | null;
   accessToken?: string | null;
   userId?: string | null;
+}
+
+export interface ProviderUsageQueryTestInput {
+  providerId?: string | null;
+  providerBaseUrl: string;
+  providerApiKey?: string | null;
+  usageQuery: ProviderUsageQueryUpdate;
 }
 
 export interface ProviderQuotaWindow {

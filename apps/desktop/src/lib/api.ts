@@ -21,6 +21,7 @@ import type {
   CompanionStatus,
   GroupUpsert,
   ProviderConfig,
+  ProviderAccountInfo,
   ProviderExportFormat,
   ProviderExportOutput,
   ProviderHealth,
@@ -32,6 +33,8 @@ import type {
   ProviderGroup,
   ProviderKind,
   ProviderLaunchMode,
+  ProviderUsageQueryTemplate,
+  ProviderUsageQueryTestInput,
   ProviderViewMode,
   ProviderUpsert,
   RepairOutcome,
@@ -433,6 +436,8 @@ export function updateApiKeyProvider(input: ApiKeyProviderUpdate) {
         ? {
             template: input.usageQuery.template,
             baseUrl: input.usageQuery.baseUrl?.trim() || input.baseUrl.trim(),
+            script: input.usageQuery.script?.trim() || "",
+            timeoutSeconds: input.usageQuery.timeoutSeconds ?? 10,
           }
         : null;
     }
@@ -553,6 +558,10 @@ export function importApiKeyProvider(input: {
   model?: string;
   refreshIntervalSeconds?: number;
   usageQueryEnabled?: boolean;
+  usageQueryTemplate?: ProviderUsageQueryTemplate;
+  usageQueryScript?: string;
+  usageQueryTimeoutSeconds?: number;
+  usageQueryApiKey?: string;
   usageQueryBaseUrl?: string;
   usageQueryAccessToken?: string;
   usageQueryUserId?: string;
@@ -576,8 +585,10 @@ export function importApiKeyProvider(input: {
         subscriptionType: "API Key",
         usageQuery: input.usageQueryEnabled
           ? {
-              template: "new_api",
+              template: input.usageQueryTemplate ?? "general",
               baseUrl: input.usageQueryBaseUrl?.trim() || input.baseUrl.trim(),
+              script: input.usageQueryScript?.trim() || "",
+              timeoutSeconds: input.usageQueryTimeoutSeconds ?? 10,
             }
           : null,
       },
@@ -627,13 +638,35 @@ export function importApiKeyProvider(input: {
       refreshIntervalSeconds: input.refreshIntervalSeconds ?? null,
       usageQuery: {
         enabled: Boolean(input.usageQueryEnabled),
-        template: "new_api",
+        template: input.usageQueryTemplate ?? "general",
         baseUrl: emptyToNull(input.usageQueryBaseUrl),
+        script: emptyToNull(input.usageQueryScript),
+        timeoutSeconds: input.usageQueryTimeoutSeconds ?? 10,
+        apiKey: emptyToNull(input.usageQueryApiKey),
         accessToken: emptyToNull(input.usageQueryAccessToken),
         userId: emptyToNull(input.usageQueryUserId),
       },
     },
   });
+}
+
+export function testUsageQuery(input: ProviderUsageQueryTestInput) {
+  if (!isTauri()) {
+    const total = input.usageQuery.template === "new_api" ? 1120.5 : 100;
+    const used = input.usageQuery.template === "new_api" ? 856.2 : 24.7;
+    return Promise.resolve<ProviderAccountInfo>({
+      displayName: "查询测试",
+      subscriptionType: input.usageQuery.template === "new_api" ? "default" : "API Key",
+      subscriptionStatus: "可用",
+      quotaLabel: "USD 余额",
+      quotaPercent: ((total - used) / total) * 100,
+      usageTotal: total,
+      usageUsed: used,
+      usageAvailable: total - used,
+      lastRefreshAt: new Date().toISOString(),
+    });
+  }
+  return invoke<ProviderAccountInfo>("test_usage_query", { input });
 }
 
 export function addEnvProvider(input: {

@@ -1,16 +1,19 @@
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
     default_codex_dir, provider_endpoint_is_chat_completions, CliLaunchOutcome, CliLaunchRequest,
-    CodexInstallStatus, CodexLaunchMode, CodexLaunchOutcome, CompanionError, GroupPolicy,
-    ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode, RelayConfig, RepairOptions,
-    RepairOutcome, RepairPlan, Result, TerminalKind, COMPANION_PROVIDER_ID,
+    CodexInstallStatus, CodexLaunchMode, CodexLaunchOutcome, CompanionConfig, CompanionError,
+    GroupPolicy, ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode, RelayConfig,
+    RepairOptions, RepairOutcome, RepairPlan, Result, TerminalKind, COMPANION_PROVIDER_ID,
 };
 use codex_companion_provider::{provider_uses_agent_identity, selected_providers_for_group};
 use codex_companion_state::{
-    doctor, install_companion_provider_with_token_source, install_direct_provider_with_options,
-    repair_state, CodexInstallSnapshot, DirectInstallOptions,
+    companion_model_catalog_path, doctor, install_companion_provider_for_relay,
+    install_direct_provider_with_options, official_codex_auth_is_resolvable, repair_state,
+    CodexInstallSnapshot, CodexOfficialAuthStatus, DirectInstallOptions,
 };
+use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -82,14 +85,34 @@ impl CompanionDaemon {
         );
         let selected = selected_providers_for_group(&previous_config, &group);
         let token_source = group_relay_token_source(&group, &selected);
-        let (codex, install_snapshot) =
-            install_relay_for_launch(&codex_dir, &previous_config.relay, &token_source)?;
+        let models = relay_model_slugs(&selected);
+        let official_auth_provider = relay_official_auth_provider(&previous_config, &selected);
+        let relay_install = install_relay_for_launch(
+            &codex_dir,
+            &previous_config.relay,
+            &token_source,
+            &models,
+            official_auth_provider.as_ref(),
+        )?;
+        let RelayInstallOutcome {
+            codex,
+            install_snapshot,
+            client_restart_required,
+        } = relay_install;
         if let Err(error) =
             self.commit_group_relay_launch(group_id, &previous_config.relay.base_url())
         {
             return Err(rollback_launch_install(install_snapshot, error));
         }
+        let restart_required = restart_required
+            || client_restart_required
+            || repair_preview_requires_client_restart(
+                &codex_dir,
+                COMPANION_PROVIDER_ID.to_string(),
+            );
+        stop_codex_before_repair(restart_required);
         let repair = repair_for_launch(&codex_dir, COMPANION_PROVIDER_ID.to_string());
+        let restart_required = restart_required || repair_requires_client_restart(&repair);
         let codex_launch = ensure_codex_started(restart_required);
 
         Ok(CodexLaunchOutcome {
@@ -169,6 +192,7 @@ impl CompanionDaemon {
                 return Err(rollback_launch_install(install_snapshot, error));
             }
             let target_provider_id = direct_repair_target_provider_id(&provider);
+            stop_codex_before_repair(true);
             let repair = repair_for_launch(&codex_dir, target_provider_id.clone());
             let restart_required = true;
             let codex_launch = restart_codex();
@@ -194,14 +218,35 @@ impl CompanionDaemon {
             pending_relay_restart,
         );
         let token_source = provider_relay_token_source(&provider);
-        let (codex, install_snapshot) =
-            install_relay_for_launch(&codex_dir, &config_snapshot.relay, &token_source)?;
+        let models = relay_model_slugs(std::slice::from_ref(&provider));
+        let selected = std::slice::from_ref(&provider);
+        let official_auth_provider = relay_official_auth_provider(&config_snapshot, selected);
+        let relay_install = install_relay_for_launch(
+            &codex_dir,
+            &config_snapshot.relay,
+            &token_source,
+            &models,
+            official_auth_provider.as_ref(),
+        )?;
+        let RelayInstallOutcome {
+            codex,
+            install_snapshot,
+            client_restart_required,
+        } = relay_install;
         if let Err(error) =
             self.commit_provider_relay_launch(&provider.id, &config_snapshot.relay.base_url())
         {
             return Err(rollback_launch_install(install_snapshot, error));
         }
+        let restart_required = restart_required
+            || client_restart_required
+            || repair_preview_requires_client_restart(
+                &codex_dir,
+                COMPANION_PROVIDER_ID.to_string(),
+            );
+        stop_codex_before_repair(restart_required);
         let repair = repair_for_launch(&codex_dir, COMPANION_PROVIDER_ID.to_string());
+        let restart_required = restart_required || repair_requires_client_restart(&repair);
         let codex_launch = ensure_codex_started(restart_required);
 
         Ok(CodexLaunchOutcome {
@@ -329,18 +374,74 @@ fn record_relay_launch(config: &mut codex_companion_core::CompanionConfig, mode:
     config.app.codex_restart_required_on_next_relay = false;
 }
 
+struct RelayInstallOutcome {
+    codex: CodexInstallStatus,
+    install_snapshot: CodexInstallSnapshot,
+    client_restart_required: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CodexClientStartupState {
+    config: Option<Vec<u8>>,
+    auth: Option<Vec<u8>>,
+    model_catalog: Option<Vec<u8>>,
+}
+
+impl CodexClientStartupState {
+    fn capture(codex_dir: &Path) -> Result<Self> {
+        Ok(Self {
+            config: read_optional_file(&codex_dir.join("config.toml"))?,
+            auth: read_optional_file(&codex_dir.join("auth.json"))?,
+            model_catalog: read_optional_file(&companion_model_catalog_path(codex_dir))?,
+        })
+    }
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read(path)
+        .map(Some)
+        .map_err(|source| CompanionError::io(path, source))
+}
+
 fn install_relay_for_launch(
     codex_dir: &Path,
     relay: &RelayConfig,
     token_source: &str,
-) -> Result<(CodexInstallStatus, CodexInstallSnapshot)> {
+    model_slugs: &[String],
+    official_auth_provider: Option<&ProviderConfig>,
+) -> Result<RelayInstallOutcome> {
+    let before = CodexClientStartupState::capture(codex_dir)?;
     let snapshot = CodexInstallSnapshot::capture(codex_dir)?;
-    let codex = install_companion_provider_with_token_source(
-        Some(codex_dir.to_path_buf()),
-        relay,
-        Some(token_source),
-    )?;
-    Ok((codex, snapshot))
+    let install_result = (|| -> Result<(CodexInstallStatus, bool)> {
+        let outcome = install_companion_provider_for_relay(
+            Some(codex_dir.to_path_buf()),
+            relay,
+            Some(token_source),
+            model_slugs,
+            official_auth_provider,
+            false,
+        )?;
+        let mut codex = outcome.codex;
+        append_relay_auth_status(
+            &mut codex.message,
+            &outcome.official_auth,
+            outcome.managed_model_catalog,
+        );
+        let after = CodexClientStartupState::capture(codex_dir)?;
+        Ok((codex, before != after))
+    })();
+
+    match install_result {
+        Ok((codex, client_restart_required)) => Ok(RelayInstallOutcome {
+            codex,
+            install_snapshot: snapshot,
+            client_restart_required,
+        }),
+        Err(error) => Err(rollback_launch_install(snapshot, error)),
+    }
 }
 
 fn rollback_launch_install(
@@ -602,6 +703,67 @@ fn group_relay_token_source(group: &ProviderGroup, providers: &[ProviderConfig])
     }
 }
 
+pub(crate) fn relay_model_slugs(providers: &[ProviderConfig]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut models = Vec::new();
+    for model in providers
+        .iter()
+        .flat_map(|provider| provider.model_map.keys())
+    {
+        let model = model.trim();
+        if model.is_empty() || model == "default" || !seen.insert(model.to_string()) {
+            continue;
+        }
+        models.push(model.to_string());
+    }
+    models
+}
+
+pub(crate) fn relay_official_auth_provider(
+    config: &CompanionConfig,
+    selected: &[ProviderConfig],
+) -> Option<ProviderConfig> {
+    let selected_official = selected
+        .iter()
+        .filter(|provider| matches!(provider.kind, ProviderKind::OfficialCodex))
+        .collect::<Vec<_>>();
+    if !selected_official.is_empty() {
+        return selected_official
+            .into_iter()
+            .find(|provider| official_codex_auth_is_resolvable(provider))
+            .cloned();
+    }
+
+    let mut enabled_official = config
+        .providers
+        .values()
+        .filter(|provider| provider.enabled)
+        .filter(|provider| matches!(provider.kind, ProviderKind::OfficialCodex));
+    let only = enabled_official.next()?.clone();
+    (enabled_official.next().is_none() && official_codex_auth_is_resolvable(&only)).then_some(only)
+}
+
+fn append_relay_auth_status(
+    message: &mut String,
+    status: &CodexOfficialAuthStatus,
+    managed_model_catalog: bool,
+) {
+    if status.ready {
+        if status.changed {
+            message.push_str("；已恢复官方 ChatGPT OAuth");
+        } else {
+            message.push_str("；官方 ChatGPT OAuth 已就绪");
+        }
+    } else {
+        message.push_str("；未找到唯一可恢复的官方 ChatGPT OAuth，Ultra 仍受当前登录状态限制");
+    }
+    if managed_model_catalog {
+        message.push_str("；已为中转模型启用 Ultra");
+    } else {
+        message.push_str("；已保留现有模型目录，Ultra 是否显示由该目录决定");
+    }
+}
+
 pub fn single_provider_group_id(provider: &ProviderConfig) -> String {
     format!("{SINGLE_PROVIDER_GROUP_PREFIX}{}", provider.id)
 }
@@ -643,6 +805,30 @@ fn repair_for_launch(codex_dir: &std::path::Path, target_provider_id: String) ->
             format!("启动前修复未完成，已跳过且不阻塞 Codex 启动: {error}"),
         )
     })
+}
+
+fn repair_preview_requires_client_restart(
+    codex_dir: &std::path::Path,
+    target_provider_id: String,
+) -> bool {
+    repair_state(RepairOptions {
+        codex_dir: codex_dir.to_path_buf(),
+        history: true,
+        plugins: true,
+        dry_run: true,
+        target_provider_id: Some(target_provider_id),
+    })
+    .is_ok_and(|repair| {
+        repair.plan.history_lines > 0
+            || repair.plan.state_rows > 0
+            || (!repair.plan.source_provider_ids.is_empty() && repair.plan.plugin_files > 0)
+    })
+}
+
+fn repair_requires_client_restart(repair: &RepairOutcome) -> bool {
+    repair.migrated_history_files > 0
+        || repair.migrated_plugin_files > 0
+        || repair.migrated_state_rows > 0
 }
 
 fn skipped_launch_repair(
@@ -722,16 +908,20 @@ fn restart_codex() -> CodexProcessLaunch {
     ensure_codex_started(true)
 }
 
+pub(crate) fn restart_codex_if_running() -> bool {
+    let target = CodexLaunchTarget::from_env();
+    if target.skip_restart || !codex_running(&target) {
+        return false;
+    }
+    stop_codex(&target);
+    thread::sleep(Duration::from_millis(650));
+    start_codex(&target)
+}
+
 fn ensure_codex_started(restart_required: bool) -> CodexProcessLaunch {
     let target = CodexLaunchTarget::from_env();
-    let action = codex_process_action(
-        restart_required,
-        if restart_required {
-            true
-        } else {
-            codex_running(&target)
-        },
-    );
+    let running = codex_running(&target);
+    let action = codex_process_action(restart_required, running);
     if matches!(action, CodexProcessAction::None) {
         return CodexProcessLaunch::none();
     }
@@ -746,8 +936,10 @@ fn ensure_codex_started(restart_required: bool) -> CodexProcessLaunch {
         CodexProcessAction::None => false,
         CodexProcessAction::Start => start_codex(&target),
         CodexProcessAction::Restart => {
-            stop_codex(&target);
-            thread::sleep(Duration::from_millis(650));
+            if running {
+                stop_codex(&target);
+                thread::sleep(Duration::from_millis(650));
+            }
             start_codex(&target)
         }
     };
@@ -756,6 +948,18 @@ fn ensure_codex_started(restart_required: bool) -> CodexProcessLaunch {
         succeeded,
         skipped: false,
     }
+}
+
+fn stop_codex_before_repair(restart_required: bool) {
+    if !restart_required {
+        return;
+    }
+    let target = CodexLaunchTarget::from_env();
+    if target.skip_restart || !codex_running(&target) {
+        return;
+    }
+    stop_codex(&target);
+    thread::sleep(Duration::from_millis(650));
 }
 
 fn direct_launch_message(provider_name: &str, codex_launch: CodexProcessLaunch) -> String {
@@ -1125,6 +1329,22 @@ mod tests {
         }
     }
 
+    fn write_official_auth(directory: &Path, name: &str) -> String {
+        let path = directory.join(format!("{name}.json"));
+        fs::write(
+            &path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": format!("{name}-access"),
+                    "refresh_token": format!("{name}-refresh")
+                }
+            })
+            .to_string(),
+        )
+        .expect("official auth");
+        format!("file:{}", path.display())
+    }
+
     #[test]
     fn official_provider_file_auth_can_direct_connect() {
         let provider = provider(ProviderKind::OfficialCodex, Some("file:/tmp/auth.json"));
@@ -1185,6 +1405,64 @@ mod tests {
     }
 
     #[test]
+    fn relay_launch_requires_restart_after_session_provider_repair() {
+        let repair = RepairOutcome {
+            plan: RepairPlan {
+                codex_dir: PathBuf::from("/tmp/codex"),
+                target_provider_id: COMPANION_PROVIDER_ID.to_string(),
+                history_files: 1,
+                history_lines: 0,
+                plugin_files: 0,
+                state_rows: 1,
+                source_provider_ids: vec!["openai".to_string()],
+                dry_run: false,
+            },
+            backup_root: Some(PathBuf::from("/tmp/backup")),
+            migrated_history_files: 0,
+            migrated_history_lines: 0,
+            migrated_plugin_files: 0,
+            migrated_state_rows: 1,
+            skipped_reason: None,
+        };
+
+        assert!(repair_requires_client_restart(&repair));
+    }
+
+    #[test]
+    fn relay_launch_preview_detects_stale_session_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        fs::write(
+            sessions.join("session.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"openai\"}}\n",
+        )
+        .expect("session");
+
+        assert!(repair_preview_requires_client_restart(
+            temp.path(),
+            COMPANION_PROVIDER_ID.to_string(),
+        ));
+    }
+
+    #[test]
+    fn relay_launch_preview_keeps_current_sessions_hot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        fs::write(
+            sessions.join("session.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"codex-companion\"}}\n",
+        )
+        .expect("session");
+
+        assert!(!repair_preview_requires_client_restart(
+            temp.path(),
+            COMPANION_PROVIDER_ID.to_string(),
+        ));
+    }
+
+    #[test]
     fn relay_launch_starts_codex_when_not_running() {
         assert_eq!(
             codex_process_action(false, false),
@@ -1221,6 +1499,41 @@ mod tests {
     }
 
     #[test]
+    fn relay_auth_message_reports_managed_ultra_catalog_separately() {
+        let mut message = String::new();
+        append_relay_auth_status(
+            &mut message,
+            &CodexOfficialAuthStatus {
+                ready: true,
+                changed: true,
+                source_provider_id: Some("official".to_string()),
+            },
+            true,
+        );
+
+        assert!(message.contains("已恢复官方 ChatGPT OAuth"));
+        assert!(message.contains("已为中转模型启用 Ultra"));
+    }
+
+    #[test]
+    fn relay_auth_message_does_not_promise_ultra_for_user_catalog() {
+        let mut message = String::new();
+        append_relay_auth_status(
+            &mut message,
+            &CodexOfficialAuthStatus {
+                ready: true,
+                changed: false,
+                source_provider_id: None,
+            },
+            false,
+        );
+
+        assert!(message.contains("官方 ChatGPT OAuth 已就绪"));
+        assert!(message.contains("Ultra 是否显示由该目录决定"));
+        assert!(!message.contains("已为中转模型启用 Ultra"));
+    }
+
+    #[test]
     fn default_client_names_prefer_chatgpt_and_keep_legacy_codex() {
         assert_eq!(
             default_codex_app_names(),
@@ -1251,6 +1564,130 @@ mod tests {
 
         assert!(source.contains("environment variable OPENROUTER_API_KEY"));
         assert!(source.contains("Provider"));
+    }
+
+    #[test]
+    fn relay_catalog_uses_declared_client_model_names() {
+        let mut first = provider(ProviderKind::RelayProvider, None);
+        first
+            .model_map
+            .insert("gpt-5.6-sol".to_string(), "upstream-sol".to_string());
+        first
+            .model_map
+            .insert("default".to_string(), "upstream-default".to_string());
+        let mut second = provider(ProviderKind::RelayProvider, None);
+        second
+            .model_map
+            .insert("gpt-5.6-sol".to_string(), "other-sol".to_string());
+        second
+            .model_map
+            .insert("gpt-5.6-terra".to_string(), "upstream-terra".to_string());
+
+        assert_eq!(
+            relay_model_slugs(&[first, second]),
+            vec!["gpt-5.6-sol", "gpt-5.6-terra"]
+        );
+    }
+
+    #[test]
+    fn relay_auth_prefers_the_first_official_account_in_the_selected_group() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outside_ref = write_official_auth(temp.path(), "outside");
+        let selected_first_ref = write_official_auth(temp.path(), "selected-first");
+        let selected_second_ref = write_official_auth(temp.path(), "selected-second");
+        let mut outside = provider(ProviderKind::OfficialCodex, Some(&outside_ref));
+        outside.id = "outside".to_string();
+        let mut selected_first = provider(ProviderKind::OfficialCodex, Some(&selected_first_ref));
+        selected_first.id = "selected-first".to_string();
+        let mut selected_second = provider(ProviderKind::OfficialCodex, Some(&selected_second_ref));
+        selected_second.id = "selected-second".to_string();
+        let mut config = CompanionConfig::default();
+        for account in [&outside, &selected_first, &selected_second] {
+            config.providers.insert(account.id.clone(), account.clone());
+        }
+
+        let source = relay_official_auth_provider(
+            &config,
+            &[selected_first.clone(), selected_second.clone()],
+        )
+        .expect("selected official source");
+
+        assert_eq!(source.id, selected_first.id);
+    }
+
+    #[test]
+    fn relay_auth_skips_an_invalid_selected_account() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let invalid_ref = format!("file:{}", temp.path().join("missing.json").display());
+        let valid_ref = write_official_auth(temp.path(), "valid");
+        let mut invalid = provider(ProviderKind::OfficialCodex, Some(&invalid_ref));
+        invalid.id = "invalid".to_string();
+        let mut valid = provider(ProviderKind::OfficialCodex, Some(&valid_ref));
+        valid.id = "valid".to_string();
+        let mut config = CompanionConfig::default();
+        for account in [&invalid, &valid] {
+            config.providers.insert(account.id.clone(), account.clone());
+        }
+
+        let source = relay_official_auth_provider(&config, &[invalid, valid.clone()])
+            .expect("valid selected official source");
+
+        assert_eq!(source.id, valid.id);
+    }
+
+    #[test]
+    fn relay_auth_uses_only_enabled_official_account_outside_the_group() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let official_ref = write_official_auth(temp.path(), "official");
+        let mut official = provider(ProviderKind::OfficialCodex, Some(&official_ref));
+        official.id = "official".to_string();
+        let selected = provider(ProviderKind::RelayProvider, Some("file:/tmp/relay.json"));
+        let mut config = CompanionConfig::default();
+        config
+            .providers
+            .insert(official.id.clone(), official.clone());
+        config
+            .providers
+            .insert(selected.id.clone(), selected.clone());
+
+        let source = relay_official_auth_provider(&config, &[selected]).expect("official source");
+
+        assert_eq!(source.id, official.id);
+    }
+
+    #[test]
+    fn relay_auth_does_not_guess_between_unselected_official_accounts() {
+        let mut first = provider(ProviderKind::OfficialCodex, Some("file:/tmp/first.json"));
+        first.id = "first".to_string();
+        let mut second = provider(ProviderKind::OfficialCodex, Some("file:/tmp/second.json"));
+        second.id = "second".to_string();
+        let selected = provider(ProviderKind::RelayProvider, Some("file:/tmp/relay.json"));
+        let mut config = CompanionConfig::default();
+        for account in [&first, &second, &selected] {
+            config.providers.insert(account.id.clone(), account.clone());
+        }
+
+        assert!(relay_official_auth_provider(&config, &[selected]).is_none());
+    }
+
+    #[test]
+    fn relay_install_restarts_only_when_startup_state_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let relay = RelayConfig::default();
+        let sol = vec!["gpt-5.6-sol".to_string()];
+
+        let first = install_relay_for_launch(temp.path(), &relay, "test", &sol, None)
+            .expect("first install");
+        assert!(first.client_restart_required);
+
+        let second = install_relay_for_launch(temp.path(), &relay, "test", &sol, None)
+            .expect("same install");
+        assert!(!second.client_restart_required);
+
+        let terra = vec!["gpt-5.6-terra".to_string()];
+        let changed = install_relay_for_launch(temp.path(), &relay, "test", &terra, None)
+            .expect("changed catalog");
+        assert!(changed.client_restart_required);
     }
 
     #[test]
@@ -1445,11 +1882,29 @@ mod tests {
         use std::os::fd::AsRawFd;
 
         let temp = tempfile::tempdir().expect("tempdir");
+        let official_auth_path = temp.path().join("official-auth.json");
+        fs::write(
+            &official_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "official-access",
+                    "refresh_token": "official-refresh"
+                }
+            })
+            .to_string(),
+        )
+        .expect("official auth");
+        let official_auth_ref = format!("file:{}", official_auth_path.display());
+        let mut official = provider(ProviderKind::OfficialCodex, Some(&official_auth_ref));
+        official.id = "official".to_string();
+        let mut companion = codex_companion_core::CompanionConfig::default();
+        companion
+            .providers
+            .insert(official.id.clone(), official.clone());
         let companion_config = temp.path().join("companion-config.json");
         fs::write(
             &companion_config,
-            serde_json::to_string_pretty(&codex_companion_core::CompanionConfig::default())
-                .expect("serialize config"),
+            serde_json::to_string_pretty(&companion).expect("serialize config"),
         )
         .expect("write companion config");
         let companion_file = fs::File::open(&companion_config).expect("open companion config");
@@ -1467,6 +1922,8 @@ mod tests {
             "base_url = \"https://api.openai.com/v1\"\n"
         );
         fs::write(codex_dir.join("config.toml"), original_config).expect("codex config");
+        let original_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-before-relay"}"#;
+        fs::write(codex_dir.join("auth.json"), original_auth).expect("codex auth");
 
         let daemon = CompanionDaemon::new(store);
         let error = daemon
@@ -1481,6 +1938,11 @@ mod tests {
             fs::read_to_string(codex_dir.join("config.toml")).expect("restored config"),
             original_config
         );
+        assert_eq!(
+            fs::read_to_string(codex_dir.join("auth.json")).expect("restored auth"),
+            original_auth
+        );
+        assert!(!companion_model_catalog_path(&codex_dir).exists());
         assert!(!codex_dir
             .join("backups/codex-companion/managed-state.json")
             .exists());

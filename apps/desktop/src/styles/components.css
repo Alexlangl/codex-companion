@@ -1206,27 +1206,177 @@ dd {
   min-height: 16px;
 }
 
-.usage-query-settings {
+.api-key-form-tabs {
   display: grid;
-  gap: 12px;
-  margin: 14px 0;
-  border: 1px solid var(--border);
+  gap: 14px;
+}
+
+.api-key-form-tabs-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.api-key-form-tabs-trigger {
+  min-height: 38px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 0 12px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.api-key-form-tabs-trigger[data-state="active"] {
+  border-bottom-color: var(--primary);
+  color: var(--foreground);
+}
+
+.api-key-form-tabs-content {
+  min-width: 0;
+}
+
+.usage-query-panel,
+.usage-query-config {
+  display: grid;
+  min-width: 0;
+  gap: 14px;
+}
+
+.usage-query-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.usage-query-header h3 {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  margin: 0;
+  font-size: 14px;
+}
+
+.usage-query-header p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.usage-query-toggle {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.usage-query-config {
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+
+.usage-query-config:disabled {
+  opacity: 0.56;
+}
+
+.usage-template-list {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
   border-radius: var(--radius);
-  padding: 12px;
+  padding: 4px;
   background: var(--muted-bg);
 }
 
-.usage-query-settings .check-row {
-  margin: 0;
+.usage-template-trigger {
+  min-width: 0;
+  min-height: 34px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 4px;
+  padding: 0 8px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.usage-query-fields {
+.usage-template-trigger[data-state="active"] {
+  color: var(--foreground);
+  background: var(--surface-solid);
+  box-shadow: 0 1px 3px var(--shadow);
+}
+
+.usage-template-content,
+.usage-query-credentials {
+  min-width: 0;
+}
+
+.usage-query-credentials {
   display: grid;
-  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 12px;
 }
 
-.usage-query-fields .field-hint {
+.usage-query-code-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: end;
+}
+
+.usage-query-code-header > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.usage-query-code-header strong {
+  font-size: 12px;
+}
+
+.usage-query-code-header span {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.usage-query-code {
+  min-height: 250px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.usage-query-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 180px) auto;
+  gap: 12px;
+  align-items: end;
+  justify-content: space-between;
+}
+
+.usage-query-actions .field {
   margin: 0;
+}
+
+.usage-query-test-result {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.usage-query-test-success {
+  color: var(--ok);
 }
 
 .repair-status {
@@ -1847,6 +1997,10 @@ dd {
 
 .provider-card-bottom {
   padding-top: 2px;
+}
+
+.provider-card-bottom-no-quota {
+  justify-content: flex-end;
 }
 
 .provider-card-active {
@@ -3246,6 +3400,30 @@ dd {
 }
 
 @media (max-width: 700px) {
+  .usage-query-header,
+  .usage-query-code-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .usage-query-toggle {
+    align-self: flex-start;
+  }
+
+  .usage-template-list,
+  .usage-query-credentials,
+  .usage-query-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .usage-template-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .usage-query-actions .button {
+    width: 100%;
+  }
+
   .add-tabs-list {
     gap: 2px;
   }

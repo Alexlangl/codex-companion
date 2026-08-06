@@ -1,7 +1,7 @@
 import { CheckCircle2, Play, RadioTower, Router } from "lucide-react";
 import type { ReactNode } from "react";
 import { Badge, Button, Panel } from "../../components/ui";
-import { currentApplication, currentProviderId } from "../../lib/current-application";
+import { currentApplication, currentProviderId, launchApplication } from "../../lib/current-application";
 import { compactPath, formatTime } from "../../lib/format";
 import {
   hasQuotaInfo,
@@ -29,20 +29,25 @@ export function Dashboard({
 }) {
   const providers = Object.values(status.config.providers);
   const application = currentApplication(status);
+  const launchTarget = launchApplication(status);
   const healthy = providers.filter((provider) => {
     const health = status.config.health[provider.id]?.status;
     return health === "healthy" || health === "unknown";
   }).length;
-  const routeReady = application.kind !== "none" && application.providers.length > 0;
+  const routeReady = launchTarget.kind !== "none" && launchTarget.providers.length > 0;
+  const routeConnected = application.kind !== "none";
+  const readinessLabel = launchReadinessLabel(routeConnected, routeReady);
+  const launchTargetName = routeConnected ? application.name : `待启动：${launchTarget.name}`;
+  const launchDescription = routeConnected ? application.description : status.codex.message;
 
   function launchCurrentApplication() {
-    if (application.kind === "group") {
-      void onLaunchGroup(application.launchGroupId);
-    } else if (application.kind === "provider") {
-      if (application.launchMode === "relay" && application.launchGroupId) {
-        void onLaunchGroup(application.launchGroupId);
+    if (launchTarget.kind === "group") {
+      void onLaunchGroup(launchTarget.launchGroupId);
+    } else if (launchTarget.kind === "provider") {
+      if (launchTarget.launchMode === "relay" && launchTarget.launchGroupId) {
+        void onLaunchGroup(launchTarget.launchGroupId);
       } else {
-        void onLaunchProvider(application.provider.id, application.launchMode);
+        void onLaunchProvider(launchTarget.provider.id, launchTarget.launchMode);
       }
     }
   }
@@ -52,13 +57,13 @@ export function Dashboard({
       <Panel eyebrow="当前路由" title="启动 Codex">
         <div className="launch-card">
           <div className="launch-card-main">
-            <span className={`launch-readiness ${routeReady ? "launch-readiness-ready" : ""}`}>
+            <span className={`launch-readiness ${routeConnected ? "launch-readiness-ready" : ""}`}>
               <span className="status-dot" aria-hidden="true" />
-              {routeReady ? "路由就绪" : "等待配置"}
+              {readinessLabel}
             </span>
             <div className="launch-context">
-              <strong>{application.name}</strong>
-              <span>{application.description}</span>
+              <strong>{launchTargetName}</strong>
+              <span>{launchDescription}</span>
             </div>
           </div>
           <Button disabled={busy !== "idle" || !routeReady} onClick={launchCurrentApplication}>
@@ -73,14 +78,14 @@ export function Dashboard({
         </div>
       </Panel>
 
-      <Panel eyebrow="路由成员" title={application.kind === "group" ? "应用分组" : "应用账号"}>
-        {application.providers.length === 0 ? (
+      <Panel eyebrow="路由成员" title={launchTarget.kind === "group" ? "应用分组" : "应用账号"}>
+        {launchTarget.providers.length === 0 ? (
           <p className="empty">当前应用还没有账号。去账号页面添加账号后，再到分组里编排优先级。</p>
         ) : (
           <div className="dashboard-provider-list">
-            {application.providers.map((provider, index) => (
+            {launchTarget.providers.map((provider, index) => (
               <DashboardProviderCard
-                compact={application.kind === "group"}
+                compact={launchTarget.kind === "group"}
                 healthStatus={status.config.health[provider.id]?.status}
                 index={index}
                 key={provider.id}
@@ -105,6 +110,12 @@ export function Dashboard({
       </Panel>
     </div>
   );
+}
+
+function launchReadinessLabel(isConnected: boolean, canLaunch: boolean): string {
+  if (isConnected) return "路由就绪";
+  if (canLaunch) return "Codex 未连接";
+  return "等待配置";
 }
 
 function DashboardProviderCard({

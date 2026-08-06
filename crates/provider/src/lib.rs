@@ -13,7 +13,7 @@ mod validate;
 use codex_companion_core::{atomic_write_private_file, CompanionError, Result};
 use std::{fs, path::Path};
 
-pub use account_refresh::refresh_official_codex_account;
+pub use account_refresh::{refresh_official_codex_account, test_configured_usage_query};
 pub use auth::{resolve_auth_token, resolve_chatgpt_account_id};
 pub use codex_oauth::{ensure_codex_auth_snapshot, load_codex_auth_snapshot, CodexAuthSnapshot};
 pub use export::export_provider_json;
@@ -31,7 +31,8 @@ pub use registry::{add_provider, list_providers, remove_provider, update_api_key
 pub use types::{
     ApiKeyProviderUpdate, GroupUpsert, ProviderExportFormat, ProviderExportOutput,
     ProviderImportBatchReport, ProviderImportDraft, ProviderImportFailure, ProviderImportOutcome,
-    ProviderImportReviewItem, ProviderImportReviewReport, ProviderUpsert, ProviderUsageQueryUpdate,
+    ProviderImportReviewItem, ProviderImportReviewReport, ProviderUpsert,
+    ProviderUsageQueryTestInput, ProviderUsageQueryUpdate,
 };
 
 pub(crate) fn write_private_auth_file(path: &Path, contents: &str) -> Result<()> {
@@ -56,6 +57,31 @@ pub(crate) fn persist_with_private_auth_file<T>(
                     "credential 写入失败: {error}；回滚也失败: {rollback_error}"
                 ))),
             };
+        }
+        match persist() {
+            Ok(value) => Ok(value),
+            Err(error) => match restore_private_auth_file(path, previous.as_deref()) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(CompanionError::InvalidConfig(format!(
+                    "provider 保存失败: {error}；credential 回滚也失败: {rollback_error}"
+                ))),
+            },
+        }
+    })
+}
+
+pub(crate) fn persist_with_private_auth_file_removal<T>(
+    path: &Path,
+    persist: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    with_private_auth_file_lock(path, || {
+        let previous = if path.exists() {
+            Some(fs::read(path).map_err(|source| CompanionError::io(path, source))?)
+        } else {
+            None
+        };
+        if path.exists() {
+            fs::remove_file(path).map_err(|source| CompanionError::io(path, source))?;
         }
         match persist() {
             Ok(value) => Ok(value),

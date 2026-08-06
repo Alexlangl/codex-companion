@@ -4,7 +4,8 @@ use crate::content_encoding::{
 use crate::events::{append_event, record_health_success, update_health};
 use crate::state::{apply_group_policy, AffinityBindContext, RelayState};
 use crate::upstream::{
-    send_upstream, stream_response, text_response, upstream_url, UpstreamRequest,
+    send_upstream, stream_response, text_response, upstream_url, StreamPreflightError,
+    UpstreamRequest,
 };
 use crate::{RequestAttemptFinish, RequestAttemptStart, RequestLogFinish, RequestLogStart};
 use axum::{
@@ -16,7 +17,7 @@ use axum::{
 use bytes::Bytes;
 use codex_companion_core::{
     provider_endpoint_is_chat_completions, redact_sensitive_text, ApiClient, CompanionConfig,
-    GroupPolicy, HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderGroup, ProviderKind,
+    GroupPolicy, HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderGroup,
 };
 use codex_companion_health::{
     classify_failure, cooldown_active, mark_failure, mark_model_failure, normalize_expired_cooldown,
@@ -27,9 +28,12 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(300);
+const UPSTREAM_STREAM_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
+const UPSTREAM_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) async fn proxy(
     State(state): State<RelayState>,
@@ -267,12 +271,7 @@ async fn proxy_dispatch(
     {
         selected.push(preferred_provider.clone());
     }
-    if method == Method::GET
-        && uri.path() == "/v1/models"
-        && selected
-            .iter()
-            .any(|provider| provider.kind == ProviderKind::OfficialCodex)
-    {
+    if method == Method::GET && uri.path() == "/v1/models" {
         let models = selected
             .iter()
             .flat_map(|provider| provider.model_map.keys().cloned())
@@ -514,18 +513,37 @@ async fn proxy_dispatch(
         }
         let request_guard = state.begin_provider_request(&provider.id);
         let upstream = upstream_url(&provider, &uri);
-        match send_upstream(
-            &state.client,
-            &state.api_service,
-            UpstreamRequest::new(&provider, &method, &uri, &headers, body.clone(), &upstream),
+        let upstream_result = tokio::time::timeout(
+            UPSTREAM_RESPONSE_HEADER_TIMEOUT,
+            send_upstream(
+                &state.client,
+                &state.api_service,
+                UpstreamRequest::new(&provider, &method, &uri, &headers, body.clone(), &upstream),
+            ),
         )
         .await
-        {
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "上游网络等待响应超时（Provider {}）",
+                provider.name
+            ))
+        });
+        match upstream_result {
             Ok(mut response) if response.status().is_success() => {
                 let upstream_status = response.status();
-                if let Err(error) = response.preflight_stream_failure().await {
-                    let failure = classify_failure(None, &error);
-                    let message = format!("stream 输出前语义失败: {}", compact_error_body(&error));
+                let preflight = tokio::time::timeout(
+                    UPSTREAM_STREAM_PREFLIGHT_TIMEOUT,
+                    response.preflight_stream_failure(),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(StreamPreflightError::Network(
+                        "等待上游 SSE 首帧超时".to_string(),
+                    ))
+                });
+                if let Err(error) = preflight {
+                    let failure = classify_failure(None, &error.classification_text());
+                    let message = error.to_string();
                     record_provider_failure(
                         &state,
                         &config,
@@ -655,6 +673,16 @@ async fn proxy_dispatch(
                     attempt_started_at,
                     Some(&message),
                 );
+                last_error = Some(message.clone());
+                if index + 1 < candidate_count && group.fallback_enabled {
+                    append_event(
+                        &state.store,
+                        "fallback",
+                        Some(provider.id),
+                        format!("[{request_id}] {message}"),
+                    );
+                    continue;
+                }
                 append_event(
                     &state.store,
                     "error",
@@ -679,10 +707,19 @@ async fn proxy_dispatch(
             }
             Ok(response) => {
                 let status = response.status();
-                let body_text = response.text().await.unwrap_or_default();
+                let body_text = match tokio::time::timeout(
+                    UPSTREAM_ERROR_BODY_TIMEOUT,
+                    response.text(),
+                )
+                .await
+                {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(error)) => format!("读取上游错误响应失败: {error}"),
+                    Err(_) => "读取上游错误响应超时".to_string(),
+                };
                 let failure = classify_failure(Some(status.as_u16()), &body_text);
                 let upstream_payload_too_large = status == StatusCode::PAYLOAD_TOO_LARGE;
-                let request_incompatible = is_upstream_request_incompatibility(status, &body_text);
+                let request_incompatible = status == StatusCode::BAD_REQUEST;
                 let compact_unsupported = compact_request
                     && matches!(
                         status,
@@ -915,16 +952,6 @@ fn prioritize_session_affinity(
 
 fn fallback_eligible(failure: &codex_companion_health::FailureClassification) -> bool {
     failure.retryable || failure.kind == HealthFailureKind::AuthFailed
-}
-
-fn is_upstream_request_incompatibility(status: StatusCode, body: &str) -> bool {
-    if status != StatusCode::BAD_REQUEST {
-        return false;
-    }
-    let lower = body.to_ascii_lowercase();
-    lower.contains("expected an id that begins with")
-        && lower.contains("input[")
-        && lower.contains("].id")
 }
 
 fn failure_error_code(kind: &HealthFailureKind) -> &'static str {
@@ -1438,7 +1465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn official_codex_models_are_served_from_the_validated_local_catalog() {
+    async fn declared_provider_models_are_served_from_the_local_catalog() {
         let store = store_with_group(vec![provider(
             "official",
             "https://chatgpt.com/backend-api/codex",
@@ -1446,7 +1473,6 @@ mod tests {
         store
             .update(|config| {
                 let provider = config.providers.get_mut("official").expect("provider");
-                provider.kind = ProviderKind::OfficialCodex;
                 provider
                     .model_map
                     .insert("gpt-live".to_string(), "gpt-live".to_string());
@@ -1526,12 +1552,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_when_provider_rejects_a_response_item_id_prefix() {
+    async fn falls_back_when_provider_rejects_the_request_as_invalid() {
         let incompatible_hits = Arc::new(AtomicUsize::new(0));
         let compatible_hits = Arc::new(AtomicUsize::new(0));
         let incompatible_url = spawn_mock_server(
             StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"Invalid 'input[154].id': 'item_99fb83474df510b04e475dc5'. Expected an ID that begins with 'ctc'.","type":"invalid_request_error","param":"input[154].id","code":"invalid_value"}}"#,
+            r#"{"error":{"message":"Upstream rejected the request as invalid","type":"invalid_request_error"}}"#,
             Some(incompatible_hits.clone()),
         )
         .await;
@@ -1576,7 +1602,7 @@ mod tests {
             .contains_key("incompatible"));
         let events =
             std::fs::read_to_string(store.data_dir().join("relay/events.jsonl")).expect("events");
-        assert!(events.contains("Expected an ID that begins with 'ctc'"));
+        assert!(events.contains("Upstream rejected the request as invalid"));
         assert!(events.contains("\"kind\":\"fallback\""));
         let request = state
             .api_service
@@ -1592,24 +1618,6 @@ mod tests {
         assert_eq!(request.attempt_log[1].provider_id, "compatible");
         assert_eq!(request.attempt_log[1].route_reason, "fallback");
         assert_eq!(request.attempt_log[1].outcome, "succeeded");
-    }
-
-    #[test]
-    fn recognizes_only_response_item_id_prefix_bad_requests_as_incompatible() {
-        let response_item_error = r#"{"error":{"message":"Invalid 'input[146].id': 'item_13ac92c3844b3c3b87fa512f'. Expected an ID that begins with 'rs'."}}"#;
-
-        assert!(is_upstream_request_incompatibility(
-            StatusCode::BAD_REQUEST,
-            response_item_error
-        ));
-        assert!(!is_upstream_request_incompatibility(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"model is required"}}"#
-        ));
-        assert!(!is_upstream_request_incompatibility(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            response_item_error
-        ));
     }
 
     #[tokio::test]
@@ -1934,6 +1942,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn falls_back_when_successful_response_cannot_be_converted() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let provider_a_url = spawn_sse_mock_server(
+            "data: {\"type\":\"response.completed\"}\n\n",
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_mock_server(
+            StatusCode::OK,
+            r#"{"id":"resp_b","status":"completed","output":[]}"#,
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+        let auth_path = store.data_dir().join("official-a-auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"tokens":{"access_token":"opaque-valid-token"}}"#,
+        )
+        .expect("write auth");
+        store
+            .update(|config| {
+                let provider = config.providers.get_mut("a").expect("provider a");
+                provider.kind = ProviderKind::OfficialCodex;
+                provider.auth_ref = Some(format!("file:{}", auth_path.display()));
+                Ok(())
+            })
+            .expect("configure official provider");
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+
+        let response = proxy_inner(
+            state.clone(),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":false}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("b")
+        );
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+        let request = state
+            .api_service
+            .snapshot(10)
+            .expect("request snapshot")
+            .recent_requests
+            .into_iter()
+            .next()
+            .expect("request log");
+        assert_eq!(request.attempt_log.len(), 2);
+        assert_eq!(request.attempt_log[0].provider_id, "a");
+        assert_eq!(request.attempt_log[0].outcome, "failed");
+        assert_eq!(request.attempt_log[1].provider_id, "b");
+        assert_eq!(request.attempt_log[1].route_reason, "fallback");
+        assert_eq!(request.attempt_log[1].outcome, "succeeded");
+        let events =
+            std::fs::read_to_string(store.data_dir().join("relay/events.jsonl")).expect("events");
+        assert!(events.contains("无法转换为本地协议"));
+        assert!(events.contains("\"kind\":\"fallback\""));
+    }
+
+    #[tokio::test]
     async fn falls_back_when_sse_rate_limit_happens_before_any_output() {
         let provider_a_hits = Arc::new(AtomicUsize::new(0));
         let provider_b_hits = Arc::new(AtomicUsize::new(0));
@@ -1941,8 +2024,7 @@ mod tests {
             concat!(
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\n",
                 "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
-                "\"error\":{\"code\":\"rate_limit_exceeded\",",
-                "\"message\":\"Concurrency limit exceeded for account, please retry later\"}}}\n\n"
+                "\"error\":{\"message\":\"exceeded retry limit, last status: 429 Too Many Requests\"}}}\n\n"
             ),
             Some(provider_a_hits.clone()),
         )

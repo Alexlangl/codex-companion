@@ -42,6 +42,7 @@ futures-util = "0.3"
 flate2 = "1.1"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rquickjs = { version = "0.8", features = ["array-buffer", "classes"] }
 rand = "0.9"
 regex = "1.12"
 rust_decimal = { version = "1.39", default-features = false, features = ["std"] }

@@ -7,7 +7,7 @@ import { currentApplication, userVisibleGroups } from "../../lib/current-applica
 import { getApiRequestLogs } from "../../lib/api";
 import { formatTime } from "../../lib/format";
 import { apiRequestLogsEqual } from "../../lib/log-snapshot";
-import { providerAccountTitle, providerHealthLabel, providerHealthTone, quotaInfo } from "../../lib/provider-display";
+import { hasQuotaInfo, providerAccountTitle, providerHealthLabel, providerHealthTone, quotaInfo } from "../../lib/provider-display";
 import type { ApiRequestLog, BusyState, CompanionStatus, GroupPolicy, GroupUpsert, ProviderConfig } from "../../types/domain";
 
 const GROUP_ROUTE_REFRESH_INTERVAL_MS = 2_000;
@@ -82,16 +82,20 @@ export function Groups(props: GroupsProps) {
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    await onSave({
-      ...form,
-      id: form.id.trim(),
-      name: form.name.trim(),
-      providerOrder: existingProviderIds(form.providerOrder, providers),
-      providerWeights: Object.fromEntries(
-        form.providerOrder.map((providerId) => [providerId, form.providerWeights[providerId] ?? 1]),
-      ),
-    });
-    setOpen(false);
+    try {
+      await onSave({
+        ...form,
+        id: form.id.trim(),
+        name: form.name.trim(),
+        providerOrder: existingProviderIds(form.providerOrder, providers),
+        providerWeights: Object.fromEntries(
+          form.providerOrder.map((providerId) => [providerId, form.providerWeights[providerId] ?? 1]),
+        ),
+      });
+      setOpen(false);
+    } catch {
+      // The controller owns the global error message; keep the editor open for correction.
+    }
   }
 
   function toggleProvider(provider: ProviderConfig, checked: boolean) {
@@ -203,6 +207,7 @@ export function Groups(props: GroupsProps) {
                           const provider = status.config.providers[id];
                           const health = status.config.health[id];
                           const quota = provider ? quotaInfo(provider.account) : null;
+                          const showQuota = quota ? hasQuotaInfo(quota) : false;
                           const canRequestPriorityFailback = isActiveGroup
                             && group.policy === "priority_fallback"
                             && group.fallbackEnabled
@@ -215,7 +220,7 @@ export function Groups(props: GroupsProps) {
                               <span>{index + 1}</span>
                               <div className="group-provider-main">
                                 <strong>{provider ? providerAccountTitle(provider) : id}</strong>
-                                <small>{provider ? groupProviderMeta(provider, quota?.percentLabel) : "账号不存在"}</small>
+                                <small>{provider ? groupProviderMeta(provider, showQuota ? quota?.percentLabel : undefined) : "账号不存在"}</small>
                               </div>
                               <div className="group-provider-badges">
                                 {canRequestPriorityFailback && (
@@ -229,7 +234,7 @@ export function Groups(props: GroupsProps) {
                                   )}
                                 {recentlyUsedProviderId === id ? <Badge tone="accent">最近使用</Badge> : null}
                                 <Badge tone={providerHealthTone(health?.status)}>{providerHealthLabel(health?.status)}</Badge>
-                                {quota ? <Badge tone={quota.tone}>{quota.percentLabel}</Badge> : null}
+                                {showQuota && quota ? <Badge tone={quota.tone}>{quota.percentLabel}</Badge> : null}
                               </div>
                             </div>
                           );
@@ -254,7 +259,13 @@ export function Groups(props: GroupsProps) {
         </div>
       </Panel>
 
-      <Dialog.Root open={open} onOpenChange={setOpen}>
+      <Dialog.Root
+        open={open}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen && disabled) return;
+          setOpen(nextOpen);
+        }}
+      >
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
           <Dialog.Content className="dialog-content group-editor-dialog">
@@ -265,7 +276,7 @@ export function Groups(props: GroupsProps) {
                   按顺序选择账号。启动分组后，自动切换会按这里的优先级执行。
                 </Dialog.Description>
               </div>
-              <Dialog.Close className="icon-button" aria-label="关闭">
+              <Dialog.Close className="icon-button" aria-label="关闭" disabled={disabled}>
                 <X size={16} />
               </Dialog.Close>
             </div>

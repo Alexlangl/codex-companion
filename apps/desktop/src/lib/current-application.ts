@@ -50,7 +50,7 @@ export function currentApplication(status: CompanionStatus): CurrentApplication 
   const codexProviderId =
     modelProvider === "openai" && lastDirectProvider?.kind === "official_codex"
       ? lastDirectProviderId
-      : modelProvider || lastDirectProviderId;
+      : modelProvider;
   if (codexProviderId && codexProviderId !== "codex-companion") {
     const provider = status.config.providers[codexProviderId];
     if (provider) {
@@ -58,7 +58,41 @@ export function currentApplication(status: CompanionStatus): CurrentApplication 
     }
   }
 
+  if (!status.codex.installed) {
+    return {
+      kind: "none",
+      id: "",
+      name: "Codex 未连接 Companion",
+      description: status.codex.message,
+      providers: [],
+    };
+  }
+
   const group = status.activeGroup ?? status.config.groups[status.config.relay.activeGroupId];
+  return groupApplication(status, group);
+}
+
+export function launchApplication(status: CompanionStatus): CurrentApplication {
+  const current = currentApplication(status);
+  if (current.kind !== "none") return current;
+
+  const lastDirectProviderId =
+    status.config.app.lastCodexLaunchMode === "provider_direct"
+      ? status.config.app.lastCodexTargetProviderId?.trim()
+      : "";
+  const lastDirectProvider = lastDirectProviderId ? status.config.providers[lastDirectProviderId] : undefined;
+  if (lastDirectProvider) {
+    return providerApplication(lastDirectProvider, "direct");
+  }
+
+  const group = status.activeGroup ?? status.config.groups[status.config.relay.activeGroupId];
+  return groupApplication(status, group);
+}
+
+function groupApplication(
+  status: CompanionStatus,
+  group: ProviderGroup | null | undefined,
+): CurrentApplication {
   if (!group) {
     return {
       kind: "none",

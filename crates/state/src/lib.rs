@@ -1,3 +1,4 @@
+mod model_catalog;
 mod pricing;
 mod session_index;
 mod token_usage;
@@ -18,13 +19,19 @@ use std::path::{Path, PathBuf};
 use toml_edit::{value, DocumentMut, Item, Table};
 use walkdir::WalkDir;
 
+use model_catalog::{
+    build_model_catalog, managed_model_catalog_path, normalized_model_slugs,
+    MANAGED_MODEL_CATALOG_FILENAME,
+};
+
 const CODEX_STATE_DB_FILENAME: &str = "state_5.sqlite";
 const CODEX_OPENAI_PROVIDER_ID: &str = "openai";
 const CODEX_API_KEY_AUTH_MODE: &str = "apikey";
+const CODEX_CHATGPT_AUTH_MODE: &str = "chatgpt";
 #[cfg(all(target_os = "macos", not(test)))]
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const COMPANION_MARKER_TABLE: &str = "codex_companion";
-const COMPANION_MARKER_VERSION: i64 = 2;
+const COMPANION_MARKER_VERSION: i64 = 3;
 const COMPANION_STATE_RELATIVE_PATH: &str = "backups/codex-companion/managed-state.json";
 const REPAIR_BACKUP_RETENTION: usize = 10;
 
@@ -35,10 +42,28 @@ pub use token_usage::{
     token_usage_sync_status, TokenUsageDateRange, TokenUsageFilters,
 };
 
+pub fn companion_model_catalog_path(codex_dir: &Path) -> PathBuf {
+    managed_model_catalog_path(codex_dir)
+}
+
 #[derive(Debug, Clone, Default)]
 struct SessionMetadata {
     cwd: Option<String>,
     rollout_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexOfficialAuthStatus {
+    pub ready: bool,
+    pub changed: bool,
+    pub source_provider_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompanionRelayInstallOutcome {
+    pub codex: CodexInstallStatus,
+    pub official_auth: CodexOfficialAuthStatus,
+    pub managed_model_catalog: bool,
 }
 
 pub fn install_companion_provider(
@@ -53,53 +78,129 @@ pub fn install_companion_provider_with_token_source(
     relay: &RelayConfig,
     token_source_override: Option<&str>,
 ) -> Result<CodexInstallStatus> {
+    install_companion_provider_with_token_source_and_models(
+        codex_dir,
+        relay,
+        token_source_override,
+        &[],
+    )
+}
+
+pub fn install_companion_provider_with_token_source_and_models(
+    codex_dir: Option<PathBuf>,
+    relay: &RelayConfig,
+    token_source_override: Option<&str>,
+    model_slugs: &[String],
+) -> Result<CodexInstallStatus> {
+    Ok(install_companion_provider_for_relay(
+        codex_dir,
+        relay,
+        token_source_override,
+        model_slugs,
+        None,
+        false,
+    )?
+    .codex)
+}
+
+pub fn install_companion_provider_for_relay(
+    codex_dir: Option<PathBuf>,
+    relay: &RelayConfig,
+    token_source_override: Option<&str>,
+    model_slugs: &[String],
+    official_auth_provider: Option<&ProviderConfig>,
+    require_official_auth: bool,
+) -> Result<CompanionRelayInstallOutcome> {
     let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
     fs::create_dir_all(&codex_dir).map_err(|source| CompanionError::io(&codex_dir, source))?;
-    let config_path = codex_dir.join("config.toml");
-    let current = if config_path.exists() {
-        fs::read_to_string(&config_path)
-            .map_err(|source| CompanionError::io(&config_path, source))?
-    } else {
-        String::new()
-    };
-    let mut doc = current.parse::<DocumentMut>().map_err(|source| {
-        CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
-    })?;
-    let managed_target_provider =
-        load_companion_marker(&codex_dir, &doc).and_then(|marker| marker.target_provider);
-    let auth_rollback = AuthRollback::capture(&codex_dir)?;
-    let mut backup = prepare_config_write(&codex_dir, &config_path, &mut doc)?;
-    restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
-    let auth_shape = detect_codex_auth_shape(&codex_dir)?;
+    let install_snapshot = CodexInstallSnapshot::capture(&codex_dir)?;
+    let install_result = (|| -> Result<CompanionRelayInstallOutcome> {
+        let config_path = codex_dir.join("config.toml");
+        let current = if config_path.exists() {
+            fs::read_to_string(&config_path)
+                .map_err(|source| CompanionError::io(&config_path, source))?
+        } else {
+            String::new()
+        };
+        let mut doc = current.parse::<DocumentMut>().map_err(|source| {
+            CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
+        })?;
+        let managed_target_provider =
+            load_companion_marker(&codex_dir, &doc).and_then(|marker| marker.target_provider);
+        let auth_rollback = AuthRollback::capture(&codex_dir)?;
+        let mut backup = prepare_config_write(&codex_dir, &config_path, &mut doc)?;
+        let official_auth =
+            prepare_relay_official_codex_auth(&codex_dir, &mut backup, official_auth_provider)?;
+        if require_official_auth && !official_auth.ready {
+            return Err(CompanionError::InvalidConfig(
+                "未找到可确定恢复的官方 Codex OAuth：请把官方账号加入当前分组，或只保留一个启用的官方账号"
+                    .to_string(),
+            ));
+        }
+        let auth_shape = detect_codex_auth_shape(&codex_dir)?;
 
-    remove_previous_managed_provider_table(
-        &mut doc,
-        managed_target_provider.as_deref(),
-        COMPANION_PROVIDER_ID,
-    );
-    doc["model_provider"] = value(COMPANION_PROVIDER_ID);
-    let provider_table = ensure_model_provider_table(&mut doc, COMPANION_PROVIDER_ID);
-    provider_table["name"] = value(COMPANION_PROVIDER_NAME);
-    provider_table["base_url"] = value(relay.base_url());
-    provider_table["wire_api"] = value("responses");
-    let marker = companion_marker(
-        &doc,
-        &backup,
-        CompanionInstallKind::Relay,
-        COMPANION_PROVIDER_ID,
-        token_source_override.unwrap_or_else(|| auth_shape.relay_token_source()),
-    );
+        remove_previous_managed_provider_table(
+            &mut doc,
+            managed_target_provider.as_deref(),
+            COMPANION_PROVIDER_ID,
+        );
+        doc["model_provider"] = value(COMPANION_PROVIDER_ID);
+        if official_auth.ready {
+            doc["cli_auth_credentials_store"] = value("file");
+        }
+        let provider_table = ensure_model_provider_table(&mut doc, COMPANION_PROVIDER_ID);
+        provider_table["name"] = value(COMPANION_PROVIDER_NAME);
+        provider_table["base_url"] = value(relay.base_url());
+        provider_table["wire_api"] = value("responses");
+        let model_catalog_rollback = install_managed_model_catalog(
+            &codex_dir,
+            &mut doc,
+            &mut backup,
+            model_slugs,
+            &auth_rollback,
+        )?;
+        let managed_model_catalog = doc
+            .get("model_catalog_json")
+            .and_then(Item::as_str)
+            .is_some_and(|path| managed_model_catalog_pointer(&codex_dir, path));
+        let marker = companion_marker(
+            &doc,
+            &backup,
+            CompanionInstallKind::Relay,
+            COMPANION_PROVIDER_ID,
+            token_source_override.unwrap_or_else(|| auth_shape.relay_token_source()),
+        );
 
-    write_config_and_state_with_auth_rollback(
-        &config_path,
-        &doc,
-        &marker,
-        &auth_rollback,
-        &codex_dir,
-    )?;
-    let mut status = doctor(codex_dir, relay)?;
-    status.message = format!("{}，auth.json 未被本地代理写入", status.message);
-    Ok(status)
+        write_config_and_state_with_auth_rollback(
+            &config_path,
+            &doc,
+            &marker,
+            &auth_rollback,
+            &model_catalog_rollback,
+            &codex_dir,
+        )?;
+        let mut codex = doctor(codex_dir.clone(), relay)?;
+        if official_auth.ready {
+            codex.message = format!("{}，官方 ChatGPT OAuth 已纳入受管 auth.json", codex.message);
+        } else {
+            codex.message = format!("{}，auth.json 未被本地代理写入", codex.message);
+        }
+        Ok(CompanionRelayInstallOutcome {
+            codex,
+            official_auth,
+            managed_model_catalog,
+        })
+    })();
+
+    match install_result {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => match install_snapshot.restore() {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(CompanionError::InvalidConfig(format!(
+                "安装 Codex 本地代理失败: {error}；恢复安装前状态也失败: {rollback_error}"
+            ))),
+        },
+    }
 }
 
 pub fn install_direct_provider(
@@ -181,7 +282,7 @@ pub fn install_direct_provider_with_options(
         match direct_auth {
             DirectAuthMaterial::EnvKey(env_var) => {
                 restored_prior_auth_write =
-                    restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
+                    finish_prior_auth_write_for_config_only(&mut backup, &codex_dir)?;
                 token_source = format!("environment variable {env_var}");
                 provider_table["env_key"] = value(env_var);
                 provider_table["experimental_bearer_token"] = Item::None;
@@ -190,7 +291,7 @@ pub fn install_direct_provider_with_options(
                 provider_table["env_key"] = Item::None;
                 if preserve_api_key_in_config {
                     restored_prior_auth_write =
-                        restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
+                        finish_prior_auth_write_for_config_only(&mut backup, &codex_dir)?;
                     provider_table["experimental_bearer_token"] = value(api_key);
                     token_source = "provider-scoped experimental_bearer_token in Codex config.toml; official ChatGPT OAuth auth.json preserved"
                         .to_string();
@@ -212,7 +313,7 @@ pub fn install_direct_provider_with_options(
             }
             DirectAuthMaterial::None => {
                 restored_prior_auth_write =
-                    restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
+                    finish_prior_auth_write_for_config_only(&mut backup, &codex_dir)?;
                 provider_table["env_key"] = Item::None;
                 provider_table["experimental_bearer_token"] = Item::None;
             }
@@ -221,6 +322,19 @@ pub fn install_direct_provider_with_options(
     if !direct_writes_auth && restored_prior_auth_write {
         token_source.push_str("; any prior Companion auth.json write was restored first");
     }
+    let direct_model_slugs = provider
+        .model_map
+        .keys()
+        .filter(|model| model.as_str() != "default")
+        .cloned()
+        .collect::<Vec<_>>();
+    let model_catalog_rollback = install_managed_model_catalog(
+        &codex_dir,
+        &mut doc,
+        &mut backup,
+        &direct_model_slugs,
+        &auth_rollback,
+    )?;
     let marker = companion_marker(
         &doc,
         &backup,
@@ -234,6 +348,7 @@ pub fn install_direct_provider_with_options(
         &doc,
         &marker,
         &auth_rollback,
+        &model_catalog_rollback,
         &codex_dir,
     )?;
     let auth_shape_after = detect_codex_auth_shape(&codex_dir)?;
@@ -338,6 +453,14 @@ fn resolve_direct_auth(provider: &ProviderConfig) -> Result<DirectAuthMaterial> 
         return Ok(DirectAuthMaterial::ApiKey(api_key));
     }
     Ok(DirectAuthMaterial::None)
+}
+
+pub fn official_codex_auth_is_resolvable(provider: &ProviderConfig) -> bool {
+    matches!(provider.kind, ProviderKind::OfficialCodex)
+        && matches!(
+            resolve_direct_auth(provider),
+            Ok(DirectAuthMaterial::CodexAuth(_))
+        )
 }
 
 fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
@@ -468,6 +591,10 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
     );
 
     let mut auth = serde_json::Map::new();
+    auth.insert(
+        "auth_mode".to_string(),
+        Value::String(CODEX_CHATGPT_AUTH_MODE.to_string()),
+    );
     auth.insert("OPENAI_API_KEY".to_string(), Value::Null);
     auth.insert("tokens".to_string(), Value::Object(tokens));
     insert_optional_json_string(
@@ -481,6 +608,84 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
         pick_first_json_string(&sources, &[&["last_refresh"], &["lastRefresh"]]),
     );
     Some(Value::Object(auth))
+}
+
+fn resolve_official_codex_auth(
+    codex_dir: &Path,
+    source_provider: Option<&ProviderConfig>,
+) -> Result<Option<(Value, Option<String>)>> {
+    fs::create_dir_all(codex_dir).map_err(|source| CompanionError::io(codex_dir, source))?;
+    let auth_path = codex_dir.join("auth.json");
+    let current = if auth_path.exists() {
+        Some(read_json_value(&auth_path)?)
+    } else {
+        None
+    };
+    let normalized_current = current.as_ref().and_then(normalize_codex_oauth_auth);
+    let current_is_pure_chatgpt = current.as_ref().is_some_and(|auth| {
+        classify_codex_auth_shape(auth) == CodexAuthShape::OfficialOAuth
+            && auth.get("auth_mode").and_then(Value::as_str) == Some(CODEX_CHATGPT_AUTH_MODE)
+            && normalized_current.is_some()
+    });
+
+    let (material, source_provider_id) = if current_is_pure_chatgpt {
+        (current.clone().expect("current auth checked above"), None)
+    } else if let Some(provider) = source_provider {
+        if !matches!(provider.kind, ProviderKind::OfficialCodex) {
+            return Err(CompanionError::InvalidConfig(format!(
+                "provider {} 不是官方 Codex OAuth 账号",
+                provider.id
+            )));
+        }
+        let DirectAuthMaterial::CodexAuth(material) = resolve_direct_auth(provider)? else {
+            return Err(CompanionError::InvalidConfig(format!(
+                "官方 Codex 账号 {} 缺少可恢复的 OAuth access_token",
+                provider.name
+            )));
+        };
+        (material, Some(provider.id.clone()))
+    } else if let Some(material) = normalized_current {
+        (material, None)
+    } else {
+        return Ok(None);
+    };
+
+    Ok(Some((material, source_provider_id)))
+}
+
+fn prepare_relay_official_codex_auth(
+    codex_dir: &Path,
+    backup: &mut ManagedConfigBackup,
+    source_provider: Option<&ProviderConfig>,
+) -> Result<CodexOfficialAuthStatus> {
+    let mut resolved = resolve_official_codex_auth(codex_dir, source_provider)?;
+    if resolved.is_none() && backup.auth_write_hash.is_some() {
+        restore_prior_auth_write_if_managed(backup, codex_dir)?;
+        resolved = resolve_official_codex_auth(codex_dir, source_provider)?;
+    }
+    let Some((material, source_provider_id)) = resolved else {
+        finish_prior_auth_write_for_config_only(backup, codex_dir)?;
+        return Ok(CodexOfficialAuthStatus::default());
+    };
+
+    let auth_path = codex_dir.join("auth.json");
+    let current = if auth_path.exists() {
+        Some(read_json_value(&auth_path)?)
+    } else {
+        None
+    };
+    let changed = current.as_ref() != Some(&material);
+    ensure_auth_backup(backup, codex_dir)?;
+    if changed {
+        write_optional_json(&auth_path, Some(&material))?;
+    }
+    record_auth_write(backup, codex_dir)?;
+
+    Ok(CodexOfficialAuthStatus {
+        ready: true,
+        changed,
+        source_provider_id,
+    })
 }
 
 fn write_official_codex_config(doc: &mut DocumentMut, managed_target_provider: Option<&str>) {
@@ -841,9 +1046,11 @@ pub struct CodexInstallSnapshot {
     config_path: PathBuf,
     auth_path: PathBuf,
     state_path: PathBuf,
+    model_catalog_path: PathBuf,
     config: ConfigRollback,
     auth: ConfigRollback,
     state: ConfigRollback,
+    model_catalog: ConfigRollback,
 }
 
 impl CodexInstallSnapshot {
@@ -851,13 +1058,16 @@ impl CodexInstallSnapshot {
         let config_path = codex_dir.join("config.toml");
         let auth_path = codex_dir.join("auth.json");
         let state_path = companion_state_path(codex_dir);
+        let model_catalog_path = managed_model_catalog_path(codex_dir);
         Ok(Self {
             config: ConfigRollback::capture(&config_path)?,
             auth: ConfigRollback::capture(&auth_path)?,
             state: ConfigRollback::capture(&state_path)?,
+            model_catalog: ConfigRollback::capture(&model_catalog_path)?,
             config_path,
             auth_path,
             state_path,
+            model_catalog_path,
         })
     }
 
@@ -867,6 +1077,10 @@ impl CodexInstallSnapshot {
             ("config.toml", self.config.restore(&self.config_path)),
             ("auth.json", self.auth.restore(&self.auth_path)),
             ("managed-state.json", self.state.restore(&self.state_path)),
+            (
+                MANAGED_MODEL_CATALOG_FILENAME,
+                self.model_catalog.restore(&self.model_catalog_path),
+            ),
         ] {
             if let Err(error) = result {
                 errors.push(format!("{label}: {error}"));
@@ -888,11 +1102,14 @@ struct ManagedConfigBackup {
     backup_root: String,
     config_backup: Option<String>,
     auth_backup: Option<String>,
+    model_catalog_backup: Option<String>,
     previous_config_exists: bool,
     previous_auth_exists: bool,
+    previous_model_catalog_exists: bool,
     previous_model_provider: Option<String>,
     auth_write_hash: Option<String>,
     auth_write_snapshot: Option<String>,
+    model_catalog_write_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -903,8 +1120,10 @@ struct CompanionConfigMarker {
     backup_root: Option<String>,
     config_backup: Option<String>,
     auth_backup: Option<String>,
+    model_catalog_backup: Option<String>,
     previous_config_exists: bool,
     previous_auth_exists: bool,
+    previous_model_catalog_exists: bool,
     previous_model_provider: Option<String>,
     target_provider: Option<String>,
     install_kind: Option<String>,
@@ -912,6 +1131,7 @@ struct CompanionConfigMarker {
     config_hash: Option<String>,
     auth_write_hash: Option<String>,
     auth_write_snapshot: Option<String>,
+    model_catalog_write_hash: Option<String>,
 }
 
 impl CompanionConfigMarker {
@@ -945,6 +1165,10 @@ impl CompanionConfigMarker {
                 .get("auth_backup")
                 .and_then(Item::as_str)
                 .map(ToOwned::to_owned),
+            model_catalog_backup: marker
+                .get("model_catalog_backup")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
             previous_config_exists: marker
                 .get("previous_config_exists")
                 .and_then(Item::as_bool)
@@ -953,6 +1177,10 @@ impl CompanionConfigMarker {
                 .get("previous_auth_exists")
                 .and_then(Item::as_bool)
                 .unwrap_or(true),
+            previous_model_catalog_exists: marker
+                .get("previous_model_catalog_exists")
+                .and_then(Item::as_bool)
+                .unwrap_or(false),
             previous_model_provider: marker
                 .get("previous_model_provider")
                 .and_then(Item::as_str)
@@ -979,6 +1207,10 @@ impl CompanionConfigMarker {
                 .map(ToOwned::to_owned),
             auth_write_snapshot: marker
                 .get("auth_write_snapshot")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            model_catalog_write_hash: marker
+                .get("model_catalog_write_hash")
                 .and_then(Item::as_str)
                 .map(ToOwned::to_owned),
         })
@@ -1037,11 +1269,14 @@ fn prepare_config_write(
                 backup_root,
                 config_backup: marker.config_backup,
                 auth_backup: marker.auth_backup,
+                model_catalog_backup: marker.model_catalog_backup,
                 previous_config_exists: marker.previous_config_exists,
                 previous_auth_exists: marker.previous_auth_exists,
+                previous_model_catalog_exists: marker.previous_model_catalog_exists,
                 previous_model_provider: marker.previous_model_provider,
                 auth_write_hash: marker.auth_write_hash,
                 auth_write_snapshot: marker.auth_write_snapshot,
+                model_catalog_write_hash: marker.model_catalog_write_hash,
             });
         }
     }
@@ -1060,14 +1295,17 @@ fn prepare_config_write(
         backup_root: path_relative_to_codex_dir(&backup_root, codex_dir),
         config_backup,
         auth_backup: None,
+        model_catalog_backup: None,
         previous_config_exists: config_path.exists(),
         previous_auth_exists: false,
+        previous_model_catalog_exists: false,
         previous_model_provider: doc
             .get("model_provider")
             .and_then(Item::as_str)
             .map(ToOwned::to_owned),
         auth_write_hash: None,
         auth_write_snapshot: None,
+        model_catalog_write_hash: None,
     })
 }
 
@@ -1097,6 +1335,74 @@ fn record_auth_write(backup: &mut ManagedConfigBackup, codex_dir: &Path) -> Resu
     Ok(())
 }
 
+fn install_managed_model_catalog(
+    codex_dir: &Path,
+    doc: &mut DocumentMut,
+    backup: &mut ManagedConfigBackup,
+    requested_models: &[String],
+    auth_rollback: &AuthRollback,
+) -> Result<ConfigRollback> {
+    let catalog_path = managed_model_catalog_path(codex_dir);
+    let catalog_rollback = match ConfigRollback::capture(&catalog_path) {
+        Ok(rollback) => rollback,
+        Err(error) => {
+            return match auth_rollback.restore(codex_dir) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(CompanionError::InvalidConfig(format!(
+                    "准备 Codex 模型目录失败: {error}；恢复 auth.json 也失败: {rollback_error}"
+                ))),
+            };
+        }
+    };
+
+    let result = (|| -> Result<()> {
+        let catalog_pointer_is_claimable = match doc.get("model_catalog_json") {
+            None => true,
+            Some(item) => item
+                .as_str()
+                .is_some_and(|path| managed_model_catalog_pointer(codex_dir, path)),
+        };
+        if !catalog_pointer_is_claimable {
+            return Ok(());
+        }
+
+        if let Some(expected_hash) = backup.model_catalog_write_hash.as_deref() {
+            if catalog_path.is_file() && hash_file(&catalog_path)? != expected_hash {
+                let changed_backup_root = create_backup_root(codex_dir)?;
+                backup_file(&catalog_path, &changed_backup_root, codex_dir)?;
+            }
+        } else {
+            backup.previous_model_catalog_exists = catalog_path.is_file();
+            if backup.previous_model_catalog_exists {
+                let backup_root = codex_dir.join(&backup.backup_root);
+                backup.model_catalog_backup =
+                    backup_file_to_root(&catalog_path, &backup_root, codex_dir)?;
+            }
+        }
+
+        let configured_model = doc.get("model").and_then(Item::as_str);
+        let models = normalized_model_slugs(requested_models, configured_model);
+        let catalog = build_model_catalog(codex_dir, &models)?;
+        atomic_write_private_file(&catalog_path, &catalog)?;
+        backup.model_catalog_write_hash = Some(hash_file(&catalog_path)?);
+        doc["model_catalog_json"] = value(MANAGED_MODEL_CATALOG_FILENAME);
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let catalog_error = catalog_rollback.restore(&catalog_path).err();
+        let auth_error = auth_rollback.restore(codex_dir).err();
+        if let Some(rollback_error) = catalog_error.or(auth_error) {
+            return Err(CompanionError::InvalidConfig(format!(
+                "生成 Codex 模型目录失败: {error}；回滚安装状态也失败: {rollback_error}"
+            )));
+        }
+        return Err(error);
+    }
+
+    Ok(catalog_rollback)
+}
+
 fn restore_prior_auth_write_if_managed(
     backup: &mut ManagedConfigBackup,
     codex_dir: &Path,
@@ -1117,6 +1423,73 @@ fn restore_prior_auth_write_if_managed(
     backup.auth_write_hash = None;
     backup.auth_write_snapshot = None;
     Ok(true)
+}
+
+fn finish_prior_auth_write_for_config_only(
+    backup: &mut ManagedConfigBackup,
+    codex_dir: &Path,
+) -> Result<bool> {
+    if backup.auth_write_hash.is_some()
+        && codex_auth_has_official_credentials(codex_dir)?
+        && !codex_auth_has_api_key(codex_dir)?
+    {
+        let auth_path = codex_dir.join("auth.json");
+        backup.auth_backup = None;
+        backup.previous_auth_exists = auth_path.exists();
+        backup.auth_write_hash = None;
+        backup.auth_write_snapshot = None;
+        return Ok(false);
+    }
+    restore_prior_auth_write_if_managed(backup, codex_dir)
+}
+
+fn codex_auth_has_api_key(codex_dir: &Path) -> Result<bool> {
+    let auth_path = codex_dir.join("auth.json");
+    if !auth_path.exists() {
+        return Ok(false);
+    }
+    let auth = read_json_value(&auth_path)?;
+    Ok(auth
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty()))
+}
+
+fn codex_auth_has_official_credentials(codex_dir: &Path) -> Result<bool> {
+    let auth_path = codex_dir.join("auth.json");
+    if !auth_path.exists() {
+        return Ok(false);
+    }
+    let auth = read_json_value(&auth_path)?;
+    let null = Value::Null;
+    let candidate = oauth_account_candidate(&auth);
+    let tokens = candidate
+        .get("tokens")
+        .or_else(|| auth.get("tokens"))
+        .unwrap_or(&null);
+    let credentials = candidate
+        .get("credentials")
+        .or_else(|| auth.get("credentials"))
+        .unwrap_or(&null);
+    let auth_source = auth.get("auth").unwrap_or(&null);
+    Ok(pick_first_json_string(
+        &[tokens, credentials, auth_source, candidate, &auth],
+        &[
+            &["refresh_token"],
+            &["refreshToken"],
+            &["access_token"],
+            &["accessToken"],
+            &["id_token"],
+            &["idToken"],
+            &["session_token"],
+            &["sessionToken"],
+            &["credentials", "refresh_token"],
+            &["credentials", "access_token"],
+            &["tokens", "refresh_token"],
+            &["tokens", "access_token"],
+        ],
+    )
+    .is_some())
 }
 
 fn restore_managed_auth(
@@ -1261,8 +1634,10 @@ fn companion_marker(
         backup_root: Some(backup.backup_root.clone()),
         config_backup: backup.config_backup.clone(),
         auth_backup: backup.auth_backup.clone(),
+        model_catalog_backup: backup.model_catalog_backup.clone(),
         previous_config_exists: backup.previous_config_exists,
         previous_auth_exists: backup.previous_auth_exists,
+        previous_model_catalog_exists: backup.previous_model_catalog_exists,
         previous_model_provider: backup.previous_model_provider.clone(),
         target_provider: Some(target_provider.to_string()),
         install_kind: Some(install_kind.as_str().to_string()),
@@ -1270,6 +1645,7 @@ fn companion_marker(
         config_hash: Some(config_doc_hash(doc)),
         auth_write_hash: backup.auth_write_hash.clone(),
         auth_write_snapshot: backup.auth_write_snapshot.clone(),
+        model_catalog_write_hash: backup.model_catalog_write_hash.clone(),
     }
 }
 
@@ -1446,7 +1822,21 @@ pub fn uninstall_companion_provider(codex_dir: Option<PathBuf>) -> Result<CodexI
     let config_path = codex_dir.join("config.toml");
     if !config_path.exists() {
         if let Some(marker) = read_companion_state(&codex_dir) {
-            restore_auth_from_marker(&codex_dir, &marker)?;
+            let auth_rollback = AuthRollback::capture(&codex_dir)?;
+            let catalog_path = managed_model_catalog_path(&codex_dir);
+            let catalog_rollback = ConfigRollback::capture(&catalog_path)?;
+            if let Err(error) = restore_auth_from_marker(&codex_dir, &marker)
+                .and_then(|_| restore_model_catalog_from_marker(&codex_dir, &marker))
+            {
+                let auth_error = auth_rollback.restore(&codex_dir).err();
+                let catalog_error = catalog_rollback.restore(&catalog_path).err();
+                if let Some(rollback_error) = auth_error.or(catalog_error) {
+                    return Err(CompanionError::InvalidConfig(format!(
+                        "卸载恢复失败: {error}；回滚卸载状态也失败: {rollback_error}"
+                    )));
+                }
+                return Err(error);
+            }
             remove_companion_state(&codex_dir)?;
         }
         return doctor(codex_dir, &RelayConfig::default());
@@ -1503,16 +1893,22 @@ fn restore_managed_install(
 ) -> Result<()> {
     let config_rollback = ConfigRollback::capture(config_path)?;
     let auth_rollback = AuthRollback::capture(codex_dir)?;
-    restore_changed_config_from_marker(codex_dir, config_path, marker, current_doc)?;
-    if let Err(auth_error) = restore_auth_from_marker(codex_dir, marker) {
-        let config_restore = config_rollback.restore(config_path);
-        let auth_restore = auth_rollback.restore(codex_dir);
-        if let Err(rollback_error) = config_restore.and(auth_restore) {
+    let catalog_path = managed_model_catalog_path(codex_dir);
+    let catalog_rollback = ConfigRollback::capture(&catalog_path)?;
+    let restore_result =
+        restore_changed_config_from_marker(codex_dir, config_path, marker, current_doc)
+            .and_then(|_| restore_auth_from_marker(codex_dir, marker))
+            .and_then(|_| restore_model_catalog_from_marker(codex_dir, marker));
+    if let Err(error) = restore_result {
+        let config_error = config_rollback.restore(config_path).err();
+        let auth_error = auth_rollback.restore(codex_dir).err();
+        let catalog_error = catalog_rollback.restore(&catalog_path).err();
+        if let Some(rollback_error) = config_error.or(auth_error).or(catalog_error) {
             return Err(CompanionError::InvalidConfig(format!(
-                "卸载已恢复 config.toml 但恢复 auth.json 失败: {auth_error}；尝试回滚卸载状态也失败: {rollback_error}"
+                "卸载恢复失败: {error}；尝试回滚卸载状态也失败: {rollback_error}"
             )));
         }
-        return Err(auth_error);
+        return Err(error);
     }
     Ok(())
 }
@@ -1558,6 +1954,36 @@ fn restore_changed_config_from_marker(
             .and_then(|doc| doc.get("openai_base_url"))
         {
             current_doc["openai_base_url"] = original_base_url.clone();
+        }
+    }
+    let managed_catalog_is_live = current_doc
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .is_some_and(|path| managed_model_catalog_pointer(codex_dir, path));
+    if managed_catalog_is_live {
+        if let Some(original_catalog) = original_doc
+            .as_ref()
+            .and_then(|doc| doc.get("model_catalog_json"))
+        {
+            current_doc["model_catalog_json"] = original_catalog.clone();
+        } else {
+            current_doc.as_table_mut().remove("model_catalog_json");
+        }
+    }
+    let managed_file_auth_store = current_doc
+        .get("cli_auth_credentials_store")
+        .and_then(Item::as_str)
+        == Some("file");
+    if managed_file_auth_store {
+        if let Some(original_auth_store) = original_doc
+            .as_ref()
+            .and_then(|doc| doc.get("cli_auth_credentials_store"))
+        {
+            current_doc["cli_auth_credentials_store"] = original_auth_store.clone();
+        } else {
+            current_doc
+                .as_table_mut()
+                .remove("cli_auth_credentials_store");
         }
     }
     current_doc.as_table_mut().remove(COMPANION_MARKER_TABLE);
@@ -1640,6 +2066,39 @@ fn restore_auth_from_marker(codex_dir: &Path, marker: &CompanionConfigMarker) ->
         expected_hash,
         marker.auth_write_snapshot.as_deref(),
     )
+}
+
+fn restore_model_catalog_from_marker(
+    codex_dir: &Path,
+    marker: &CompanionConfigMarker,
+) -> Result<()> {
+    let Some(expected_hash) = marker.model_catalog_write_hash.as_deref() else {
+        return Ok(());
+    };
+    let catalog_path = managed_model_catalog_path(codex_dir);
+    if !catalog_path.is_file() {
+        return Ok(());
+    }
+    if hash_file(&catalog_path)? != expected_hash {
+        let changed_backup_root = create_backup_root(codex_dir)?;
+        backup_file(&catalog_path, &changed_backup_root, codex_dir)?;
+        return Ok(());
+    }
+    if marker.previous_model_catalog_exists {
+        if let Some(backup_path) = marker
+            .model_catalog_backup
+            .as_deref()
+            .map(|path| resolve_codex_relative(codex_dir, path))
+            .filter(|path| path.is_file())
+        {
+            fs::copy(&backup_path, &catalog_path)
+                .map_err(|source| CompanionError::io(&backup_path, source))?;
+        }
+    } else {
+        fs::remove_file(&catalog_path)
+            .map_err(|source| CompanionError::io(&catalog_path, source))?;
+    }
+    Ok(())
 }
 
 pub fn doctor(codex_dir: PathBuf, relay: &RelayConfig) -> Result<CodexInstallStatus> {
@@ -2623,21 +3082,60 @@ fn resolve_codex_relative(codex_dir: &Path, path: &str) -> PathBuf {
     }
 }
 
+fn managed_model_catalog_pointer(codex_dir: &Path, value: &str) -> bool {
+    let pointer = Path::new(value);
+    pointer == Path::new(MANAGED_MODEL_CATALOG_FILENAME)
+        || (pointer.is_absolute() && pointer == managed_model_catalog_path(codex_dir))
+}
+
 fn write_config_and_state_with_auth_rollback(
     config_path: &Path,
     doc: &DocumentMut,
     marker: &CompanionConfigMarker,
     auth_rollback: &AuthRollback,
+    model_catalog_rollback: &ConfigRollback,
     codex_dir: &Path,
 ) -> Result<()> {
-    let config_rollback = ConfigRollback::capture(config_path)?;
+    let config_rollback = match ConfigRollback::capture(config_path) {
+        Ok(rollback) => rollback,
+        Err(error) => {
+            let auth_error = auth_rollback.restore(codex_dir).err();
+            let catalog_error = model_catalog_rollback
+                .restore(&managed_model_catalog_path(codex_dir))
+                .err();
+            if let Some(rollback_error) = auth_error.or(catalog_error) {
+                return Err(CompanionError::InvalidConfig(format!(
+                    "准备写入 Codex 配置失败: {error}；回滚安装状态也失败: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+    };
     let state_path = companion_state_path(codex_dir);
-    let state_rollback = ConfigRollback::capture(&state_path)?;
+    let state_rollback = match ConfigRollback::capture(&state_path) {
+        Ok(rollback) => rollback,
+        Err(error) => {
+            let auth_error = auth_rollback.restore(codex_dir).err();
+            let catalog_error = model_catalog_rollback
+                .restore(&managed_model_catalog_path(codex_dir))
+                .err();
+            if let Some(rollback_error) = auth_error.or(catalog_error) {
+                return Err(CompanionError::InvalidConfig(format!(
+                    "准备写入 Companion 管理状态失败: {error}；回滚安装状态也失败: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+    };
     if let Err(source) = fs::write(config_path, doc.to_string()) {
         let write_error = CompanionError::io(config_path, source);
-        if let Err(rollback_error) = auth_rollback.restore(codex_dir) {
+        let auth_error = auth_rollback.restore(codex_dir).err();
+        let catalog_error = model_catalog_rollback
+            .restore(&managed_model_catalog_path(codex_dir))
+            .err();
+        if let Some(rollback_error) = auth_error.or(catalog_error) {
             return Err(CompanionError::InvalidConfig(format!(
-                "写入 Codex config.toml 失败: {write_error}；尝试恢复 auth.json 也失败: {rollback_error}"
+                "写入 Codex config.toml 失败: {write_error}；回滚安装状态也失败: {rollback_error}"
             )));
         }
         return Err(write_error);
@@ -2646,7 +3144,14 @@ fn write_config_and_state_with_auth_rollback(
         let config_error = config_rollback.restore(config_path).err();
         let auth_error = auth_rollback.restore(codex_dir).err();
         let state_error = state_rollback.restore(&state_path).err();
-        if let Some(rollback_error) = config_error.or(auth_error).or(state_error) {
+        let catalog_error = model_catalog_rollback
+            .restore(&managed_model_catalog_path(codex_dir))
+            .err();
+        if let Some(rollback_error) = config_error
+            .or(auth_error)
+            .or(state_error)
+            .or(catalog_error)
+        {
             return Err(CompanionError::InvalidConfig(format!(
                 "写入 Companion 管理状态失败: {write_error}；回滚配置时也失败: {rollback_error}"
             )));
@@ -2680,14 +3185,33 @@ mod tests {
         }
     }
 
+    fn official_provider(auth_path: &Path) -> ProviderConfig {
+        ProviderConfig {
+            id: "official-account".to_string(),
+            name: "Official Account".to_string(),
+            kind: ProviderKind::OfficialCodex,
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            websocket_url: None,
+            auth_ref: Some(format!("file:{}", auth_path.display())),
+            direct_auth_ref: None,
+            model_map: Default::default(),
+            priority: 50,
+            enabled: true,
+            refresh_interval_seconds: codex_companion_core::default_refresh_interval_seconds(),
+            account: None,
+        }
+    }
+
     #[test]
     fn codex_install_snapshot_restores_config_auth_and_managed_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("config.toml");
         let auth_path = temp.path().join("auth.json");
         let state_path = companion_state_path(temp.path());
+        let model_catalog_path = managed_model_catalog_path(temp.path());
         fs::write(&config_path, "model_provider = \"openai\"\n").expect("config");
         fs::write(&auth_path, b"original-auth").expect("auth");
+        fs::write(&model_catalog_path, b"original-catalog").expect("catalog");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2698,6 +3222,7 @@ mod tests {
 
         fs::write(&config_path, "model_provider = \"codex-companion\"\n").expect("new config");
         fs::write(&auth_path, b"changed-auth").expect("new auth");
+        fs::write(&model_catalog_path, b"changed-catalog").expect("new catalog");
         fs::create_dir_all(state_path.parent().expect("state parent")).expect("state dir");
         fs::write(&state_path, b"managed-state").expect("state");
 
@@ -2710,6 +3235,10 @@ mod tests {
         assert_eq!(
             fs::read(auth_path).expect("restored auth"),
             b"original-auth"
+        );
+        assert_eq!(
+            fs::read(model_catalog_path).expect("restored catalog"),
+            b"original-catalog"
         );
         #[cfg(unix)]
         {
@@ -2745,15 +3274,19 @@ mod tests {
         doc[COMPANION_MARKER_TABLE]["previous_config_exists"] =
             value(marker.previous_config_exists);
         doc[COMPANION_MARKER_TABLE]["previous_auth_exists"] = value(marker.previous_auth_exists);
+        doc[COMPANION_MARKER_TABLE]["previous_model_catalog_exists"] =
+            value(marker.previous_model_catalog_exists);
         for (key, field) in [
             ("config_backup", marker.config_backup),
             ("auth_backup", marker.auth_backup),
+            ("model_catalog_backup", marker.model_catalog_backup),
             ("previous_model_provider", marker.previous_model_provider),
             ("target_provider", marker.target_provider),
             ("install_kind", marker.install_kind),
             ("token_source", marker.token_source),
             ("auth_write_hash", marker.auth_write_hash),
             ("auth_write_snapshot", marker.auth_write_snapshot),
+            ("model_catalog_write_hash", marker.model_catalog_write_hash),
             ("written_at", marker.written_at),
         ] {
             if let Some(field) = field {
@@ -2777,6 +3310,132 @@ mod tests {
         assert!(text.contains("model_provider = \"codex-companion\""));
         assert!(text.contains("name = \"本地代理\""));
         assert!(text.contains("base_url = \"http://127.0.0.1:17687/v1\""));
+        assert!(text.contains("model_catalog_json = \"codex-companion-model-catalog.json\""));
+        let catalog = read_json_value(&managed_model_catalog_path(temp.path()))
+            .expect("managed model catalog");
+        assert_eq!(catalog["models"][0]["slug"], "gpt-5.6-sol");
+        assert!(catalog["models"][0]["supported_reasoning_levels"]
+            .as_array()
+            .expect("reasoning levels")
+            .iter()
+            .any(|level| level["effort"] == "ultra"));
+    }
+
+    #[test]
+    fn uninstall_restores_previous_model_catalog_pointer_and_contents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let catalog_path = managed_model_catalog_path(temp.path());
+        fs::write(&catalog_path, b"user-catalog").expect("user catalog");
+        fs::write(
+            temp.path().join("config.toml"),
+            format!(
+                "model_provider = \"openai\"\nmodel_catalog_json = \"{}\"\n",
+                MANAGED_MODEL_CATALOG_FILENAME
+            ),
+        )
+        .expect("config");
+
+        let outcome = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            None,
+            false,
+        )
+        .expect("install");
+        assert!(outcome.managed_model_catalog);
+        assert_ne!(
+            fs::read(&catalog_path).expect("managed catalog"),
+            b"user-catalog"
+        );
+
+        uninstall_companion_provider(Some(temp.path().to_path_buf())).expect("uninstall");
+
+        assert_eq!(
+            fs::read(&catalog_path).expect("restored catalog"),
+            b"user-catalog"
+        );
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains(&format!(
+            "model_catalog_json = \"{}\"",
+            MANAGED_MODEL_CATALOG_FILENAME
+        )));
+    }
+
+    #[test]
+    fn install_preserves_user_owned_model_catalog() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let user_catalog_path = temp.path().join("my-model-catalog.json");
+        fs::write(&user_catalog_path, b"user-catalog").expect("user catalog");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\nmodel_catalog_json = \"my-model-catalog.json\"\n",
+        )
+        .expect("config");
+
+        let outcome = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            None,
+            false,
+        )
+        .expect("install");
+        assert!(!outcome.managed_model_catalog);
+
+        let installed = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(installed.contains("model_catalog_json = \"my-model-catalog.json\""));
+        assert_eq!(
+            fs::read(&user_catalog_path).expect("user catalog"),
+            b"user-catalog"
+        );
+        assert!(!managed_model_catalog_path(temp.path()).exists());
+
+        uninstall_companion_provider(Some(temp.path().to_path_buf())).expect("uninstall");
+
+        let restored = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(restored.contains("model_catalog_json = \"my-model-catalog.json\""));
+        assert_eq!(
+            fs::read(&user_catalog_path).expect("user catalog"),
+            b"user-catalog"
+        );
+    }
+
+    #[test]
+    fn install_preserves_user_catalog_with_managed_filename_in_a_subdirectory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let custom_dir = temp.path().join("custom");
+        fs::create_dir_all(&custom_dir).expect("custom directory");
+        let user_catalog_path = custom_dir.join(MANAGED_MODEL_CATALOG_FILENAME);
+        fs::write(&user_catalog_path, b"user-catalog").expect("user catalog");
+        let pointer = format!("custom/{MANAGED_MODEL_CATALOG_FILENAME}");
+        fs::write(
+            temp.path().join("config.toml"),
+            format!("model_provider = \"openai\"\nmodel_catalog_json = \"{pointer}\"\n"),
+        )
+        .expect("config");
+
+        install_companion_provider(Some(temp.path().to_path_buf()), &RelayConfig::default())
+            .expect("install");
+
+        let installed = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(installed.contains(&format!("model_catalog_json = \"{pointer}\"")));
+        assert_eq!(
+            fs::read(&user_catalog_path).expect("user catalog"),
+            b"user-catalog"
+        );
+        assert!(!managed_model_catalog_path(temp.path()).exists());
+
+        uninstall_companion_provider(Some(temp.path().to_path_buf())).expect("uninstall");
+
+        let restored = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(restored.contains(&format!("model_catalog_json = \"{pointer}\"")));
+        assert_eq!(
+            fs::read(&user_catalog_path).expect("user catalog"),
+            b"user-catalog"
+        );
     }
 
     #[test]
@@ -3064,6 +3723,319 @@ mod tests {
     }
 
     #[test]
+    fn preserved_third_party_after_official_direct_keeps_official_oauth_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-before-official"}"#,
+        )
+        .expect("initial auth");
+        let official_auth_path = temp.path().join("official-auth.json");
+        fs::write(
+            &official_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "official-access",
+                    "refresh_token": "official-refresh",
+                    "chatgpt_account_id": "official-account-id"
+                }
+            })
+            .to_string(),
+        )
+        .expect("official auth");
+        install_direct_provider(
+            Some(temp.path().to_path_buf()),
+            &official_provider(&official_auth_path),
+        )
+        .expect("activate official account");
+        let official_live_auth = fs::read(temp.path().join("auth.json")).expect("live oauth");
+
+        let third_party_auth_path = temp.path().join("third-party-auth.json");
+        fs::write(&third_party_auth_path, r#"{"api_key":"sk-third-party"}"#)
+            .expect("third-party auth");
+        let third_party = api_key_provider(
+            Some(format!("file:{}", third_party_auth_path.display())),
+            None,
+        );
+        install_direct_provider_with_options(
+            Some(temp.path().to_path_buf()),
+            &third_party,
+            DirectInstallOptions {
+                preserve_official_codex_auth: true,
+            },
+        )
+        .expect("activate preserved third-party provider");
+
+        assert_eq!(
+            fs::read(temp.path().join("auth.json")).expect("preserved oauth"),
+            official_live_auth
+        );
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(
+            config.contains("model_provider = \"openrouter\""),
+            "{config}"
+        );
+        assert!(
+            config.contains("experimental_bearer_token = \"sk-third-party\""),
+            "{config}"
+        );
+    }
+
+    #[test]
+    fn relay_after_official_direct_keeps_official_oauth_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-before-official"}"#,
+        )
+        .expect("initial auth");
+        let official_auth_path = temp.path().join("official-auth.json");
+        fs::write(
+            &official_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "official-access",
+                    "refresh_token": "official-refresh",
+                    "chatgpt_account_id": "official-account-id"
+                }
+            })
+            .to_string(),
+        )
+        .expect("official auth");
+        install_direct_provider(
+            Some(temp.path().to_path_buf()),
+            &official_provider(&official_auth_path),
+        )
+        .expect("activate official account");
+        let official_live_auth = fs::read(temp.path().join("auth.json")).expect("live oauth");
+
+        install_companion_provider(Some(temp.path().to_path_buf()), &RelayConfig::default())
+            .expect("activate relay");
+
+        assert_eq!(
+            fs::read(temp.path().join("auth.json")).expect("preserved oauth"),
+            official_live_auth
+        );
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(
+            config.contains("model_provider = \"codex-companion\""),
+            "{config}"
+        );
+    }
+
+    #[test]
+    fn official_direct_clears_stale_api_key_auth_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-before-official"}"#,
+        )
+        .expect("initial auth");
+        let official_auth_path = temp.path().join("official-auth.json");
+        fs::write(
+            &official_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "official-access",
+                    "refresh_token": "official-refresh"
+                }
+            })
+            .to_string(),
+        )
+        .expect("official auth");
+
+        install_direct_provider(
+            Some(temp.path().to_path_buf()),
+            &official_provider(&official_auth_path),
+        )
+        .expect("activate official account");
+
+        let auth = read_json_value(&temp.path().join("auth.json")).expect("live oauth");
+        assert_eq!(auth["auth_mode"], CODEX_CHATGPT_AUTH_MODE, "{auth}");
+        assert_eq!(auth["OPENAI_API_KEY"], Value::Null);
+        assert_eq!(auth["tokens"]["access_token"], "official-access");
+    }
+
+    #[test]
+    fn relay_auth_restore_is_repeatable_and_uninstall_restores_api_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\ncli_auth_credentials_store = \"keyring\"\n",
+        )
+        .expect("initial config");
+        let original_auth = serde_json::json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "sk-third-party"
+        });
+        fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec_pretty(&original_auth).expect("serialize auth"),
+        )
+        .expect("api key auth");
+        let official_auth_path = temp.path().join("official-auth.json");
+        fs::write(
+            &official_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "official-access",
+                    "refresh_token": "official-refresh",
+                    "chatgpt_account_id": "official-account-id"
+                }
+            })
+            .to_string(),
+        )
+        .expect("official auth");
+        let provider = official_provider(&official_auth_path);
+
+        let outcome = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            Some(&provider),
+            false,
+        )
+        .expect("restore official OAuth");
+        let status = outcome.official_auth;
+
+        assert!(status.ready);
+        assert!(status.changed);
+        assert_eq!(
+            status.source_provider_id.as_deref(),
+            Some("official-account")
+        );
+        let auth = read_json_value(&temp.path().join("auth.json")).expect("live auth");
+        assert_eq!(auth["auth_mode"], CODEX_CHATGPT_AUTH_MODE);
+        assert_eq!(auth["OPENAI_API_KEY"], Value::Null);
+        assert_eq!(auth["tokens"]["access_token"], "official-access");
+        assert_eq!(auth["tokens"]["refresh_token"], "official-refresh");
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains("cli_auth_credentials_store = \"file\""));
+
+        let repeated = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            Some(&provider),
+            false,
+        )
+        .expect("repeat relay install");
+        assert!(repeated.official_auth.ready);
+        assert!(!repeated.official_auth.changed);
+
+        uninstall_companion_provider(Some(temp.path().to_path_buf())).expect("uninstall relay");
+        assert_eq!(
+            read_json_value(&temp.path().join("auth.json")).expect("restored auth"),
+            original_auth
+        );
+        let restored_config = fs::read_to_string(temp.path().join("config.toml"))
+            .expect("restored config")
+            .parse::<DocumentMut>()
+            .expect("restored config toml");
+        assert_eq!(
+            restored_config
+                .get("cli_auth_credentials_store")
+                .and_then(Item::as_str),
+            Some("keyring")
+        );
+    }
+
+    #[test]
+    fn relay_auth_restore_keeps_existing_pure_chatgpt_login() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "access_token": "current-access",
+                "refresh_token": "current-refresh"
+            },
+            "last_refresh": "2026-08-06T00:00:00Z"
+        });
+        fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec_pretty(&auth).expect("serialize auth"),
+        )
+        .expect("auth");
+
+        let outcome = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            None,
+            false,
+        )
+        .expect("keep current official OAuth");
+        let status = outcome.official_auth;
+
+        assert!(status.ready);
+        assert!(!status.changed);
+        assert_eq!(
+            read_json_value(&temp.path().join("auth.json")).expect("live auth"),
+            auth
+        );
+    }
+
+    #[test]
+    fn relay_auth_restore_reports_unavailable_without_a_deterministic_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-third-party"}"#,
+        )
+        .expect("api key auth");
+
+        let outcome = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            None,
+            false,
+        )
+        .expect("inspect auth");
+        let status = outcome.official_auth;
+
+        assert_eq!(status, CodexOfficialAuthStatus::default());
+        let auth = read_json_value(&temp.path().join("auth.json")).expect("live auth");
+        assert_eq!(auth["auth_mode"], "apikey");
+    }
+
+    #[test]
+    fn required_relay_oauth_failure_restores_entire_install_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original_config = "model_provider = \"openai\"\n";
+        let original_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-third-party"}"#;
+        fs::write(temp.path().join("config.toml"), original_config).expect("config");
+        fs::write(temp.path().join("auth.json"), original_auth).expect("auth");
+
+        let error = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &["gpt-5.6-sol".to_string()],
+            None,
+            true,
+        )
+        .expect_err("official OAuth is required");
+
+        assert!(error.to_string().contains("未找到可确定恢复"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("config.toml")).expect("restored config"),
+            original_config
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).expect("restored auth"),
+            original_auth
+        );
+        assert!(!managed_model_catalog_path(temp.path()).exists());
+        assert!(!companion_state_path(temp.path()).exists());
+    }
+
+    #[test]
     fn relay_install_restores_previous_direct_auth_write() {
         let temp = tempfile::tempdir().expect("tempdir");
         let original_auth = serde_json::json!({
@@ -3099,7 +4071,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_install_preserves_auth_changes_made_after_direct_write() {
+    fn relay_install_preserves_refreshed_oauth_and_restores_chatgpt_mode() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("auth.json"),
@@ -3135,7 +4107,7 @@ mod tests {
 
         let auth = read_json_value(&temp.path().join("auth.json")).expect("auth");
         assert_eq!(auth["OPENAI_API_KEY"], Value::Null);
-        assert!(auth.get("auth_mode").is_none());
+        assert_eq!(auth["auth_mode"], CODEX_CHATGPT_AUTH_MODE);
         assert_eq!(auth["tokens"]["refresh_token"], "refreshed-by-codex");
         assert_eq!(auth["tokens"]["access_token"], "new-access-token");
     }
@@ -3738,6 +4710,50 @@ mod tests {
             })
             .expect("cwd");
         assert_eq!(cwd, "/work/project");
+    }
+
+    #[test]
+    fn repair_rewrites_sqlite_provider_when_session_file_is_already_repaired() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        fs::write(
+            sessions.join("session.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"model_provider\":\"codex-companion\",\"cwd\":\"/work/project\"}}\n",
+        )
+        .expect("write");
+
+        let db = temp.path().join(CODEX_STATE_DB_FILENAME);
+        let conn = Connection::open(&db).expect("db");
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL, cwd TEXT NOT NULL, rollout_path TEXT NOT NULL);
+             INSERT INTO threads (id, model_provider, cwd, rollout_path) VALUES ('s1', 'openai', '/work/project', '');",
+        )
+        .expect("schema");
+        drop(conn);
+
+        let outcome = repair_state(RepairOptions {
+            codex_dir: temp.path().to_path_buf(),
+            history: true,
+            plugins: false,
+            dry_run: false,
+            target_provider_id: Some(COMPANION_PROVIDER_ID.to_string()),
+        })
+        .expect("repair");
+
+        assert_eq!(outcome.plan.history_lines, 0);
+        assert_eq!(outcome.plan.state_rows, 1);
+        assert_eq!(outcome.migrated_history_lines, 0);
+        assert_eq!(outcome.migrated_state_rows, 1);
+        let provider: String = Connection::open(&db)
+            .expect("db")
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("provider");
+        assert_eq!(provider, COMPANION_PROVIDER_ID);
     }
 
     #[test]

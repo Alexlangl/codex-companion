@@ -133,7 +133,7 @@ impl RelayConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     pub id: String,
@@ -159,15 +159,26 @@ pub struct ProviderConfig {
 pub struct ProviderUsageQuery {
     pub template: ProviderUsageQueryTemplate,
     pub base_url: String,
+    #[serde(default)]
+    pub script: String,
+    #[serde(default = "default_usage_query_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+pub fn default_usage_query_timeout_seconds() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderUsageQueryTemplate {
+    General,
     NewApi,
+    OpenRouter,
+    Custom,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAccountInfo {
     #[serde(default)]
@@ -193,7 +204,7 @@ pub struct ProviderAccountInfo {
     pub last_refresh_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderQuotaWindow {
     pub label: String,

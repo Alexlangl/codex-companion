@@ -7,6 +7,7 @@ use codex_companion_provider::{
     refresh_provider_status, remove_provider, review_provider_json_many, test_provider,
     ApiKeyProviderImportRequest, ApiKeyProviderUpdate, ProviderExportFormat, ProviderExportOutput,
     ProviderImportBatchReport, ProviderImportOutcome, ProviderImportReviewReport, ProviderUpsert,
+    ProviderUsageQueryTestInput,
 };
 use std::path::PathBuf;
 
@@ -122,6 +123,13 @@ impl CompanionDaemon {
             .get(id)
             .ok_or_else(|| format!("unknown provider: {id}"))?;
         test_provider(provider).await
+    }
+
+    pub async fn test_usage_query(
+        &self,
+        input: ProviderUsageQueryTestInput,
+    ) -> Result<codex_companion_core::ProviderAccountInfo> {
+        codex_companion_provider::test_configured_usage_query(&self.store, input).await
     }
 
     pub async fn refresh_provider(&self, id: &str) -> Result<ProviderHealth> {

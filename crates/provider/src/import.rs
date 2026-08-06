@@ -1,6 +1,11 @@
+#[cfg(test)]
 use crate::persist_with_private_auth_file;
 use crate::registry::add_provider;
-use crate::registry::prepare_usage_query_update;
+use crate::registry::{
+    managed_account_credential_path, managed_api_key_credential_path,
+    persist_private_credential_change, prepare_usage_query_update, usage_query_credential_path,
+    PrivateCredentialChange,
+};
 use crate::types::{
     ProviderImportBatchReport, ProviderImportDraft, ProviderImportFailure, ProviderImportOutcome,
     ProviderImportReviewItem, ProviderImportReviewReport, ProviderUpsert, OFFICIAL_CODEX_BASE_URL,
@@ -161,11 +166,7 @@ fn import_oauth_provider(
     auth: serde_json::Value,
     account: ProviderAccountInfo,
 ) -> Result<ProviderImportOutcome> {
-    let auth_path = store
-        .data_dir()
-        .join("auth")
-        .join("accounts")
-        .join(format!("{}.json", draft.provider_id));
+    let auth_path = managed_account_credential_path(store, &draft.provider_id);
     if let Some(parent) = auth_path.parent() {
         fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
     }
@@ -180,6 +181,8 @@ fn import_oauth_provider(
         model_map.insert(model.clone(), model.clone());
     }
     let existed = store.load()?.providers.contains_key(&draft.provider_id);
+    let api_key_path = managed_api_key_credential_path(store, &draft.provider_id);
+    let usage_query_path = usage_query_credential_path(store, &draft.provider_id);
     let provider_input = ProviderUpsert {
         id: draft.provider_id,
         name: draft.provider_name,
@@ -194,9 +197,18 @@ fn import_oauth_provider(
         refresh_interval_seconds: default_refresh_interval_seconds(),
         account: Some(account),
     };
-    let provider = persist_with_private_auth_file(&auth_path, &auth_contents, || {
-        add_provider(store, provider_input)
-    })?;
+    let provider =
+        persist_private_credential_change(PrivateCredentialChange::Remove(api_key_path), || {
+            persist_private_credential_change(
+                PrivateCredentialChange::Remove(usage_query_path),
+                || {
+                    persist_private_credential_change(
+                        PrivateCredentialChange::Write(auth_path.clone(), auth_contents),
+                        || add_provider(store, provider_input),
+                    )
+                },
+            )
+        })?;
 
     Ok(ProviderImportOutcome {
         provider,
@@ -220,11 +232,7 @@ fn import_agent_identity_provider(
     provider_id: String,
     provider_name: String,
 ) -> Result<ProviderImportOutcome> {
-    let auth_path = store
-        .data_dir()
-        .join("auth")
-        .join("accounts")
-        .join(format!("{provider_id}.json"));
+    let auth_path = managed_account_credential_path(store, &provider_id);
     if let Some(parent) = auth_path.parent() {
         fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
     }
@@ -234,6 +242,8 @@ fn import_agent_identity_provider(
     let auth_contents = format!("{text}\n");
 
     let existed = store.load()?.providers.contains_key(&provider_id);
+    let api_key_path = managed_api_key_credential_path(store, &provider_id);
+    let usage_query_path = usage_query_credential_path(store, &provider_id);
     let provider_input = ProviderUpsert {
         id: provider_id,
         name: provider_name,
@@ -248,9 +258,18 @@ fn import_agent_identity_provider(
         refresh_interval_seconds: default_refresh_interval_seconds(),
         account: Some(account),
     };
-    let provider = persist_with_private_auth_file(&auth_path, &auth_contents, || {
-        add_provider(store, provider_input)
-    })?;
+    let provider =
+        persist_private_credential_change(PrivateCredentialChange::Remove(api_key_path), || {
+            persist_private_credential_change(
+                PrivateCredentialChange::Remove(usage_query_path),
+                || {
+                    persist_private_credential_change(
+                        PrivateCredentialChange::Write(auth_path.clone(), auth_contents),
+                        || add_provider(store, provider_input),
+                    )
+                },
+            )
+        })?;
 
     Ok(ProviderImportOutcome {
         provider,
@@ -624,13 +643,9 @@ fn import_api_key_provider_with_metadata(
         .as_deref()
         .and_then(sanitize_provider_id)
         .unwrap_or_else(|| derive_api_key_provider_id(&provider_name, &base_url));
-    let auth_path = store
-        .data_dir()
-        .join("auth")
-        .join("api-keys")
-        .join(format!("{provider_id}.json"));
+    let auth_path = managed_api_key_credential_path(store, &provider_id);
 
-    let (auth_ref, auth_contents) = if let Some(api_key) = api_key {
+    let (auth_ref, auth_credential_change) = if let Some(api_key) = api_key {
         if let Some(parent) = auth_path.parent() {
             fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
         }
@@ -642,10 +657,13 @@ fn import_api_key_provider_with_metadata(
         })?;
         (
             Some(format!("file:{}", auth_path.display())),
-            Some(format!("{text}\n")),
+            PrivateCredentialChange::Write(auth_path.clone(), format!("{text}\n")),
         )
     } else {
-        (env_var.as_ref().map(|value| format!("env:{value}")), None)
+        (
+            env_var.as_ref().map(|value| format!("env:{value}")),
+            PrivateCredentialChange::Remove(auth_path.clone()),
+        )
     };
     let direct_auth_ref = env_var.as_ref().map(|value| format!("env:{value}"));
 
@@ -659,13 +677,14 @@ fn import_api_key_provider_with_metadata(
         .as_ref()
         .and_then(|provider| provider.account.as_ref())
         .and_then(|account| account.usage_query.as_ref());
-    let (usage_query, usage_query_private_write) = prepare_usage_query_update(
+    let (usage_query, usage_query_credential_change) = prepare_usage_query_update(
         store,
         &provider_id,
         &base_url,
         existing_usage_query,
         usage_query.as_ref(),
     )?;
+    let account_credential_path = managed_account_credential_path(store, &provider_id);
     let provider_input = ProviderUpsert {
         id: provider_id,
         name: provider_name.clone(),
@@ -690,20 +709,14 @@ fn import_api_key_provider_with_metadata(
         }),
     };
     let persist_provider = || add_provider(store, provider_input);
-    let provider = match (auth_contents, usage_query_private_write) {
-        (Some(auth_contents), Some((usage_path, usage_contents))) => {
-            persist_with_private_auth_file(&usage_path, &usage_contents, || {
-                persist_with_private_auth_file(&auth_path, &auth_contents, persist_provider)
-            })
-        }
-        (Some(auth_contents), None) => {
-            persist_with_private_auth_file(&auth_path, &auth_contents, persist_provider)
-        }
-        (None, Some((usage_path, usage_contents))) => {
-            persist_with_private_auth_file(&usage_path, &usage_contents, persist_provider)
-        }
-        (None, None) => persist_provider(),
-    }?;
+    let provider = persist_private_credential_change(usage_query_credential_change, || {
+        persist_private_credential_change(auth_credential_change, || {
+            persist_private_credential_change(
+                PrivateCredentialChange::Remove(account_credential_path),
+                persist_provider,
+            )
+        })
+    })?;
 
     Ok(ProviderImportOutcome {
         provider,
@@ -2676,6 +2689,122 @@ base_url = "https://api.deepseek.com/v1"
             outcome.provider.account.unwrap().email.as_deref(),
             Some("api-key-1234")
         );
+    }
+
+    #[test]
+    fn reimporting_api_key_provider_with_env_removes_managed_key_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let initial = import_api_key_provider_request(
+            &store,
+            ApiKeyProviderImportRequest {
+                provider_name: "Example Relay".to_string(),
+                kind: ProviderKind::RelayProvider,
+                base_url: "https://relay.example.com/v1".to_string(),
+                websocket_url: None,
+                api_key: "sk-managed".to_string(),
+                env_var: None,
+                model: None,
+                refresh_interval_seconds: None,
+                usage_query: None,
+            },
+        )
+        .expect("initial import");
+        assert!(initial.auth_path.exists());
+
+        let reimported = import_api_key_provider_request(
+            &store,
+            ApiKeyProviderImportRequest {
+                provider_name: "Example Relay".to_string(),
+                kind: ProviderKind::RelayProvider,
+                base_url: "https://relay.example.com/v1".to_string(),
+                websocket_url: None,
+                api_key: String::new(),
+                env_var: Some("EXAMPLE_RELAY_API_KEY".to_string()),
+                model: None,
+                refresh_interval_seconds: None,
+                usage_query: None,
+            },
+        )
+        .expect("environment import");
+
+        assert_eq!(reimported.provider.id, initial.provider.id);
+        assert_eq!(
+            reimported.provider.auth_ref.as_deref(),
+            Some("env:EXAMPLE_RELAY_API_KEY")
+        );
+        assert!(!initial.auth_path.exists());
+    }
+
+    #[test]
+    fn oauth_import_over_api_key_removes_stale_managed_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let api_key = serde_json::json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "sk-managed",
+            "api_base_url": "https://relay.example.com/v1",
+            "api_provider_id": "shared-provider",
+            "api_provider_name": "Shared Provider"
+        });
+        let initial =
+            import_provider_json(&store, &api_key.to_string(), None, None).expect("API key import");
+        let usage_path = usage_query_credential_path(&store, &initial.provider.id);
+        fs::create_dir_all(usage_path.parent().expect("usage parent")).expect("usage directory");
+        fs::write(&usage_path, r#"{"access_token":"stale"}"#).expect("stale usage");
+
+        let oauth = serde_json::json!({
+            "access_token": "official-access",
+            "refresh_token": "official-refresh",
+            "account_id": "official-account",
+            "email": "official@example.com"
+        });
+        let replaced = import_provider_json(
+            &store,
+            &oauth.to_string(),
+            Some("shared-provider".to_string()),
+            None,
+        )
+        .expect("OAuth import");
+
+        assert_eq!(replaced.provider.kind, ProviderKind::OfficialCodex);
+        assert_eq!(replaced.provider.id, initial.provider.id);
+        assert!(replaced.auth_path.exists());
+        assert!(!initial.auth_path.exists());
+        assert!(!usage_path.exists());
+    }
+
+    #[test]
+    fn api_key_import_over_oauth_removes_stale_managed_account() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let oauth = serde_json::json!({
+            "access_token": "official-access",
+            "refresh_token": "official-refresh",
+            "account_id": "official-account",
+            "email": "official@example.com"
+        });
+        let initial = import_provider_json(
+            &store,
+            &oauth.to_string(),
+            Some("shared-provider".to_string()),
+            None,
+        )
+        .expect("OAuth import");
+
+        let api_key = serde_json::json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "sk-managed",
+            "api_base_url": "https://relay.example.com/v1",
+            "api_provider_id": "shared-provider",
+            "api_provider_name": "Shared Provider"
+        });
+        let replaced =
+            import_provider_json(&store, &api_key.to_string(), None, None).expect("API key import");
+
+        assert_eq!(replaced.provider.kind, ProviderKind::RelayProvider);
+        assert!(replaced.auth_path.exists());
+        assert!(!initial.auth_path.exists());
     }
 
     #[test]

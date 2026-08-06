@@ -1,4 +1,4 @@
-import type { ProviderKind } from "../../types/domain";
+import type { ProviderKind, ProviderUsageQueryTemplate } from "../../types/domain";
 
 export type ApiKeyKind = Extract<ProviderKind, "openai_compatible" | "relay_provider">;
 
@@ -12,6 +12,10 @@ export interface ApiKeyForm {
   envVar: string;
   refreshIntervalSeconds: number;
   usageQueryEnabled: boolean;
+  usageQueryTemplate: ProviderUsageQueryTemplate;
+  usageQueryScript: string;
+  usageQueryTimeoutSeconds: number;
+  usageQueryApiKey: string;
   usageQueryBaseUrl: string;
   usageQueryAccessToken: string;
   usageQueryUserId: string;
@@ -32,6 +36,10 @@ export const emptyApiKeyForm: ApiKeyForm = {
   envVar: "",
   refreshIntervalSeconds: 60,
   usageQueryEnabled: false,
+  usageQueryTemplate: "general",
+  usageQueryScript: "",
+  usageQueryTimeoutSeconds: 10,
+  usageQueryApiKey: "",
   usageQueryBaseUrl: "",
   usageQueryAccessToken: "",
   usageQueryUserId: "",

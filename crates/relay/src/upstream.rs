@@ -19,9 +19,9 @@ use futures_util::{stream, Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io;
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
+use std::{fmt, io};
 
 pub(crate) struct UpstreamResponse {
     response: Option<reqwest::Response>,
@@ -32,6 +32,34 @@ pub(crate) struct UpstreamResponse {
     transform: ResponseTransform,
     tool_context: ChatToolContext,
     chat_messages: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StreamPreflightError {
+    Network(String),
+    Protocol(String),
+    Semantic(String),
+}
+
+impl StreamPreflightError {
+    pub(crate) fn classification_text(&self) -> String {
+        match self {
+            Self::Network(message) => format!("upstream network failure: {message}"),
+            Self::Protocol(message) | Self::Semantic(message) => {
+                format!("upstream semantic failure: {message}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for StreamPreflightError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Network(message) => write!(formatter, "stream 输出前上游网络失败：{message}"),
+            Self::Protocol(message) => write!(formatter, "stream 输出前上游响应无效：{message}"),
+            Self::Semantic(message) => write!(formatter, "stream 输出前上游语义失败：{message}"),
+        }
+    }
 }
 
 impl UpstreamResponse {
@@ -59,8 +87,18 @@ impl UpstreamResponse {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    pub(crate) async fn preflight_stream_failure(&mut self) -> Result<(), String> {
-        if !self.status.is_success() || !is_event_stream(&self.headers) || self.response.is_none() {
+    pub(crate) async fn preflight_stream_failure(&mut self) -> Result<(), StreamPreflightError> {
+        if !self.status.is_success() {
+            return Ok(());
+        }
+        if let Some(body) = self
+            .buffered_body
+            .as_deref()
+            .filter(|body| looks_like_sse(body))
+        {
+            return preflight_buffered_sse(body);
+        }
+        if !is_event_stream(&self.headers) || self.response.is_none() {
             return Ok(());
         }
         let mut inspection = Vec::new();
@@ -71,9 +109,13 @@ impl UpstreamResponse {
                 .expect("response checked above")
                 .chunk()
                 .await
-                .map_err(|error| format!("读取上游 SSE 首帧失败: {error}"))?;
+                .map_err(|error| {
+                    StreamPreflightError::Network(format!("读取上游 SSE 首帧失败: {error}"))
+                })?;
             let Some(chunk) = chunk else {
-                return Err("上游 SSE 在输出内容前结束".to_string());
+                return Err(StreamPreflightError::Protocol(
+                    "上游 SSE 在输出内容前结束".to_string(),
+                ));
             };
             inspection.extend_from_slice(&chunk);
             self.prefetched_body.push_back(chunk);
@@ -90,7 +132,9 @@ impl UpstreamResponse {
                 match preflight_sse_block(&block) {
                     StreamPreflight::Continue => {}
                     StreamPreflight::OutputStarted | StreamPreflight::Terminal => return Ok(()),
-                    StreamPreflight::Failure(message) => return Err(message),
+                    StreamPreflight::Failure(message) => {
+                        return Err(StreamPreflightError::Semantic(message));
+                    }
                 }
             }
             if inspection.len() >= 64 * 1024 || (!parsed_any && inspection.len() >= 16 * 1024) {
@@ -98,6 +142,29 @@ impl UpstreamResponse {
             }
         }
     }
+}
+
+fn preflight_buffered_sse(body: &[u8]) -> Result<(), StreamPreflightError> {
+    let mut inspection = body.to_vec();
+    while let Some(index) = next_sse_block_index(&inspection) {
+        let block = String::from_utf8_lossy(&inspection[..index]).into_owned();
+        let drain_to = if inspection[index..].starts_with(b"\r\n\r\n") {
+            index + 4
+        } else {
+            index + 2
+        };
+        inspection.drain(..drain_to);
+        match preflight_sse_block(&block) {
+            StreamPreflight::Continue => {}
+            StreamPreflight::OutputStarted | StreamPreflight::Terminal => return Ok(()),
+            StreamPreflight::Failure(message) => {
+                return Err(StreamPreflightError::Semantic(message));
+            }
+        }
+    }
+    Err(StreamPreflightError::Protocol(
+        "上游 SSE 在输出内容前结束".to_string(),
+    ))
 }
 
 enum StreamPreflight {
@@ -249,6 +316,7 @@ pub(crate) async fn send_upstream(
         session_identity.as_deref(),
     );
     let body = rewrite_model(provider, body);
+    let body = normalize_ultra_reasoning_effort(body);
     let (body, tool_context, chat_messages) =
         if transform == ResponseTransform::ChatCompletionsToResponses {
             responses_body_to_chat_completions_with_store(
@@ -641,6 +709,34 @@ fn rewrite_model(provider: &ProviderConfig, body: Bytes) -> Bytes {
     }
     value["model"] = serde_json::Value::String(mapped);
     serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
+}
+
+fn normalize_ultra_reasoning_effort(body: Bytes) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    let mut changed = false;
+    if let Some(effort) = value
+        .get_mut("reasoning")
+        .and_then(Value::as_object_mut)
+        .and_then(|reasoning| reasoning.get_mut("effort"))
+        .filter(|effort| effort.as_str() == Some("ultra"))
+    {
+        *effort = Value::String("max".to_string());
+        changed = true;
+    }
+    if let Some(effort) = value
+        .get_mut("reasoning_effort")
+        .filter(|effort| effort.as_str() == Some("ultra"))
+    {
+        *effort = Value::String("max".to_string());
+        changed = true;
+    }
+    if changed {
+        serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
+    } else {
+        body
+    }
 }
 
 pub(crate) async fn stream_response(
@@ -1115,6 +1211,11 @@ fn compact_json_error(value: &Value) -> String {
         .get("message")
         .and_then(Value::as_str)
         .or_else(|| value.pointer("/error/message").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .pointer("/response/error/message")
+                .and_then(Value::as_str)
+        })
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| value.to_string())
 }
@@ -1615,6 +1716,26 @@ fn responses_body_to_chat_completions_with_store(
     copy_json_field(object, &mut output, "parallel_tool_calls");
     copy_json_field(object, &mut output, "response_format");
     copy_json_field(object, &mut output, "metadata");
+    if let Some(reasoning_effort) = object
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+        .or_else(|| object.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+    {
+        output.insert(
+            "reasoning_effort".to_string(),
+            Value::String(
+                if reasoning_effort == "ultra" {
+                    "max"
+                } else {
+                    reasoning_effort
+                }
+                .to_string(),
+            ),
+        );
+    }
     if prompt_cache_enabled {
         let prompt_cache_key = object
             .get("prompt_cache_key")
@@ -3330,7 +3451,7 @@ fn append_client_version(mut url: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_companion_core::{default_refresh_interval_seconds, ProviderKind};
+    use codex_companion_core::{default_refresh_interval_seconds, HealthFailureKind, ProviderKind};
     use std::collections::BTreeMap;
 
     #[tokio::test]
@@ -3480,10 +3601,47 @@ mod tests {
         };
         let body = rewrite_model(
             &provider,
-            Bytes::from_static(br#"{"model":"gpt-5-codex","input":"hello"}"#),
+            Bytes::from_static(
+                br#"{"model":"gpt-5-codex","input":"hello","reasoning":{"effort":"ultra"}}"#,
+            ),
         );
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(value["model"], "deepseek-chat");
+        assert_eq!(value["reasoning"]["effort"], "ultra");
+    }
+
+    #[test]
+    fn normalizes_ultra_to_official_upstream_max_effort() {
+        let body = normalize_ultra_reasoning_effort(Bytes::from_static(
+            br#"{"reasoning":{"effort":"ultra"},"reasoning_effort":"ultra"}"#,
+        ));
+        let value: Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(value["reasoning"]["effort"], "max");
+        assert_eq!(value["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn detects_semantic_failure_in_buffered_sse() {
+        let error = preflight_buffered_sse(
+            b"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"exceeded retry limit, last status: 429 Too Many Requests\"}}}\n\n",
+        )
+        .expect_err("semantic failure");
+
+        assert!(
+            matches!(error, StreamPreflightError::Semantic(message) if message.contains("429 Too Many Requests"))
+        );
+    }
+
+    #[test]
+    fn stream_preflight_network_errors_keep_network_classification() {
+        let error = StreamPreflightError::Network("连接超时".to_string());
+
+        assert!(error.to_string().contains("网络失败"));
+        assert_eq!(
+            classify_failure(None, &error.classification_text()).kind,
+            HealthFailureKind::NetworkFailed
+        );
     }
 
     #[test]
@@ -3901,6 +4059,21 @@ mod tests {
         assert_eq!(value["messages"][1]["role"], "user");
         assert_eq!(value["messages"][1]["content"], "hello");
         assert!(value.get("messages").and_then(Value::as_array).is_some());
+    }
+
+    #[test]
+    fn maps_ultra_to_official_max_effort_for_chat_completions() {
+        let (body, _, _) = responses_body_to_chat_completions(
+            Bytes::from_static(
+                br#"{"model":"gpt-5.6-sol","input":"hello","reasoning":{"effort":"ultra"}}"#,
+            ),
+            "p",
+            false,
+        );
+        let value: Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(value["reasoning_effort"], "max");
+        assert!(value.get("reasoning").is_none());
     }
 
     #[test]
