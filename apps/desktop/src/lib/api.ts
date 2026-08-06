@@ -427,6 +427,15 @@ export function updateApiKeyProvider(input: ApiKeyProviderUpdate) {
         : input.envVar && input.envVar.trim()
           ? `env:${input.envVar.trim()}`
           : existing.directAuthRef;
+    let usageQuery = existing.account?.usageQuery ?? null;
+    if (input.usageQuery) {
+      usageQuery = input.usageQuery.enabled
+        ? {
+            template: input.usageQuery.template,
+            baseUrl: input.usageQuery.baseUrl?.trim() || input.baseUrl.trim(),
+          }
+        : null;
+    }
     const provider: ProviderConfig = {
       ...existing,
       name: input.providerName.trim(),
@@ -441,6 +450,7 @@ export function updateApiKeyProvider(input: ApiKeyProviderUpdate) {
         email: input.providerDisplayName?.trim() || existing.account?.email || null,
         displayName: input.providerName.trim(),
         subscriptionType: "API Key",
+        usageQuery,
       },
     };
     mockStatus = {
@@ -542,6 +552,10 @@ export function importApiKeyProvider(input: {
   envVar?: string;
   model?: string;
   refreshIntervalSeconds?: number;
+  usageQueryEnabled?: boolean;
+  usageQueryBaseUrl?: string;
+  usageQueryAccessToken?: string;
+  usageQueryUserId?: string;
 }) {
   if (!isTauri()) {
     const id = `${sanitizeProviderId(input.providerName)}_${accountIdHash(input.baseUrl)}`;
@@ -560,6 +574,12 @@ export function importApiKeyProvider(input: {
       account: {
         displayName: input.providerName,
         subscriptionType: "API Key",
+        usageQuery: input.usageQueryEnabled
+          ? {
+              template: "new_api",
+              baseUrl: input.usageQueryBaseUrl?.trim() || input.baseUrl.trim(),
+            }
+          : null,
       },
     };
     const created = !mockStatus.config.providers[id];
@@ -605,6 +625,13 @@ export function importApiKeyProvider(input: {
       envVar: emptyToNull(input.envVar),
       model: emptyToNull(input.model),
       refreshIntervalSeconds: input.refreshIntervalSeconds ?? null,
+      usageQuery: {
+        enabled: Boolean(input.usageQueryEnabled),
+        template: "new_api",
+        baseUrl: emptyToNull(input.usageQueryBaseUrl),
+        accessToken: emptyToNull(input.usageQueryAccessToken),
+        userId: emptyToNull(input.usageQueryUserId),
+      },
     },
   });
 }

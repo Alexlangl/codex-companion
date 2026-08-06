@@ -11,6 +11,10 @@ export interface ApiKeyForm {
   apiKey: string;
   envVar: string;
   refreshIntervalSeconds: number;
+  usageQueryEnabled: boolean;
+  usageQueryBaseUrl: string;
+  usageQueryAccessToken: string;
+  usageQueryUserId: string;
 }
 
 export interface JsonImportFile {
@@ -27,4 +31,8 @@ export const emptyApiKeyForm: ApiKeyForm = {
   apiKey: "",
   envVar: "",
   refreshIntervalSeconds: 60,
+  usageQueryEnabled: false,
+  usageQueryBaseUrl: "",
+  usageQueryAccessToken: "",
+  usageQueryUserId: "",
 };

@@ -215,6 +215,7 @@ export interface ProviderAccountInfo {
   teamName?: string | null;
   accountId?: string | null;
   userId?: string | null;
+  usageQuery?: ProviderUsageQuery | null;
   subscriptionType?: string | null;
   subscriptionStatus?: string | null;
   quotaLabel?: string | null;
@@ -226,6 +227,21 @@ export interface ProviderAccountInfo {
   usageAvailable?: number | null;
   validUntil?: string | null;
   lastRefreshAt?: string | null;
+}
+
+export type ProviderUsageQueryTemplate = "new_api";
+
+export interface ProviderUsageQuery {
+  template: ProviderUsageQueryTemplate;
+  baseUrl: string;
+}
+
+export interface ProviderUsageQueryUpdate {
+  enabled: boolean;
+  template: ProviderUsageQueryTemplate;
+  baseUrl?: string | null;
+  accessToken?: string | null;
+  userId?: string | null;
 }
 
 export interface ProviderQuotaWindow {
@@ -424,6 +440,7 @@ export interface ApiKeyProviderUpdate {
   apiKey?: string | null;
   envVar?: string | null;
   refreshIntervalSeconds: number;
+  usageQuery?: ProviderUsageQueryUpdate | null;
 }
 
 export type ProviderExportFormat = "codex_companion" | "sub2api" | "cpa";

@@ -201,7 +201,10 @@ function primaryQuotaWindow(windows?: ProviderQuotaWindow[] | null) {
 
 function formatApiUsage(available?: number | null, total?: number | null, used?: number | null, label?: string | null) {
   if (available === undefined || available === null) return null;
-  if (label?.includes("余额")) return `$${compactNumber(available)}`;
+  if (label?.includes("余额")) {
+    const usedText = used !== undefined && used !== null ? `已用 $${compactNumber(used)} · ` : "";
+    return `${usedText}剩余 $${compactNumber(available)} USD`;
+  }
   if (total !== undefined && total !== null && total > 0) {
     const usedText = used !== undefined && used !== null ? ` · 已用 ${compactNumber(used)}` : "";
     return `${compactNumber(available)} / ${compactNumber(total)}${usedText}`;

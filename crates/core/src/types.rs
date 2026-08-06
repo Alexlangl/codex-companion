@@ -154,6 +154,19 @@ pub struct ProviderConfig {
     pub account: Option<ProviderAccountInfo>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUsageQuery {
+    pub template: ProviderUsageQueryTemplate,
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderUsageQueryTemplate {
+    NewApi,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAccountInfo {
@@ -164,6 +177,8 @@ pub struct ProviderAccountInfo {
     pub team_name: Option<String>,
     pub account_id: Option<String>,
     pub user_id: Option<String>,
+    #[serde(default)]
+    pub usage_query: Option<ProviderUsageQuery>,
     pub subscription_type: Option<String>,
     pub subscription_status: Option<String>,
     pub quota_label: Option<String>,

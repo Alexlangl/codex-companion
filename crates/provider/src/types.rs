@@ -1,6 +1,6 @@
 use codex_companion_core::{
     default_refresh_interval_seconds, GroupPolicy, ProviderAccountInfo, ProviderConfig,
-    ProviderKind,
+    ProviderKind, ProviderUsageQueryTemplate,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -31,6 +31,24 @@ pub struct ProviderUpsert {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProviderUsageQueryUpdate {
+    pub enabled: bool,
+    #[serde(default = "default_usage_query_template")]
+    pub template: ProviderUsageQueryTemplate,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
+fn default_usage_query_template() -> ProviderUsageQueryTemplate {
+    ProviderUsageQueryTemplate::NewApi
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiKeyProviderUpdate {
     pub id: String,
     #[serde(default)]
@@ -46,6 +64,8 @@ pub struct ApiKeyProviderUpdate {
     pub env_var: Option<String>,
     #[serde(default = "default_refresh_interval_seconds")]
     pub refresh_interval_seconds: u64,
+    #[serde(default)]
+    pub usage_query: Option<ProviderUsageQueryUpdate>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

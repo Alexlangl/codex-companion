@@ -136,23 +136,22 @@ export function ProviderCard({
   const validity = validityLabel(account?.validUntil);
   const resetAt = quota.resetAt ? formatTime(quota.resetAt) : "待刷新";
   const showQuota = hasQuotaInfo(quota);
-  const quotaIsBalance = showQuota && quota.percent === null && quota.percentLabel.startsWith("$");
+  const quotaIsBalance = showQuota && account?.quotaLabel?.includes("余额") === true;
   const showPlanBadge = provider.kind === "official_codex" && Boolean(account?.subscriptionType);
   const canEdit = provider.kind !== "official_codex";
   const lastRefreshAt = account?.lastRefreshAt ? formatTime(account.lastRefreshAt) : null;
   const usesAgentIdentity = providerUsesAgentIdentity(provider);
   const usesWebSocket = providerUsesWebSocket(provider);
-  const balanceTitle = quotaIsBalance ? "账户余额" : showQuota ? quota.label : "无法刷新余额";
+  const balanceTitle = providerBalanceTitle(quotaIsBalance, showQuota, quota.label);
   const balanceValue = showQuota ? quota.percentLabel : null;
-  const balanceDetail = quotaIsBalance
-    ? lastRefreshAt
-    : showQuota
-      ? validity
-        ? `有效期 ${validity}`
-        : quota.resetAt
-          ? `重置 ${resetAt}`
-          : null
-      : null;
+  const balanceDetail = providerBalanceDetail({
+    isBalance: quotaIsBalance,
+    isVisible: showQuota,
+    lastRefreshAt,
+    planName: account?.subscriptionType,
+    resetAt: quota.resetAt ? resetAt : null,
+    validity,
+  });
   const mutationDisabled = disabled || refreshing;
   return (
     <div aria-busy={refreshing} className={`provider-card-row ${active ? "provider-card-active" : ""}`}>
@@ -212,6 +211,36 @@ export function ProviderCard({
       {health?.lastError ? <p className="provider-error-line">{health.lastError}</p> : null}
     </div>
   );
+}
+
+function providerBalanceTitle(isBalance: boolean, isVisible: boolean, quotaLabel: string): string {
+  if (isBalance) return "账户余额";
+  if (isVisible) return quotaLabel;
+  return "无法刷新余额";
+}
+
+function providerBalanceDetail({
+  isBalance,
+  isVisible,
+  lastRefreshAt,
+  planName,
+  resetAt,
+  validity,
+}: {
+  isBalance: boolean;
+  isVisible: boolean;
+  lastRefreshAt: string | null;
+  planName?: string | null;
+  resetAt: string | null;
+  validity: string | null;
+}): string | null {
+  if (isBalance) {
+    return [planName, lastRefreshAt].filter(Boolean).join(" · ") || null;
+  }
+  if (!isVisible) return null;
+  if (validity) return `有效期 ${validity}`;
+  if (resetAt) return `重置 ${resetAt}`;
+  return null;
 }
 
 function LaunchModeControl({

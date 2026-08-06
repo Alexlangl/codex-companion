@@ -22,7 +22,15 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+  type RefObject,
+} from "react";
 import { Button, Field, Panel } from "../../components/ui";
 import {
   cancelCodexOAuth,
@@ -196,9 +204,16 @@ export function Providers({
       apiKey: apiKeyForm.apiKey.trim(),
       envVar: apiKeyForm.envVar.trim(),
       refreshIntervalSeconds: Number(apiKeyForm.refreshIntervalSeconds) || 60,
+      usageQueryBaseUrl: apiKeyForm.usageQueryBaseUrl.trim(),
+      usageQueryAccessToken: apiKeyForm.usageQueryAccessToken.trim(),
+      usageQueryUserId: apiKeyForm.usageQueryUserId.trim(),
     };
     if (!input.apiKey && !input.envVar) {
       setApiKeyError("至少填写 API Key 或 API Key 环境变量名。直连的密钥写入方式受“保留官方 Codex 登录”设置控制；本地代理由 Companion 注入密钥且不写 auth.json。");
+      return;
+    }
+    if (input.usageQueryEnabled && (!input.usageQueryAccessToken || !input.usageQueryUserId)) {
+      setApiKeyError("启用 NewAPI 余量查询时，需要填写个人访问令牌和用户 ID。");
       return;
     }
     await onImportApiKey(input);
@@ -287,9 +302,21 @@ export function Providers({
       apiKey: editForm.apiKey.trim(),
       envVar: editForm.envVar.trim(),
       refreshIntervalSeconds: Number(editForm.refreshIntervalSeconds) || 60,
+      usageQueryBaseUrl: editForm.usageQueryBaseUrl.trim(),
+      usageQueryAccessToken: editForm.usageQueryAccessToken.trim(),
+      usageQueryUserId: editForm.usageQueryUserId.trim(),
     };
     if (!input.providerDisplayName || !input.providerName || !input.baseUrl) {
       setEditError("Provider Name、供应商名称和请求地址不能为空。");
+      return;
+    }
+    const hasSavedUsageQuery = Boolean(editProvider.account?.usageQuery);
+    if (
+      input.usageQueryEnabled &&
+      !hasSavedUsageQuery &&
+      (!input.usageQueryAccessToken || !input.usageQueryUserId)
+    ) {
+      setEditError("首次启用 NewAPI 余量查询时，需要填写个人访问令牌和用户 ID。");
       return;
     }
     await onUpdateApiKey({
@@ -302,6 +329,13 @@ export function Providers({
       apiKey: input.apiKey || null,
       envVar: input.envVar || null,
       refreshIntervalSeconds: input.refreshIntervalSeconds,
+      usageQuery: {
+        enabled: input.usageQueryEnabled,
+        template: "new_api",
+        baseUrl: input.usageQueryBaseUrl || null,
+        accessToken: input.usageQueryAccessToken || null,
+        userId: input.usageQueryUserId || null,
+      },
     });
     setEditProvider(null);
     setEditError("");
@@ -807,6 +841,7 @@ function ApiKeyEditForm({
       <Field label="API Key（留空保留）">
         <input value={form.apiKey} onChange={(event) => update({ ...form, apiKey: event.target.value })} placeholder="sk-..." type="password" />
       </Field>
+      <UsageQueryFields form={form} isEditing update={update} />
       <details className="advanced-details" open={Boolean(form.envVar)}>
         <summary>高级选项</summary>
         <Field label="环境变量名">
@@ -855,8 +890,70 @@ function apiKeyFormFromProvider(provider: ProviderConfig): ApiKeyForm {
     websocketUrl: provider.websocketUrl ?? "",
     apiKey: "",
     envVar: authRef.startsWith("env:") ? authRef.slice("env:".length) : "",
+    usageQueryEnabled: Boolean(provider.account?.usageQuery),
+    usageQueryBaseUrl: provider.account?.usageQuery?.baseUrl ?? "",
+    usageQueryAccessToken: "",
+    usageQueryUserId: "",
     refreshIntervalSeconds: provider.refreshIntervalSeconds || 60,
   };
+}
+
+function UsageQueryFields({
+  form,
+  isEditing,
+  update,
+}: {
+  form: ApiKeyForm;
+  isEditing: boolean;
+  update: (form: ApiKeyForm) => void;
+}) {
+  function handleEnabledChange(event: ChangeEvent<HTMLInputElement>): void {
+    update({ ...form, usageQueryEnabled: event.target.checked });
+  }
+
+  return (
+    <fieldset className="usage-query-settings">
+      <label className="check-row">
+        <input
+          checked={form.usageQueryEnabled}
+          onChange={handleEnabledChange}
+          type="checkbox"
+        />
+        <span>启用 NewAPI 余量查询</span>
+      </label>
+      {form.usageQueryEnabled ? (
+        <div className="usage-query-fields">
+          <Field label="余量查询地址">
+            <input
+              onChange={(event) => update({ ...form, usageQueryBaseUrl: event.target.value })}
+              placeholder={form.baseUrl || "https://api.example.com"}
+              value={form.usageQueryBaseUrl}
+            />
+          </Field>
+          <Field label={isEditing ? "个人访问令牌（留空保留）" : "个人访问令牌"}>
+            <input
+              autoComplete="off"
+              onChange={(event) => update({ ...form, usageQueryAccessToken: event.target.value })}
+              placeholder="从个人安全设置获取"
+              type="password"
+              value={form.usageQueryAccessToken}
+            />
+          </Field>
+          <Field label={isEditing ? "用户 ID（留空保留）" : "用户 ID"}>
+            <input
+              autoComplete="off"
+              onChange={(event) => update({ ...form, usageQueryUserId: event.target.value })}
+              placeholder="例如 1"
+              value={form.usageQueryUserId}
+            />
+          </Field>
+          <p className="field-hint">
+            使用个人访问令牌请求 /api/user/self；未填写查询地址时沿用 Provider 请求地址。
+          </p>
+        </div>
+      ) : null}
+    </fieldset>
+  );
 }
 
 function downloadJson(fileName: string, jsonContent: string) {
@@ -1290,6 +1387,7 @@ function ProviderAddTabs({
           <Field label="API Key 环境变量名（可选）">
             <input value={apiKeyForm.envVar} onChange={(event) => updateApiKeyForm({ ...apiKeyForm, envVar: event.target.value })} placeholder="OPENROUTER_API_KEY" />
           </Field>
+          <UsageQueryFields form={apiKeyForm} isEditing={false} update={updateApiKeyForm} />
           <Field label="状态刷新间隔（秒）">
             <input min={15} type="number" value={apiKeyForm.refreshIntervalSeconds} onChange={(event) => updateApiKeyForm({ ...apiKeyForm, refreshIntervalSeconds: Number(event.target.value) })} />
           </Field>

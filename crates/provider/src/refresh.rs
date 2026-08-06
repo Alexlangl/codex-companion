@@ -83,7 +83,7 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
         account_result = Some(result);
         health_result
     } else if provider_supports_api_key_usage(&provider) {
-        match refresh_api_key_usage(&provider).await {
+        match refresh_api_key_usage(&provider, &store.data_dir()).await {
             Ok(account) => {
                 account_result = Some(Ok(account));
                 Ok(())

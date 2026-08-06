@@ -1,9 +1,9 @@
 use crate::persist_with_private_auth_file;
-use crate::types::{ApiKeyProviderUpdate, ProviderUpsert};
+use crate::types::{ApiKeyProviderUpdate, ProviderUpsert, ProviderUsageQueryUpdate};
 use crate::validate::{validate_base_url, validate_id};
 use codex_companion_core::{
     CompanionError, ConfigStore, ProviderAccountInfo, ProviderConfig, ProviderGroup,
-    ProviderHealth, ProviderKind, Result, DEFAULT_GROUP_ID,
+    ProviderHealth, ProviderKind, ProviderUsageQuery, Result, DEFAULT_GROUP_ID,
 };
 use std::fs;
 
@@ -117,12 +117,29 @@ pub fn update_api_key_provider(
 
     let mut account = existing
         .account
+        .clone()
         .unwrap_or_else(ProviderAccountInfo::default);
     if let Some(provider_display_name) = provider_display_name {
         account.email = Some(provider_display_name);
     }
     account.display_name = Some(provider_name.clone());
     account.subscription_type = Some("API Key".to_string());
+
+    let existing_usage_query = existing
+        .account
+        .as_ref()
+        .and_then(|account| account.usage_query.as_ref());
+    let (usage_query, usage_query_private_write) = prepare_usage_query_update(
+        store,
+        &input.id,
+        &base_url,
+        existing_usage_query,
+        input.usage_query.as_ref(),
+    )?;
+    if existing_usage_query != usage_query.as_ref() {
+        clear_usage_snapshot(&mut account);
+    }
+    account.usage_query = usage_query;
 
     let provider_input = ProviderUpsert {
         id: input.id,
@@ -139,12 +156,106 @@ pub fn update_api_key_provider(
         account: Some(account),
     };
     let persist_provider = || add_provider(store, provider_input);
-    match private_auth_write {
-        Some((auth_path, contents)) => {
+    match (private_auth_write, usage_query_private_write) {
+        (Some((auth_path, auth_contents)), Some((usage_path, usage_contents))) => {
+            persist_with_private_auth_file(&usage_path, &usage_contents, || {
+                persist_with_private_auth_file(&auth_path, &auth_contents, persist_provider)
+            })
+        }
+        (Some((auth_path, contents)), None) => {
             persist_with_private_auth_file(&auth_path, &contents, persist_provider)
         }
-        None => persist_provider(),
+        (None, Some((usage_path, contents))) => {
+            persist_with_private_auth_file(&usage_path, &contents, persist_provider)
+        }
+        (None, None) => persist_provider(),
     }
+}
+
+fn clear_usage_snapshot(account: &mut ProviderAccountInfo) {
+    account.quota_label = None;
+    account.quota_percent = None;
+    account.quota_reset_at = None;
+    account.quota_windows.clear();
+    account.usage_total = None;
+    account.usage_used = None;
+    account.usage_available = None;
+    account.last_refresh_at = None;
+}
+
+pub(crate) fn prepare_usage_query_update(
+    store: &ConfigStore,
+    provider_id: &str,
+    provider_base_url: &str,
+    existing: Option<&ProviderUsageQuery>,
+    update: Option<&ProviderUsageQueryUpdate>,
+) -> Result<(
+    Option<ProviderUsageQuery>,
+    Option<(std::path::PathBuf, String)>,
+)> {
+    let Some(update) = update else {
+        return Ok((existing.cloned(), None));
+    };
+    if !update.enabled {
+        return Ok((None, None));
+    }
+
+    let base_url = update
+        .base_url
+        .as_deref()
+        .and_then(normalize_non_empty)
+        .unwrap_or_else(|| provider_base_url.to_string());
+    validate_base_url(&base_url)?;
+    let credential_path = store
+        .data_dir()
+        .join("auth")
+        .join("usage-queries")
+        .join(format!("{provider_id}.json"));
+    let existing_credentials = read_usage_query_credentials(&credential_path);
+    let access_token = update
+        .access_token
+        .as_deref()
+        .and_then(normalize_non_empty)
+        .or_else(|| {
+            existing_credentials
+                .as_ref()
+                .and_then(|value| json_string(value, "access_token"))
+        })
+        .ok_or_else(|| CompanionError::InvalidConfig("余量查询缺少访问令牌".to_string()))?;
+    let user_id = update
+        .user_id
+        .as_deref()
+        .and_then(normalize_non_empty)
+        .or_else(|| {
+            existing_credentials
+                .as_ref()
+                .and_then(|value| json_string(value, "user_id"))
+        })
+        .ok_or_else(|| CompanionError::InvalidConfig("余量查询缺少用户 ID".to_string()))?;
+    let credentials = serde_json::to_string_pretty(&serde_json::json!({
+        "access_token": access_token,
+        "user_id": user_id,
+    }))
+    .map_err(|source| CompanionError::InvalidConfig(format!("余量查询凭据序列化失败: {source}")))?;
+    Ok((
+        Some(ProviderUsageQuery {
+            template: update.template,
+            base_url: base_url.trim().trim_end_matches('/').to_string(),
+        }),
+        Some((credential_path, format!("{credentials}\n"))),
+    ))
+}
+
+fn read_usage_query_credentials(path: &std::path::Path) -> Option<serde_json::Value> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_non_empty)
 }
 
 pub fn remove_provider(store: &ConfigStore, id: &str) -> Result<bool> {
@@ -179,8 +290,10 @@ fn normalize_non_empty(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ApiKeyProviderUpdate;
-    use codex_companion_core::{default_refresh_interval_seconds, GroupPolicy, ProviderKind};
+    use crate::types::{ApiKeyProviderUpdate, ProviderUsageQueryUpdate};
+    use codex_companion_core::{
+        default_refresh_interval_seconds, GroupPolicy, ProviderKind, ProviderUsageQueryTemplate,
+    };
     use std::collections::BTreeMap;
 
     fn provider(id: &str) -> ProviderUpsert {
@@ -265,6 +378,7 @@ mod tests {
                 api_key: Some("sk-secret".to_string()),
                 env_var: None,
                 refresh_interval_seconds: 30,
+                usage_query: None,
             },
         )
         .expect("update");
@@ -287,5 +401,135 @@ mod tests {
                 .and_then(|account| account.email.as_deref()),
             Some("api-key-demo")
         );
+    }
+
+    #[test]
+    fn update_provider_persists_new_api_query_credentials_privately() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        add_provider(&store, provider("configured-usage")).expect("add");
+
+        let updated = update_api_key_provider(
+            &store,
+            ApiKeyProviderUpdate {
+                id: "configured-usage".to_string(),
+                provider_display_name: None,
+                provider_name: "Configured Usage".to_string(),
+                kind: ProviderKind::RelayProvider,
+                base_url: "https://api.example.com/v1/responses".to_string(),
+                websocket_url: None,
+                api_key: Some("sk-test".to_string()),
+                env_var: None,
+                refresh_interval_seconds: 60,
+                usage_query: Some(ProviderUsageQueryUpdate {
+                    enabled: true,
+                    template: ProviderUsageQueryTemplate::NewApi,
+                    base_url: Some("https://balance.example.com".to_string()),
+                    access_token: Some("access-test".to_string()),
+                    user_id: Some("user-test".to_string()),
+                }),
+            },
+        )
+        .expect("configure query");
+
+        let query = updated
+            .account
+            .as_ref()
+            .and_then(|account| account.usage_query.as_ref())
+            .expect("query metadata");
+        assert_eq!(query.template, ProviderUsageQueryTemplate::NewApi);
+        assert_eq!(query.base_url, "https://balance.example.com");
+        let credential_path = temp
+            .path()
+            .join("auth")
+            .join("usage-queries")
+            .join("configured-usage.json");
+        let credentials = fs::read_to_string(&credential_path).expect("credentials");
+        let credentials = serde_json::from_str::<serde_json::Value>(&credentials).expect("json");
+        assert_eq!(credentials["access_token"], "access-test");
+        assert_eq!(credentials["user_id"], "user-test");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&credential_path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        store
+            .update(|config| {
+                let account = config
+                    .providers
+                    .get_mut("configured-usage")
+                    .expect("provider")
+                    .account
+                    .as_mut()
+                    .expect("account");
+                account.quota_label = Some("账户余额".to_string());
+                account.usage_available = Some(12.0);
+                Ok(())
+            })
+            .expect("seed snapshot");
+        let retained = update_api_key_provider(
+            &store,
+            ApiKeyProviderUpdate {
+                id: "configured-usage".to_string(),
+                provider_display_name: None,
+                provider_name: "Configured Usage".to_string(),
+                kind: ProviderKind::RelayProvider,
+                base_url: "https://api.example.com/v1/responses".to_string(),
+                websocket_url: None,
+                api_key: None,
+                env_var: None,
+                refresh_interval_seconds: 60,
+                usage_query: Some(ProviderUsageQueryUpdate {
+                    enabled: true,
+                    template: ProviderUsageQueryTemplate::NewApi,
+                    base_url: Some("https://balance.example.com".to_string()),
+                    access_token: None,
+                    user_id: None,
+                }),
+            },
+        )
+        .expect("retain credentials");
+        assert_eq!(
+            retained
+                .account
+                .as_ref()
+                .and_then(|account| account.usage_available),
+            Some(12.0)
+        );
+
+        let disabled = update_api_key_provider(
+            &store,
+            ApiKeyProviderUpdate {
+                id: "configured-usage".to_string(),
+                provider_display_name: None,
+                provider_name: "Configured Usage".to_string(),
+                kind: ProviderKind::RelayProvider,
+                base_url: "https://api.example.com/v1/responses".to_string(),
+                websocket_url: None,
+                api_key: None,
+                env_var: None,
+                refresh_interval_seconds: 60,
+                usage_query: Some(ProviderUsageQueryUpdate {
+                    enabled: false,
+                    template: ProviderUsageQueryTemplate::NewApi,
+                    base_url: None,
+                    access_token: None,
+                    user_id: None,
+                }),
+            },
+        )
+        .expect("disable query");
+        let disabled_account = disabled.account.as_ref().expect("account");
+        assert!(disabled_account.usage_query.is_none());
+        assert_eq!(disabled_account.quota_label, None);
+        assert_eq!(disabled_account.usage_available, None);
+        assert_eq!(disabled_account.last_refresh_at, None);
     }
 }

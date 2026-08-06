@@ -2,10 +2,14 @@ use crate::auth::resolve_auth_token;
 use crate::codex_oauth::ensure_codex_auth_snapshot;
 use chrono::{DateTime, Local, Utc};
 use codex_companion_core::{
-    CompanionError, ProviderAccountInfo, ProviderConfig, ProviderKind, ProviderQuotaWindow, Result,
+    provider_api_base_url, CompanionError, ProviderAccountInfo, ProviderConfig, ProviderKind,
+    ProviderQuotaWindow, ProviderUsageQueryTemplate, Result,
 };
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, REFERER, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT,
+};
 use serde::{Deserialize, Deserializer};
+use std::path::Path;
 use url::Url;
 
 const ACCOUNT_CHECK_URL: &str = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
@@ -143,11 +147,10 @@ pub async fn refresh_official_codex_account(
     Ok(account)
 }
 
-pub async fn refresh_api_key_usage(provider: &ProviderConfig) -> Result<ProviderAccountInfo> {
-    let token = resolve_auth_token(provider).ok_or_else(|| {
-        CompanionError::InvalidConfig(format!("provider {} 缺少 API key", provider.id))
-    })?;
-    let client = reqwest::Client::new();
+pub async fn refresh_api_key_usage(
+    provider: &ProviderConfig,
+    data_dir: &Path,
+) -> Result<ProviderAccountInfo> {
     let mut account = provider.account.clone().unwrap_or_default();
     account.display_name = account.display_name.or_else(|| Some(provider.name.clone()));
     account.subscription_type = account
@@ -155,6 +158,24 @@ pub async fn refresh_api_key_usage(provider: &ProviderConfig) -> Result<Provider
         .or_else(|| Some("API Key".to_string()));
     account.subscription_status = Some("连接正常".to_string());
 
+    if let Some(query) = account.usage_query.clone() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|source| {
+                CompanionError::InvalidConfig(format!("创建余量查询客户端失败: {source}"))
+            })?;
+        let credentials = load_usage_query_credentials(data_dir, &provider.id)?;
+        let value = fetch_configured_usage(&client, &query, &credentials).await?;
+        apply_configured_usage_to_account(&mut account, query.template, &value)?;
+        account.last_refresh_at = Some(Utc::now().to_rfc3339());
+        return Ok(account);
+    }
+
+    let token = resolve_auth_token(provider).ok_or_else(|| {
+        CompanionError::InvalidConfig(format!("provider {} 缺少 API key", provider.id))
+    })?;
+    let client = reqwest::Client::new();
     let mut last_error = None;
     for usage_url in api_usage_endpoints(&provider.base_url) {
         match fetch_api_usage(&client, &usage_url, &token).await {
@@ -172,7 +193,145 @@ pub async fn refresh_api_key_usage(provider: &ProviderConfig) -> Result<Provider
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct UsageQueryCredentials {
+    access_token: String,
+    user_id: String,
+}
+
+fn load_usage_query_credentials(
+    data_dir: &Path,
+    provider_id: &str,
+) -> Result<UsageQueryCredentials> {
+    let path = data_dir
+        .join("auth")
+        .join("usage-queries")
+        .join(format!("{provider_id}.json"));
+    let text =
+        std::fs::read_to_string(&path).map_err(|source| CompanionError::io(&path, source))?;
+    let credentials = serde_json::from_str::<UsageQueryCredentials>(&text).map_err(|source| {
+        CompanionError::InvalidConfig(format!("余量查询凭据格式无效: {source}"))
+    })?;
+    if credentials.access_token.trim().is_empty() || credentials.user_id.trim().is_empty() {
+        return Err(CompanionError::InvalidConfig(
+            "余量查询缺少访问令牌或用户 ID".to_string(),
+        ));
+    }
+    Ok(credentials)
+}
+
+async fn fetch_configured_usage(
+    client: &reqwest::Client,
+    query: &codex_companion_core::ProviderUsageQuery,
+    credentials: &UsageQueryCredentials,
+) -> Result<serde_json::Value> {
+    match query.template {
+        ProviderUsageQueryTemplate::NewApi => {
+            let url = new_api_self_url(&query.base_url);
+            let response = client
+                .get(&url)
+                .bearer_auth(credentials.access_token.trim())
+                .header(ACCEPT, "application/json")
+                .header(CONTENT_TYPE, "application/json")
+                .header(
+                    USER_AGENT,
+                    concat!("codex-companion/", env!("CARGO_PKG_VERSION")),
+                )
+                .header("New-Api-User", credentials.user_id.trim())
+                .send()
+                .await
+                .map_err(|source| {
+                    CompanionError::InvalidConfig(format!("NewAPI 余量查询请求失败: {source}"))
+                })?;
+            let status = response.status();
+            let body = response.text().await.map_err(|source| {
+                CompanionError::InvalidConfig(format!("读取 NewAPI 余量响应失败: {source}"))
+            })?;
+            if !status.is_success() {
+                return Err(CompanionError::InvalidConfig(format!(
+                    "NewAPI 余量接口返回 {status} [body_len:{}]",
+                    body.len()
+                )));
+            }
+            serde_json::from_str(&body).map_err(|source| {
+                CompanionError::InvalidConfig(format!("解析 NewAPI 余量响应失败: {source}"))
+            })
+        }
+    }
+}
+
+fn new_api_self_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/api/user/self") {
+        return trimmed.to_string();
+    }
+    let api_base_url = provider_api_base_url(trimmed);
+    api_root_url(&api_base_url, "/api/user/self")
+}
+
+fn apply_configured_usage_to_account(
+    account: &mut ProviderAccountInfo,
+    template: ProviderUsageQueryTemplate,
+    value: &serde_json::Value,
+) -> Result<()> {
+    match template {
+        ProviderUsageQueryTemplate::NewApi => apply_new_api_usage_to_account(account, value),
+    }
+}
+
+fn apply_new_api_usage_to_account(
+    account: &mut ProviderAccountInfo,
+    value: &serde_json::Value,
+) -> Result<()> {
+    let success = value
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let data = value.get("data").filter(|data| data.is_object());
+    if !success || data.is_none() {
+        let message = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("查询失败");
+        return Err(CompanionError::InvalidConfig(format!(
+            "NewAPI 余量查询失败: {message}"
+        )));
+    }
+    let data = data.expect("checked above");
+    let remaining = pick_first_number(data, &[&["quota"]])
+        .ok_or_else(|| CompanionError::InvalidConfig("NewAPI 余量响应缺少 quota".to_string()))?
+        / 500_000.0;
+    let used = pick_first_number(data, &[&["used_quota"]]).ok_or_else(|| {
+        CompanionError::InvalidConfig("NewAPI 余量响应缺少 used_quota".to_string())
+    })? / 500_000.0;
+    let plan_name =
+        pick_first_string(&[data], &[&["group"]]).unwrap_or_else(|| "默认套餐".to_string());
+
+    account.subscription_type = Some(plan_name);
+    account.subscription_status = Some(if remaining > 0.0 {
+        "可用".to_string()
+    } else {
+        "额度耗尽".to_string()
+    });
+    account.quota_label = Some("账户余额".to_string());
+    account.quota_percent = None;
+    account.quota_reset_at = None;
+    account.quota_windows.clear();
+    account.usage_available = Some(remaining);
+    account.usage_used = Some(used);
+    account.usage_total = Some(remaining + used);
+    Ok(())
+}
+
 pub fn provider_supports_api_key_usage(provider: &ProviderConfig) -> bool {
+    if provider
+        .account
+        .as_ref()
+        .and_then(|account| account.usage_query.as_ref())
+        .is_some()
+    {
+        return true;
+    }
     if provider.kind == ProviderKind::RelayProvider {
         return true;
     }
@@ -1301,6 +1460,97 @@ fn get_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_configured_new_api_balance_in_usd() {
+        let value = serde_json::json!({
+            "success": true,
+            "data": {
+                "group": "default",
+                "quota": 132_135_000,
+                "used_quota": 428_085_000
+            }
+        });
+        let mut account = ProviderAccountInfo::default();
+
+        apply_new_api_usage_to_account(&mut account, &value).expect("parse NewAPI balance");
+
+        assert_eq!(account.subscription_type.as_deref(), Some("default"));
+        assert_eq!(account.subscription_status.as_deref(), Some("可用"));
+        assert_eq!(account.quota_label.as_deref(), Some("账户余额"));
+        assert_eq!(account.quota_percent, None);
+        assert_eq!(account.usage_available, Some(264.27));
+        assert_eq!(account.usage_used, Some(856.17));
+        assert_eq!(account.usage_total, Some(1120.44));
+    }
+
+    #[test]
+    fn normalizes_new_api_query_addresses() {
+        assert_eq!(
+            new_api_self_url("https://api.example.com/v1/responses"),
+            "https://api.example.com/api/user/self"
+        );
+        assert_eq!(
+            new_api_self_url("https://api.example.com/api/user/self/"),
+            "https://api.example.com/api/user/self"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_new_api_query_sends_user_credentials_to_self_endpoint() {
+        use axum::{
+            extract::Request, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
+        };
+
+        let app = Router::new().route(
+            "/api/user/self",
+            get(|request: Request| async move {
+                let headers = request.headers();
+                let authorized = headers
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Bearer access-test");
+                let user_matches = headers
+                    .get("New-Api-User")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("user-test");
+                if !authorized || !user_matches {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                Json(serde_json::json!({
+                    "success": true,
+                    "data": {
+                        "group": "default",
+                        "quota": 1_000_000,
+                        "used_quota": 500_000
+                    }
+                }))
+                .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let query = codex_companion_core::ProviderUsageQuery {
+            template: ProviderUsageQueryTemplate::NewApi,
+            base_url: format!("http://{address}/v1/responses"),
+        };
+        let credentials = UsageQueryCredentials {
+            access_token: "access-test".to_string(),
+            user_id: "user-test".to_string(),
+        };
+
+        let response = fetch_configured_usage(&reqwest::Client::new(), &query, &credentials)
+            .await
+            .expect("query succeeds");
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["data"]["quota"], 1_000_000);
+    }
 
     #[test]
     fn parses_usage_windows_with_rate_limits() {

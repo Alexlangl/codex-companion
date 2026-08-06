@@ -175,6 +175,24 @@ fn tray_provider_quota_summary(provider: &ProviderConfig) -> Option<(String, Opt
     }
     if let Some(available) = account.usage_available.filter(|value| value.is_finite()) {
         let available = format_tray_number(available);
+        if account
+            .quota_label
+            .as_deref()
+            .is_some_and(|label| label.contains("余额"))
+        {
+            let used = account
+                .usage_used
+                .filter(|value| value.is_finite())
+                .map(format_tray_number);
+            let detail = match used {
+                Some(used) => format!("已用 ${used} · 剩余 ${available} USD"),
+                None => format!("剩余 ${available} USD"),
+            };
+            return Some((
+                format!("额度：{} · {detail}", tray_provider_label(provider)),
+                Some(format!("${available} USD")),
+            ));
+        }
         return Some((
             format!("额度：{} · 剩余 {available}", tray_provider_label(provider)),
             Some(available),
@@ -297,6 +315,25 @@ mod tray_tests {
             (
                 "额度：Fallback Provider · 剩余 12.8".to_string(),
                 Some("12.8".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn quota_summary_formats_new_api_balance_as_usd() {
+        let balance_provider = provider(ProviderAccountInfo {
+            display_name: Some("NewAPI".to_string()),
+            quota_label: Some("账户余额".to_string()),
+            usage_available: Some(264.27),
+            usage_used: Some(856.17),
+            ..ProviderAccountInfo::default()
+        });
+
+        assert_eq!(
+            tray_quota_summary(&[balance_provider], None),
+            (
+                "额度：NewAPI · 已用 $856.2 · 剩余 $264.3 USD".to_string(),
+                Some("$264.3 USD".to_string())
             )
         );
     }

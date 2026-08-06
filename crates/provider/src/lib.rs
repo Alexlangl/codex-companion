@@ -31,7 +31,7 @@ pub use registry::{add_provider, list_providers, remove_provider, update_api_key
 pub use types::{
     ApiKeyProviderUpdate, GroupUpsert, ProviderExportFormat, ProviderExportOutput,
     ProviderImportBatchReport, ProviderImportDraft, ProviderImportFailure, ProviderImportOutcome,
-    ProviderImportReviewItem, ProviderImportReviewReport, ProviderUpsert,
+    ProviderImportReviewItem, ProviderImportReviewReport, ProviderUpsert, ProviderUsageQueryUpdate,
 };
 
 pub(crate) fn write_private_auth_file(path: &Path, contents: &str) -> Result<()> {

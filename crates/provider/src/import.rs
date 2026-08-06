@@ -1,5 +1,6 @@
 use crate::persist_with_private_auth_file;
 use crate::registry::add_provider;
+use crate::registry::prepare_usage_query_update;
 use crate::types::{
     ProviderImportBatchReport, ProviderImportDraft, ProviderImportFailure, ProviderImportOutcome,
     ProviderImportReviewItem, ProviderImportReviewReport, ProviderUpsert, OFFICIAL_CODEX_BASE_URL,
@@ -553,6 +554,8 @@ pub struct ApiKeyProviderImportRequest {
     pub env_var: Option<String>,
     pub model: Option<String>,
     pub refresh_interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub usage_query: Option<crate::types::ProviderUsageQueryUpdate>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -578,6 +581,7 @@ pub fn import_api_key_provider(
             env_var,
             model,
             refresh_interval_seconds,
+            usage_query: None,
         },
     )
 }
@@ -604,6 +608,7 @@ fn import_api_key_provider_with_metadata(
         env_var,
         model,
         refresh_interval_seconds,
+        usage_query,
     } = input;
     let provider_name = normalize_non_empty(&provider_name)
         .ok_or_else(|| CompanionError::InvalidConfig("provider 名称不能为空".to_string()))?;
@@ -648,7 +653,19 @@ fn import_api_key_provider_with_metadata(
     if let Some(model) = model {
         model_map.insert(model.clone(), model);
     }
-    let existed = store.load()?.providers.contains_key(&provider_id);
+    let existing_provider = store.load()?.providers.get(&provider_id).cloned();
+    let existed = existing_provider.is_some();
+    let existing_usage_query = existing_provider
+        .as_ref()
+        .and_then(|provider| provider.account.as_ref())
+        .and_then(|account| account.usage_query.as_ref());
+    let (usage_query, usage_query_private_write) = prepare_usage_query_update(
+        store,
+        &provider_id,
+        &base_url,
+        existing_usage_query,
+        usage_query.as_ref(),
+    )?;
     let provider_input = ProviderUpsert {
         id: provider_id,
         name: provider_name.clone(),
@@ -666,17 +683,26 @@ fn import_api_key_provider_with_metadata(
             auth_mode: Some("apikey".to_string()),
             display_name: Some(provider_name.clone()),
             email: account_email,
+            usage_query,
             subscription_type: Some("API Key".to_string()),
             subscription_status: Some("待检查".to_string()),
             ..ProviderAccountInfo::default()
         }),
     };
     let persist_provider = || add_provider(store, provider_input);
-    let provider = match auth_contents {
-        Some(auth_contents) => {
+    let provider = match (auth_contents, usage_query_private_write) {
+        (Some(auth_contents), Some((usage_path, usage_contents))) => {
+            persist_with_private_auth_file(&usage_path, &usage_contents, || {
+                persist_with_private_auth_file(&auth_path, &auth_contents, persist_provider)
+            })
+        }
+        (Some(auth_contents), None) => {
             persist_with_private_auth_file(&auth_path, &auth_contents, persist_provider)
         }
-        None => persist_provider(),
+        (None, Some((usage_path, usage_contents))) => {
+            persist_with_private_auth_file(&usage_path, &usage_contents, persist_provider)
+        }
+        (None, None) => persist_provider(),
     }?;
 
     Ok(ProviderImportOutcome {
@@ -752,6 +778,7 @@ fn prepare_api_key_provider_from_json(
             env_var: None,
             model,
             refresh_interval_seconds: None,
+            usage_query: None,
         },
         provider_id,
         account_email: email,
@@ -850,6 +877,7 @@ pub fn import_local_codex_provider(
                 env_var: config_provider.api_key_env_var.clone(),
                 model: config_provider.model.clone(),
                 refresh_interval_seconds: None,
+                usage_query: None,
             },
         );
     }
@@ -915,6 +943,7 @@ pub fn import_local_codex_provider(
                 env_var: config_provider.api_key_env_var.clone(),
                 model: config_provider.model.clone(),
                 refresh_interval_seconds: None,
+                usage_query: None,
             },
         );
     }
@@ -1612,6 +1641,7 @@ fn extract_provider_account_info(
         team_name,
         account_id,
         user_id,
+        usage_query: None,
         subscription_type,
         subscription_status,
         quota_label,

@@ -490,6 +490,7 @@ fn add_api_key(daemon: &CompanionDaemon, app: &mut TuiState) {
             env_var: None,
             model: None,
             refresh_interval_seconds: Some(60),
+            usage_query: None,
         },
     ) {
         Ok(outcome) => app.message = format!("已添加账号：{}", outcome.provider.name),

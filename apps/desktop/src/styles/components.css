@@ -1206,6 +1206,29 @@ dd {
   min-height: 16px;
 }
 
+.usage-query-settings {
+  display: grid;
+  gap: 12px;
+  margin: 14px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--muted-bg);
+}
+
+.usage-query-settings .check-row {
+  margin: 0;
+}
+
+.usage-query-fields {
+  display: grid;
+  gap: 12px;
+}
+
+.usage-query-fields .field-hint {
+  margin: 0;
+}
+
 .repair-status {
   display: grid;
   gap: 9px;
