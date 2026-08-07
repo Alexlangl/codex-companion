@@ -21,7 +21,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
-use std::{fmt, io};
+use std::{fmt, io, time::Duration};
+
+const STREAM_PREFLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_STREAM_PREFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) struct UpstreamResponse {
     response: Option<reqwest::Response>,
@@ -87,7 +90,10 @@ impl UpstreamResponse {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    pub(crate) async fn preflight_stream_failure(&mut self) -> Result<(), StreamPreflightError> {
+    pub(crate) async fn preflight_stream_failure(
+        &mut self,
+        hold_reasoning_for_fallback: bool,
+    ) -> Result<(), StreamPreflightError> {
         if !self.status.is_success() {
             return Ok(());
         }
@@ -96,19 +102,24 @@ impl UpstreamResponse {
             .as_deref()
             .filter(|body| looks_like_sse(body))
         {
-            return preflight_buffered_sse(body);
+            return preflight_buffered_sse(body, hold_reasoning_for_fallback);
         }
         if !is_event_stream(&self.headers) || self.response.is_none() {
             return Ok(());
         }
         let mut inspection = Vec::new();
+        let mut prefetched_bytes = 0_usize;
         loop {
-            let chunk = self
+            let next_chunk = self
                 .response
                 .as_mut()
                 .expect("response checked above")
-                .chunk()
+                .chunk();
+            let chunk = tokio::time::timeout(STREAM_PREFLIGHT_IDLE_TIMEOUT, next_chunk)
                 .await
+                .map_err(|_| {
+                    StreamPreflightError::Network("等待上游 SSE 后续事件超时".to_string())
+                })?
                 .map_err(|error| {
                     StreamPreflightError::Network(format!("读取上游 SSE 首帧失败: {error}"))
                 })?;
@@ -117,6 +128,7 @@ impl UpstreamResponse {
                     "上游 SSE 在输出内容前结束".to_string(),
                 ));
             };
+            prefetched_bytes = prefetched_bytes.saturating_add(chunk.len());
             inspection.extend_from_slice(&chunk);
             self.prefetched_body.push_back(chunk);
             let mut parsed_any = false;
@@ -131,20 +143,28 @@ impl UpstreamResponse {
                 inspection.drain(..drain_to);
                 match preflight_sse_block(&block) {
                     StreamPreflight::Continue => {}
+                    StreamPreflight::Reasoning if hold_reasoning_for_fallback => {}
+                    StreamPreflight::Reasoning => return Ok(()),
                     StreamPreflight::OutputStarted | StreamPreflight::Terminal => return Ok(()),
                     StreamPreflight::Failure(message) => {
                         return Err(StreamPreflightError::Semantic(message));
                     }
                 }
             }
-            if inspection.len() >= 64 * 1024 || (!parsed_any && inspection.len() >= 16 * 1024) {
+            if prefetched_bytes >= MAX_STREAM_PREFLIGHT_BYTES
+                || inspection.len() >= 64 * 1024
+                || (!parsed_any && inspection.len() >= 16 * 1024)
+            {
                 return Ok(());
             }
         }
     }
 }
 
-fn preflight_buffered_sse(body: &[u8]) -> Result<(), StreamPreflightError> {
+fn preflight_buffered_sse(
+    body: &[u8],
+    hold_reasoning_for_fallback: bool,
+) -> Result<(), StreamPreflightError> {
     let mut inspection = body.to_vec();
     while let Some(index) = next_sse_block_index(&inspection) {
         let block = String::from_utf8_lossy(&inspection[..index]).into_owned();
@@ -156,7 +176,10 @@ fn preflight_buffered_sse(body: &[u8]) -> Result<(), StreamPreflightError> {
         inspection.drain(..drain_to);
         match preflight_sse_block(&block) {
             StreamPreflight::Continue => {}
-            StreamPreflight::OutputStarted | StreamPreflight::Terminal => return Ok(()),
+            StreamPreflight::Reasoning | StreamPreflight::OutputStarted
+                if hold_reasoning_for_fallback => {}
+            StreamPreflight::Reasoning | StreamPreflight::OutputStarted => return Ok(()),
+            StreamPreflight::Terminal => return Ok(()),
             StreamPreflight::Failure(message) => {
                 return Err(StreamPreflightError::Semantic(message));
             }
@@ -169,6 +192,7 @@ fn preflight_buffered_sse(body: &[u8]) -> Result<(), StreamPreflightError> {
 
 enum StreamPreflight {
     Continue,
+    Reasoning,
     OutputStarted,
     Terminal,
     Failure(String),
@@ -198,6 +222,14 @@ fn preflight_sse_block(block: &str) -> StreamPreflight {
         .unwrap_or_default();
     if matches!(event_type, "response.completed" | "response.incomplete") {
         return StreamPreflight::Terminal;
+    }
+    let reasoning_event = event_type.contains("reasoning")
+        || value
+            .pointer("/item/type")
+            .and_then(Value::as_str)
+            .is_some_and(|item_type| item_type == "reasoning");
+    if reasoning_event {
+        return StreamPreflight::Reasoning;
     }
     if event_type.contains("output_item")
         || event_type.ends_with(".delta")
@@ -3624,7 +3656,15 @@ mod tests {
     #[test]
     fn detects_semantic_failure_in_buffered_sse() {
         let error = preflight_buffered_sse(
-            b"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"exceeded retry limit, last status: 429 Too Many Requests\"}}}\n\n",
+            concat!(
+                "data: {\"type\":\"response.created\"}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n",
+                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checking\"}\n\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":",
+                "\"exceeded retry limit, last status: 429 Too Many Requests\"}}}\n\n"
+            )
+            .as_bytes(),
+            true,
         )
         .expect_err("semantic failure");
 

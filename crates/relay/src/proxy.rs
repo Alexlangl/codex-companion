@@ -4,8 +4,7 @@ use crate::content_encoding::{
 use crate::events::{append_event, record_health_success, update_health};
 use crate::state::{apply_group_policy, AffinityBindContext, RelayState};
 use crate::upstream::{
-    send_upstream, stream_response, text_response, upstream_url, StreamPreflightError,
-    UpstreamRequest,
+    send_upstream, stream_response, text_response, upstream_url, UpstreamRequest,
 };
 use crate::{RequestAttemptFinish, RequestAttemptStart, RequestLogFinish, RequestLogStart};
 use axum::{
@@ -33,7 +32,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(300);
-const UPSTREAM_STREAM_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
 const UPSTREAM_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) async fn proxy(
@@ -538,16 +536,9 @@ async fn proxy_dispatch(
         match upstream_result {
             Ok(mut response) if response.status().is_success() => {
                 let upstream_status = response.status();
-                let preflight = tokio::time::timeout(
-                    UPSTREAM_STREAM_PREFLIGHT_TIMEOUT,
-                    response.preflight_stream_failure(),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(StreamPreflightError::Network(
-                        "等待上游 SSE 首帧超时".to_string(),
-                    ))
-                });
+                let preflight = response
+                    .preflight_stream_failure(group.fallback_enabled && index + 1 < candidate_count)
+                    .await;
                 if let Err(error) = preflight {
                     let failure = classify_failure(None, &error.classification_text());
                     let message = error.to_string();
@@ -1406,6 +1397,7 @@ mod tests {
         ProviderGroup, ProviderHealth, ProviderKind,
     };
     use std::collections::BTreeMap;
+    use std::convert::Infallible;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -2031,15 +2023,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_when_sse_rate_limit_happens_before_any_output() {
+    async fn falls_back_when_sse_rate_limit_happens_after_reasoning_preamble() {
         let provider_a_hits = Arc::new(AtomicUsize::new(0));
         let provider_b_hits = Arc::new(AtomicUsize::new(0));
-        let provider_a_url = spawn_sse_mock_server(
+        let provider_a_url = spawn_delayed_sse_mock_server(
             concat!(
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n",
+                "data: {\"type\":\"response.reasoning_summary_part.added\",\"part\":{\"type\":\"summary_text\"}}\n\n",
+                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checking capacity\"}\n\n"
+            ),
+            concat!(
+                "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}\n\n",
                 "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
                 "\"error\":{\"message\":\"exceeded retry limit, last status: 429 Too Many Requests\"}}}\n\n"
             ),
+            Duration::from_millis(20),
             Some(provider_a_hits.clone()),
         )
         .await;
@@ -3394,6 +3393,53 @@ mod tests {
                         hits.fetch_add(1, Ordering::SeqCst);
                     }
                     ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/v1")
+    }
+
+    async fn spawn_delayed_sse_mock_server(
+        first: &'static str,
+        second: &'static str,
+        delay: Duration,
+        hits: Option<Arc<AtomicUsize>>,
+    ) -> String {
+        let app = Router::new().route(
+            "/{*path}",
+            any(move || {
+                let hits = hits.clone();
+                async move {
+                    if let Some(hits) = hits {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let stream = futures_util::stream::unfold(0_u8, move |step| async move {
+                        match step {
+                            0 => Some((
+                                Ok::<Bytes, Infallible>(Bytes::from_static(first.as_bytes())),
+                                1,
+                            )),
+                            1 => {
+                                tokio::time::sleep(delay).await;
+                                Some((
+                                    Ok::<Bytes, Infallible>(Bytes::from_static(second.as_bytes())),
+                                    2,
+                                ))
+                            }
+                            _ => None,
+                        }
+                    });
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .expect("SSE response")
                 }
             }),
         );
