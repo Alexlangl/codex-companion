@@ -85,6 +85,7 @@ pub enum HealthFailureKind {
     RateLimited,
     QuotaExhausted,
     ModelMissing,
+    RequestRejected,
     UpstreamFailed,
     NetworkFailed,
     Unknown,

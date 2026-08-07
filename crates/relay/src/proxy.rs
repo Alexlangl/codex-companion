@@ -20,7 +20,8 @@ use codex_companion_core::{
     GroupPolicy, HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderGroup,
 };
 use codex_companion_health::{
-    classify_failure, cooldown_active, mark_failure, mark_model_failure, normalize_expired_cooldown,
+    classify_failure, cooldown_active, mark_failure, mark_model_failure,
+    normalize_expired_cooldown, repair_legacy_auth_misclassification,
 };
 use codex_companion_provider::selected_providers_for_group;
 use futures_util::StreamExt;
@@ -235,7 +236,12 @@ async fn proxy_dispatch(
             return Ok(allowed_models_response(&client.allowed_models));
         }
     }
-    normalize_health(&mut config);
+    if normalize_health(&mut config) {
+        let _ = state.store.update(|current| {
+            normalize_health(current);
+            Ok(())
+        });
+    }
     let group = config
         .groups
         .get(&config.relay.active_group_id)
@@ -358,6 +364,7 @@ async fn proxy_dispatch(
                         HealthFailureKind::RateLimited
                             | HealthFailureKind::UpstreamFailed
                             | HealthFailureKind::NetworkFailed
+                            | HealthFailureKind::RequestRejected
                             | HealthFailureKind::Unknown
                     )
                 });
@@ -960,6 +967,7 @@ fn failure_error_code(kind: &HealthFailureKind) -> &'static str {
         HealthFailureKind::RateLimited => "upstream_rate_limited",
         HealthFailureKind::QuotaExhausted => "upstream_quota_exhausted",
         HealthFailureKind::ModelMissing => "upstream_model_not_found",
+        HealthFailureKind::RequestRejected => "upstream_request_rejected",
         HealthFailureKind::NetworkFailed => "upstream_network_error",
         HealthFailureKind::UpstreamFailed => "upstream_error",
         HealthFailureKind::Unknown => "upstream_unknown_error",
@@ -1076,6 +1084,9 @@ fn record_provider_failure(
     failure: &codex_companion_health::FailureClassification,
     message: &str,
 ) {
+    if matches!(&failure.kind, HealthFailureKind::RequestRejected) {
+        return;
+    }
     if let Some(model) = model.filter(|_| is_model_scoped_failure(&failure.kind)) {
         let _ = state.api_service.set_model_cooldown(
             provider_id,
@@ -1347,10 +1358,13 @@ fn scoped_affinity_key(key: &str, client_id: Option<&str>) -> String {
     hash_affinity_key(&format!("client:{}:{key}", client_id.unwrap_or("local")))
 }
 
-fn normalize_health(config: &mut CompanionConfig) {
+fn normalize_health(config: &mut CompanionConfig) -> bool {
+    let mut repaired = false;
     for health in config.health.values_mut() {
+        repaired |= repair_legacy_auth_misclassification(health);
         normalize_expired_cooldown(health);
     }
+    repaired
 }
 
 fn compact_error_body(body: &str) -> String {
@@ -2747,6 +2761,120 @@ mod tests {
             .api_service
             .model_cooldown_active("a", "gpt-two")
             .expect("gpt-two cooldown"));
+    }
+
+    #[tokio::test]
+    async fn insufficient_balance_403_falls_back_as_quota_exhaustion() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let url_a = spawn_mock_server(
+            StatusCode::FORBIDDEN,
+            r#"{"error":{"code":"INSUFFICIENT_BALANCE","message":"Insufficient account balance"}}"#,
+            Some(hits_a.clone()),
+        )
+        .await;
+        let url_b = spawn_mock_server(StatusCode::OK, "ok from b", Some(hits_b.clone())).await;
+        let store = store_with_group(vec![provider("a", &url_a), provider("b", &url_b)]);
+
+        let response = proxy_inner(
+            RelayState::new(store.clone(), reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        let health = store.load().expect("config").health;
+        assert_eq!(
+            health.get("a").map(|health| health.status.clone()),
+            Some(HealthStatusKind::QuotaExhausted)
+        );
+        assert_eq!(
+            health
+                .get("a")
+                .and_then(|health| health.last_failure_kind.clone()),
+            Some(HealthFailureKind::QuotaExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn content_policy_403_falls_back_without_poisoning_provider_health() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let url_a = spawn_mock_server(
+            StatusCode::FORBIDDEN,
+            r#"{"error":{"code":"content_policy_violation","message":"request rejected by content policy"}}"#,
+            Some(hits_a.clone()),
+        )
+        .await;
+        let url_b = spawn_mock_server(StatusCode::OK, "ok from b", Some(hits_b.clone())).await;
+        let store = store_with_group(vec![provider("a", &url_a), provider("b", &url_b)]);
+
+        let response = proxy_inner(
+            RelayState::new(store.clone(), reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert!(!store.load().expect("config").health.contains_key("a"));
+    }
+
+    #[tokio::test]
+    async fn legacy_content_policy_auth_failure_is_repaired_before_routing() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = spawn_mock_server(StatusCode::OK, "ok", Some(hits.clone())).await;
+        let store = store_with_group(vec![provider("a", &url)]);
+        store
+            .update(|config| {
+                config.health.insert(
+                    "a".to_string(),
+                    ProviderHealth {
+                        status: HealthStatusKind::AuthFailed,
+                        last_error: Some(
+                            "上游返回 403 Forbidden: content_policy_violation".to_string(),
+                        ),
+                        last_failure_kind: Some(HealthFailureKind::AuthFailed),
+                        failure_count: 1,
+                        ..ProviderHealth::default()
+                    },
+                );
+                Ok(())
+            })
+            .expect("seed legacy health");
+
+        let response = proxy_inner(
+            RelayState::new(store.clone(), reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .load()
+                .expect("config")
+                .health
+                .get("a")
+                .map(|health| health.status.clone()),
+            Some(HealthStatusKind::Healthy)
+        );
     }
 
     #[tokio::test]

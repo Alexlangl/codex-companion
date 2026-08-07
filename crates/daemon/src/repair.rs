@@ -10,10 +10,10 @@ use codex_companion_core::{
 };
 use codex_companion_provider::selected_providers;
 use codex_companion_state::{
-    collect_token_usage_cached, collect_token_usage_cached_with_filters, doctor,
-    install_companion_provider_for_relay, rebuild_token_usage_cached_with_filters,
-    relay_preserved_official_auth_is_ready, repair_state, CodexInstallSnapshot,
-    TokenUsageDateRange, TokenUsageFilters,
+    collect_token_usage_cached, collect_token_usage_cached_with_filters,
+    companion_managed_model_catalog_is_active, doctor, install_companion_provider_for_relay,
+    rebuild_token_usage_cached_with_filters, relay_preserved_official_auth_is_ready, repair_state,
+    CodexInstallSnapshot, TokenUsageDateRange, TokenUsageFilters,
 };
 use std::path::PathBuf;
 
@@ -61,17 +61,36 @@ impl CompanionDaemon {
 
     fn reconcile_preserved_official_codex_auth_in_dir(&self, codex_dir: PathBuf) -> Result<bool> {
         let config = self.store.load()?;
-        if !config.app.preserve_official_codex_auth {
-            return Ok(false);
-        }
         let relay_active = matches!(
             config.app.last_codex_launch_mode,
             Some(CodexLaunchMode::GroupRelay | CodexLaunchMode::ProviderRelay)
         ) && doctor(codex_dir.clone(), &config.relay)?.installed;
-        if !relay_active || relay_preserved_official_auth_is_ready(&codex_dir)? {
+        if !relay_active {
             return Ok(false);
         }
-        self.set_preserve_official_codex_auth_in_dir(true, codex_dir)?;
+        let selected = selected_providers(&config);
+        let models = relay_model_slugs(&selected);
+        let auth_repair_needed = config.app.preserve_official_codex_auth
+            && !relay_preserved_official_auth_is_ready(&codex_dir)?;
+        let catalog_repair_needed =
+            models.is_empty() && companion_managed_model_catalog_is_active(&codex_dir)?;
+        if !auth_repair_needed && !catalog_repair_needed {
+            return Ok(false);
+        }
+        let source = config
+            .app
+            .preserve_official_codex_auth
+            .then(|| relay_official_auth_provider(&config, &selected))
+            .flatten();
+        install_companion_provider_for_relay(
+            Some(codex_dir),
+            &config.relay,
+            Some("Companion relay startup reconciliation"),
+            &models,
+            source.as_ref(),
+            config.app.preserve_official_codex_auth,
+        )?;
+        restart_codex_if_running();
         Ok(true)
     }
 
@@ -395,6 +414,66 @@ mod tests {
                 .app
                 .preserve_official_codex_auth
         );
+    }
+
+    #[test]
+    fn startup_reconciliation_removes_an_old_managed_catalog_when_oauth_is_ready() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_dir = temp.path().join("codex");
+        let source_path = temp.path().join("official-auth.json");
+        std::fs::write(
+            &source_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "official-access",
+                    "refresh_token": "official-refresh"
+                }
+            })
+            .to_string(),
+        )
+        .expect("official auth");
+        let mut official = provider(ProviderKind::OfficialCodex);
+        official.auth_ref = Some(format!("file:{}", source_path.display()));
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .insert(official.id.clone(), official.clone());
+                config.app.last_codex_launch_mode = Some(CodexLaunchMode::GroupRelay);
+                config.app.preserve_official_codex_auth = true;
+                Ok(())
+            })
+            .expect("config");
+        install_companion_provider_for_relay(
+            Some(codex_dir.clone()),
+            &codex_companion_core::RelayConfig::default(),
+            None,
+            &["gpt-5.6-sol".to_string()],
+            Some(&official),
+            true,
+        )
+        .expect("old-style relay install");
+        assert!(
+            companion_managed_model_catalog_is_active(&codex_dir).expect("managed catalog state")
+        );
+        assert!(relay_preserved_official_auth_is_ready(&codex_dir).expect("oauth ready"));
+        let daemon = CompanionDaemon::new(store);
+
+        assert!(daemon
+            .reconcile_preserved_official_codex_auth_in_dir(codex_dir.clone())
+            .expect("reconcile catalog"));
+
+        let codex_config =
+            std::fs::read_to_string(codex_dir.join("config.toml")).expect("live Codex config");
+        assert!(!codex_config.contains("model_catalog_json"));
+        assert!(!codex_dir
+            .join("codex-companion-model-catalog.json")
+            .exists());
+        assert!(relay_preserved_official_auth_is_ready(&codex_dir).expect("oauth remains ready"));
+        assert!(!daemon
+            .reconcile_preserved_official_codex_auth_in_dir(codex_dir)
+            .expect("repeated reconciliation"));
     }
 
     #[test]

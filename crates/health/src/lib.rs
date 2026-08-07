@@ -11,13 +11,12 @@ pub struct FailureClassification {
 pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassification {
     let lower = body.to_ascii_lowercase();
 
-    if matches!(status, Some(401 | 403)) {
-        return class(HealthFailureKind::AuthFailed, false, true);
-    }
     if lower.contains("deactivated_workspace") {
         return class(HealthFailureKind::AuthFailed, false, true);
     }
     if lower.contains("insufficient_quota")
+        || lower.contains("insufficient_balance")
+        || lower.contains("insufficient account balance")
         || lower.contains("usage_limit_reached")
         || lower.contains("usage limit has been reached")
         || lower.contains("usage limit reached")
@@ -43,6 +42,20 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
     }
     if lower.contains("model_not_found") || lower.contains("model not found") {
         return class(HealthFailureKind::ModelMissing, true, true);
+    }
+    if lower.contains("content_policy_violation")
+        || lower.contains("content policy violation")
+        || lower.contains("content filter")
+        || lower.contains("safety policy")
+    {
+        return class(HealthFailureKind::RequestRejected, true, false);
+    }
+    if matches!(status, Some(401)) || (matches!(status, Some(403)) && explicit_auth_failure(&lower))
+    {
+        return class(HealthFailureKind::AuthFailed, false, true);
+    }
+    if matches!(status, Some(403)) {
+        return class(HealthFailureKind::RequestRejected, true, false);
     }
     if lower.contains("upstream semantic failure")
         || lower.contains("response.failed")
@@ -72,6 +85,9 @@ pub fn mark_success(health: &mut ProviderHealth) {
 }
 
 pub fn mark_failure(health: &mut ProviderHealth, failure: &FailureClassification, message: String) {
+    if matches!(&failure.kind, HealthFailureKind::RequestRejected) {
+        return;
+    }
     health.last_checked = Some(Utc::now());
     health.failure_count = health.failure_count.saturating_add(1);
     health.last_error = Some(message);
@@ -83,9 +99,9 @@ pub fn mark_failure(health: &mut ProviderHealth, failure: &FailureClassification
         HealthFailureKind::RateLimited => HealthStatusKind::RateLimited,
         HealthFailureKind::ModelMissing => HealthStatusKind::ModelMissing,
         HealthFailureKind::NetworkFailed => HealthStatusKind::Offline,
-        HealthFailureKind::UpstreamFailed | HealthFailureKind::Unknown => {
-            HealthStatusKind::Degraded
-        }
+        HealthFailureKind::RequestRejected
+        | HealthFailureKind::UpstreamFailed
+        | HealthFailureKind::Unknown => HealthStatusKind::Degraded,
     };
 
     if failure.cooldown {
@@ -134,6 +150,62 @@ pub fn normalize_expired_cooldown(health: &mut ProviderHealth) {
     }
 }
 
+pub fn repair_legacy_auth_misclassification(health: &mut ProviderHealth) -> bool {
+    if !matches!(health.status, HealthStatusKind::AuthFailed) {
+        return false;
+    }
+    let Some(message) = health.last_error.as_deref() else {
+        return false;
+    };
+    let failure = classify_failure(None, message);
+    let request_rejected = matches!(&failure.kind, HealthFailureKind::RequestRejected);
+    health.status = match &failure.kind {
+        HealthFailureKind::QuotaExhausted => HealthStatusKind::QuotaExhausted,
+        HealthFailureKind::RateLimited => HealthStatusKind::RateLimited,
+        HealthFailureKind::ModelMissing => HealthStatusKind::ModelMissing,
+        HealthFailureKind::RequestRejected => {
+            health.last_error = None;
+            health.last_failure_kind = None;
+            health.cooldown_until = None;
+            health.failure_count = 0;
+            if health.last_success.is_some() {
+                HealthStatusKind::Healthy
+            } else {
+                HealthStatusKind::Unknown
+            }
+        }
+        _ => return false,
+    };
+    if !request_rejected {
+        health.last_failure_kind = Some(failure.kind);
+    }
+    true
+}
+
+fn explicit_auth_failure(body: &str) -> bool {
+    [
+        "invalid_api_key",
+        "invalid api key",
+        "incorrect api key",
+        "api key is invalid",
+        "invalid bearer token",
+        "invalid access token",
+        "token is invalid",
+        "token expired",
+        "expired token",
+        "authentication_error",
+        "authentication failed",
+        "authentication required",
+        "unauthorized",
+        "凭证无效",
+        "认证失败",
+        "鉴权失败",
+        "令牌无效",
+    ]
+    .iter()
+    .any(|pattern| body.contains(pattern))
+}
+
 fn class(kind: HealthFailureKind, retryable: bool, cooldown: bool) -> FailureClassification {
     FailureClassification {
         kind,
@@ -168,6 +240,26 @@ mod tests {
         assert_eq!(
             classify_failure(Some(400), "insufficient_quota").kind,
             HealthFailureKind::QuotaExhausted
+        );
+        assert_eq!(
+            classify_failure(
+                Some(403),
+                r#"{"error":{"code":"INSUFFICIENT_BALANCE","message":"Insufficient account balance"}}"#
+            )
+            .kind,
+            HealthFailureKind::QuotaExhausted
+        );
+        assert_eq!(
+            classify_failure(
+                Some(403),
+                r#"{"error":{"code":"content_policy_violation"}}"#
+            )
+            .kind,
+            HealthFailureKind::RequestRejected
+        );
+        assert_eq!(
+            classify_failure(Some(403), r#"{"error":{"message":"invalid api key"}}"#).kind,
+            HealthFailureKind::AuthFailed
         );
         assert_eq!(
             classify_failure(
@@ -213,6 +305,46 @@ mod tests {
             classify_failure(None, "timeout").kind,
             HealthFailureKind::NetworkFailed
         );
+    }
+
+    #[test]
+    fn request_rejection_does_not_change_provider_health() {
+        let failure = classify_failure(Some(403), "content_policy_violation");
+        let mut health = ProviderHealth::default();
+        mark_failure(&mut health, &failure, "blocked prompt".to_string());
+
+        assert_eq!(health.status, HealthStatusKind::Unknown);
+        assert_eq!(health.failure_count, 0);
+        assert!(health.last_error.is_none());
+    }
+
+    #[test]
+    fn repairs_legacy_403_misclassifications() {
+        let mut quota = ProviderHealth {
+            status: HealthStatusKind::AuthFailed,
+            last_error: Some("上游返回 403: INSUFFICIENT_BALANCE".to_string()),
+            last_failure_kind: Some(HealthFailureKind::AuthFailed),
+            ..ProviderHealth::default()
+        };
+        assert!(repair_legacy_auth_misclassification(&mut quota));
+        assert_eq!(quota.status, HealthStatusKind::QuotaExhausted);
+        assert_eq!(
+            quota.last_failure_kind,
+            Some(HealthFailureKind::QuotaExhausted)
+        );
+
+        let mut policy = ProviderHealth {
+            status: HealthStatusKind::AuthFailed,
+            last_error: Some("上游返回 403: content_policy_violation".to_string()),
+            last_failure_kind: Some(HealthFailureKind::AuthFailed),
+            failure_count: 1,
+            ..ProviderHealth::default()
+        };
+        assert!(repair_legacy_auth_misclassification(&mut policy));
+        assert_eq!(policy.status, HealthStatusKind::Unknown);
+        assert!(policy.last_failure_kind.is_none());
+        assert!(policy.last_error.is_none());
+        assert_eq!(policy.failure_count, 0);
     }
 
     #[test]

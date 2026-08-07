@@ -47,6 +47,39 @@ pub fn companion_model_catalog_path(codex_dir: &Path) -> PathBuf {
     managed_model_catalog_path(codex_dir)
 }
 
+pub fn companion_managed_model_catalog_is_active(codex_dir: &Path) -> Result<bool> {
+    let config_path = codex_dir.join("config.toml");
+    if !config_path.is_file() {
+        return Ok(false);
+    }
+    let config = fs::read_to_string(&config_path)
+        .map_err(|source| CompanionError::io(&config_path, source))?
+        .parse::<DocumentMut>()
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
+        })?;
+    let managed_pointer = config
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .is_some_and(|path| managed_model_catalog_pointer(codex_dir, path));
+    if !managed_pointer {
+        return Ok(false);
+    }
+    let Some(expected_hash) = load_companion_marker(codex_dir, &config)
+        .and_then(|marker| marker.model_catalog_write_hash)
+    else {
+        return Ok(false);
+    };
+    let catalog_path = managed_model_catalog_path(codex_dir);
+    if !catalog_path.exists() {
+        return Ok(true);
+    }
+    if !catalog_path.is_file() {
+        return Ok(false);
+    }
+    Ok(hash_file(&catalog_path)? == expected_hash)
+}
+
 pub fn relay_preserved_official_auth_is_ready(codex_dir: &Path) -> Result<bool> {
     let config_path = codex_dir.join("config.toml");
     let auth_path = codex_dir.join("auth.json");
@@ -221,10 +254,11 @@ pub fn install_companion_provider_for_relay(
             model_slugs,
             &auth_rollback,
         )?;
-        let managed_model_catalog = doc
-            .get("model_catalog_json")
-            .and_then(Item::as_str)
-            .is_some_and(|path| managed_model_catalog_pointer(&codex_dir, path));
+        let managed_model_catalog = backup.model_catalog_write_hash.is_some()
+            && doc
+                .get("model_catalog_json")
+                .and_then(Item::as_str)
+                .is_some_and(|path| managed_model_catalog_pointer(&codex_dir, path));
         let marker = companion_marker(
             &doc,
             &backup,
@@ -1459,6 +1493,39 @@ fn install_managed_model_catalog(
     };
 
     let result = (|| -> Result<()> {
+        let has_explicit_models = requested_models.iter().any(|model| {
+            let model = model.trim();
+            !model.is_empty() && model != "default"
+        });
+        if !has_explicit_models {
+            let managed_catalog_is_live = doc
+                .get("model_catalog_json")
+                .and_then(Item::as_str)
+                .is_some_and(|path| managed_model_catalog_pointer(codex_dir, path));
+            if managed_catalog_is_live && backup.model_catalog_write_hash.is_some() {
+                let restored = restore_model_catalog_contents(
+                    codex_dir,
+                    backup.previous_model_catalog_exists,
+                    backup.model_catalog_backup.as_deref(),
+                    backup.model_catalog_write_hash.as_deref(),
+                )?;
+                if restored {
+                    let original_doc =
+                        read_config_backup_doc(codex_dir, backup.config_backup.as_deref());
+                    if let Some(original_catalog) = original_doc
+                        .as_ref()
+                        .and_then(|original| original.get("model_catalog_json"))
+                    {
+                        doc["model_catalog_json"] = original_catalog.clone();
+                    } else {
+                        doc.as_table_mut().remove("model_catalog_json");
+                    }
+                }
+                backup.model_catalog_write_hash = None;
+            }
+            return Ok(());
+        }
+
         let catalog_pointer_is_claimable = match doc.get("model_catalog_json") {
             None => true,
             Some(item) => item
@@ -2105,10 +2172,11 @@ fn read_original_config_doc(
     codex_dir: &Path,
     marker: &CompanionConfigMarker,
 ) -> Option<DocumentMut> {
-    let backup_path = marker
-        .config_backup
-        .as_deref()
-        .map(|backup| resolve_codex_relative(codex_dir, backup))?;
+    read_config_backup_doc(codex_dir, marker.config_backup.as_deref())
+}
+
+fn read_config_backup_doc(codex_dir: &Path, backup: Option<&str>) -> Option<DocumentMut> {
+    let backup_path = backup.map(|backup| resolve_codex_relative(codex_dir, backup))?;
     let text = fs::read_to_string(backup_path).ok()?;
     text.parse::<DocumentMut>().ok()
 }
@@ -2175,33 +2243,48 @@ fn restore_model_catalog_from_marker(
     codex_dir: &Path,
     marker: &CompanionConfigMarker,
 ) -> Result<()> {
-    let Some(expected_hash) = marker.model_catalog_write_hash.as_deref() else {
-        return Ok(());
+    restore_model_catalog_contents(
+        codex_dir,
+        marker.previous_model_catalog_exists,
+        marker.model_catalog_backup.as_deref(),
+        marker.model_catalog_write_hash.as_deref(),
+    )?;
+    Ok(())
+}
+
+fn restore_model_catalog_contents(
+    codex_dir: &Path,
+    previous_catalog_exists: bool,
+    catalog_backup: Option<&str>,
+    expected_hash: Option<&str>,
+) -> Result<bool> {
+    let Some(expected_hash) = expected_hash else {
+        return Ok(false);
     };
     let catalog_path = managed_model_catalog_path(codex_dir);
-    if !catalog_path.is_file() {
-        return Ok(());
+    if catalog_path.exists() && !catalog_path.is_file() {
+        return Ok(false);
     }
-    if hash_file(&catalog_path)? != expected_hash {
+    if catalog_path.is_file() && hash_file(&catalog_path)? != expected_hash {
         let changed_backup_root = create_backup_root(codex_dir)?;
         backup_file(&catalog_path, &changed_backup_root, codex_dir)?;
-        return Ok(());
+        return Ok(false);
     }
-    if marker.previous_model_catalog_exists {
-        if let Some(backup_path) = marker
-            .model_catalog_backup
-            .as_deref()
+    if previous_catalog_exists {
+        if let Some(backup_path) = catalog_backup
             .map(|path| resolve_codex_relative(codex_dir, path))
             .filter(|path| path.is_file())
         {
             fs::copy(&backup_path, &catalog_path)
                 .map_err(|source| CompanionError::io(&backup_path, source))?;
+        } else {
+            return Ok(false);
         }
-    } else {
+    } else if catalog_path.exists() {
         fs::remove_file(&catalog_path)
             .map_err(|source| CompanionError::io(&catalog_path, source))?;
     }
-    Ok(())
+    Ok(true)
 }
 
 pub fn doctor(codex_dir: PathBuf, relay: &RelayConfig) -> Result<CodexInstallStatus> {
@@ -3403,7 +3486,7 @@ mod tests {
     }
 
     #[test]
-    fn install_writes_companion_provider() {
+    fn install_without_explicit_models_preserves_the_official_catalog() {
         let temp = tempfile::tempdir().expect("tempdir");
         let relay = RelayConfig::default();
         let status =
@@ -3413,10 +3496,27 @@ mod tests {
         assert!(text.contains("model_provider = \"codex-companion\""));
         assert!(text.contains("name = \"本地代理\""));
         assert!(text.contains("base_url = \"http://127.0.0.1:17687/v1\""));
+        assert!(!text.contains("model_catalog_json"));
+        assert!(!managed_model_catalog_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn install_writes_a_catalog_for_explicit_models() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        install_companion_provider_with_token_source_and_models(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()],
+        )
+        .expect("install");
+
+        let text = fs::read_to_string(temp.path().join("config.toml")).expect("config");
         assert!(text.contains("model_catalog_json = \"codex-companion-model-catalog.json\""));
         let catalog = read_json_value(&managed_model_catalog_path(temp.path()))
             .expect("managed model catalog");
         assert_eq!(catalog["models"][0]["slug"], "gpt-5.6-sol");
+        assert_eq!(catalog["models"][1]["slug"], "gpt-5.6-terra");
         assert!(catalog["models"][0]["supported_reasoning_levels"]
             .as_array()
             .expect("reasoning levels")
@@ -3442,7 +3542,7 @@ mod tests {
             Some(temp.path().to_path_buf()),
             &RelayConfig::default(),
             None,
-            &[],
+            &["gpt-5.6-sol".to_string()],
             None,
             false,
         )
@@ -3464,6 +3564,73 @@ mod tests {
             "model_catalog_json = \"{}\"",
             MANAGED_MODEL_CATALOG_FILENAME
         )));
+    }
+
+    #[test]
+    fn empty_models_remove_a_catalog_managed_by_an_older_install() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model = \"gpt-5.6-sol\"\nmodel_provider = \"openai\"\n",
+        )
+        .expect("config");
+
+        let first = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &["gpt-5.6-sol".to_string()],
+            None,
+            false,
+        )
+        .expect("old-style install");
+        assert!(first.managed_model_catalog);
+        assert!(managed_model_catalog_path(temp.path()).is_file());
+
+        let repaired = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            None,
+            false,
+        )
+        .expect("repair install");
+
+        assert!(!repaired.managed_model_catalog);
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(!config.contains("model_catalog_json"));
+        assert!(!managed_model_catalog_path(temp.path()).exists());
+        assert!(read_companion_state(temp.path())
+            .expect("managed state")
+            .model_catalog_write_hash
+            .is_none());
+    }
+
+    #[test]
+    fn managed_catalog_detection_does_not_claim_a_user_modified_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &["gpt-5.6-sol".to_string()],
+            None,
+            false,
+        )
+        .expect("managed catalog install");
+        assert!(
+            companion_managed_model_catalog_is_active(temp.path()).expect("managed catalog state")
+        );
+
+        fs::write(
+            managed_model_catalog_path(temp.path()),
+            br#"{"models":[{"slug":"user-model"}]}"#,
+        )
+        .expect("user catalog edit");
+
+        assert!(!companion_managed_model_catalog_is_active(temp.path())
+            .expect("user-owned catalog state"));
     }
 
     #[test]

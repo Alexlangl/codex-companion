@@ -11,6 +11,7 @@ description.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 codex-companion-core.workspace = true
+codex-companion-health.workspace = true
 codex-companion-provider.workspace = true
 codex-companion-relay.workspace = true
 codex-companion-state.workspace = true

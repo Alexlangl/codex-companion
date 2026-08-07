@@ -760,7 +760,7 @@ fn append_relay_auth_status(
     if managed_model_catalog {
         message.push_str("；已为中转模型启用 Ultra");
     } else {
-        message.push_str("；已保留现有模型目录，Ultra 是否显示由该目录决定");
+        message.push_str("；未覆盖模型目录，模型列表与 Ultra 由 Codex 官方或用户目录决定");
     }
 }
 
@@ -1529,7 +1529,7 @@ mod tests {
         );
 
         assert!(message.contains("官方 ChatGPT OAuth 已就绪"));
-        assert!(message.contains("Ultra 是否显示由该目录决定"));
+        assert!(message.contains("模型列表与 Ultra 由 Codex 官方或用户目录决定"));
         assert!(!message.contains("已为中转模型启用 Ultra"));
     }
 

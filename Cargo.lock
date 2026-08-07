@@ -674,6 +674,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "codex-companion-core",
+ "codex-companion-health",
  "codex-companion-provider",
  "codex-companion-relay",
  "codex-companion-state",
