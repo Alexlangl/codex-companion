@@ -28,6 +28,7 @@ const CODEX_STATE_DB_FILENAME: &str = "state_5.sqlite";
 const CODEX_OPENAI_PROVIDER_ID: &str = "openai";
 const CODEX_API_KEY_AUTH_MODE: &str = "apikey";
 const CODEX_CHATGPT_AUTH_MODE: &str = "chatgpt";
+const COMPANION_RELAY_BEARER_TOKEN: &str = "CODEX_COMPANION_RELAY";
 #[cfg(all(target_os = "macos", not(test)))]
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const COMPANION_MARKER_TABLE: &str = "codex_companion";
@@ -44,6 +45,57 @@ pub use token_usage::{
 
 pub fn companion_model_catalog_path(codex_dir: &Path) -> PathBuf {
     managed_model_catalog_path(codex_dir)
+}
+
+pub fn relay_preserved_official_auth_is_ready(codex_dir: &Path) -> Result<bool> {
+    let config_path = codex_dir.join("config.toml");
+    let auth_path = codex_dir.join("auth.json");
+    if !config_path.exists() || !auth_path.exists() {
+        return Ok(false);
+    }
+
+    let config = fs::read_to_string(&config_path)
+        .map_err(|source| CompanionError::io(&config_path, source))?
+        .parse::<DocumentMut>()
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
+        })?;
+    let auth = read_json_value(&auth_path)?;
+    let official_auth_ready = classify_codex_auth_shape(&auth) == CodexAuthShape::OfficialOAuth
+        && auth.get("auth_mode").and_then(Value::as_str) == Some(CODEX_CHATGPT_AUTH_MODE)
+        && normalize_codex_oauth_auth(&auth).is_some();
+    let provider = config
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(COMPANION_PROVIDER_ID))
+        .and_then(Item::as_table);
+    let desktop = config.get("desktop").and_then(Item::as_table);
+    let ultra_effort_enabled = desktop
+        .and_then(|desktop| desktop.get("enabled-reasoning-efforts"))
+        .map(|efforts| {
+            efforts.as_array().is_some_and(|efforts| {
+                efforts
+                    .iter()
+                    .any(|effort| effort.as_str() == Some("ultra"))
+            })
+        })
+        .unwrap_or(true);
+
+    Ok(official_auth_ready
+        && config.get("model_provider").and_then(Item::as_str) == Some(COMPANION_PROVIDER_ID)
+        && provider
+            .and_then(|provider| provider.get("requires_openai_auth"))
+            .and_then(Item::as_bool)
+            == Some(true)
+        && provider
+            .and_then(|provider| provider.get("experimental_bearer_token"))
+            .and_then(Item::as_str)
+            == Some(COMPANION_RELAY_BEARER_TOKEN)
+        && desktop
+            .and_then(|desktop| desktop.get("show-ultra-in-model-picker-slider"))
+            .and_then(Item::as_bool)
+            == Some(true)
+        && ultra_effort_enabled)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -152,6 +204,16 @@ pub fn install_companion_provider_for_relay(
         provider_table["name"] = value(COMPANION_PROVIDER_NAME);
         provider_table["base_url"] = value(relay.base_url());
         provider_table["wire_api"] = value("responses");
+        if official_auth.ready {
+            provider_table["requires_openai_auth"] = value(true);
+            provider_table["experimental_bearer_token"] = value(COMPANION_RELAY_BEARER_TOKEN);
+        } else {
+            provider_table["requires_openai_auth"] = Item::None;
+            provider_table["experimental_bearer_token"] = Item::None;
+        }
+        if official_auth.ready {
+            enable_codex_desktop_ultra(&mut doc);
+        }
         let model_catalog_rollback = install_managed_model_catalog(
             &codex_dir,
             &mut doc,
@@ -321,6 +383,9 @@ pub fn install_direct_provider_with_options(
     }
     if !direct_writes_auth && restored_prior_auth_write {
         token_source.push_str("; any prior Companion auth.json write was restored first");
+    }
+    if preserve_api_key_in_config && detect_codex_auth_shape(&codex_dir)?.has_official_oauth() {
+        enable_codex_desktop_ultra(&mut doc);
     }
     let direct_model_slugs = provider
         .model_map
@@ -753,6 +818,44 @@ fn ensure_model_provider_table<'a>(doc: &'a mut DocumentMut, provider_id: &str) 
         .get_mut(provider_id)
         .and_then(Item::as_table_mut)
         .expect("model provider was initialized as a table")
+}
+
+fn enable_codex_desktop_ultra(doc: &mut DocumentMut) {
+    if doc.get("desktop").and_then(Item::as_table).is_none() {
+        let inline_values = doc
+            .get("desktop")
+            .and_then(Item::as_inline_table)
+            .map(|inline| {
+                inline
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut desktop = Table::new();
+        for (key, value) in inline_values {
+            desktop.insert(&key, Item::Value(value));
+        }
+        doc["desktop"] = Item::Table(desktop);
+    }
+
+    let desktop = doc
+        .get_mut("desktop")
+        .and_then(Item::as_table_mut)
+        .expect("desktop was initialized as a table");
+    desktop["show-ultra-in-model-picker-slider"] = value(true);
+    let Some(efforts) = desktop
+        .get_mut("enabled-reasoning-efforts")
+        .and_then(Item::as_array_mut)
+    else {
+        return;
+    };
+    if !efforts
+        .iter()
+        .any(|effort| effort.as_str() == Some("ultra"))
+    {
+        efforts.push("ultra");
+    }
 }
 
 fn remove_previous_managed_provider_table(
@@ -3691,8 +3794,12 @@ mod tests {
     fn preserve_official_auth_moves_third_party_api_key_into_provider_config() {
         let temp = tempfile::tempdir().expect("tempdir");
         let original_auth = serde_json::json!({
-            "OPENAI_API_KEY": null,
-            "tokens": {"refresh_token": "refresh-token"}
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": "sk-existing",
+            "tokens": {
+                "access_token": "access-token",
+                "refresh_token": "refresh-token"
+            }
         })
         .to_string();
         fs::write(temp.path().join("auth.json"), &original_auth).expect("auth");
@@ -3719,12 +3826,18 @@ mod tests {
         let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
         assert!(config.contains("model_provider = \"openrouter\""));
         assert!(config.contains("experimental_bearer_token = \"sk-test\""));
+        assert!(config.contains("show-ultra-in-model-picker-slider = true"));
         assert!(!config.contains("auth_write_hash = \""));
     }
 
     #[test]
     fn preserved_third_party_after_official_direct_keeps_official_oauth_unchanged() {
         let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("config.toml"),
+            "[desktop]\ntheme = \"dark\"\nenabled-reasoning-efforts = [\"high\"]\n",
+        )
+        .expect("config");
         fs::write(
             temp.path().join("auth.json"),
             r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-before-official"}"#,
@@ -3778,6 +3891,23 @@ mod tests {
         assert!(
             config.contains("experimental_bearer_token = \"sk-third-party\""),
             "{config}"
+        );
+        let doc = config.parse::<DocumentMut>().expect("config toml");
+        let desktop = doc["desktop"].as_table().expect("desktop table");
+        assert_eq!(desktop["theme"].as_str(), Some("dark"));
+        assert_eq!(
+            desktop["show-ultra-in-model-picker-slider"].as_bool(),
+            Some(true)
+        );
+        let efforts = desktop["enabled-reasoning-efforts"]
+            .as_array()
+            .expect("reasoning efforts");
+        assert_eq!(
+            efforts
+                .iter()
+                .filter_map(|effort| effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["high", "ultra"]
         );
     }
 
@@ -3861,7 +3991,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("config.toml"),
-            "model_provider = \"openai\"\ncli_auth_credentials_store = \"keyring\"\n",
+            "model_provider = \"openai\"\ncli_auth_credentials_store = \"keyring\"\n\n[desktop]\ntheme = \"dark\"\nenabled-reasoning-efforts = [\"high\"]\n",
         )
         .expect("initial config");
         let original_auth = serde_json::json!({
@@ -3912,6 +4042,34 @@ mod tests {
         assert_eq!(auth["tokens"]["refresh_token"], "official-refresh");
         let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
         assert!(config.contains("cli_auth_credentials_store = \"file\""));
+        let config_doc = config.parse::<DocumentMut>().expect("config toml");
+        let relay_provider = config_doc["model_providers"][COMPANION_PROVIDER_ID]
+            .as_table()
+            .expect("relay provider");
+        assert_eq!(relay_provider["requires_openai_auth"].as_bool(), Some(true));
+        assert_eq!(
+            relay_provider["experimental_bearer_token"].as_str(),
+            Some(COMPANION_RELAY_BEARER_TOKEN)
+        );
+        let desktop = config_doc["desktop"].as_table().expect("desktop table");
+        assert_eq!(desktop["theme"].as_str(), Some("dark"));
+        assert_eq!(
+            desktop["show-ultra-in-model-picker-slider"].as_bool(),
+            Some(true)
+        );
+        let efforts = desktop["enabled-reasoning-efforts"]
+            .as_array()
+            .expect("reasoning efforts");
+        assert_eq!(
+            efforts
+                .iter()
+                .filter_map(|effort| effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["high", "ultra"]
+        );
+        assert!(
+            relay_preserved_official_auth_is_ready(temp.path()).expect("preserved relay readiness")
+        );
 
         let repeated = install_companion_provider_for_relay(
             Some(temp.path().to_path_buf()),
@@ -4002,6 +4160,12 @@ mod tests {
         assert_eq!(status, CodexOfficialAuthStatus::default());
         let auth = read_json_value(&temp.path().join("auth.json")).expect("live auth");
         assert_eq!(auth["auth_mode"], "apikey");
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(!config.contains("show-ultra-in-model-picker-slider"));
+        assert!(!config.contains("requires_openai_auth"));
+        assert!(!config.contains(COMPANION_RELAY_BEARER_TOKEN));
+        assert!(!relay_preserved_official_auth_is_ready(temp.path())
+            .expect("unavailable relay readiness"));
     }
 
     #[test]

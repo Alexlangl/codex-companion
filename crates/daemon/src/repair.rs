@@ -11,8 +11,9 @@ use codex_companion_core::{
 use codex_companion_provider::selected_providers;
 use codex_companion_state::{
     collect_token_usage_cached, collect_token_usage_cached_with_filters, doctor,
-    install_companion_provider_for_relay, rebuild_token_usage_cached_with_filters, repair_state,
-    CodexInstallSnapshot, TokenUsageDateRange, TokenUsageFilters,
+    install_companion_provider_for_relay, rebuild_token_usage_cached_with_filters,
+    relay_preserved_official_auth_is_ready, repair_state, CodexInstallSnapshot,
+    TokenUsageDateRange, TokenUsageFilters,
 };
 use std::path::PathBuf;
 
@@ -51,6 +52,27 @@ impl CompanionDaemon {
     pub fn set_preserve_official_codex_auth(&self, preserve: bool) -> Result<bool> {
         let codex_dir = default_codex_dir()?;
         self.set_preserve_official_codex_auth_in_dir(preserve, codex_dir)
+    }
+
+    pub fn reconcile_preserved_official_codex_auth(&self) -> Result<bool> {
+        let codex_dir = default_codex_dir()?;
+        self.reconcile_preserved_official_codex_auth_in_dir(codex_dir)
+    }
+
+    fn reconcile_preserved_official_codex_auth_in_dir(&self, codex_dir: PathBuf) -> Result<bool> {
+        let config = self.store.load()?;
+        if !config.app.preserve_official_codex_auth {
+            return Ok(false);
+        }
+        let relay_active = matches!(
+            config.app.last_codex_launch_mode,
+            Some(CodexLaunchMode::GroupRelay | CodexLaunchMode::ProviderRelay)
+        ) && doctor(codex_dir.clone(), &config.relay)?.installed;
+        if !relay_active || relay_preserved_official_auth_is_ready(&codex_dir)? {
+            return Ok(false);
+        }
+        self.set_preserve_official_codex_auth_in_dir(true, codex_dir)?;
+        Ok(true)
     }
 
     fn set_preserve_official_codex_auth_in_dir(
@@ -302,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn enabling_auth_protection_restores_oauth_for_an_active_relay() {
+    fn startup_reconciliation_repairs_an_existing_preserved_relay() {
         let temp = tempfile::tempdir().expect("tempdir");
         let codex_dir = temp.path().join("codex");
         std::fs::create_dir_all(&codex_dir).expect("codex dir");
@@ -332,6 +354,7 @@ mod tests {
                     .providers
                     .insert(official.id.clone(), official.clone());
                 config.app.last_codex_launch_mode = Some(CodexLaunchMode::GroupRelay);
+                config.app.preserve_official_codex_auth = true;
                 Ok(())
             })
             .expect("config");
@@ -346,9 +369,9 @@ mod tests {
         .expect("install relay");
         let daemon = CompanionDaemon::new(store);
 
-        daemon
-            .set_preserve_official_codex_auth_in_dir(true, codex_dir.clone())
-            .expect("enable protection");
+        assert!(daemon
+            .reconcile_preserved_official_codex_auth_in_dir(codex_dir.clone())
+            .expect("reconcile protection"));
 
         let auth: serde_json::Value =
             serde_json::from_slice(&std::fs::read(codex_dir.join("auth.json")).expect("live auth"))
@@ -356,6 +379,14 @@ mod tests {
         assert_eq!(auth["auth_mode"], "chatgpt");
         assert_eq!(auth["OPENAI_API_KEY"], serde_json::Value::Null);
         assert_eq!(auth["tokens"]["access_token"], "official-access");
+        let codex_config =
+            std::fs::read_to_string(codex_dir.join("config.toml")).expect("live Codex config");
+        assert!(codex_config.contains("requires_openai_auth = true"));
+        assert!(codex_config.contains("experimental_bearer_token = \"CODEX_COMPANION_RELAY\""));
+        assert!(codex_config.contains("show-ultra-in-model-picker-slider = true"));
+        assert!(!daemon
+            .reconcile_preserved_official_codex_auth_in_dir(codex_dir.clone())
+            .expect("repeated reconciliation"));
         assert!(
             daemon
                 .store()

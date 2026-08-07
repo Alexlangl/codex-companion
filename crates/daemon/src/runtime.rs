@@ -25,6 +25,9 @@ impl CompanionDaemon {
     pub async fn start_relay(&self) -> anyhow::Result<codex_companion_relay::RelayStartOutcome> {
         let relay = codex_companion_relay::BoundRelay::bind(self.store.clone()).await?;
         let outcome = relay.outcome();
+        if let Err(error) = self.reconcile_preserved_official_codex_auth() {
+            eprintln!("Codex official login reconciliation failed: {error}");
+        }
         let refresh_loop = start_scoped_health_refresh_loop(self.store.clone());
         let serve_result = relay.serve().await;
         if let Some(refresh_loop) = refresh_loop {
