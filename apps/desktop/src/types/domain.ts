@@ -286,6 +286,37 @@ export interface ProviderGroup {
   priorityFailbackTargetProviderId?: string | null;
 }
 
+export type ModelSourceKind = "local_cache" | "official_oauth" | "relay";
+export type ModelSourceStatus = "available" | "failed" | "skipped";
+
+export interface ModelMatrixSource {
+  id: string;
+  name: string;
+  kind: ModelSourceKind;
+  providerId?: string | null;
+  activeGroup: boolean;
+  status: ModelSourceStatus;
+  modelCount: number;
+  fetchedAt?: string | null;
+  error?: string | null;
+}
+
+export interface ModelMatrixModel {
+  id: string;
+  displayName: string;
+  sourceIds: string[];
+  reasoningEfforts: string[];
+  multiAgentVersion?: string | null;
+  ultraCapable: boolean;
+  visibility?: string | null;
+}
+
+export interface ModelMatrixSnapshot {
+  generatedAt: string;
+  sources: ModelMatrixSource[];
+  models: ModelMatrixModel[];
+}
+
 export interface CompanionConfig {
   relay: RelayConfig;
   providers: Record<string, ProviderConfig>;

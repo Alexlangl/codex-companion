@@ -39,6 +39,56 @@ pub enum ProviderKind {
     RelayProvider,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSourceKind {
+    LocalCache,
+    OfficialOauth,
+    Relay,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSourceStatus {
+    Available,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMatrixSource {
+    pub id: String,
+    pub name: String,
+    pub kind: ModelSourceKind,
+    pub provider_id: Option<String>,
+    pub active_group: bool,
+    pub status: ModelSourceStatus,
+    pub model_count: usize,
+    pub fetched_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMatrixModel {
+    pub id: String,
+    pub display_name: String,
+    pub source_ids: Vec<String>,
+    pub reasoning_efforts: Vec<String>,
+    pub multi_agent_version: Option<String>,
+    pub ultra_capable: bool,
+    pub visibility: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMatrixSnapshot {
+    pub generated_at: DateTime<Utc>,
+    pub sources: Vec<ModelMatrixSource>,
+    pub models: Vec<ModelMatrixModel>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupPolicy {

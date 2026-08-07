@@ -20,6 +20,7 @@ import type {
   CodexInstallStatus,
   CompanionStatus,
   GroupUpsert,
+  ModelMatrixSnapshot,
   ProviderConfig,
   ProviderAccountInfo,
   ProviderExportFormat,
@@ -72,6 +73,11 @@ let mockSessionProviderPreferences: Record<string, string> = {};
 export function getStatus() {
   if (!isTauri()) return Promise.resolve(mockStatus);
   return invoke<CompanionStatus>("get_status");
+}
+
+export function getModelMatrix() {
+  if (!isTauri()) return Promise.resolve(structuredClone(createMockModelMatrix()));
+  return invoke<ModelMatrixSnapshot>("get_model_matrix");
 }
 
 export function getApiServiceSnapshot() {
@@ -1995,6 +2001,86 @@ function createMockStatus(): CompanionStatus {
       codexIsolated: false,
     },
   });
+}
+
+function createMockModelMatrix(): ModelMatrixSnapshot {
+  const generatedAt = new Date().toISOString();
+  return {
+    generatedAt,
+    sources: [
+      {
+        id: "local-cache",
+        name: "本地官方缓存",
+        kind: "local_cache",
+        providerId: null,
+        activeGroup: false,
+        status: "available",
+        modelCount: 3,
+        fetchedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+        error: null,
+      },
+      {
+        id: "provider:official-team",
+        name: "Official Codex",
+        kind: "official_oauth",
+        providerId: "official-team",
+        activeGroup: true,
+        status: "available",
+        modelCount: 3,
+        fetchedAt: generatedAt,
+        error: null,
+      },
+      {
+        id: "provider:backup-api",
+        name: "Backup API",
+        kind: "relay",
+        providerId: "backup-api",
+        activeGroup: true,
+        status: "available",
+        modelCount: 3,
+        fetchedAt: generatedAt,
+        error: null,
+      },
+    ],
+    models: [
+      {
+        id: "gpt-5.6-sol",
+        displayName: "GPT-5.6-Sol",
+        sourceIds: ["local-cache", "provider:official-team", "provider:backup-api"],
+        reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+        multiAgentVersion: "v2",
+        ultraCapable: true,
+        visibility: "list",
+      },
+      {
+        id: "gpt-5.6-terra",
+        displayName: "GPT-5.6-Terra",
+        sourceIds: ["local-cache", "provider:official-team"],
+        reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+        multiAgentVersion: "v2",
+        ultraCapable: true,
+        visibility: "list",
+      },
+      {
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        sourceIds: ["local-cache", "provider:official-team", "provider:backup-api"],
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        multiAgentVersion: null,
+        ultraCapable: false,
+        visibility: "list",
+      },
+      {
+        id: "relay-preview-model",
+        displayName: "relay-preview-model",
+        sourceIds: ["provider:backup-api"],
+        reasoningEfforts: [],
+        multiAgentVersion: null,
+        ultraCapable: false,
+        visibility: null,
+      },
+    ],
+  };
 }
 
 function createMockApiServiceSnapshot(): ApiServiceSnapshot {

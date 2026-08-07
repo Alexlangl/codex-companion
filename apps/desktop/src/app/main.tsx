@@ -18,6 +18,7 @@ import {
   RadioTower,
   Settings as SettingsIcon,
   Sun,
+  TableProperties,
   X,
 } from "lucide-react";
 import React from "react";
@@ -25,6 +26,7 @@ import { createRoot } from "react-dom/client";
 import { Button, IconButton } from "../components/ui";
 import { Dashboard } from "../features/dashboard/Dashboard";
 import { Groups } from "../features/groups/Groups";
+import { Models } from "../features/models/Models";
 import { Providers } from "../features/providers/Providers";
 import { canDirectLaunch, directLaunchWritesAuthJson } from "../features/providers/provider-launch";
 import { Relay } from "../features/relay/Relay";
@@ -69,6 +71,7 @@ const pageMeta = {
   dashboard: { title: "总览", description: "确认当前路由、账号健康与 Codex 启动状态" },
   providers: { title: "账号", description: "管理认证材料、健康状态与启动方式" },
   groups: { title: "分组", description: "编排账号顺序与故障切换策略" },
+  models: { title: "模型", description: "比对本地缓存、官方账号与中转支持范围" },
   relay: { title: "转发", description: "监控本地 API、客户端与请求路由" },
   token: { title: "用量", description: "分析本地会话 Token 与估算成本" },
   sessions: { title: "会话", description: "查找并恢复本地 Codex 会话" },
@@ -239,6 +242,7 @@ function App() {
                       <Tab value="dashboard" icon={<LayoutDashboard aria-hidden="true" size={16} />} label="总览" showTooltip={isSidebarCollapsed} />
                       <Tab value="providers" icon={<Boxes aria-hidden="true" size={16} />} label="账号" showTooltip={isSidebarCollapsed} />
                       <Tab value="groups" icon={<GitBranch aria-hidden="true" size={16} />} label="分组" showTooltip={isSidebarCollapsed} />
+                      <Tab value="models" icon={<TableProperties aria-hidden="true" size={16} />} label="模型" showTooltip={isSidebarCollapsed} />
                     </NavigationGroup>
                     <NavigationGroup label="服务">
                       <Tab value="relay" icon={<RadioTower aria-hidden="true" size={16} />} label="转发" showTooltip={isSidebarCollapsed} />
@@ -320,6 +324,14 @@ function App() {
                     onUse={actions.useGroup}
                     onLaunch={actions.launchGroup}
                   />
+                </Tabs.Content>
+                <Tabs.Content
+                  className="tabs-content"
+                  forceMount
+                  hidden={activeTab !== "models"}
+                  value="models"
+                >
+                  <Models active={activeTab === "models"} />
                 </Tabs.Content>
                 <Tabs.Content className="tabs-content" value="relay">
                   <Relay active={activeTab === "relay"} status={status} />

@@ -463,6 +463,14 @@ fn get_status() -> Result<codex_companion_core::CompanionStatus, String> {
 }
 
 #[tauri::command]
+async fn get_model_matrix() -> Result<codex_companion_core::ModelMatrixSnapshot, String> {
+    daemon()?
+        .model_matrix()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn get_api_service_snapshot() -> Result<codex_companion_core::ApiServiceSnapshot, String> {
     daemon()?
         .api_service_snapshot()
@@ -1111,6 +1119,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
+            get_model_matrix,
             get_api_service_snapshot,
             get_api_request_logs,
             get_relay_events,
