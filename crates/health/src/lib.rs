@@ -37,6 +37,9 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
     {
         return class(HealthFailureKind::RateLimited, true, true);
     }
+    if matches!(status, Some(408)) {
+        return class(HealthFailureKind::NetworkFailed, true, true);
+    }
     if matches!(status, Some(404)) && lower.contains("model") {
         return class(HealthFailureKind::ModelMissing, true, true);
     }
@@ -55,6 +58,12 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
         return class(HealthFailureKind::AuthFailed, false, true);
     }
     if matches!(status, Some(403)) {
+        return class(HealthFailureKind::RequestRejected, true, false);
+    }
+    if matches!(status, Some(404 | 405 | 406 | 409 | 410 | 501)) {
+        return class(HealthFailureKind::UpstreamFailed, true, true);
+    }
+    if matches!(status, Some(415 | 422)) {
         return class(HealthFailureKind::RequestRejected, true, false);
     }
     if lower.contains("upstream semantic failure")

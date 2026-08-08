@@ -296,7 +296,12 @@ mod tests {
     async fn accepts_responses_requests_larger_than_axum_default_limit() {
         let upstream = Router::new().route(
             "/{*path}",
-            any(|| async { (StatusCode::OK, r#"{"status":"ok"}"#) }),
+            any(|| async {
+                (
+                    StatusCode::OK,
+                    r#"{"id":"resp_large","object":"response","status":"completed","output":[]}"#,
+                )
+            }),
         );
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -372,7 +377,10 @@ mod tests {
                     serde_json::from_slice(&body).expect("upstream json");
                 assert_eq!(decoded["model"], "gpt-test");
                 assert!(!headers.contains_key(header::CONTENT_ENCODING));
-                (StatusCode::OK, r#"{"status":"ok"}"#)
+                (
+                    StatusCode::OK,
+                    r#"{"id":"resp_zstd","object":"response","status":"completed","output":[]}"#,
+                )
             }),
         );
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -420,7 +428,10 @@ mod tests {
                     let payload: serde_json::Value =
                         serde_json::from_slice(&body).expect("upstream request json");
                     *received.lock().expect("received lock") = Some(payload);
-                    (StatusCode::OK, r#"{"status":"ok"}"#)
+                    (
+                        StatusCode::OK,
+                        r#"{"id":"resp_ultra","object":"response","status":"completed","output":[]}"#,
+                    )
                 }
             }),
         );

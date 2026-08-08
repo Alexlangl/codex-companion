@@ -21,9 +21,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
-use std::{fmt, io, time::Duration};
+use std::{
+    fmt, io,
+    time::{Duration, Instant},
+};
 
 const STREAM_PREFLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const STREAM_PREFLIGHT_MAX_DURATION: Duration = Duration::from_secs(120);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_STREAM_PREFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) struct UpstreamResponse {
@@ -109,20 +114,27 @@ impl UpstreamResponse {
         }
         let mut inspection = Vec::new();
         let mut prefetched_bytes = 0_usize;
+        let started_at = Instant::now();
         loop {
+            let remaining = STREAM_PREFLIGHT_MAX_DURATION
+                .checked_sub(started_at.elapsed())
+                .ok_or_else(|| {
+                    StreamPreflightError::Network("等待上游在可见输出前开始生成超时".to_string())
+                })?;
             let next_chunk = self
                 .response
                 .as_mut()
                 .expect("response checked above")
                 .chunk();
-            let chunk = tokio::time::timeout(STREAM_PREFLIGHT_IDLE_TIMEOUT, next_chunk)
-                .await
-                .map_err(|_| {
-                    StreamPreflightError::Network("等待上游 SSE 后续事件超时".to_string())
-                })?
-                .map_err(|error| {
-                    StreamPreflightError::Network(format!("读取上游 SSE 首帧失败: {error}"))
-                })?;
+            let chunk =
+                tokio::time::timeout(remaining.min(STREAM_PREFLIGHT_IDLE_TIMEOUT), next_chunk)
+                    .await
+                    .map_err(|_| {
+                        StreamPreflightError::Network("等待上游 SSE 后续事件超时".to_string())
+                    })?
+                    .map_err(|error| {
+                        StreamPreflightError::Network(format!("读取上游 SSE 首帧失败: {error}"))
+                    })?;
             let Some(chunk) = chunk else {
                 return Err(StreamPreflightError::Protocol(
                     "上游 SSE 在输出内容前结束".to_string(),
@@ -151,11 +163,15 @@ impl UpstreamResponse {
                     }
                 }
             }
-            if prefetched_bytes >= MAX_STREAM_PREFLIGHT_BYTES
-                || inspection.len() >= 64 * 1024
-                || (!parsed_any && inspection.len() >= 16 * 1024)
-            {
-                return Ok(());
+            if prefetched_bytes >= MAX_STREAM_PREFLIGHT_BYTES {
+                return Err(StreamPreflightError::Protocol(
+                    "上游在可见输出前发送了过大的 SSE 数据".to_string(),
+                ));
+            }
+            if inspection.len() >= 64 * 1024 || (!parsed_any && inspection.len() >= 16 * 1024) {
+                return Err(StreamPreflightError::Protocol(
+                    "上游 SSE 在可见输出前包含无法解析的数据".to_string(),
+                ));
             }
         }
     }
@@ -208,7 +224,10 @@ fn preflight_sse_block(block: &str) -> StreamPreflight {
         return StreamPreflight::Continue;
     }
     if data == "[DONE]" {
-        return StreamPreflight::Terminal;
+        // [DONE] 不是 Responses API 的完成响应，不能单独据此提交响应。
+        // Chat Completions 的真实终止块会带 finish_reason；直通 Responses
+        // 则必须带 response.completed 或 response.incomplete。
+        return StreamPreflight::Continue;
     }
     let Ok(value) = serde_json::from_str::<Value>(&data) else {
         return StreamPreflight::Continue;
@@ -223,6 +242,12 @@ fn preflight_sse_block(block: &str) -> StreamPreflight {
     if matches!(event_type, "response.completed" | "response.incomplete") {
         return StreamPreflight::Terminal;
     }
+    if value
+        .pointer("/choices/0/finish_reason")
+        .is_some_and(|reason| !reason.is_null())
+    {
+        return StreamPreflight::Terminal;
+    }
     let reasoning_event = event_type.contains("reasoning")
         || value
             .pointer("/item/type")
@@ -231,15 +256,112 @@ fn preflight_sse_block(block: &str) -> StreamPreflight {
     if reasoning_event {
         return StreamPreflight::Reasoning;
     }
-    if event_type.contains("output_item")
-        || event_type.ends_with(".delta")
-        || event_type.contains("content_part")
-        || value.pointer("/choices/0/delta/content").is_some()
-        || value.pointer("/choices/0/delta/tool_calls").is_some()
-    {
+    if has_visible_stream_output(&value, event_type) {
         return StreamPreflight::OutputStarted;
     }
     StreamPreflight::Continue
+}
+
+pub(crate) fn response_event_has_visible_output(value: &Value) -> bool {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    has_visible_stream_output(value, event_type)
+}
+
+fn has_visible_stream_output(value: &Value, event_type: &str) -> bool {
+    if value
+        .pointer("/choices/0/delta/content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| !content.is_empty())
+        || value
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+        || value
+            .pointer("/choices/0/message")
+            .is_some_and(message_has_visible_output)
+    {
+        return true;
+    }
+
+    if matches!(
+        event_type,
+        "response.output_item.added" | "response.output_item.done"
+    ) {
+        return value
+            .get("item")
+            .is_some_and(response_item_has_visible_output);
+    }
+    if event_type == "response.content_part.added" {
+        return value
+            .get("part")
+            .is_some_and(content_part_has_visible_output);
+    }
+    if event_type.contains("function_call") || event_type.contains("custom_tool") {
+        return value.get("delta").is_some_and(nonempty_json_value)
+            || value
+                .get("item")
+                .is_some_and(response_item_has_visible_output);
+    }
+    event_type == "response.output_text.delta"
+        && value
+            .get("delta")
+            .and_then(Value::as_str)
+            .is_some_and(|delta| !delta.is_empty())
+}
+
+fn response_item_has_visible_output(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("reasoning") => false,
+        Some("function_call" | "custom_tool_call" | "tool_search_call") => true,
+        Some("message") => item
+            .get("content")
+            .is_some_and(content_part_has_visible_output),
+        _ => {
+            item.get("content")
+                .is_some_and(content_part_has_visible_output)
+                || item.get("arguments").is_some_and(nonempty_json_value)
+        }
+    }
+}
+
+fn message_has_visible_output(message: &Value) -> bool {
+    message
+        .get("content")
+        .is_some_and(content_part_has_visible_output)
+        || message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+}
+
+fn content_part_has_visible_output(value: &Value) -> bool {
+    match value {
+        Value::String(text) => !text.is_empty(),
+        Value::Array(parts) => parts.iter().any(content_part_has_visible_output),
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("reasoning") {
+                return false;
+            }
+            ["text", "output_text", "content", "arguments"]
+                .into_iter()
+                .filter_map(|key| object.get(key))
+                .any(nonempty_json_value)
+        }
+        _ => false,
+    }
+}
+
+fn nonempty_json_value(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => !object.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,20 +551,14 @@ pub(crate) async fn send_upstream(
         && method == Method::POST
         && uri
             .path_and_query()
-            .is_some_and(|value| is_responses_url(value.as_str()))
+            .is_some_and(|value| is_responses_generation_url(value.as_str()))
         && !is_event_stream(&headers);
     let (response, buffered_body) = if inspect_body {
         let body = response
             .bytes()
             .await
             .map_err(|error| format!("读取上游成功响应失败: {error}"))?;
-        if !looks_like_sse(&body) {
-            if let Ok(value) = serde_json::from_slice::<Value>(&body) {
-                if let Some(message) = semantic_failure_message(&value) {
-                    return Err(format!("upstream semantic failure: {message}"));
-                }
-            }
-        }
+        validate_successful_responses_body(transform, &body)?;
         (None, Some(body))
     } else {
         (Some(response), buffered_error)
@@ -771,6 +887,66 @@ fn normalize_ultra_reasoning_effort(body: Bytes) -> Bytes {
     }
 }
 
+fn validate_successful_responses_body(
+    transform: ResponseTransform,
+    body: &[u8],
+) -> Result<(), String> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Err("upstream semantic failure: 上游返回了空的成功响应".to_string());
+    }
+    if looks_like_sse(body) {
+        return Ok(());
+    }
+    let value = serde_json::from_slice::<Value>(body)
+        .map_err(|_| "upstream semantic failure: 上游返回了非 JSON 的成功响应".to_string())?;
+    if let Some(message) = semantic_failure_message(&value) {
+        return Err(format!("upstream semantic failure: {message}"));
+    }
+    match transform {
+        ResponseTransform::ChatCompletionsToResponses => {
+            let choice = value
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first());
+            if !choice.is_some_and(|choice| choice.get("message").is_some_and(Value::is_object)) {
+                return Err(
+                    "upstream semantic failure: Chat Completions 成功响应缺少 choices[0].message"
+                        .to_string(),
+                );
+            }
+        }
+        ResponseTransform::OfficialCodexStreamToResponse => {
+            return Err(
+                "upstream semantic failure: 官方 Codex 上游未返回可解析的 SSE 响应".to_string(),
+            );
+        }
+        ResponseTransform::None => {
+            let valid_object = value.get("object").and_then(Value::as_str) == Some("response");
+            let valid_status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| {
+                    matches!(
+                        status,
+                        "queued"
+                            | "in_progress"
+                            | "completed"
+                            | "incomplete"
+                            | "failed"
+                            | "cancelled"
+                    )
+                });
+            if !valid_object || !valid_status {
+                return Err(
+                    "upstream semantic failure: Responses 成功响应不符合 Responses 协议"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn stream_response(
     store: ConfigStore,
     request_id: String,
@@ -902,14 +1078,9 @@ async fn collect_response_bytes(
     prefetched_body: VecDeque<Bytes>,
 ) -> Result<Bytes, String> {
     let mut bytes = Vec::new();
-    for chunk in prefetched_body {
-        bytes.extend_from_slice(&chunk);
-    }
-    if let Some(body) = buffered_body {
-        bytes.extend_from_slice(&body);
-    } else if let Some(response) = response {
-        let tail = response.bytes().await.map_err(|error| error.to_string())?;
-        bytes.extend_from_slice(&tail);
+    let mut stream = response_byte_stream(response, buffered_body, prefetched_body);
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
     }
     Ok(Bytes::from(bytes))
 }
@@ -956,10 +1127,31 @@ fn response_byte_stream(
     }
     let prefetched = stream::iter(prefetched_body.into_iter().map(Ok));
     let tail: ResponseByteStream = match response {
-        Some(response) => Box::pin(response.bytes_stream().map_err(io::Error::other)),
+        Some(response) => {
+            idle_timeout_stream(Box::pin(response.bytes_stream().map_err(io::Error::other)))
+        }
         None => Box::pin(stream::empty()),
     };
     Box::pin(prefetched.chain(tail))
+}
+
+fn idle_timeout_stream(upstream: ResponseByteStream) -> ResponseByteStream {
+    Box::pin(stream::unfold(
+        (upstream, false),
+        |(mut upstream, timed_out)| async move {
+            if timed_out {
+                return None;
+            }
+            match tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream.next()).await {
+                Ok(Some(chunk)) => Some((chunk, (upstream, false))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "上游流空闲超时")),
+                    (upstream, true),
+                )),
+            }
+        },
+    ))
 }
 
 fn responses_sse_observer_stream(
@@ -1158,11 +1350,20 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
 }
 
 fn looks_like_sse(body: &[u8]) -> bool {
-    body.iter()
-        .copied()
-        .skip_while(u8::is_ascii_whitespace)
-        .take(5)
-        .eq(b"data:".iter().copied())
+    let start = body
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    let body = &body[start..];
+    [
+        b"data:".as_slice(),
+        b"event:".as_slice(),
+        b"id:".as_slice(),
+        b"retry:".as_slice(),
+    ]
+    .into_iter()
+    .any(|prefix| body.starts_with(prefix))
+        || body.starts_with(b":")
 }
 
 fn terminal_response_from_sse(body: &[u8]) -> Result<Value, String> {
@@ -1216,7 +1417,7 @@ fn terminal_response_from_sse(body: &[u8]) -> Result<Value, String> {
     Err(failure.unwrap_or_else(|| "stream ended without a terminal response event".to_string()))
 }
 
-fn semantic_failure_message(value: &Value) -> Option<String> {
+pub(crate) fn semantic_failure_message(value: &Value) -> Option<String> {
     let object = value.as_object()?;
     if let Some(error) = object.get("error").filter(|error| !error.is_null()) {
         return Some(compact_json_error(error));
