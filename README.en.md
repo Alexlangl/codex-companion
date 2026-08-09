@@ -314,6 +314,7 @@ Security boundaries:
 - Diagnostic logs redact tokens, Authorization, cookies, API keys, private keys, and `AgentAssertion`; they rotate at 2 MB and retain at most five files.
 - Repair supports dry-run first; real repairs use transactional backups and roll back the current operation on failure.
 - Token cost is an estimate based on local sessions and price snapshots, not an OpenAI or gateway invoice.
+- `codex-auto-review` has no separate entry in the [public OpenAI pricing table](https://developers.openai.com/api/docs/pricing). When its parent model can be identified unambiguously, Companion applies that model's price as a heuristic, labels it as parent-model inference in the UI, and exposes `inferredParentModel` in the API; this is neither an official price nor an invoice amount.
 
 <details>
 <summary><strong>Custom model pricing</strong></summary>

@@ -399,6 +399,7 @@ export interface TokenUsageSummary {
   totalTokens: number;
   cost: TokenCostBreakdown;
   pricedEvents: number;
+  inferredPricedEvents: number;
   unpricedEvents: number;
   unpricedModels: string[];
   pricingAsOf: string;
@@ -432,6 +433,7 @@ export interface TokenUsageBucket {
   totalTokens: number;
   cost: TokenCostBreakdown;
   pricedEvents: number;
+  inferredPricedEvents: number;
   unpricedEvents: number;
 }
 
@@ -456,6 +458,7 @@ export interface TokenUsageEvent {
   totalTokens: number;
   cost?: TokenCostBreakdown | null;
   pricingModel?: string | null;
+  pricingSource?: "eventModel" | "inferredParentModel" | null;
 }
 
 export interface ProviderUpsert {

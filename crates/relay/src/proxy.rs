@@ -1388,6 +1388,7 @@ fn relay_root_response() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream::MAX_SSE_FRAME_BYTES;
     use axum::{body::to_bytes, routing::any, Router};
     use chrono::{Duration as ChronoDuration, Utc};
     use codex_companion_core::{
@@ -2245,20 +2246,488 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preserves_large_split_sse_frame_without_failing_over() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let first = Bytes::from(format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}",
+            "x".repeat(16 * 1024)
+        ));
+        let provider_a_url = spawn_delayed_sse_mock_server(
+            first,
+            Bytes::from_static(
+                b"\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            ),
+            Duration::from_millis(20),
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_sse_mock_server(
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fallback\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            ),
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("a")
+        );
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        assert!(body.len() > 16 * 1024);
+        assert!(String::from_utf8_lossy(&body).contains("response.output_text.delta"));
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn falls_back_when_sse_frame_reaches_the_eight_mib_limit() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let mut frame = Vec::with_capacity(MAX_SSE_FRAME_BYTES);
+        frame.extend_from_slice(b"data: ");
+        frame.resize(MAX_SSE_FRAME_BYTES, b'x');
+        let provider_a_url = spawn_delayed_sse_mock_server(
+            Bytes::from(frame),
+            Bytes::from_static(b"\n\n"),
+            Duration::from_millis(20),
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_sse_mock_server(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("b")
+        );
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn falls_back_for_large_split_sse_failure() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let first = Bytes::from(format!(
+            concat!(
+                "data: {{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",",
+                "\"error\":{{\"message\":\"exceeded retry limit, last status: 429 Too Many Requests {}"
+            ),
+            "x".repeat(16 * 1024)
+        ));
+        let provider_a_url = spawn_delayed_sse_mock_server(
+            first,
+            Bytes::from_static(b"\"}}}\n\n"),
+            Duration::from_millis(20),
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_sse_mock_server(
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok from b\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            ),
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("b")
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        assert!(String::from_utf8_lossy(&body).contains("ok from b"));
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn accepts_cr_only_responses_sse_without_failing_over() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let expected = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cr\"}}\r\r",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cr\",",
+            "\"status\":\"completed\"}}\r\r"
+        );
+        let provider_a_url = spawn_sse_mock_server(expected, Some(provider_a_hits.clone())).await;
+        let provider_b_url = spawn_sse_mock_server(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("a")
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        assert_eq!(body.as_ref(), expected.as_bytes());
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn falls_back_for_cr_only_responses_sse_failure() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let provider_a_url = spawn_sse_mock_server(
+            concat!(
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
+                "\"error\":{\"message\":\"429 Too Many Requests\"}}}\r\r"
+            ),
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_sse_mock_server(
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok from b\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            ),
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("b")
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        assert!(String::from_utf8_lossy(&body).contains("ok from b"));
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn preserves_crlf_sse_boundary_split_across_transport_chunks() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let first = Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\r",
+        );
+        let second = Bytes::from_static(b"\n\r\n");
+        let provider_a_url = spawn_delayed_sse_mock_server(
+            first.clone(),
+            second.clone(),
+            Duration::from_millis(20),
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_sse_mock_server(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("a")
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(&second);
+        assert_eq!(body.as_ref(), expected);
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn falls_back_from_opaque_event_stream_when_group_has_an_alternative() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let first = Bytes::from_static(b"opaque event-stream ");
+        let second = Bytes::from_static(b"payload\0with binary tail");
+        let provider_a_url = spawn_delayed_sse_mock_server(
+            first.clone(),
+            second.clone(),
+            Duration::from_millis(20),
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_sse_mock_server(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+
+        let response = proxy_inner(
+            state,
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("b")
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .load()
+                .expect("config")
+                .health
+                .get("a")
+                .and_then(|health| health.last_failure_kind.clone()),
+            Some(HealthFailureKind::UpstreamFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn single_provider_passes_through_opaque_event_stream_byte_for_byte() {
+        let provider_hits = Arc::new(AtomicUsize::new(0));
+        let first = Bytes::from_static(b"opaque event-stream ");
+        let second = Bytes::from_static(b"payload\0with binary tail");
+        let provider_url = spawn_delayed_sse_mock_server(
+            first.clone(),
+            second.clone(),
+            Duration::from_millis(20),
+            Some(provider_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![provider("a", &provider_url)]);
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("a")
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("body");
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(&second);
+        assert_eq!(body.as_ref(), expected);
+        assert_eq!(provider_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn falls_back_from_mislabeled_json_stream_error_with_semantic_health() {
+        let provider_a_hits = Arc::new(AtomicUsize::new(0));
+        let provider_b_hits = Arc::new(AtomicUsize::new(0));
+        let provider_a_url = spawn_delayed_sse_mock_server(
+            Bytes::from_static(br#"{"error":{"message":"429 Too"#),
+            Bytes::from_static(br#" Many Requests"}}"#),
+            Duration::from_millis(20),
+            Some(provider_a_hits.clone()),
+        )
+        .await;
+        let provider_b_url = spawn_sse_mock_server(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            Some(provider_b_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("a", &provider_a_url),
+            provider("b", &provider_b_url),
+        ]);
+
+        let response = proxy_inner(
+            RelayState::new(store.clone(), reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","stream":true}"#),
+        )
+        .await
+        .expect("proxy");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("b")
+        );
+        assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .load()
+                .expect("config")
+                .health
+                .get("a")
+                .and_then(|health| health.last_failure_kind.clone()),
+            Some(HealthFailureKind::RateLimited)
+        );
+    }
+
+    #[tokio::test]
     async fn falls_back_when_sse_rate_limit_happens_after_reasoning_preamble() {
         let provider_a_hits = Arc::new(AtomicUsize::new(0));
         let provider_b_hits = Arc::new(AtomicUsize::new(0));
         let provider_a_url = spawn_delayed_sse_mock_server(
-            concat!(
-                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\n",
-                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n",
-                "data: {\"type\":\"response.reasoning_summary_part.added\",\"part\":{\"type\":\"summary_text\"}}\n\n",
-                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checking capacity\"}\n\n"
+            Bytes::from_static(
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n",
+                    "data: {\"type\":\"response.reasoning_summary_part.added\",\"part\":{\"type\":\"summary_text\"}}\n\n",
+                    "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checking capacity\"}\n\n"
+                )
+                .as_bytes(),
             ),
-            concat!(
-                "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}\n\n",
-                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
-                "\"error\":{\"message\":\"exceeded retry limit, last status: 429 Too Many Requests\"}}}\n\n"
+            Bytes::from_static(
+                concat!(
+                    "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}\n\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
+                    "\"error\":{\"message\":\"exceeded retry limit, last status: 429 Too Many Requests\"}}}\n\n"
+                )
+                .as_bytes(),
             ),
             Duration::from_millis(20),
             Some(provider_a_hits.clone()),
@@ -3672,8 +4141,8 @@ mod tests {
     }
 
     async fn spawn_delayed_sse_mock_server(
-        first: &'static str,
-        second: &'static str,
+        first: Bytes,
+        second: Bytes,
         delay: Duration,
         hits: Option<Arc<AtomicUsize>>,
     ) -> String {
@@ -3681,24 +4150,24 @@ mod tests {
             "/{*path}",
             any(move || {
                 let hits = hits.clone();
+                let first = first.clone();
+                let second = second.clone();
                 async move {
                     if let Some(hits) = hits {
                         hits.fetch_add(1, Ordering::SeqCst);
                     }
-                    let stream = futures_util::stream::unfold(0_u8, move |step| async move {
-                        match step {
-                            0 => Some((
-                                Ok::<Bytes, Infallible>(Bytes::from_static(first.as_bytes())),
-                                1,
-                            )),
-                            1 => {
-                                tokio::time::sleep(delay).await;
-                                Some((
-                                    Ok::<Bytes, Infallible>(Bytes::from_static(second.as_bytes())),
-                                    2,
-                                ))
+                    let stream = futures_util::stream::unfold(0_u8, move |step| {
+                        let first = first.clone();
+                        let second = second.clone();
+                        async move {
+                            match step {
+                                0 => Some((Ok::<Bytes, Infallible>(first), 1)),
+                                1 => {
+                                    tokio::time::sleep(delay).await;
+                                    Some((Ok::<Bytes, Infallible>(second), 2))
+                                }
+                                _ => None,
                             }
-                            _ => None,
                         }
                     });
                     Response::builder()

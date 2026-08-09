@@ -717,6 +717,8 @@ pub struct TokenUsageSummary {
     pub total_tokens: u64,
     pub cost: TokenCostBreakdown,
     pub priced_events: usize,
+    #[serde(default)]
+    pub inferred_priced_events: usize,
     pub unpriced_events: usize,
     pub unpriced_models: Vec<String>,
     pub pricing_as_of: String,
@@ -776,6 +778,8 @@ pub struct TokenUsageBucket {
     pub total_tokens: u64,
     pub cost: TokenCostBreakdown,
     pub priced_events: usize,
+    #[serde(default)]
+    pub inferred_priced_events: usize,
     pub unpriced_events: usize,
 }
 
@@ -801,6 +805,13 @@ impl Default for TokenCostBreakdown {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TokenUsagePricingSource {
+    EventModel,
+    InferredParentModel,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsageEvent {
@@ -816,6 +827,7 @@ pub struct TokenUsageEvent {
     pub total_tokens: u64,
     pub cost: Option<TokenCostBreakdown>,
     pub pricing_model: Option<String>,
+    pub pricing_source: Option<TokenUsagePricingSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

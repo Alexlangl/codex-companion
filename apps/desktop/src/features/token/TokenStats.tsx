@@ -313,6 +313,11 @@ export function TokenStats({
             </p>
           </div>
         ) : null}
+        {stats?.inferredPricedEvents ? (
+          <p className="usage-pricing-note" role="status">
+            其中 {stats.inferredPricedEvents} 条成本按父任务模型推断，仅用于本地估算，不代表 OpenAI 或上游账单。
+          </p>
+        ) : null}
         {stats && integrityIssueCount > 0 ? (
           <div aria-live="polite" className="warning-box usage-integrity-warning" role="status">
             <strong>有 {integrityIssueCount} 个文件未纳入统计</strong>
@@ -354,6 +359,8 @@ export function TokenStats({
           <dd>{stats?.events ?? 0}</dd>
           <dt>已定价事件</dt>
           <dd>{stats?.pricedEvents ?? 0}</dd>
+          <dt>父模型推断</dt>
+          <dd>{stats?.inferredPricedEvents ?? 0}</dd>
           <dt>新输入成本</dt>
           <dd>{formatUsd(stats?.cost.freshInputUsd)}</dd>
           <dt>缓存输入成本</dt>
@@ -411,6 +418,9 @@ function tokenEventBreakdown(event: TokenUsageEvent): string {
 function formatEventCost(event: TokenUsageEvent): string {
   if (!event.cost) {
     return "未定价";
+  }
+  if (event.pricingSource === "inferredParentModel" && event.pricingModel) {
+    return `按父任务模型 ${event.pricingModel} 推断 ${formatUsd(event.cost.totalUsd)}`;
   }
   return `估算 ${formatUsd(event.cost.totalUsd)}`;
 }
@@ -503,6 +513,7 @@ function BucketList({ buckets, max }: { buckets: TokenUsageBucket[]; max: number
           </div>
           <small>
             新输入 {formatTokens(bucket.inputTokens)} · 缓存读 {formatTokens(bucket.cachedInputTokens)} · 缓存写 {formatTokens(bucket.cacheWriteInputTokens)} · 输出 {formatTokens(bucket.outputTokens)} · {bucket.events} 次
+            {bucket.inferredPricedEvents ? ` · ${bucket.inferredPricedEvents} 次父模型推断` : ""}
             {bucket.unpricedEvents ? ` · ${bucket.unpricedEvents} 次未定价` : ""}
           </small>
         </div>

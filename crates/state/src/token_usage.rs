@@ -1,8 +1,8 @@
 use crate::pricing::{default_pricing_override_path, CostBreakdown, PricingCatalog, PRICING_AS_OF};
 use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use codex_companion_core::{
-    CompanionError, Result, TokenUsageBucket, TokenUsageEvent, TokenUsageSummary,
-    TokenUsageSyncStatus,
+    CompanionError, Result, TokenUsageBucket, TokenUsageEvent, TokenUsagePricingSource,
+    TokenUsageSummary, TokenUsageSyncStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-const TOKEN_USAGE_CACHE_VERSION: u32 = 7;
+const TOKEN_USAGE_CACHE_VERSION: u32 = 9;
+const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 const TOKEN_USAGE_PREFIX_BYTES: u64 = 64 * 1024;
 
 static TOKEN_USAGE_SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -238,6 +239,7 @@ struct ParsedTokenUsageFile {
 #[derive(Debug)]
 struct ReplayParentCatalog {
     files_by_thread: BTreeMap<String, Vec<PathBuf>>,
+    identities_by_thread: BTreeMap<String, Vec<CodexSessionIdentity>>,
     timelines: Mutex<BTreeMap<PathBuf, Option<Arc<ReplayParentTimeline>>>>,
 }
 
@@ -246,22 +248,30 @@ struct ReplayParentTimeline {
     max_timestamp: Option<DateTime<Utc>>,
     terminal_timestamps: Vec<DateTime<Utc>>,
     signatures: Vec<(DateTime<Utc>, CumulativeTokens)>,
+    models: Vec<(DateTime<Utc>, String)>,
 }
 
 impl ReplayParentCatalog {
     fn new(files: Vec<PathBuf>) -> Self {
         let mut files_by_thread = BTreeMap::<String, Vec<PathBuf>>::new();
+        let mut identities_by_thread = BTreeMap::<String, Vec<CodexSessionIdentity>>::new();
         for path in files {
             let Some(identity) = read_first_session_identity(&path).ok().flatten() else {
                 continue;
             };
+            let thread_id = identity.thread_id.clone();
             files_by_thread
-                .entry(identity.thread_id)
+                .entry(thread_id.clone())
                 .or_default()
                 .push(path);
+            identities_by_thread
+                .entry(thread_id)
+                .or_default()
+                .push(identity);
         }
         Self {
             files_by_thread,
+            identities_by_thread,
             timelines: Mutex::new(BTreeMap::new()),
         }
     }
@@ -281,6 +291,38 @@ impl ReplayParentCatalog {
         let loaded = read_replay_parent_timeline(path).ok().map(Arc::new);
         timelines.insert(path.to_path_buf(), loaded.clone());
         loaded
+    }
+
+    fn model_for_thread_at(&self, thread_id: &str, cutoff: DateTime<Utc>) -> Option<String> {
+        let models = self
+            .candidates_for(thread_id)
+            .into_iter()
+            .filter_map(|path| self.timeline_for(&path))
+            .filter_map(|timeline| parent_model_before_timeline(&timeline, cutoff))
+            .collect::<BTreeSet<_>>();
+        if models.len() == 1 {
+            models.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    fn inherited_model_for_session(&self, thread_id: &str) -> Option<String> {
+        let identities = self.identities_by_thread.get(thread_id)?;
+        let mut contexts = BTreeSet::new();
+        for identity in identities {
+            let (Some(parent_thread_id), Some(forked_at)) =
+                (identity.parent_thread_id.as_deref(), identity.forked_at)
+            else {
+                return None;
+            };
+            contexts.insert((parent_thread_id.to_string(), forked_at));
+        }
+        if contexts.len() != 1 {
+            return None;
+        }
+        let (parent_thread_id, forked_at) = contexts.into_iter().next()?;
+        self.model_for_thread_at(&parent_thread_id, forked_at)
     }
 }
 
@@ -312,6 +354,7 @@ pub fn collect_token_usage(codex_dir: PathBuf) -> Result<TokenUsageSummary> {
         suspected_duplicates += usize::from(parsed.suspected_duplicate);
         all_events.extend(parsed.events);
     }
+    apply_inherited_pricing_models(&mut all_events, &replay_catalog);
     Ok(summarize_token_events(
         TokenUsageSummaryInput {
             codex_dir,
@@ -449,6 +492,7 @@ fn collect_token_usage_cached_inner(
         let _ = write_token_usage_cache(&cache_path, &cache);
     }
 
+    apply_inherited_pricing_models(&mut all_events, &replay_catalog);
     let pricing_path = default_pricing_override_path(&cache_dir);
     let catalog = PricingCatalog::builtin().load_override(&pricing_path)?;
     Ok(summarize_token_events(
@@ -561,9 +605,12 @@ fn summarize_token_events(
         summary.cache_write_input_tokens += event.cache_write_input_tokens;
         summary.output_tokens += event.output_tokens;
         summary.total_tokens += event.total_tokens;
+        let pricing_model = event.pricing_model.as_deref().unwrap_or(&event.model);
+        let inferred_pricing =
+            event.pricing_source == Some(TokenUsagePricingSource::InferredParentModel);
         let event_cost = pricing
             .estimate(
-                &event.model,
+                pricing_model,
                 event.provider_id.as_deref(),
                 event.input_tokens,
                 event.cached_input_tokens,
@@ -572,11 +619,17 @@ fn summarize_token_events(
             )
             .map(|(matched, cost)| {
                 event.pricing_model = Some(matched.model.clone());
+                event
+                    .pricing_source
+                    .get_or_insert(TokenUsagePricingSource::EventModel);
                 event.cost = Some(cost.to_api());
                 cost
             });
         if let Some(cost) = event_cost.as_ref() {
             summary.priced_events += 1;
+            if inferred_pricing {
+                summary.inferred_priced_events += 1;
+            }
             summary_cost.add_assign(cost);
         } else {
             summary.unpriced_events += 1;
@@ -742,8 +795,32 @@ fn parse_session_file(
             ReplayResolution::Deferred | ReplayResolution::SuspectedDuplicate => false,
         })
         .map(|(_, parsed)| parsed.event)
-        .collect();
+        .collect::<Vec<_>>();
     Ok(ParsedTokenUsageFile { events, ..metadata })
+}
+
+fn apply_inherited_pricing_models(
+    events: &mut [TokenUsageEvent],
+    replay_catalog: &ReplayParentCatalog,
+) {
+    for event in events
+        .iter_mut()
+        .filter(|event| event.model == CODEX_AUTO_REVIEW_MODEL)
+    {
+        event.pricing_model = None;
+        event.pricing_source = None;
+        let Some(session_id) = event.session_id.as_deref() else {
+            continue;
+        };
+        let Some(parent_model) = replay_catalog.inherited_model_for_session(session_id) else {
+            continue;
+        };
+        if parent_model == CODEX_AUTO_REVIEW_MODEL {
+            continue;
+        }
+        event.pricing_model = Some(parent_model);
+        event.pricing_source = Some(TokenUsagePricingSource::InferredParentModel);
+    }
 }
 
 fn parse_token_lines(
@@ -946,24 +1023,7 @@ fn read_replay_parent_timeline(path: &Path) -> Result<ReplayParentTimeline> {
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
-        let timestamp = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc));
-        if let Some(timestamp) = timestamp {
-            timeline.max_timestamp = Some(
-                timeline
-                    .max_timestamp
-                    .map_or(timestamp, |current| current.max(timestamp)),
-            );
-            if is_session_terminal_event(&value) {
-                timeline.terminal_timestamps.push(timestamp);
-            }
-            if let Some(signature) = token_usage_signature(&value) {
-                timeline.signatures.push((timestamp, signature));
-            }
-        }
+        append_replay_parent_timeline_value(&mut timeline, &value);
     }
     Ok(timeline)
 }
@@ -1012,14 +1072,18 @@ fn parse_codex_session_identity(
         payload,
         &[&["source", "subagent", "thread_spawn", "parent_thread_id"]],
     );
-    let parent_thread_id = match (forked_from_id, spawned_from_id) {
-        (Some(forked), Some(spawned)) if forked == spawned => Some(forked),
-        (Some(parent), None) | (None, Some(parent)) => Some(parent),
-        _ => None,
-    };
+    let explicit_parent_id = pick_string(payload, &[&["parent_thread_id"], &["parentThreadId"]]);
+    let parent_thread_ids = [forked_from_id, spawned_from_id, explicit_parent_id]
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
     let legacy_parent = pick_string(payload, &[&["session_id"], &["sessionId"]])
         .filter(|parent| parent != &thread_id);
-    let parent_thread_id = parent_thread_id.or(legacy_parent);
+    let parent_thread_id = match parent_thread_ids.len() {
+        0 => legacy_parent,
+        1 => parent_thread_ids.into_iter().next(),
+        _ => None,
+    };
     let carries_history_snapshot = parent_thread_id.is_some()
         || payload
             .get("forked_from_id")
@@ -1159,27 +1223,49 @@ fn replay_parent_timeline_from_lines(lines: &[String]) -> ReplayParentTimeline {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let Some(timestamp) = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc))
-        else {
-            continue;
-        };
-        timeline.max_timestamp = Some(
-            timeline
-                .max_timestamp
-                .map_or(timestamp, |current| current.max(timestamp)),
-        );
-        if is_session_terminal_event(&value) {
-            timeline.terminal_timestamps.push(timestamp);
-        }
-        if let Some(signature) = token_usage_signature(&value) {
-            timeline.signatures.push((timestamp, signature));
-        }
+        append_replay_parent_timeline_value(&mut timeline, &value);
     }
     timeline
+}
+
+fn append_replay_parent_timeline_value(timeline: &mut ReplayParentTimeline, value: &Value) {
+    let Some(timestamp) = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+    else {
+        return;
+    };
+    timeline.max_timestamp = Some(
+        timeline
+            .max_timestamp
+            .map_or(timestamp, |current| current.max(timestamp)),
+    );
+    if is_session_terminal_event(value) {
+        timeline.terminal_timestamps.push(timestamp);
+    }
+    if let Some(signature) = token_usage_signature(value) {
+        timeline.signatures.push((timestamp, signature));
+    }
+    if let Some(model) = value
+        .get("payload")
+        .and_then(|payload| {
+            pick_string(
+                payload,
+                &[
+                    &["model"],
+                    &["model_name"],
+                    &["modelName"],
+                    &["info", "model"],
+                ],
+            )
+        })
+        .map(|model| normalize_codex_model(&model))
+        .filter(|model| model != "unknown")
+    {
+        timeline.models.push((timestamp, model));
+    }
 }
 
 fn parent_signatures_before_timeline(
@@ -1201,6 +1287,18 @@ fn parent_signatures_before_timeline(
             .map(|(_, signature)| signature.clone())
             .collect()
     })
+}
+
+fn parent_model_before_timeline(
+    timeline: &ReplayParentTimeline,
+    cutoff: DateTime<Utc>,
+) -> Option<String> {
+    timeline
+        .models
+        .iter()
+        .filter(|(timestamp, _)| *timestamp <= cutoff)
+        .max_by_key(|(timestamp, _)| *timestamp)
+        .map(|(_, model)| model.clone())
 }
 
 fn matching_replay_prefix(child: &[ParsedTokenUsageEvent], parent: &[CumulativeTokens]) -> usize {
@@ -1366,6 +1464,7 @@ fn parse_token_event(state: &mut FileParseState, value: &Value) -> Option<TokenU
         total_tokens: delta.total(),
         cost: None,
         pricing_model: None,
+        pricing_source: None,
     })
 }
 
@@ -1540,6 +1639,9 @@ fn add_to_bucket(
     accumulator.bucket.total_tokens += event.total_tokens;
     if let Some(cost) = cost {
         accumulator.bucket.priced_events += 1;
+        if event.pricing_source == Some(TokenUsagePricingSource::InferredParentModel) {
+            accumulator.bucket.inferred_priced_events += 1;
+        }
         accumulator.cost.add_assign(cost);
     } else {
         accumulator.bucket.unpriced_events += 1;
@@ -1942,6 +2044,213 @@ mod tests {
         assert_eq!(summary.cost.cached_input_usd, "0.00000525");
         assert_eq!(summary.cost.output_usd, "0.00042");
         assert_eq!(summary.cost.total_usd, "0.00065275");
+    }
+
+    #[test]
+    fn auto_review_uses_the_parent_model_for_pricing() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("08")
+            .join("08");
+        fs::create_dir_all(&day).expect("mkdir");
+        fs::write(
+            day.join("parent.jsonl"),
+            r#"{"timestamp":"2026-08-08T03:00:00Z","type":"session_meta","payload":{"id":"parent"}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-08-08T03:00:00.500Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-08-08T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10}}}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-08-08T03:00:03Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+                + "\n",
+        )
+        .expect("parent");
+        fs::write(
+            day.join("review.jsonl"),
+            r#"{"timestamp":"2026-08-08T03:00:04Z","type":"session_meta","payload":{"id":"review","parent_thread_id":"parent","source":{"subagent":{"other":"guardian"}}}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-08-08T03:00:04.500Z","type":"turn_context","payload":{"model":"codex-auto-review"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-08-08T03:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150,"cached_input_tokens":100,"output_tokens":15}}}}"#
+                + "\n",
+        )
+        .expect("review");
+
+        let summary = collect_token_usage(temp.path().to_path_buf()).expect("summary");
+        let review_event = summary
+            .recent_events
+            .iter()
+            .find(|event| event.session_id.as_deref() == Some("review"))
+            .expect("review event");
+
+        assert_eq!(summary.unpriced_events, 0);
+        assert_eq!(summary.priced_events, 2);
+        assert_eq!(summary.inferred_priced_events, 1);
+        assert_eq!(review_event.model, CODEX_AUTO_REVIEW_MODEL);
+        assert_eq!(review_event.pricing_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(
+            review_event.pricing_source,
+            Some(TokenUsagePricingSource::InferredParentModel)
+        );
+        let review_bucket = summary
+            .by_model
+            .iter()
+            .find(|bucket| bucket.key == CODEX_AUTO_REVIEW_MODEL)
+            .expect("auto-review bucket");
+        assert_eq!(review_bucket.priced_events, 1);
+        assert_eq!(review_bucket.inferred_priced_events, 1);
+    }
+
+    #[test]
+    fn auto_review_stays_unpriced_when_parent_model_is_ambiguous() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("08")
+            .join("08");
+        fs::create_dir_all(&day).expect("mkdir");
+        for (name, model) in [
+            ("parent-a.jsonl", "gpt-5.4"),
+            ("parent-b.jsonl", "gpt-5.6-luna"),
+        ] {
+            fs::write(
+                day.join(name),
+                format!(
+                    concat!(
+                        "{{\"timestamp\":\"2026-08-08T03:00:00Z\",\"type\":\"session_meta\",",
+                        "\"payload\":{{\"id\":\"parent\"}}}}\n",
+                        "{{\"timestamp\":\"2026-08-08T03:00:00.500Z\",\"type\":\"turn_context\",",
+                        "\"payload\":{{\"model\":\"{}\"}}}}\n",
+                        "{{\"timestamp\":\"2026-08-08T03:00:01Z\",\"type\":\"event_msg\",",
+                        "\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":",
+                        "{{\"input_tokens\":100,\"output_tokens\":10}}}}}}}}\n",
+                        "{{\"timestamp\":\"2026-08-08T03:00:03Z\",\"type\":\"event_msg\",",
+                        "\"payload\":{{\"type\":\"task_complete\"}}}}\n"
+                    ),
+                    model
+                ),
+            )
+            .expect("parent");
+        }
+        fs::write(
+            day.join("review.jsonl"),
+            r#"{"timestamp":"2026-08-08T03:00:04Z","type":"session_meta","payload":{"id":"review","parent_thread_id":"parent","source":{"subagent":{"other":"guardian"}}}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-08-08T03:00:04.500Z","type":"turn_context","payload":{"model":"codex-auto-review"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-08-08T03:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150,"cached_input_tokens":100,"output_tokens":15}}}}"#
+                + "\n",
+        )
+        .expect("review");
+
+        let summary = collect_token_usage(temp.path().to_path_buf()).expect("summary");
+        let review_event = summary
+            .recent_events
+            .iter()
+            .find(|event| event.session_id.as_deref() == Some("review"))
+            .expect("review event");
+
+        assert_eq!(summary.unpriced_events, 1);
+        assert_eq!(summary.inferred_priced_events, 0);
+        assert_eq!(summary.unpriced_models, vec![CODEX_AUTO_REVIEW_MODEL]);
+        assert_eq!(review_event.pricing_model, None);
+        assert_eq!(review_event.pricing_source, None);
+        assert!(review_event.cost.is_none());
+    }
+
+    #[test]
+    fn cached_auto_review_pricing_is_recomputed_when_parent_catalog_changes() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("08")
+            .join("08");
+        fs::create_dir_all(&day).expect("mkdir");
+        let parent = |model: &str| {
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-08T03:00:00Z\",\"type\":\"session_meta\",",
+                    "\"payload\":{{\"id\":\"parent\"}}}}\n",
+                    "{{\"timestamp\":\"2026-08-08T03:00:00.500Z\",\"type\":\"turn_context\",",
+                    "\"payload\":{{\"model\":\"{}\"}}}}\n",
+                    "{{\"timestamp\":\"2026-08-08T03:00:01Z\",\"type\":\"event_msg\",",
+                    "\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":",
+                    "{{\"input_tokens\":100,\"output_tokens\":10}}}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-08T03:00:03Z\",\"type\":\"event_msg\",",
+                    "\"payload\":{{\"type\":\"task_complete\"}}}}\n"
+                ),
+                model
+            )
+        };
+        fs::write(day.join("parent-a.jsonl"), parent("gpt-5.4")).expect("parent a");
+        fs::write(
+            day.join("review.jsonl"),
+            r#"{"timestamp":"2026-08-08T03:00:04Z","type":"session_meta","payload":{"id":"review","parent_thread_id":"parent","source":{"subagent":{"other":"guardian"}}}}"#.to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-08-08T03:00:04.500Z","type":"turn_context","payload":{"model":"codex-auto-review"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-08-08T03:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150,"cached_input_tokens":100,"output_tokens":15}}}}"#
+                + "\n",
+        )
+        .expect("review");
+        let cache_dir = temp.path().join("cache");
+
+        let first = collect_token_usage_cached(temp.path().to_path_buf(), cache_dir.clone())
+            .expect("first scan");
+        let first_review = first
+            .recent_events
+            .iter()
+            .find(|event| event.session_id.as_deref() == Some("review"))
+            .expect("first review event");
+        assert_eq!(first.inferred_priced_events, 1);
+        assert_eq!(first_review.pricing_model.as_deref(), Some("gpt-5.4"));
+        let cache = read_token_usage_cache(&cache_dir.join("token-usage-cache.json"));
+        let cached_review = cache
+            .files
+            .values()
+            .flat_map(|file| &file.events)
+            .find(|event| event.session_id.as_deref() == Some("review"))
+            .expect("cached review event");
+        assert_eq!(cached_review.pricing_model, None);
+        assert_eq!(cached_review.pricing_source, None);
+
+        fs::write(day.join("parent-b.jsonl"), parent("gpt-5.6-luna")).expect("parent b");
+        let second =
+            collect_token_usage_cached(temp.path().to_path_buf(), cache_dir).expect("second scan");
+        let second_review = second
+            .recent_events
+            .iter()
+            .find(|event| event.session_id.as_deref() == Some("review"))
+            .expect("second review event");
+
+        assert_eq!(second.inferred_priced_events, 0);
+        assert_eq!(second_review.pricing_model, None);
+        assert_eq!(second_review.pricing_source, None);
+        assert!(second_review.cost.is_none());
+    }
+
+    #[test]
+    fn conflicting_explicit_parent_ids_do_not_fall_back_to_legacy_parent() {
+        let identity = parse_codex_session_identity(
+            &serde_json::json!({
+                "id": "review",
+                "session_id": "legacy-parent",
+                "forked_from_id": "parent-a",
+                "parent_thread_id": "parent-b"
+            }),
+            Some("2026-08-08T03:00:04Z"),
+        )
+        .expect("identity");
+
+        assert_eq!(identity.parent_thread_id, None);
+        assert!(identity.carries_history_snapshot);
     }
 
     #[test]

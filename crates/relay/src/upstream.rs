@@ -30,11 +30,13 @@ const STREAM_PREFLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_PREFLIGHT_MAX_DURATION: Duration = Duration::from_secs(120);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_STREAM_PREFLIGHT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) struct UpstreamResponse {
     response: Option<reqwest::Response>,
     buffered_body: Option<Bytes>,
     prefetched_body: VecDeque<Bytes>,
+    opaque_event_stream: bool,
     status: StatusCode,
     headers: HeaderMap,
     transform: ResponseTransform,
@@ -97,7 +99,7 @@ impl UpstreamResponse {
 
     pub(crate) async fn preflight_stream_failure(
         &mut self,
-        hold_reasoning_for_fallback: bool,
+        has_fallback_candidate: bool,
     ) -> Result<(), StreamPreflightError> {
         if !self.status.is_success() {
             return Ok(());
@@ -107,7 +109,7 @@ impl UpstreamResponse {
             .as_deref()
             .filter(|body| looks_like_sse(body))
         {
-            return preflight_buffered_sse(body, hold_reasoning_for_fallback);
+            return preflight_buffered_sse(body, has_fallback_candidate);
         }
         if !is_event_stream(&self.headers) || self.response.is_none() {
             return Ok(());
@@ -136,42 +138,109 @@ impl UpstreamResponse {
                         StreamPreflightError::Network(format!("读取上游 SSE 首帧失败: {error}"))
                     })?;
             let Some(chunk) = chunk else {
+                match preflight_sse_blocks(&mut inspection, has_fallback_candidate, false, true)? {
+                    StreamPreflightProgress::Ready => return Ok(()),
+                    StreamPreflightProgress::FrameTooLarge => {
+                        inspection.clear();
+                        return self.resolve_oversized_sse_frame(has_fallback_candidate);
+                    }
+                    StreamPreflightProgress::Continue => {}
+                }
+                if !inspection.is_empty() && !could_start_sse_frame(&inspection) {
+                    match inspect_non_sse_body(&inspection, true) {
+                        NonSsePreflight::SemanticFailure(message) => {
+                            return Err(StreamPreflightError::Semantic(message));
+                        }
+                        NonSsePreflight::PendingJson | NonSsePreflight::Opaque => {
+                            inspection.clear();
+                            return self.resolve_opaque_event_stream(has_fallback_candidate);
+                        }
+                    }
+                }
                 return Err(StreamPreflightError::Protocol(
                     "上游 SSE 在输出内容前结束".to_string(),
                 ));
             };
+            let remaining_preflight_bytes =
+                MAX_STREAM_PREFLIGHT_BYTES.saturating_sub(prefetched_bytes);
             prefetched_bytes = prefetched_bytes.saturating_add(chunk.len());
-            inspection.extend_from_slice(&chunk);
-            self.prefetched_body.push_back(chunk);
-            let mut parsed_any = false;
-            while let Some(index) = next_sse_block_index(&inspection) {
-                parsed_any = true;
-                let block = String::from_utf8_lossy(&inspection[..index]).into_owned();
-                let drain_to = if inspection[index..].starts_with(b"\r\n\r\n") {
-                    index + 4
-                } else {
-                    index + 2
-                };
-                inspection.drain(..drain_to);
-                match preflight_sse_block(&block) {
-                    StreamPreflight::Continue => {}
-                    StreamPreflight::Reasoning if hold_reasoning_for_fallback => {}
-                    StreamPreflight::Reasoning => return Ok(()),
-                    StreamPreflight::OutputStarted | StreamPreflight::Terminal => return Ok(()),
-                    StreamPreflight::Failure(message) => {
-                        return Err(StreamPreflightError::Semantic(message));
+            let inspected_chunk_bytes = remaining_preflight_bytes.min(chunk.len());
+            let mut inspected_chunk = &chunk[..inspected_chunk_bytes];
+            self.prefetched_body.push_back(chunk.clone());
+            while !inspected_chunk.is_empty() {
+                let remaining_frame_bytes = MAX_SSE_FRAME_BYTES.saturating_sub(inspection.len());
+                if remaining_frame_bytes == 0 {
+                    inspection.clear();
+                    return self.resolve_oversized_sse_frame(has_fallback_candidate);
+                }
+                let take = remaining_frame_bytes.min(inspected_chunk.len());
+                inspection.extend_from_slice(&inspected_chunk[..take]);
+                inspected_chunk = &inspected_chunk[take..];
+                match preflight_sse_blocks(&mut inspection, has_fallback_candidate, false, false)? {
+                    StreamPreflightProgress::Ready => return Ok(()),
+                    StreamPreflightProgress::FrameTooLarge => {
+                        inspection.clear();
+                        return self.resolve_oversized_sse_frame(has_fallback_candidate);
                     }
+                    StreamPreflightProgress::Continue => {}
+                }
+                if !inspection.is_empty() && !could_start_sse_frame(&inspection) {
+                    match inspect_non_sse_body(&inspection, false) {
+                        NonSsePreflight::PendingJson => {}
+                        NonSsePreflight::SemanticFailure(message) => {
+                            return Err(StreamPreflightError::Semantic(message));
+                        }
+                        NonSsePreflight::Opaque => {
+                            inspection.clear();
+                            return self.resolve_opaque_event_stream(has_fallback_candidate);
+                        }
+                    }
+                }
+                if sse_frame_limit_reached(inspection.len(), MAX_SSE_FRAME_BYTES) {
+                    inspection.clear();
+                    return self.resolve_oversized_sse_frame(has_fallback_candidate);
                 }
             }
             if prefetched_bytes >= MAX_STREAM_PREFLIGHT_BYTES {
-                return Err(StreamPreflightError::Protocol(
-                    "上游在可见输出前发送了过大的 SSE 数据".to_string(),
-                ));
+                // The total preflight budget can be exhausted by many valid small frames.
+                // The current unfinished frame is bounded independently above.
+                return Ok(());
             }
-            if inspection.len() >= 64 * 1024 || (!parsed_any && inspection.len() >= 16 * 1024) {
-                return Err(StreamPreflightError::Protocol(
-                    "上游 SSE 在可见输出前包含无法解析的数据".to_string(),
-                ));
+        }
+    }
+
+    fn resolve_opaque_event_stream(
+        &mut self,
+        has_fallback_candidate: bool,
+    ) -> Result<(), StreamPreflightError> {
+        if has_fallback_candidate {
+            return Err(StreamPreflightError::Protocol(
+                "上游声明了 SSE，但响应不使用可识别的 SSE 帧格式".to_string(),
+            ));
+        }
+        self.opaque_event_stream = true;
+        Ok(())
+    }
+
+    fn resolve_oversized_sse_frame(
+        &mut self,
+        has_fallback_candidate: bool,
+    ) -> Result<(), StreamPreflightError> {
+        let message = format!(
+            "上游 SSE 单帧达到 {} MiB 本地检查上限",
+            MAX_SSE_FRAME_BYTES / (1024 * 1024)
+        );
+        if has_fallback_candidate {
+            return Err(StreamPreflightError::Protocol(message));
+        }
+        match self.transform {
+            ResponseTransform::None => {
+                self.opaque_event_stream = true;
+                Ok(())
+            }
+            ResponseTransform::ChatCompletionsToResponses => Ok(()),
+            ResponseTransform::OfficialCodexStreamToResponse => {
+                Err(StreamPreflightError::Protocol(message))
             }
         }
     }
@@ -182,28 +251,80 @@ fn preflight_buffered_sse(
     hold_reasoning_for_fallback: bool,
 ) -> Result<(), StreamPreflightError> {
     let mut inspection = body.to_vec();
-    while let Some(index) = next_sse_block_index(&inspection) {
-        let block = String::from_utf8_lossy(&inspection[..index]).into_owned();
-        let drain_to = if inspection[index..].starts_with(b"\r\n\r\n") {
-            index + 4
-        } else {
-            index + 2
-        };
-        inspection.drain(..drain_to);
+    match preflight_sse_blocks(
+        &mut inspection,
+        hold_reasoning_for_fallback,
+        hold_reasoning_for_fallback,
+        true,
+    )? {
+        StreamPreflightProgress::Ready => Ok(()),
+        StreamPreflightProgress::Continue => Err(StreamPreflightError::Protocol(
+            "上游 SSE 在输出内容前结束".to_string(),
+        )),
+        StreamPreflightProgress::FrameTooLarge => Err(StreamPreflightError::Protocol(format!(
+            "上游 SSE 单帧达到 {} MiB 本地检查上限",
+            MAX_SSE_FRAME_BYTES / (1024 * 1024)
+        ))),
+    }
+}
+
+fn preflight_sse_blocks(
+    inspection: &mut Vec<u8>,
+    hold_reasoning_for_fallback: bool,
+    hold_output_for_fallback: bool,
+    end_of_stream: bool,
+) -> Result<StreamPreflightProgress, StreamPreflightError> {
+    while let Some(boundary) = next_sse_block_boundary(inspection, end_of_stream) {
+        if sse_frame_limit_reached(boundary.block_end, MAX_SSE_FRAME_BYTES) {
+            return Ok(StreamPreflightProgress::FrameTooLarge);
+        }
+        let block = String::from_utf8_lossy(&inspection[..boundary.block_end]).into_owned();
+        inspection.drain(..boundary.drain_len);
         match preflight_sse_block(&block) {
             StreamPreflight::Continue => {}
-            StreamPreflight::Reasoning | StreamPreflight::OutputStarted
-                if hold_reasoning_for_fallback => {}
-            StreamPreflight::Reasoning | StreamPreflight::OutputStarted => return Ok(()),
-            StreamPreflight::Terminal => return Ok(()),
+            StreamPreflight::Reasoning if hold_reasoning_for_fallback => {}
+            StreamPreflight::OutputStarted if hold_output_for_fallback => {}
+            StreamPreflight::Reasoning | StreamPreflight::OutputStarted => {
+                return Ok(StreamPreflightProgress::Ready);
+            }
+            StreamPreflight::Terminal => return Ok(StreamPreflightProgress::Ready),
             StreamPreflight::Failure(message) => {
                 return Err(StreamPreflightError::Semantic(message));
             }
         }
     }
-    Err(StreamPreflightError::Protocol(
-        "上游 SSE 在输出内容前结束".to_string(),
-    ))
+    Ok(StreamPreflightProgress::Continue)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPreflightProgress {
+    Continue,
+    Ready,
+    FrameTooLarge,
+}
+
+enum NonSsePreflight {
+    PendingJson,
+    Opaque,
+    SemanticFailure(String),
+}
+
+fn inspect_non_sse_body(body: &[u8], end_of_stream: bool) -> NonSsePreflight {
+    let start = body
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    let trimmed = &body[start..];
+    let starts_json = matches!(trimmed.first(), Some(b'{') | Some(b'['));
+    match serde_json::from_slice::<Value>(trimmed) {
+        Ok(value) => semantic_failure_message(&value)
+            .map(NonSsePreflight::SemanticFailure)
+            .unwrap_or(NonSsePreflight::Opaque),
+        Err(error) if starts_json && error.is_eof() && !end_of_stream => {
+            NonSsePreflight::PendingJson
+        }
+        Err(_) => NonSsePreflight::Opaque,
+    }
 }
 
 enum StreamPreflight {
@@ -216,7 +337,7 @@ enum StreamPreflight {
 
 fn preflight_sse_block(block: &str) -> StreamPreflight {
     let data = block
-        .lines()
+        .split(['\r', '\n'])
         .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
         .collect::<Vec<_>>()
         .join("\n");
@@ -537,6 +658,7 @@ pub(crate) async fn send_upstream(
                 response: None,
                 buffered_body: buffered_error,
                 prefetched_body: VecDeque::new(),
+                opaque_event_stream: false,
                 status,
                 headers: response_headers,
                 transform,
@@ -567,6 +689,7 @@ pub(crate) async fn send_upstream(
         response,
         buffered_body,
         prefetched_body: VecDeque::new(),
+        opaque_event_stream: false,
         status,
         headers,
         transform,
@@ -957,12 +1080,21 @@ pub(crate) async fn stream_response(
         response,
         buffered_body,
         prefetched_body,
+        opaque_event_stream,
         status,
         headers,
         transform,
         tool_context,
         chat_messages,
     } = upstream;
+    if opaque_event_stream {
+        return passthrough_stream_response(
+            status,
+            &headers,
+            provider_id,
+            response_byte_stream(response, buffered_body, prefetched_body),
+        );
+    }
     if transform == ResponseTransform::OfficialCodexStreamToResponse && status.is_success() {
         let body = collect_response_bytes(response, buffered_body, prefetched_body).await;
         return match body.and_then(|body| terminal_response_from_sse(&body)) {
@@ -1054,6 +1186,15 @@ pub(crate) async fn stream_response(
     } else {
         stream
     };
+    passthrough_stream_response(status, &headers, provider_id, stream)
+}
+
+fn passthrough_stream_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+    provider_id: String,
+    stream: ResponseByteStream,
+) -> Response {
     let mut builder = Response::builder().status(status);
     for (name, value) in headers.iter() {
         if matches!(*name, header::CONNECTION | header::TRANSFER_ENCODING) {
@@ -1192,6 +1333,8 @@ fn responses_sse_observer_stream(
 struct ResponsesSseObserverState {
     buffer: Vec<u8>,
     pending: VecDeque<Bytes>,
+    max_frame_bytes: usize,
+    inspection_disabled: bool,
     terminal: bool,
     failure_recorded: bool,
     response_id: String,
@@ -1207,6 +1350,8 @@ impl ResponsesSseObserverState {
         Self {
             buffer: Vec::new(),
             pending: VecDeque::new(),
+            max_frame_bytes: MAX_SSE_FRAME_BYTES,
+            inspection_disabled: false,
             terminal: false,
             failure_recorded: false,
             response_id: "resp_codex_companion".to_string(),
@@ -1218,23 +1363,53 @@ impl ResponsesSseObserverState {
         }
     }
 
+    #[cfg(test)]
+    fn with_frame_limit(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = max_frame_bytes;
+        self
+    }
+
     fn push_chunk(&mut self, chunk: &[u8]) {
-        self.buffer.extend_from_slice(chunk);
-        while let Some(index) = next_sse_block_index(&self.buffer) {
-            let block = String::from_utf8_lossy(&self.buffer[..index]).into_owned();
-            let drain_to = if self.buffer[index..].starts_with(b"\r\n\r\n") {
-                index + 4
-            } else {
-                index + 2
-            };
-            self.buffer.drain(..drain_to);
+        if self.inspection_disabled {
+            return;
+        }
+        let mut remaining = chunk;
+        while !remaining.is_empty() && !self.inspection_disabled {
+            let available = self.max_frame_bytes.saturating_sub(self.buffer.len());
+            if available == 0 {
+                self.disable_inspection();
+                return;
+            }
+            let take = available.min(remaining.len());
+            self.buffer.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            self.process_buffered_blocks(false);
+        }
+    }
+
+    fn process_buffered_blocks(&mut self, end_of_stream: bool) {
+        while let Some(boundary) = next_sse_block_boundary(&self.buffer, end_of_stream) {
+            if sse_frame_limit_reached(boundary.block_end, self.max_frame_bytes) {
+                self.disable_inspection();
+                return;
+            }
+            let block = String::from_utf8_lossy(&self.buffer[..boundary.block_end]).into_owned();
+            self.buffer.drain(..boundary.drain_len);
             self.process_block(&block);
         }
+        if sse_frame_limit_reached(self.buffer.len(), self.max_frame_bytes) {
+            self.disable_inspection();
+        }
+    }
+
+    fn disable_inspection(&mut self) {
+        self.buffer.clear();
+        self.inspection_disabled = true;
     }
 
     fn process_block(&mut self, block: &str) {
         let data = block
-            .lines()
+            .split(['\r', '\n'])
             .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
             .collect::<Vec<_>>()
             .join("\n");
@@ -1270,6 +1445,13 @@ impl ResponsesSseObserverState {
     }
 
     fn finish_stream(&mut self) {
+        if self.inspection_disabled {
+            return;
+        }
+        self.process_buffered_blocks(true);
+        if self.inspection_disabled {
+            return;
+        }
         if !self.buffer.is_empty() {
             let block = String::from_utf8_lossy(&self.buffer).into_owned();
             self.buffer.clear();
@@ -1333,13 +1515,46 @@ impl ResponsesSseObserverState {
     }
 }
 
-fn next_sse_block_index(buffer: &[u8]) -> Option<usize> {
-    match (find_bytes(buffer, b"\n\n"), find_bytes(buffer, b"\r\n\r\n")) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SseBlockBoundary {
+    block_end: usize,
+    drain_len: usize,
+}
+
+fn next_sse_block_boundary(buffer: &[u8], end_of_stream: bool) -> Option<SseBlockBoundary> {
+    let mut index = 0;
+    while index < buffer.len() {
+        let Some(first_len) = sse_line_ending_len(buffer, index, end_of_stream) else {
+            index += 1;
+            continue;
+        };
+        let second_start = index + first_len;
+        if let Some(second_len) = sse_line_ending_len(buffer, second_start, end_of_stream) {
+            return Some(SseBlockBoundary {
+                block_end: index,
+                drain_len: second_start + second_len,
+            });
+        }
+        index = second_start;
     }
+    None
+}
+
+fn sse_line_ending_len(buffer: &[u8], index: usize, end_of_stream: bool) -> Option<usize> {
+    match buffer.get(index) {
+        Some(b'\n') => Some(1),
+        Some(b'\r') => match buffer.get(index + 1) {
+            Some(b'\n') => Some(2),
+            Some(_) => Some(1),
+            None if end_of_stream => Some(1),
+            None => None,
+        },
+        _ => None,
+    }
+}
+
+fn sse_frame_limit_reached(frame_bytes: usize, max_frame_bytes: usize) -> bool {
+    frame_bytes >= max_frame_bytes
 }
 
 fn is_event_stream(headers: &HeaderMap) -> bool {
@@ -1366,14 +1581,44 @@ fn looks_like_sse(body: &[u8]) -> bool {
         || body.starts_with(b":")
 }
 
+fn could_start_sse_frame(body: &[u8]) -> bool {
+    let start = body
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    let body = &body[start..];
+    if body.is_empty() {
+        return true;
+    }
+    [
+        b"data:".as_slice(),
+        b"event:".as_slice(),
+        b"id:".as_slice(),
+        b"retry:".as_slice(),
+    ]
+    .into_iter()
+    .any(|prefix| body.starts_with(prefix) || prefix.starts_with(body))
+        || body.starts_with(b":")
+}
+
 fn terminal_response_from_sse(body: &[u8]) -> Result<Value, String> {
-    let text = std::str::from_utf8(body).map_err(|error| format!("invalid UTF-8: {error}"))?;
-    let normalized = text.replace("\r\n", "\n");
+    std::str::from_utf8(body).map_err(|error| format!("invalid UTF-8: {error}"))?;
     let mut failure = None;
     let mut output_items = BTreeMap::<u64, Value>::new();
-    for event in normalized.split("\n\n") {
+    let mut remaining = body;
+    while !remaining.is_empty() {
+        let event = if let Some(boundary) = next_sse_block_boundary(remaining, true) {
+            let event = &remaining[..boundary.block_end];
+            remaining = &remaining[boundary.drain_len..];
+            event
+        } else {
+            let event = remaining;
+            remaining = &[];
+            event
+        };
+        let event = std::str::from_utf8(event).expect("full SSE body was validated as UTF-8");
         let data = event
-            .lines()
+            .split(['\r', '\n'])
             .filter_map(|line| line.strip_prefix("data:"))
             .map(str::trim_start)
             .collect::<Vec<_>>()
@@ -3061,6 +3306,9 @@ fn chat_sse_to_responses_stream(
                 if let Some(bytes) = state.pending.pop_front() {
                     return Some((Ok(bytes), (state, upstream)));
                 }
+                if state.stop_upstream {
+                    return None;
+                }
                 match upstream.next().await {
                     Some(Ok(chunk)) => {
                         state.push_chunk(&chunk);
@@ -3089,6 +3337,8 @@ fn chat_sse_to_responses_stream(
 struct ChatSseTransformState {
     buffer: Vec<u8>,
     pending: VecDeque<Bytes>,
+    max_frame_bytes: usize,
+    stop_upstream: bool,
     response_id: String,
     model: String,
     created_at: i64,
@@ -3126,6 +3376,8 @@ impl ChatSseTransformState {
         Self {
             buffer: Vec::new(),
             pending: VecDeque::new(),
+            max_frame_bytes: MAX_SSE_FRAME_BYTES,
+            stop_upstream: false,
             response_id: "resp_codex_companion".to_string(),
             model: String::new(),
             created_at: unix_now(),
@@ -3142,6 +3394,12 @@ impl ChatSseTransformState {
         }
     }
 
+    #[cfg(test)]
+    fn with_frame_limit(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = max_frame_bytes;
+        self
+    }
+
     fn with_observer(mut self, store: ConfigStore, request_id: String) -> Self {
         let api_service = ApiServiceStore::from_config_store(&store);
         self.observer = Some((store, api_service, request_id));
@@ -3149,34 +3407,41 @@ impl ChatSseTransformState {
     }
 
     fn push_chunk(&mut self, chunk: &[u8]) {
-        self.buffer.extend_from_slice(chunk);
-        while let Some(index) = self.next_block_index() {
-            let block = String::from_utf8_lossy(&self.buffer[..index]).into_owned();
-            let drain_to = if self.buffer[index..].starts_with(b"\r\n\r\n") {
-                index + 4
-            } else {
-                index + 2
-            };
-            self.buffer.drain(..drain_to);
-            self.process_block(&block);
+        if self.stop_upstream {
+            return;
+        }
+        let mut remaining = chunk;
+        while !remaining.is_empty() && !self.stop_upstream {
+            let available = self.max_frame_bytes.saturating_sub(self.buffer.len());
+            if available == 0 {
+                self.fail_oversized_frame();
+                return;
+            }
+            let take = available.min(remaining.len());
+            self.buffer.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            self.process_buffered_blocks(false);
         }
     }
 
-    fn next_block_index(&self) -> Option<usize> {
-        match (
-            find_bytes(&self.buffer, b"\n\n"),
-            find_bytes(&self.buffer, b"\r\n\r\n"),
-        ) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
+    fn process_buffered_blocks(&mut self, end_of_stream: bool) {
+        while let Some(boundary) = next_sse_block_boundary(&self.buffer, end_of_stream) {
+            if sse_frame_limit_reached(boundary.block_end, self.max_frame_bytes) {
+                self.fail_oversized_frame();
+                return;
+            }
+            let block = String::from_utf8_lossy(&self.buffer[..boundary.block_end]).into_owned();
+            self.buffer.drain(..boundary.drain_len);
+            self.process_block(&block);
+        }
+        if sse_frame_limit_reached(self.buffer.len(), self.max_frame_bytes) {
+            self.fail_oversized_frame();
         }
     }
 
     fn process_block(&mut self, block: &str) {
         let data = block
-            .lines()
+            .split(['\r', '\n'])
             .filter_map(|line| {
                 line.strip_prefix("data:")
                     .map(str::trim_start)
@@ -3239,6 +3504,13 @@ impl ChatSseTransformState {
     }
 
     fn finish_stream(&mut self) {
+        if self.stop_upstream {
+            return;
+        }
+        self.process_buffered_blocks(true);
+        if self.stop_upstream {
+            return;
+        }
         if !self.buffer.is_empty() {
             let block = String::from_utf8_lossy(&self.buffer).into_owned();
             self.buffer.clear();
@@ -3256,6 +3528,15 @@ impl ChatSseTransformState {
 
     fn fail_incomplete(&mut self) {
         self.fail_incomplete_with_message("上游流在完成事件前中断");
+    }
+
+    fn fail_oversized_frame(&mut self) {
+        self.buffer.clear();
+        self.stop_upstream = true;
+        self.fail_incomplete_with_message(&format!(
+            "上游 SSE 单帧达到 {} MiB 本地转换上限",
+            self.max_frame_bytes / (1024 * 1024)
+        ));
     }
 
     fn fail_incomplete_with_message(&mut self, detail: &str) {
@@ -3569,12 +3850,6 @@ impl ChatSseTransformState {
     }
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
 fn response_id_from_chat_id(id: &str) -> String {
     if id.starts_with("resp_") {
         id.to_string()
@@ -3686,6 +3961,10 @@ mod tests {
     use super::*;
     use codex_companion_core::{default_refresh_interval_seconds, HealthFailureKind, ProviderKind};
     use std::collections::BTreeMap;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[tokio::test]
     async fn upstream_connection_error_has_a_user_facing_network_message() {
@@ -3855,6 +4134,45 @@ mod tests {
     }
 
     #[test]
+    fn parses_sse_boundaries_for_standard_and_mixed_line_endings() {
+        for input in [
+            b"data: one\n\nnext".as_slice(),
+            b"data: one\r\n\r\nnext".as_slice(),
+            b"data: one\r\rnext".as_slice(),
+            b"data: one\n\r\nnext".as_slice(),
+            b"data: one\r\n\nnext".as_slice(),
+            b"data: one\r\r\nnext".as_slice(),
+        ] {
+            let boundary = next_sse_block_boundary(input, false).expect("SSE boundary");
+            assert_eq!(&input[..boundary.block_end], b"data: one");
+            assert_eq!(&input[boundary.drain_len..], b"next");
+        }
+    }
+
+    #[test]
+    fn defers_a_trailing_cr_until_the_next_chunk_or_eof() {
+        for input in [b"data: one\r\n\r".as_slice(), b"data: one\r\r".as_slice()] {
+            assert_eq!(next_sse_block_boundary(input, false), None);
+            let boundary = next_sse_block_boundary(input, true).expect("EOF boundary");
+            assert_eq!(&input[..boundary.block_end], b"data: one");
+            assert_eq!(boundary.drain_len, input.len());
+        }
+    }
+
+    #[test]
+    fn enforces_the_configured_eight_mib_sse_frame_boundary() {
+        assert_eq!(MAX_SSE_FRAME_BYTES, 8 * 1024 * 1024);
+        assert!(!sse_frame_limit_reached(
+            MAX_SSE_FRAME_BYTES - 1,
+            MAX_SSE_FRAME_BYTES
+        ));
+        assert!(sse_frame_limit_reached(
+            MAX_SSE_FRAME_BYTES,
+            MAX_SSE_FRAME_BYTES
+        ));
+    }
+
+    #[test]
     fn detects_semantic_failure_in_buffered_sse() {
         let error = preflight_buffered_sse(
             concat!(
@@ -3872,6 +4190,27 @@ mod tests {
         assert!(
             matches!(error, StreamPreflightError::Semantic(message) if message.contains("429 Too Many Requests"))
         );
+    }
+
+    #[test]
+    fn distinguishes_partial_sse_prefixes_from_opaque_streams() {
+        for prefix in [
+            b"".as_slice(),
+            b" \r\n".as_slice(),
+            b"d".as_slice(),
+            b"data".as_slice(),
+            b"event:".as_slice(),
+            b": keep-alive".as_slice(),
+        ] {
+            assert!(could_start_sse_frame(prefix));
+        }
+        for opaque in [
+            b"{".as_slice(),
+            b"opaque".as_slice(),
+            b"\x1f\x8b\x08".as_slice(),
+        ] {
+            assert!(!could_start_sse_frame(opaque));
+        }
     }
 
     #[test]
@@ -4102,6 +4441,15 @@ mod tests {
         assert_eq!(response["id"], "resp_1");
         assert_eq!(response["status"], "completed");
         assert_eq!(response["output"][0]["content"][0]["text"], "OK");
+    }
+
+    #[test]
+    fn extracts_terminal_response_from_cr_only_sse() {
+        let body = b"event: response.created\rdata: {\"type\":\"response.created\"}\r\revent: response.completed\rdata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cr\",\"status\":\"completed\",\"output\":[]}}\r\r";
+        let response = terminal_response_from_sse(body).expect("terminal response");
+
+        assert_eq!(response["id"], "resp_cr");
+        assert_eq!(response["status"], "completed");
     }
 
     #[test]
@@ -4965,6 +5313,24 @@ mod tests {
     }
 
     #[test]
+    fn chat_sse_transform_accepts_cr_only_boundaries() {
+        let mut state = ChatSseTransformState::default();
+        state.push_chunk(
+            b"data: {\"id\":\"chatcmpl_cr\",\"model\":\"gpt-test\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\r\rdata: [DONE]\r\r",
+        );
+        state.finish_stream();
+
+        let output = state
+            .pending
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect::<String>();
+        assert!(output.contains("response.output_text.delta"));
+        assert!(output.contains("response.completed"));
+        assert!(!output.contains("response.failed"));
+    }
+
+    #[test]
     fn chat_sse_transform_preserves_utf8_across_transport_chunks() {
         let mut state = ChatSseTransformState::default();
         let event = concat!(
@@ -5013,6 +5379,36 @@ mod tests {
         assert!(!output.contains("response.completed"));
     }
 
+    #[tokio::test]
+    async fn chat_sse_transform_stops_reading_after_a_frame_overflow() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let upstream_polls = polls.clone();
+        let upstream = stream::unfold(0_u8, move |step| {
+            let upstream_polls = upstream_polls.clone();
+            async move {
+                upstream_polls.fetch_add(1, Ordering::SeqCst);
+                match step {
+                    0 => Some((Ok::<Bytes, io::Error>(Bytes::from(vec![b'x'; 64])), 1)),
+                    1 => Some((Ok(Bytes::from_static(b"data: [DONE]\n\n")), 2)),
+                    _ => None,
+                }
+            }
+        });
+        let state = ChatSseTransformState::default().with_frame_limit(64);
+
+        let output = chat_sse_to_responses_stream(upstream, state)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| String::from_utf8_lossy(&chunk.expect("chunk")).into_owned())
+            .collect::<String>();
+
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("upstream_stream_incomplete"));
+        assert!(output.len() < 4 * 1024);
+    }
+
     #[test]
     fn direct_responses_sse_observer_reports_incomplete_eof() {
         let temp = tempfile::tempdir().expect("temp");
@@ -5047,6 +5443,31 @@ mod tests {
                 .and_then(|health| health.last_failure_kind.clone()),
             Some(codex_companion_core::HealthFailureKind::UpstreamFailed)
         );
+    }
+
+    #[test]
+    fn direct_responses_observer_disables_inspection_after_a_frame_overflow() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.keep().join("config.json"));
+        store.load().expect("initialize config");
+        let mut state = ResponsesSseObserverState::new(
+            store.clone(),
+            "official".to_string(),
+            "request-overflow".to_string(),
+        )
+        .with_frame_limit(64);
+
+        state.push_chunk(&[b'x'; 64]);
+        state.finish_stream();
+
+        assert!(state.inspection_disabled);
+        assert!(state.buffer.is_empty());
+        assert!(state.pending.is_empty());
+        assert!(!store
+            .load()
+            .expect("config")
+            .health
+            .contains_key("official"));
     }
 
     #[test]

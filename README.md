@@ -316,6 +316,7 @@ codex-companion-tui
 - 诊断日志会脱敏 token、Authorization、cookie、API Key、私钥和 `AgentAssertion`，并按 2 MB 轮转，最多保留 5 个文件。
 - 修复操作先支持 dry-run；正式修复使用事务备份，任一步失败会回滚本次修改。
 - Token 成本是根据本地会话和价格快照计算的估算值，不等同于 OpenAI 或中转站账单。
+- `codex-auto-review` 未在 [OpenAI 公开价格表](https://developers.openai.com/api/docs/pricing)中单列价格。若父任务模型可唯一确认，Companion 会按父任务模型做启发式估算，在 UI 标记为“父模型推断”、在 API 标记为 `inferredParentModel`；该数值不是官方报价或实际账单。
 
 <details>
 <summary><strong>自定义模型价格</strong></summary>
