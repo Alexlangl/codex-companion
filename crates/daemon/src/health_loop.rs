@@ -97,9 +97,11 @@ impl LoopRegistration {
     fn acquire(data_dir: PathBuf) -> Option<Self> {
         let started = STARTED_LOOPS.get_or_init(|| Mutex::new(HashSet::new()));
         let mut started = started.lock().expect("health refresh loop mutex poisoned");
-        started
-            .insert(data_dir.clone())
-            .then_some(Self { data_dir })
+        if started.insert(data_dir.clone()) {
+            Some(Self { data_dir })
+        } else {
+            None
+        }
     }
 }
 
@@ -475,6 +477,17 @@ mod tests {
         refresh_loop.stop().await;
 
         assert!(!health_refresh_loop_started(&store));
+    }
+
+    #[test]
+    fn duplicate_loop_registration_returns_without_deadlocking() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().to_path_buf();
+        let registration = LoopRegistration::acquire(data_dir.clone()).expect("register loop");
+
+        assert!(LoopRegistration::acquire(data_dir).is_none());
+
+        drop(registration);
     }
 
     #[tokio::test]

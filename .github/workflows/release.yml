@@ -269,7 +269,7 @@ jobs:
           tag_name: ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ github.sha }}
           name: Codex Companion ${{ needs.prepare.outputs.tag }}
-          body: Desktop bundles and CLI/TUI archives built by the manual release workflow.
+          generate_release_notes: true
           draft: false
           prerelease: ${{ needs.prepare.outputs.prerelease }}
           fail_on_unmatched_files: true
