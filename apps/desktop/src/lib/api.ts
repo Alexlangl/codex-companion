@@ -47,6 +47,7 @@ import type {
   TokenUsageQuery,
 } from "../types/domain";
 import { isGenericOfficialAccountName } from "./provider-display";
+import { providerEndpointIsChatCompletions } from "./provider-url";
 import {
   extractQuotaWindows,
   findApiBaseUrl,
@@ -709,26 +710,24 @@ export function addEnvProvider(input: {
 export function importProviderJson(jsonText: string, providerId?: string, providerName?: string) {
   if (!isTauri()) {
     const value = JSON.parse(jsonText) as unknown;
-    const authMode = findString(value, ["auth_mode", "authMode"])?.toLowerCase();
-    const hasApiKeyShape = authMode === "apikey" || authMode === "api_key" || isApiKeyJson(value) || Boolean(findApiKey(value));
-    if (hasApiKeyShape) {
-      return importApiKeyJsonMock(value, providerId, providerName);
-    }
-    const runtimeId = findString(value, ["agent_runtime_id", "agentRuntimeId"]);
-    const privateKey = findString(value, ["agent_private_key", "agentPrivateKey"]);
-    const hasAgentIdentityShape = authMode === "agentidentity" || Boolean(runtimeId && privateKey);
-    if (hasAgentIdentityShape && (!runtimeId || !privateKey)) {
+    const credentialShape = mockProviderCredentialShape(value);
+    if (credentialShape.hasAgentIdentity && (!credentialShape.runtimeId || !credentialShape.privateKey)) {
       return Promise.reject(new Error("Agent Identity 缺少 runtime id 或私钥"));
     }
-    const oauthToken = findString(value, ["access_token", "accessToken", "refresh_token", "refreshToken", "id_token", "idToken"]);
-    if (!hasAgentIdentityShape && !oauthToken) {
+    if (!credentialShape.hasAgentIdentity && credentialShape.hasApiKeyShape) {
+      return importApiKeyJsonMock(value, providerId, providerName);
+    }
+    if (!credentialShape.hasAgentIdentity && !credentialShape.officialToken) {
       return Promise.reject(new Error("仅支持 Codex OAuth、Agent Identity 或 API Key 账号 JSON"));
     }
     const explicitName = emptyToNull(providerName);
     const detectedName = findString(value, ["email", "name"]);
-    const importedName = explicitName || (detectedName && !isGenericOfficialAccountName(detectedName) ? detectedName : null);
+    let importedName = explicitName;
+    if (!importedName && detectedName && !isGenericOfficialAccountName(detectedName)) {
+      importedName = detectedName;
+    }
     const detectedAccountId = findString(value, ["chatgpt_account_id", "account_id", "workspace_id"]);
-    if (hasAgentIdentityShape && !detectedAccountId) {
+    if (credentialShape.hasAgentIdentity && !detectedAccountId) {
       return Promise.reject(new Error("Agent Identity 缺少 ChatGPT account id"));
     }
     const accountId = detectedAccountId || findString(value, ["email"]) || `mock_${Date.now()}`;
@@ -773,7 +772,7 @@ export function importProviderJson(jsonText: string, providerId?: string, provid
       enabled: true,
       refreshIntervalSeconds: 60,
       account: {
-        authMode: hasAgentIdentityShape ? "agentIdentity" : "oauth",
+        authMode: mockOfficialAuthMode(credentialShape),
         displayName: name,
         email,
         teamName,
@@ -814,9 +813,9 @@ export function importProviderJson(jsonText: string, providerId?: string, provid
       },
     };
     mockStatus = syncMockDerived(mockStatus);
-    const importKind = hasAgentIdentityShape ? "agent_identity" : "openai_account";
+    const importKind = credentialShape.hasAgentIdentity ? "agent_identity" : "openai_account";
     let message = created ? "已导入 Codex 官方账号 provider" : "已更新 Codex 官方账号 provider";
-    if (hasAgentIdentityShape) {
+    if (credentialShape.hasAgentIdentity) {
       message = created ? "已导入 Agent Identity provider" : "已更新 Agent Identity provider";
     }
     return Promise.resolve<ProviderImportOutcome>({
@@ -1341,9 +1340,15 @@ export function launchProvider(id: string, mode: ProviderLaunchMode = "auto", co
   if (!isTauri()) {
     const provider = mockStatus.config.providers[id];
     if (!provider) return Promise.reject(new Error(`unknown provider: ${id}`));
-    const shouldDirect = mode === "direct" || (mode === "auto" && providerCanDirectConnect(provider));
+    const shouldDirect = providerCanDirectConnect(provider) && (mode === "direct" || mode === "auto");
     if (mode === "direct" && !providerCanDirectConnect(provider)) {
-      return Promise.reject(new Error(`${provider.name} 缺少直连所需的账号材料、API Key 文件或环境变量`));
+      return Promise.reject(
+        new Error(
+          provider.kind === "official_codex"
+            ? "官方 Codex 账号必须使用 Companion 本地代理，才能独立刷新 OAuth token 并保活"
+            : `${provider.name} 缺少直连所需的账号材料、API Key 文件或环境变量`,
+        ),
+      );
     }
     if (shouldDirect) {
       const targetProviderId = provider.kind === "official_codex" ? "openai" : provider.id;
@@ -1402,6 +1407,13 @@ export function launchProvider(id: string, mode: ProviderLaunchMode = "auto", co
 
 export function setProviderLaunchMode(providerId: string, mode: ProviderLaunchMode) {
   if (!isTauri()) {
+    const provider = mockStatus.config.providers[providerId];
+    if (provider && mode === "direct" && !providerCanDirectConnect(provider)) {
+      const message = provider.kind === "official_codex"
+        ? "官方 Codex 账号必须使用 Companion 本地代理，不能保存为直连模式"
+        : `${provider.name} 当前不满足直连条件，不能保存为直连模式`;
+      return Promise.reject(new Error(message));
+    }
     const previousMode =
       mockStatus.config.app.providerLaunchModes[providerId] ?? "direct";
     const needsRelayRestart = previousMode === "direct" && mode === "relay";
@@ -1581,32 +1593,26 @@ function reviewProviderJsonMock(
   providerId?: string,
   providerName?: string,
 ): ProviderImportReviewItem {
-  const authMode = findString(value, ["auth_mode", "authMode"])?.toLowerCase();
-  const hasApiKeyShape = authMode === "apikey" || authMode === "api_key" || isNewApiChannelConnection(value) || Boolean(findApiKey(value));
-  if (hasApiKeyShape) {
-    return reviewApiKeyJsonMock(value, index, providerId, providerName);
-  }
-
-  const runtimeId = findString(value, ["agent_runtime_id", "agentRuntimeId"]);
-  const privateKey = findString(value, ["agent_private_key", "agentPrivateKey"]);
-  const hasAgentIdentityShape = authMode === "agentidentity" || Boolean(runtimeId && privateKey);
-  if (hasAgentIdentityShape && (!runtimeId || !privateKey)) {
+  const credentialShape = mockProviderCredentialShape(value);
+  if (credentialShape.hasAgentIdentity && (!credentialShape.runtimeId || !credentialShape.privateKey)) {
     throw new Error("Agent Identity 缺少 runtime id 或私钥");
   }
-
-  const token = findString(value, ["access_token", "accessToken", "refresh_token", "refreshToken", "id_token", "idToken"]);
-  if (!hasAgentIdentityShape && !token) {
+  if (!credentialShape.hasAgentIdentity && credentialShape.hasApiKeyShape) {
+    return reviewApiKeyJsonMock(value, index, providerId, providerName);
+  }
+  if (!credentialShape.hasAgentIdentity && !credentialShape.officialToken) {
     throw new Error("仅支持 Codex OAuth、Agent Identity 或 API Key 账号 JSON");
   }
   const accountId = findString(value, ["chatgpt_account_id", "account_id", "accountId", "workspace_id"]);
-  if (hasAgentIdentityShape && !accountId) {
+  if (credentialShape.hasAgentIdentity && !accountId) {
     throw new Error("Agent Identity 缺少 ChatGPT account id");
   }
   const name =
     emptyToNull(providerName) ||
     findString(value, ["email", "display_name", "displayName", "name"]) ||
     "Codex 官方账号";
-  const identity = accountId || `mock_${accountIdHash(token || runtimeId || name)}`;
+  const credentialIdentity = credentialShape.officialToken || credentialShape.runtimeId || name;
+  const identity = accountId || `mock_${accountIdHash(credentialIdentity)}`;
   const id = normalizeMockProviderId(providerId) || `codex_openai_${sanitizeProviderId(name)}_${accountIdHash(identity)}`;
   return {
     index,
@@ -1614,13 +1620,80 @@ function reviewProviderJsonMock(
     providerId: id,
     providerName: redactMockReviewText(name),
     providerKind: "official_codex",
-    importKind: hasAgentIdentityShape ? "agent_identity" : "openai_account",
-    credentialKind: hasAgentIdentityShape ? "Agent Identity 私钥" : "OAuth tokens",
+    importKind: credentialShape.hasAgentIdentity ? "agent_identity" : "openai_account",
+    credentialKind: mockOfficialCredentialKind(credentialShape),
     baseUrl: "https://chatgpt.com/backend-api/codex",
     websocketUrl: null,
     model: redactOptionalMockReviewText(findString(value, ["model", "defaultModel", "default_model"])),
     willOverwrite: Boolean(mockStatus.config.providers[id]),
   };
+}
+
+type MockProviderCredentialShape = {
+  authMode: string | null;
+  hasAgentIdentity: boolean;
+  hasApiKeyShape: boolean;
+  isOfficialPat: boolean;
+  officialToken: string | null;
+  privateKey: string | null;
+  runtimeId: string | null;
+};
+
+function mockProviderCredentialShape(value: unknown): MockProviderCredentialShape {
+  const authMode = findString(value, ["codex_companion_auth_mode", "auth_mode", "authMode"])?.toLowerCase() ?? null;
+  const runtimeId = findString(value, ["agent_runtime_id", "agentRuntimeId"]);
+  const privateKey = findString(value, ["agent_private_key", "agentPrivateKey"]);
+  const hasAgentIdentity = authMode === "agentidentity" || authMode === "agent_identity" || Boolean(runtimeId && privateKey);
+  const officialToken = findString(value, [
+    "access_token",
+    "accessToken",
+    "personal_access_token",
+    "personalAccessToken",
+    "pat",
+    "token",
+    "refresh_token",
+    "refreshToken",
+    "id_token",
+    "idToken",
+  ]);
+  const hasExplicitPatToken = Boolean(findString(value, ["personal_access_token", "personalAccessToken", "pat"]));
+  const isOfficialPat = Boolean(officialToken) && (isExplicitOfficialPatMode(authMode) || hasExplicitPatToken);
+  const hasApiKeyShape = !isOfficialPat && (
+    authMode === "apikey" ||
+    authMode === "api_key" ||
+    isApiKeyJson(value) ||
+    isNewApiChannelConnection(value) ||
+    Boolean(findApiKey(value))
+  );
+  return {
+    authMode,
+    hasAgentIdentity,
+    hasApiKeyShape,
+    isOfficialPat,
+    officialToken,
+    privateKey,
+    runtimeId,
+  };
+}
+
+function mockOfficialAuthMode(credentialShape: MockProviderCredentialShape): string {
+  if (credentialShape.hasAgentIdentity) {
+    return "agentIdentity";
+  }
+  if (credentialShape.isOfficialPat) {
+    return "pat";
+  }
+  return "oauth";
+}
+
+function mockOfficialCredentialKind(credentialShape: MockProviderCredentialShape): string {
+  if (credentialShape.hasAgentIdentity) {
+    return "Agent Identity 私钥";
+  }
+  if (credentialShape.isOfficialPat) {
+    return "Personal access token";
+  }
+  return "OAuth tokens";
 }
 
 function reviewApiKeyJsonMock(
@@ -1794,9 +1867,34 @@ function isTauri() {
 }
 
 function providerCanDirectConnect(provider: ProviderConfig) {
-  if (provider.account?.authMode === "agentIdentity") return false;
-  const authRef = provider.directAuthRef?.trim() || provider.authRef?.trim();
+  if (provider.kind === "official_codex" && officialProviderUsesOAuth(provider)) return false;
+  if (provider.account?.authMode?.trim().toLowerCase() === "agentidentity") return false;
+  if (providerEndpointIsChatCompletions(provider.baseUrl)) return false;
+  const authRef = directAuthRef(provider);
   return !authRef || authRef.startsWith("env:") || authRef.startsWith("file:");
+}
+
+function officialProviderUsesOAuth(provider: ProviderConfig) {
+  if (provider.kind !== "official_codex") return false;
+  const mode = provider.account?.authMode?.trim().toLowerCase();
+  return !mode || !isOfficialPatMode(mode);
+}
+
+function directAuthRef(provider: ProviderConfig): string {
+  const authRef = provider.authRef?.trim();
+  const directAuthRef = provider.directAuthRef?.trim();
+  if (provider.kind === "official_codex") {
+    return authRef || directAuthRef || "";
+  }
+  return directAuthRef || authRef || "";
+}
+
+function isOfficialPatMode(mode?: string): boolean {
+  return ["pat", "personal_access_token", "personalaccesstoken", "token", "apikey", "api_key"].includes(mode || "");
+}
+
+function isExplicitOfficialPatMode(mode?: string | null): boolean {
+  return ["pat", "personal_access_token", "personalaccesstoken", "token"].includes(mode || "");
 }
 
 function mockLaunchOutcome(
@@ -2262,9 +2360,13 @@ function syncMockDerived(status: CompanionStatus): CompanionStatus {
         .map((id) => status.config.providers[id])
         .filter((provider): provider is ProviderConfig => Boolean(provider))
     : [];
+  const directConnectProviderIds = Object.values(status.config.providers)
+    .filter(providerCanDirectConnect)
+    .map((provider) => provider.id);
   return {
     ...status,
     activeGroup,
     activeProviders,
+    directConnectProviderIds,
   };
 }

@@ -1,6 +1,11 @@
+use crate::http::read_response_bytes_limited;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{SecondsFormat, Utc};
-use codex_companion_core::{atomic_write_private_file, CompanionError, ProviderConfig, Result};
+use codex_companion_core::{
+    atomic_write_private_file, official_auth_mode_from_account, official_auth_mode_from_auth_json,
+    provider_relay_auth_ref, redact_sensitive_text, CompanionError, OfficialAuthMode,
+    ProviderConfig, Result,
+};
 use crypto_box::SecretKey;
 use ed25519_dalek::{pkcs8::DecodePrivateKey, Signer, SigningKey};
 use serde::Deserialize;
@@ -12,6 +17,7 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 const AUTH_API_BASE_URL: &str = "https://auth.openai.com/api/accounts";
+const TASK_REGISTRATION_RESPONSE_LIMIT_BYTES: usize = 64 * 1024;
 static TASK_REGISTRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -42,7 +48,13 @@ struct TaskRegistrationResponse {
 }
 
 pub fn provider_uses_agent_identity(provider: &ProviderConfig) -> bool {
-    load_agent_identity_credential(provider).is_ok()
+    if provider.kind != codex_companion_core::ProviderKind::OfficialCodex {
+        return false;
+    }
+    if let Some(mode) = auth_file_mode(provider) {
+        return mode == OfficialAuthMode::AgentIdentity;
+    }
+    official_auth_mode_from_account(provider) == Some(OfficialAuthMode::AgentIdentity)
 }
 
 pub async fn ensure_agent_identity_authorization(
@@ -114,10 +126,10 @@ pub fn is_agent_identity_task_invalid(status: reqwest::StatusCode, body: &str) -
 }
 
 pub fn redact_agent_identity_body(provider: &ProviderConfig, body: &str) -> String {
+    let mut redacted = redact_assertions(body);
     let Ok(credential) = load_agent_identity_credential(provider) else {
-        return body.to_string();
+        return redact_sensitive_text(&redacted);
     };
-    let mut redacted = body.to_string();
     for value in [
         Some(credential.runtime_id.as_str()),
         Some(credential.encoded_private_key.as_str()),
@@ -130,21 +142,18 @@ pub fn redact_agent_identity_body(provider: &ProviderConfig, body: &str) -> Stri
     {
         redacted = redacted.replace(value, "[redacted]");
     }
-    redact_assertions(&redacted)
+    redact_sensitive_text(&redacted)
 }
 
 fn load_agent_identity_credential(provider: &ProviderConfig) -> Result<AgentIdentityCredential> {
-    let auth_path = provider
-        .auth_ref
-        .as_deref()
+    let auth_path = provider_relay_auth_ref(provider)
         .and_then(|auth_ref| auth_ref.strip_prefix("file:"))
         .map(PathBuf::from)
         .ok_or_else(|| {
             CompanionError::InvalidConfig("Agent Identity provider 缺少 auth 文件".to_string())
         })?;
     let value = read_auth_value(&auth_path)?;
-    let mode = json_string(&value, &["auth_mode", "authMode", "openai_auth_mode"]);
-    if !mode.is_some_and(|mode| mode.eq_ignore_ascii_case("agentIdentity")) {
+    if official_auth_mode_from_auth_json(&value) != Some(OfficialAuthMode::AgentIdentity) {
         return Err(CompanionError::InvalidConfig(
             "provider 不是 Agent Identity 认证".to_string(),
         ));
@@ -174,6 +183,14 @@ fn load_agent_identity_credential(provider: &ProviderConfig) -> Result<AgentIden
         task_id: json_string(&value, &["task_id", "taskId"]),
         auth_path,
     })
+}
+
+fn auth_file_mode(provider: &ProviderConfig) -> Option<OfficialAuthMode> {
+    let auth_path = provider_relay_auth_ref(provider)
+        .and_then(|auth_ref| auth_ref.strip_prefix("file:"))
+        .map(PathBuf::from)?;
+    let value = read_auth_value(&auth_path).ok()?;
+    official_auth_mode_from_auth_json(&value)
 }
 
 fn read_auth_value(path: &Path) -> Result<Value> {
@@ -255,14 +272,11 @@ async fn register_task(
             "Agent Identity task 注册返回 HTTP {status}"
         )));
     }
-    let bytes = response.bytes().await.map_err(|source| {
-        CompanionError::InvalidConfig(format!("读取 Agent Identity task 响应失败: {source}"))
-    })?;
-    if bytes.len() > 64 * 1024 {
-        return Err(CompanionError::InvalidConfig(
-            "Agent Identity task 注册响应过大".to_string(),
-        ));
-    }
+    let bytes = read_response_bytes_limited(response, TASK_REGISTRATION_RESPONSE_LIMIT_BYTES)
+        .await
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("读取 Agent Identity task 响应失败: {source}"))
+        })?;
     let result: TaskRegistrationResponse = serde_json::from_slice(&bytes).map_err(|source| {
         CompanionError::InvalidConfig(format!("Agent Identity task 注册响应格式无效: {source}"))
     })?;
@@ -362,6 +376,59 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[test]
+    fn file_mode_overrides_stale_agent_identity_metadata() {
+        let temp = tempfile::tempdir().expect("temp");
+        let auth_path = temp.path().join("auth.json");
+        fs::write(
+            &auth_path,
+            r#"{"tokens":{"access_token":"oauth-access","refresh_token":"oauth-refresh"}}"#,
+        )
+        .expect("auth");
+        let provider = ProviderConfig {
+            id: "oauth".to_string(),
+            name: "OAuth".to_string(),
+            kind: codex_companion_core::ProviderKind::OfficialCodex,
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            websocket_url: None,
+            auth_ref: Some(format!("file:{}", auth_path.display())),
+            direct_auth_ref: None,
+            model_map: Default::default(),
+            priority: 1,
+            enabled: true,
+            refresh_interval_seconds: 60,
+            account: Some(codex_companion_core::ProviderAccountInfo {
+                auth_mode: Some("agentIdentity".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        assert!(!provider_uses_agent_identity(&provider));
+    }
+
+    #[test]
+    fn declared_agent_identity_stays_relay_only_when_credential_is_incomplete() {
+        let temp = tempfile::tempdir().expect("temp");
+        let auth_path = temp.path().join("auth.json");
+        fs::write(&auth_path, r#"{"auth_mode":"agentIdentity"}"#).expect("auth");
+        let provider = ProviderConfig {
+            id: "agent".to_string(),
+            name: "Agent".to_string(),
+            kind: codex_companion_core::ProviderKind::OfficialCodex,
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            websocket_url: None,
+            auth_ref: Some(format!("file:{}", auth_path.display())),
+            direct_auth_ref: None,
+            model_map: Default::default(),
+            priority: 1,
+            enabled: true,
+            refresh_interval_seconds: 60,
+            account: None,
+        };
+
+        assert!(provider_uses_agent_identity(&provider));
+    }
 
     #[test]
     fn assertion_contains_a_verifiable_signature() {
@@ -529,6 +596,32 @@ mod tests {
             reqwest::StatusCode::UNAUTHORIZED,
             "token expired"
         ));
+    }
+
+    #[test]
+    fn unreadable_credential_still_redacts_agent_assertions_and_tokens() {
+        let provider = ProviderConfig {
+            id: "agent".to_string(),
+            name: "Agent".to_string(),
+            kind: codex_companion_core::ProviderKind::OfficialCodex,
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            websocket_url: None,
+            auth_ref: Some("file:/missing/agent-auth.json".to_string()),
+            direct_auth_ref: None,
+            model_map: Default::default(),
+            priority: 1,
+            enabled: true,
+            refresh_interval_seconds: 60,
+            account: None,
+        };
+
+        let body =
+            "upstream echoed AgentAssertion assertion-secret and refresh_token=refresh-secret";
+        let redacted = redact_agent_identity_body(&provider, body);
+
+        assert!(!redacted.contains("assertion-secret"));
+        assert!(!redacted.contains("refresh-secret"));
+        assert!(redacted.contains("AgentAssertion [redacted]"));
     }
 
     #[test]

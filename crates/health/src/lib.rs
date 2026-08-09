@@ -8,6 +8,21 @@ pub struct FailureClassification {
     pub cooldown: bool,
 }
 
+pub fn classification_for_kind(kind: HealthFailureKind) -> FailureClassification {
+    match kind {
+        HealthFailureKind::AuthFailed => class(HealthFailureKind::AuthFailed, false, true),
+        HealthFailureKind::RateLimited => class(HealthFailureKind::RateLimited, true, true),
+        HealthFailureKind::QuotaExhausted => class(HealthFailureKind::QuotaExhausted, true, true),
+        HealthFailureKind::ModelMissing => class(HealthFailureKind::ModelMissing, true, true),
+        HealthFailureKind::RequestRejected => {
+            class(HealthFailureKind::RequestRejected, true, false)
+        }
+        HealthFailureKind::UpstreamFailed => class(HealthFailureKind::UpstreamFailed, true, true),
+        HealthFailureKind::NetworkFailed => class(HealthFailureKind::NetworkFailed, true, true),
+        HealthFailureKind::Unknown => class(HealthFailureKind::Unknown, false, false),
+    }
+}
+
 pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassification {
     let lower = body.to_ascii_lowercase();
 

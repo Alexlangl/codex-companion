@@ -978,6 +978,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             if let Ok(daemon) = daemon() {
+                let refresh_daemon = daemon.clone();
+                tauri::async_runtime::spawn(async move {
+                    refresh_daemon.start_background_tasks();
+                });
                 if let Err(error) = codex_oauth::restore_listener(daemon.store().data_dir()) {
                     eprintln!("Codex OAuth pending state restore failed: {error}");
                 }

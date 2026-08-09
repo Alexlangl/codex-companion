@@ -4,6 +4,7 @@ mod auth;
 mod codex_oauth;
 mod export;
 mod groups;
+mod http;
 mod import;
 mod refresh;
 mod registry;
@@ -14,8 +15,14 @@ use codex_companion_core::{atomic_write_private_file, CompanionError, Result};
 use std::{fs, path::Path};
 
 pub use account_refresh::{refresh_official_codex_account, test_configured_usage_query};
-pub use auth::{resolve_auth_token, resolve_chatgpt_account_id};
-pub use codex_oauth::{ensure_codex_auth_snapshot, load_codex_auth_snapshot, CodexAuthSnapshot};
+pub use auth::{resolve_auth_token, resolve_chatgpt_account_id, sync_official_auth_mode};
+pub use codex_oauth::{
+    ensure_codex_auth_snapshot, ensure_codex_auth_snapshot_detailed,
+    ensure_codex_auth_snapshot_with_status, ensure_codex_auth_snapshot_with_status_detailed,
+    load_codex_auth_snapshot, provider_uses_codex_oauth,
+    refresh_codex_auth_snapshot_after_unauthorized,
+    refresh_codex_auth_snapshot_after_unauthorized_detailed, CodexAuthSnapshot, CodexOAuthError,
+};
 pub use export::export_provider_json;
 pub use groups::{
     active_group, filter_available_providers, request_priority_failback, selected_providers,

@@ -1,8 +1,10 @@
 use codex_companion_core::{
-    default_codex_dir, CompanionStatus, GroupPolicy, ProviderConfig, ProviderGroup, ProviderKind,
-    ProviderLaunchMode, RepairOptions, TokenUsageSummary,
+    default_codex_dir, provider_direct_auth_ref, CompanionStatus, GroupPolicy, ProviderConfig,
+    ProviderGroup, ProviderKind, ProviderLaunchMode, RepairOptions, TokenUsageSummary,
 };
-use codex_companion_daemon::{provider_can_direct_connect, CompanionDaemon};
+use codex_companion_daemon::{
+    provider_auto_prefers_relay, provider_can_direct_connect, CompanionDaemon,
+};
 use codex_companion_provider::{GroupUpsert, ProviderImportReviewReport};
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -542,13 +544,14 @@ fn launch_selected_provider(
     let Some(provider) = selected_provider(app, status) else {
         return;
     };
-    let mode = status
+    let configured_mode = status
         .config
         .app
         .provider_launch_modes
         .get(&provider.id)
         .cloned()
         .unwrap_or_default();
+    let mode = effective_provider_launch_mode(provider, &configured_mode);
     if provider_launch_will_direct(provider, &mode)
         && provider_direct_launch_writes_auth_json(
             provider,
@@ -565,11 +568,24 @@ fn launch_selected_provider(
     }
 }
 
+fn effective_provider_launch_mode(
+    provider: &ProviderConfig,
+    mode: &ProviderLaunchMode,
+) -> ProviderLaunchMode {
+    if matches!(mode, ProviderLaunchMode::Direct) && !provider_can_direct_connect(provider) {
+        ProviderLaunchMode::Relay
+    } else {
+        mode.clone()
+    }
+}
+
 fn provider_launch_will_direct(provider: &ProviderConfig, mode: &ProviderLaunchMode) -> bool {
     match mode {
-        ProviderLaunchMode::Direct => true,
+        ProviderLaunchMode::Direct => provider_can_direct_connect(provider),
         ProviderLaunchMode::Relay => false,
-        ProviderLaunchMode::Auto => provider_can_direct_connect(provider),
+        ProviderLaunchMode::Auto => {
+            !provider_auto_prefers_relay(provider) && provider_can_direct_connect(provider)
+        }
     }
 }
 
@@ -577,10 +593,7 @@ fn provider_direct_launch_writes_auth_json(
     provider: &ProviderConfig,
     preserve_official_codex_auth: bool,
 ) -> bool {
-    let has_file_auth = provider
-        .direct_auth_ref
-        .as_deref()
-        .or(provider.auth_ref.as_deref())
+    let has_file_auth = provider_direct_auth_ref(provider)
         .map(str::trim)
         .is_some_and(|auth_ref| auth_ref.starts_with("file:"));
     has_file_auth
@@ -828,6 +841,32 @@ mod tests {
     }
 
     #[test]
+    fn tui_auto_launch_prefers_relay_for_official_oauth() {
+        let mut provider = provider(Some("file:/tmp/provider-auth.json"));
+        provider.kind = ProviderKind::OfficialCodex;
+
+        assert!(!provider_launch_will_direct(
+            &provider,
+            &ProviderLaunchMode::Auto
+        ));
+        assert!(!provider_launch_will_direct(
+            &provider,
+            &ProviderLaunchMode::Direct
+        ));
+    }
+
+    #[test]
+    fn tui_migrates_legacy_direct_mode_when_provider_is_relay_only() {
+        let mut provider = provider(Some("file:/tmp/provider-auth.json"));
+        provider.kind = ProviderKind::OfficialCodex;
+
+        assert_eq!(
+            effective_provider_launch_mode(&provider, &ProviderLaunchMode::Direct),
+            ProviderLaunchMode::Relay
+        );
+    }
+
+    #[test]
     fn tui_requires_confirmation_for_file_auth_direct_writes() {
         assert!(provider_direct_launch_writes_auth_json(
             &provider(Some("file:/tmp/provider-auth.json")),
@@ -847,6 +886,12 @@ mod tests {
         ));
         let mut official_provider = provider(Some("file:/tmp/official-auth.json"));
         official_provider.kind = ProviderKind::OfficialCodex;
+        assert!(provider_direct_launch_writes_auth_json(
+            &official_provider,
+            true,
+        ));
+
+        official_provider.direct_auth_ref = Some("env:STALE_DIRECT_TOKEN".to_string());
         assert!(provider_direct_launch_writes_auth_json(
             &official_provider,
             true,

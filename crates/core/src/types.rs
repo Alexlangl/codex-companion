@@ -44,6 +44,7 @@ pub enum ProviderKind {
 pub enum ModelSourceKind {
     LocalCache,
     OfficialOauth,
+    OfficialPat,
     Relay,
 }
 
@@ -644,6 +645,7 @@ pub struct CompanionStatus {
     pub relay_base_url: String,
     pub active_group: Option<ProviderGroup>,
     pub active_providers: Vec<ProviderConfig>,
+    pub direct_connect_provider_ids: Vec<String>,
     pub codex: CodexInstallStatus,
     pub recent_events: Vec<RelayEvent>,
     pub data_roots: DataRootStatus,

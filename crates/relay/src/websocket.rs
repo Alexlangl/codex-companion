@@ -13,11 +13,13 @@ use codex_companion_core::{
 };
 use codex_companion_health::{
     classify_failure, cooldown_active, mark_failure, normalize_expired_cooldown,
-    repair_legacy_auth_misclassification,
+    repair_legacy_auth_misclassification, FailureClassification,
 };
 use codex_companion_provider::{
-    ensure_agent_identity_authorization, ensure_codex_auth_snapshot, provider_uses_agent_identity,
-    resolve_auth_token, selected_providers_for_group,
+    ensure_agent_identity_authorization, ensure_codex_auth_snapshot_with_status_detailed,
+    provider_uses_agent_identity, provider_uses_codex_oauth,
+    refresh_codex_auth_snapshot_after_unauthorized_detailed, resolve_auth_token,
+    selected_providers_for_group, CodexOAuthError,
 };
 use futures_util::{
     stream::{SplitSink, SplitStream},
@@ -46,6 +48,15 @@ type UpstreamSink = SplitSink<UpstreamWebSocket, UpstreamMessage>;
 type UpstreamStream = SplitStream<UpstreamWebSocket>;
 type ClientWebSocket = axum::extract::ws::WebSocket;
 type ClientSink = SplitSink<ClientWebSocket, ClientMessage>;
+
+/// Keeps the credential that established the current upstream socket. A
+/// WebSocket can report authorization failures after a successful HTTP
+/// handshake, so reconnect logic must refresh the token that was actually
+/// rejected rather than whatever happens to be in the auth file later.
+struct ConnectedWebSocket {
+    websocket: UpstreamWebSocket,
+    oauth_access_token: Option<String>,
+}
 
 pub(crate) async fn responses_websocket(
     State(state): State<RelayState>,
@@ -317,6 +328,7 @@ fn websocket_session_id(headers: &HeaderMap) -> Option<String> {
 struct WebSocketConnectError {
     message: String,
     status: Option<u16>,
+    failure: Option<FailureClassification>,
 }
 
 impl WebSocketConnectError {
@@ -324,42 +336,73 @@ impl WebSocketConnectError {
         Self {
             message: message.into(),
             status: None,
+            failure: None,
         }
     }
 
-    fn with_prefix(self, prefix: &str) -> Self {
+    fn oauth(error: CodexOAuthError) -> Self {
+        let failure = error.failure_classification();
+        let status = error.status;
         Self {
-            message: format!("{prefix}: {}", self.message),
-            status: self.status,
+            message: error.message,
+            status,
+            failure: Some(failure),
         }
+    }
+
+    fn with_prefix(mut self, prefix: &str) -> Self {
+        self.message = format!("{prefix}: {}", self.message);
+        self
     }
 }
 
 async fn connect_provider_websocket(
     state: &RelayState,
     provider: &ProviderConfig,
-) -> Result<UpstreamWebSocket, WebSocketConnectError> {
+) -> Result<ConnectedWebSocket, WebSocketConnectError> {
+    connect_provider_websocket_with_options(state, provider, true).await
+}
+
+async fn connect_provider_websocket_with_options(
+    state: &RelayState,
+    provider: &ProviderConfig,
+    retry_oauth_handshake_unauthorized: bool,
+) -> Result<ConnectedWebSocket, WebSocketConnectError> {
     let mut agent_task_id = None;
-    let authorization = if provider.kind == ProviderKind::OfficialCodex {
+    let mut official_oauth = false;
+    let mut chatgpt_account_id = provider
+        .account
+        .as_ref()
+        .and_then(|account| account.account_id.clone())
+        .filter(|account_id| !account_id.trim().is_empty());
+    let mut authorization = if provider.kind == ProviderKind::OfficialCodex {
         if provider_uses_agent_identity(provider) {
             let auth = ensure_agent_identity_authorization(&state.client, provider, None)
                 .await
                 .map_err(|error| WebSocketConnectError::message(error.to_string()))?;
             agent_task_id = Some(auth.task_id);
             Some(auth.header)
-        } else {
-            let auth = ensure_codex_auth_snapshot(provider)
+        } else if provider_uses_codex_oauth(provider) {
+            official_oauth = true;
+            let (auth, _) = ensure_codex_auth_snapshot_with_status_detailed(provider)
                 .await
-                .map_err(|error| WebSocketConnectError::message(error.to_string()))?;
+                .map_err(WebSocketConnectError::oauth)?;
+            chatgpt_account_id = auth.account_id.or(chatgpt_account_id);
             Some(format!("Bearer {}", auth.access_token))
+        } else {
+            resolve_auth_token(provider).map(|token| format!("Bearer {token}"))
         }
     } else {
         resolve_auth_token(provider).map(|token| format!("Bearer {token}"))
     };
-    let request = websocket_request(provider, authorization.as_deref())
-        .map_err(WebSocketConnectError::message)?;
-    match connect_websocket_with_timeout(request).await {
-        Ok(websocket) => Ok(websocket),
+    let request = websocket_request_with_account_id(
+        provider,
+        authorization.as_deref(),
+        chatgpt_account_id.as_deref(),
+    )
+    .map_err(WebSocketConnectError::message)?;
+    let websocket = match connect_websocket_with_timeout(request).await {
+        Ok(websocket) => websocket,
         Err(error)
             if error.status == Some(StatusCode::UNAUTHORIZED.as_u16())
                 && agent_task_id.is_some() =>
@@ -371,14 +414,62 @@ async fn connect_provider_websocket(
             )
             .await
             .map_err(|error| WebSocketConnectError::message(error.to_string()))?;
-            let request = websocket_request(provider, Some(&auth.header))
-                .map_err(WebSocketConnectError::message)?;
+            let request = websocket_request_with_account_id(
+                provider,
+                Some(&auth.header),
+                chatgpt_account_id.as_deref(),
+            )
+            .map_err(WebSocketConnectError::message)?;
             connect_websocket_with_timeout(request)
                 .await
-                .map_err(|error| error.with_prefix("WebSocket task 恢复后仍连接失败"))
+                .map_err(|error| error.with_prefix("WebSocket task 恢复后仍连接失败"))?
         }
-        Err(error) => Err(error),
-    }
+        Err(error)
+            if error.status == Some(StatusCode::UNAUTHORIZED.as_u16())
+                && official_oauth
+                && retry_oauth_handshake_unauthorized =>
+        {
+            let Some(access_token) = authorization
+                .as_deref()
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Err(error);
+            };
+            let auth =
+                refresh_codex_auth_snapshot_after_unauthorized_detailed(provider, access_token)
+                    .await
+                    .map_err(WebSocketConnectError::oauth)
+                    .map_err(|refresh_error| refresh_error.with_prefix("OAuth 401 后刷新失败"))?;
+            chatgpt_account_id = auth.account_id.or(chatgpt_account_id);
+            authorization = Some(format!("Bearer {}", auth.access_token));
+            let request = websocket_request_with_account_id(
+                provider,
+                authorization.as_deref(),
+                chatgpt_account_id.as_deref(),
+            )
+            .map_err(WebSocketConnectError::message)?;
+            connect_websocket_with_timeout(request)
+                .await
+                .map_err(|error| error.with_prefix("OAuth 刷新后仍连接失败"))?
+        }
+        Err(error) => return Err(error),
+    };
+    let oauth_access_token = official_oauth
+        .then(|| {
+            authorization
+                .as_deref()
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .flatten();
+    Ok(ConnectedWebSocket {
+        websocket,
+        oauth_access_token,
+    })
 }
 
 async fn connect_websocket_with_timeout(
@@ -392,6 +483,7 @@ async fn connect_websocket_with_timeout(
             Err(WebSocketConnectError {
                 message: format!("WebSocket 连接失败: HTTP {status}"),
                 status: Some(status.as_u16()),
+                failure: None,
             })
         }
         Ok(Err(error)) => Err(WebSocketConnectError::message(format!(
@@ -407,7 +499,7 @@ async fn connect_candidate_websocket(
 ) -> Result<(ProviderConfig, UpstreamWebSocket), String> {
     let (_, provider, upstream) =
         connect_candidate_websocket_from(state, &candidates, 0, None).await?;
-    Ok((provider, upstream))
+    Ok((provider, upstream.websocket))
 }
 
 async fn connect_candidate_websocket_from(
@@ -415,18 +507,19 @@ async fn connect_candidate_websocket_from(
     candidates: &[ProviderConfig],
     start_index: usize,
     replay: Option<&ClientMessage>,
-) -> Result<(usize, ProviderConfig, UpstreamWebSocket), String> {
+) -> Result<(usize, ProviderConfig, ConnectedWebSocket), String> {
     let mut last_error = None;
     for (index, provider) in candidates.iter().enumerate().skip(start_index) {
         match connect_provider_websocket(state, provider).await {
             Ok(mut upstream) => {
                 if let Some(frame) = replay {
                     if let Err(error) = upstream
+                        .websocket
                         .send(client_to_upstream_for_provider(frame.clone(), provider))
                         .await
                     {
                         let message = format!("WebSocket 重放请求失败: {error}");
-                        record_websocket_failure(state, provider, None, &message);
+                        record_websocket_failure(state, provider, None, None, &message);
                         last_error = Some(message);
                         continue;
                     }
@@ -434,7 +527,13 @@ async fn connect_candidate_websocket_from(
                 return Ok((index, provider.clone(), upstream));
             }
             Err(error) => {
-                record_websocket_failure(state, provider, error.status, &error.message);
+                record_websocket_failure(
+                    state,
+                    provider,
+                    error.status,
+                    error.failure,
+                    &error.message,
+                );
                 last_error = Some(error.message);
             }
         }
@@ -448,7 +547,7 @@ async fn connect_next_websocket(
     current_index: usize,
     attempted: &mut HashSet<usize>,
     replay: Option<&ClientMessage>,
-) -> Result<(usize, ProviderConfig, UpstreamWebSocket), String> {
+) -> Result<(usize, ProviderConfig, ConnectedWebSocket), String> {
     let mut last_error = None;
     for offset in 1..=candidates.len() {
         let index = (current_index + offset) % candidates.len();
@@ -460,11 +559,12 @@ async fn connect_next_websocket(
             Ok(mut upstream) => {
                 if let Some(frame) = replay {
                     if let Err(error) = upstream
+                        .websocket
                         .send(client_to_upstream_for_provider(frame.clone(), provider))
                         .await
                     {
                         let message = format!("WebSocket 重放请求失败: {error}");
-                        record_websocket_failure(state, provider, None, &message);
+                        record_websocket_failure(state, provider, None, None, &message);
                         last_error = Some(message);
                         continue;
                     }
@@ -472,7 +572,13 @@ async fn connect_next_websocket(
                 return Ok((index, provider.clone(), upstream));
             }
             Err(error) => {
-                record_websocket_failure(state, provider, error.status, &error.message);
+                record_websocket_failure(
+                    state,
+                    provider,
+                    error.status,
+                    error.failure,
+                    &error.message,
+                );
                 last_error = Some(error.message);
             }
         }
@@ -480,9 +586,18 @@ async fn connect_next_websocket(
     Err(last_error.unwrap_or_else(|| "没有可用于 WebSocket 重试的 provider".to_string()))
 }
 
+#[cfg(test)]
 fn websocket_request(
     provider: &ProviderConfig,
     authorization: Option<&str>,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
+    websocket_request_with_account_id(provider, authorization, None)
+}
+
+fn websocket_request_with_account_id(
+    provider: &ProviderConfig,
+    authorization: Option<&str>,
+    account_id_override: Option<&str>,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
     let url = provider
         .websocket_url
@@ -498,12 +613,17 @@ fn websocket_request(
                 .map_err(|_| "WebSocket Authorization 无效".to_string())?,
         );
     }
-    if let Some(account_id) = provider
-        .account
-        .as_ref()
-        .and_then(|account| account.account_id.as_deref())
+    if let Some(account_id) = account_id_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            provider
+                .account
+                .as_ref()
+                .and_then(|account| account.account_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
     {
         request.headers_mut().insert(
             "ChatGPT-Account-Id",
@@ -533,10 +653,14 @@ async fn bridge_websocket(
     candidates: Vec<ProviderConfig>,
     mut candidate_index: usize,
     mut provider: ProviderConfig,
-    upstream: UpstreamWebSocket,
+    upstream: ConnectedWebSocket,
     allowed_models: Vec<String>,
 ) {
     let (mut client_sink, mut client_stream) = client.split();
+    let ConnectedWebSocket {
+        websocket: upstream,
+        mut oauth_access_token,
+    } = upstream;
     let (upstream_sink, upstream_stream) = upstream.split();
     let mut upstream_sink = Some(upstream_sink);
     let mut upstream_stream = Some(upstream_stream);
@@ -621,6 +745,7 @@ async fn bridge_websocket(
                         &mut request_guard,
                         &mut upstream_sink,
                         &mut upstream_stream,
+                        &mut oauth_access_token,
                         Some(&message),
                     )
                     .await
@@ -680,6 +805,8 @@ async fn bridge_websocket(
                             &mut request_guard,
                             &mut upstream_sink,
                             &mut upstream_stream,
+                            &mut oauth_access_token,
+                            None,
                             None,
                             &detail,
                             true,
@@ -690,7 +817,7 @@ async fn bridge_websocket(
                             continue;
                         }
                     } else {
-                        record_websocket_failure(&state, &provider, None, &detail);
+                        record_websocket_failure(&state, &provider, None, None, &detail);
                     }
 
                     if pending.request.is_none() && !response_cancel {
@@ -703,6 +830,7 @@ async fn bridge_websocket(
                             &mut request_guard,
                             &mut upstream_sink,
                             &mut upstream_stream,
+                            &mut oauth_access_token,
                             Some(&message),
                         )
                         .await
@@ -758,6 +886,7 @@ async fn bridge_websocket(
                             &mut request_guard,
                             &mut upstream_sink,
                             &mut upstream_stream,
+                            &mut oauth_access_token,
                             &mut client_sink,
                             &detail,
                         )
@@ -780,6 +909,7 @@ async fn bridge_websocket(
                             &mut request_guard,
                             &mut upstream_sink,
                             &mut upstream_stream,
+                            &mut oauth_access_token,
                             &mut client_sink,
                             detail,
                         )
@@ -820,6 +950,7 @@ async fn bridge_websocket(
                         &mut request_guard,
                         &mut upstream_sink,
                         &mut upstream_stream,
+                        &mut oauth_access_token,
                         &mut client_sink,
                         detail,
                     )
@@ -838,6 +969,49 @@ async fn bridge_websocket(
                 match upstream_event {
                     WebSocketUpstreamEvent::Failure { detail, status } => {
                         if pending.can_replay() {
+                            let mut recovery_status = status;
+                            let mut recovery_failure = None;
+                            let mut recovery_detail = detail.clone();
+                            let should_refresh_oauth = status
+                                == Some(StatusCode::UNAUTHORIZED.as_u16())
+                                && provider_uses_codex_oauth(&provider)
+                                && oauth_access_token
+                                    .as_deref()
+                                    .is_some_and(|token| !token.trim().is_empty());
+                            if should_refresh_oauth
+                                && pending.take_oauth_unauthorized_refresh_attempt()
+                            {
+                                match refresh_and_reconnect_current_oauth_websocket(
+                                    &state,
+                                    &mut candidate_index,
+                                    &mut provider,
+                                    &mut request_guard,
+                                    &mut upstream_sink,
+                                    &mut upstream_stream,
+                                    &mut oauth_access_token,
+                                    pending.request.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        append_event(
+                                            &state.store,
+                                            "refresh",
+                                            Some(provider.id.clone()),
+                                            "WebSocket 上游 in-band 401，OAuth token 刷新后已重连并重放请求"
+                                                .to_string(),
+                                        );
+                                        pending.reset_after_replay();
+                                        last_upstream_activity = tokio::time::Instant::now();
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        recovery_status = error.status.or(status);
+                                        recovery_failure = error.failure;
+                                        recovery_detail = format!("{detail}; {}", error.message);
+                                    }
+                                }
+                            }
                             if recover_websocket_before_output(
                                 &state,
                                 &candidates,
@@ -848,8 +1022,10 @@ async fn bridge_websocket(
                                 &mut request_guard,
                                 &mut upstream_sink,
                                 &mut upstream_stream,
-                                status,
-                                &detail,
+                                &mut oauth_access_token,
+                                recovery_status,
+                                recovery_failure,
+                                &recovery_detail,
                                 false,
                             )
                             .await
@@ -873,7 +1049,7 @@ async fn bridge_websocket(
                             pending.clear();
                             continue;
                         }
-                        record_websocket_failure(&state, &provider, status, &detail);
+                        record_websocket_failure(&state, &provider, status, None, &detail);
                     }
                     WebSocketUpstreamEvent::OutputStarted => {
                         pending.mark_output_started();
@@ -913,6 +1089,8 @@ async fn bridge_websocket(
                             &mut request_guard,
                             &mut upstream_sink,
                             &mut upstream_stream,
+                            &mut oauth_access_token,
+                            None,
                             None,
                             detail,
                             false,
@@ -967,6 +1145,7 @@ async fn bridge_websocket(
                     &mut request_guard,
                     &mut upstream_sink,
                     &mut upstream_stream,
+                    &mut oauth_access_token,
                     &mut client_sink,
                     detail,
                 )
@@ -989,6 +1168,7 @@ struct PendingWebSocketResponse {
     request: Option<ClientMessage>,
     started_at: Option<tokio::time::Instant>,
     visible_output: bool,
+    oauth_unauthorized_refresh_attempted: bool,
     prefetched: VecDeque<UpstreamMessage>,
     prefetched_bytes: usize,
 }
@@ -998,6 +1178,7 @@ impl PendingWebSocketResponse {
         self.request = Some(request);
         self.started_at = Some(tokio::time::Instant::now());
         self.visible_output = false;
+        self.oauth_unauthorized_refresh_attempted = false;
         self.prefetched.clear();
         self.prefetched_bytes = 0;
     }
@@ -1021,6 +1202,18 @@ impl PendingWebSocketResponse {
         self.visible_output = true;
     }
 
+    /// A single Responses request may only force-refresh OAuth once after an
+    /// in-band 401. Retrying the request with the refreshed token is safe
+    /// before output begins; doing it repeatedly can otherwise loop forever
+    /// when the account itself has been revoked.
+    fn take_oauth_unauthorized_refresh_attempt(&mut self) -> bool {
+        if self.oauth_unauthorized_refresh_attempted {
+            return false;
+        }
+        self.oauth_unauthorized_refresh_attempted = true;
+        true
+    }
+
     fn buffer(&mut self, message: UpstreamMessage) -> bool {
         let message_bytes = websocket_message_size(&message);
         if self.prefetched.len() >= MAX_WEBSOCKET_PREFLIGHT_MESSAGES
@@ -1037,6 +1230,7 @@ impl PendingWebSocketResponse {
         self.request = None;
         self.started_at = None;
         self.visible_output = false;
+        self.oauth_unauthorized_refresh_attempted = false;
         self.prefetched.clear();
         self.prefetched_bytes = 0;
     }
@@ -1061,11 +1255,13 @@ async fn recover_websocket_before_output(
     request_guard: &mut crate::state::ProviderRequestGuard,
     upstream_sink: &mut Option<UpstreamSink>,
     upstream_stream: &mut Option<UpstreamStream>,
+    oauth_access_token: &mut Option<String>,
     status: Option<u16>,
+    failure: Option<FailureClassification>,
     detail: &str,
     allow_current_provider_reconnect: bool,
 ) -> bool {
-    record_websocket_failure(state, provider, status, detail);
+    record_websocket_failure(state, provider, status, failure, detail);
     if !pending.can_replay() {
         return false;
     }
@@ -1088,6 +1284,7 @@ async fn recover_websocket_before_output(
                 request_guard,
                 upstream_sink,
                 upstream_stream,
+                oauth_access_token,
                 next_index,
                 next_provider,
                 next_upstream,
@@ -1104,6 +1301,7 @@ async fn recover_websocket_before_output(
                     request_guard,
                     upstream_sink,
                     upstream_stream,
+                    oauth_access_token,
                     replay,
                 )
                 .await
@@ -1139,18 +1337,26 @@ async fn reconnect_current_websocket(
     request_guard: &mut crate::state::ProviderRequestGuard,
     upstream_sink: &mut Option<UpstreamSink>,
     upstream_stream: &mut Option<UpstreamStream>,
+    oauth_access_token: &mut Option<String>,
     replay: Option<&ClientMessage>,
 ) -> bool {
     let current_provider = provider.clone();
     let mut upstream = match connect_provider_websocket(state, &current_provider).await {
         Ok(upstream) => upstream,
         Err(error) => {
-            record_websocket_failure(state, &current_provider, error.status, &error.message);
+            record_websocket_failure(
+                state,
+                &current_provider,
+                error.status,
+                error.failure,
+                &error.message,
+            );
             return false;
         }
     };
     if let Some(frame) = replay {
         if let Err(error) = upstream
+            .websocket
             .send(client_to_upstream_for_provider(
                 frame.clone(),
                 &current_provider,
@@ -1158,7 +1364,7 @@ async fn reconnect_current_websocket(
             .await
         {
             let detail = format!("WebSocket 重放请求失败: {error}");
-            record_websocket_failure(state, &current_provider, None, &detail);
+            record_websocket_failure(state, &current_provider, None, None, &detail);
             return false;
         }
     }
@@ -1170,11 +1376,71 @@ async fn reconnect_current_websocket(
         request_guard,
         upstream_sink,
         upstream_stream,
+        oauth_access_token,
         current_index,
         current_provider,
         upstream,
     );
     true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_and_reconnect_current_oauth_websocket(
+    state: &RelayState,
+    candidate_index: &mut usize,
+    provider: &mut ProviderConfig,
+    request_guard: &mut crate::state::ProviderRequestGuard,
+    upstream_sink: &mut Option<UpstreamSink>,
+    upstream_stream: &mut Option<UpstreamStream>,
+    oauth_access_token: &mut Option<String>,
+    replay: Option<&ClientMessage>,
+) -> Result<(), WebSocketConnectError> {
+    let failed_access_token = oauth_access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            WebSocketConnectError::message("当前 WebSocket 未记录 OAuth access token")
+        })?;
+    refresh_codex_auth_snapshot_after_unauthorized_detailed(provider, failed_access_token)
+        .await
+        .map_err(WebSocketConnectError::oauth)
+        .map_err(|error| error.with_prefix("WebSocket in-band OAuth 401 后刷新失败"))?;
+
+    // The refresh helper has already persisted the new snapshot. Do not issue
+    // a second forced refresh if its replacement handshake also returns 401;
+    // this request has a one-shot recovery budget.
+    let current_provider = provider.clone();
+    let mut upstream =
+        connect_provider_websocket_with_options(state, &current_provider, false).await?;
+    if let Some(frame) = replay {
+        upstream
+            .websocket
+            .send(client_to_upstream_for_provider(
+                frame.clone(),
+                &current_provider,
+            ))
+            .await
+            .map_err(|error| {
+                WebSocketConnectError::message(format!(
+                    "WebSocket OAuth 刷新后重放请求失败: {error}"
+                ))
+            })?;
+    }
+    let current_index = *candidate_index;
+    install_websocket_connection(
+        state,
+        candidate_index,
+        provider,
+        request_guard,
+        upstream_sink,
+        upstream_stream,
+        oauth_access_token,
+        current_index,
+        current_provider,
+        upstream,
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1187,6 +1453,7 @@ async fn reconnect_websocket_from_start(
     request_guard: &mut crate::state::ProviderRequestGuard,
     upstream_sink: &mut Option<UpstreamSink>,
     upstream_stream: &mut Option<UpstreamStream>,
+    oauth_access_token: &mut Option<String>,
     replay: Option<&ClientMessage>,
 ) -> Result<(), String> {
     let (next_index, next_provider, next_upstream) =
@@ -1198,6 +1465,7 @@ async fn reconnect_websocket_from_start(
         request_guard,
         upstream_sink,
         upstream_stream,
+        oauth_access_token,
         next_index,
         next_provider,
         next_upstream,
@@ -1215,14 +1483,20 @@ fn install_websocket_connection(
     request_guard: &mut crate::state::ProviderRequestGuard,
     upstream_sink: &mut Option<UpstreamSink>,
     upstream_stream: &mut Option<UpstreamStream>,
+    oauth_access_token: &mut Option<String>,
     next_index: usize,
     next_provider: ProviderConfig,
-    next_upstream: UpstreamWebSocket,
+    next_upstream: ConnectedWebSocket,
 ) {
     discard_upstream_connection(upstream_sink, upstream_stream);
     *candidate_index = next_index;
     *provider = next_provider;
     *request_guard = state.begin_provider_request(&provider.id);
+    let ConnectedWebSocket {
+        websocket: next_upstream,
+        oauth_access_token: next_oauth_access_token,
+    } = next_upstream;
+    *oauth_access_token = next_oauth_access_token;
     let (next_sink, next_stream) = next_upstream.split();
     *upstream_sink = Some(next_sink);
     *upstream_stream = Some(next_stream);
@@ -1247,6 +1521,7 @@ async fn handle_broken_upstream(
     request_guard: &mut crate::state::ProviderRequestGuard,
     upstream_sink: &mut Option<UpstreamSink>,
     upstream_stream: &mut Option<UpstreamStream>,
+    oauth_access_token: &mut Option<String>,
     client_sink: &mut ClientSink,
     detail: &str,
 ) -> bool {
@@ -1263,6 +1538,8 @@ async fn handle_broken_upstream(
             request_guard,
             upstream_sink,
             upstream_stream,
+            oauth_access_token,
+            None,
             None,
             detail,
             true,
@@ -1275,7 +1552,7 @@ async fn handle_broken_upstream(
         return true;
     }
     if !attempted_replay {
-        record_websocket_failure(state, provider, None, detail);
+        record_websocket_failure(state, provider, None, None, detail);
     }
     if flush_pending_messages(client_sink, pending).await.is_err() {
         return false;
@@ -1309,9 +1586,10 @@ fn record_websocket_failure(
     state: &RelayState,
     provider: &ProviderConfig,
     status: Option<u16>,
+    failure: Option<FailureClassification>,
     detail: &str,
 ) {
-    let failure = classify_failure(status, detail);
+    let failure = failure.unwrap_or_else(|| classify_failure(status, detail));
     if !matches!(
         failure.kind,
         codex_companion_core::HealthFailureKind::RequestRejected
@@ -1615,13 +1893,155 @@ fn upstream_to_client(message: UpstreamMessage) -> ClientMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::get, Router};
+    use axum::{extract::State, response::IntoResponse, routing::get, Router};
+    use chrono::Utc;
     use codex_companion_core::{
         default_refresh_interval_seconds, ApiClientCreate, ConfigStore, ProviderAccountInfo,
         ProviderGroup, RelayConfig,
     };
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+    };
     use tokio_tungstenite::accept_async;
+
+    type OAuthHeaderPair = (Option<String>, Option<String>);
+    type OAuthObservedHeaders = Vec<OAuthHeaderPair>;
+
+    #[derive(Clone)]
+    struct OAuthWebSocketRetryState {
+        auth_path: PathBuf,
+        attempts: Arc<AtomicUsize>,
+        observed_headers: Arc<Mutex<OAuthObservedHeaders>>,
+    }
+
+    async fn oauth_websocket_retry_handler(
+        State(state): State<OAuthWebSocketRetryState>,
+        headers: HeaderMap,
+        websocket: WebSocketUpgrade,
+    ) -> Response {
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let account_id = headers
+            .get("ChatGPT-Account-Id")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        state
+            .observed_headers
+            .lock()
+            .expect("observed headers")
+            .push((authorization, account_id));
+
+        if state.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::fs::write(
+                &state.auth_path,
+                serde_json::json!({
+                    "tokens": {
+                        "access_token": "new-access",
+                        "refresh_token": "refresh-token",
+                        "chatgpt_account_id": "workspace-after-refresh",
+                        "last_refresh": Utc::now().to_rfc3339(),
+                    }
+                })
+                .to_string(),
+            )
+            .expect("rotate auth file");
+            return (StatusCode::UNAUTHORIZED, "expired access token").into_response();
+        }
+
+        websocket
+            .on_upgrade(|mut websocket| async move {
+                let _ = websocket.close().await;
+            })
+            .into_response()
+    }
+
+    #[derive(Clone)]
+    struct InBandOAuthWebSocketRetryState {
+        auth_path: PathBuf,
+        connections: Arc<AtomicUsize>,
+        observed_headers: Arc<Mutex<OAuthObservedHeaders>>,
+    }
+
+    async fn in_band_oauth_websocket_retry_handler(
+        State(state): State<InBandOAuthWebSocketRetryState>,
+        headers: HeaderMap,
+        websocket: WebSocketUpgrade,
+    ) -> Response {
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let account_id = headers
+            .get("ChatGPT-Account-Id")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        state
+            .observed_headers
+            .lock()
+            .expect("observed headers")
+            .push((authorization, account_id));
+
+        if state.connections.fetch_add(1, Ordering::SeqCst) == 0 {
+            let auth_path = state.auth_path.clone();
+            return websocket
+                .on_upgrade(move |mut websocket| async move {
+                    let Some(Ok(ClientMessage::Text(frame))) = websocket.next().await else {
+                        return;
+                    };
+                    assert!(frame.contains("response.create"));
+                    std::fs::write(
+                        auth_path,
+                        serde_json::json!({
+                            "tokens": {
+                                "access_token": "new-access",
+                                "refresh_token": "refresh-token",
+                                "chatgpt_account_id": "workspace-after-refresh",
+                                "last_refresh": Utc::now().to_rfc3339(),
+                            }
+                        })
+                        .to_string(),
+                    )
+                    .expect("rotate auth file");
+                    websocket
+                        .send(ClientMessage::Text(
+                            r#"{"type":"response.failed","response":{"status":"failed","error":{"status":401,"message":"expired access token"}}}"#.into(),
+                        ))
+                        .await
+                        .expect("send in-band 401");
+                    let _ = websocket.close().await;
+                })
+                .into_response();
+        }
+
+        websocket
+            .on_upgrade(|mut websocket| async move {
+                let Some(Ok(ClientMessage::Text(frame))) = websocket.next().await else {
+                    return;
+                };
+                assert!(frame.contains("response.create"));
+                websocket
+                    .send(ClientMessage::Text(
+                        r#"{"type":"response.output_text.delta","delta":"after OAuth refresh"}"#
+                            .into(),
+                    ))
+                    .await
+                    .expect("send output");
+                websocket
+                    .send(ClientMessage::Text(
+                        r#"{"type":"response.completed","response":{"status":"completed"}}"#.into(),
+                    ))
+                    .await
+                    .expect("send completed");
+            })
+            .into_response()
+    }
 
     fn provider(id: &str, websocket_url: Option<String>) -> ProviderConfig {
         ProviderConfig {
@@ -1720,6 +2140,181 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("0.144.1")
         );
+    }
+
+    #[tokio::test]
+    async fn official_oauth_websocket_retries_with_refreshed_account_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "old-access",
+                    "refresh_token": "refresh-token",
+                    "last_refresh": Utc::now().to_rfc3339(),
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth file");
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_headers = Arc::new(Mutex::new(Vec::new()));
+        let upstream_state = OAuthWebSocketRetryState {
+            auth_path: auth_path.clone(),
+            attempts: attempts.clone(),
+            observed_headers: observed_headers.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let upstream = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/v1/responses", get(oauth_websocket_retry_handler))
+                .with_state(upstream_state);
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut official = provider("official", Some(format!("ws://{address}/v1/responses")));
+        official.kind = ProviderKind::OfficialCodex;
+        official.auth_ref = Some(format!("file:{}", auth_path.display()));
+        official.account = Some(ProviderAccountInfo {
+            account_id: Some("stale-workspace".to_string()),
+            ..ProviderAccountInfo::default()
+        });
+        let relay_state = state_with_group(vec![official.clone()]);
+
+        let mut websocket = connect_provider_websocket(&relay_state, &official)
+            .await
+            .expect("OAuth retry should establish the WebSocket");
+        let _ = websocket.websocket.close(None).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            observed_headers
+                .lock()
+                .expect("observed headers")
+                .as_slice(),
+            [
+                (
+                    Some("Bearer old-access".to_string()),
+                    Some("stale-workspace".to_string()),
+                ),
+                (
+                    Some("Bearer new-access".to_string()),
+                    Some("workspace-after-refresh".to_string()),
+                ),
+            ]
+        );
+
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn official_oauth_websocket_refreshes_and_replays_an_in_band_401_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "old-access",
+                    "refresh_token": "refresh-token",
+                    "last_refresh": Utc::now().to_rfc3339(),
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth file");
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let observed_headers = Arc::new(Mutex::new(Vec::new()));
+        let upstream_state = InBandOAuthWebSocketRetryState {
+            auth_path: auth_path.clone(),
+            connections: connections.clone(),
+            observed_headers: observed_headers.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream bind");
+        let address = listener.local_addr().expect("upstream address");
+        let upstream = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/v1/responses", get(in_band_oauth_websocket_retry_handler))
+                .with_state(upstream_state);
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut official = provider("official", Some(format!("ws://{address}/v1/responses")));
+        official.kind = ProviderKind::OfficialCodex;
+        official.auth_ref = Some(format!("file:{}", auth_path.display()));
+        official.account = Some(ProviderAccountInfo {
+            account_id: Some("stale-workspace".to_string()),
+            ..ProviderAccountInfo::default()
+        });
+        let state = state_with_group(vec![official]);
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("relay bind");
+        let relay_address = relay_listener.local_addr().expect("relay address");
+        let relay = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/v1/responses", get(responses_websocket))
+                .with_state(state);
+            let _ = axum::serve(relay_listener, app).await;
+        });
+
+        let (mut client, _) = connect_async(format!("ws://{relay_address}/v1/responses"))
+            .await
+            .expect("relay handshake");
+        client
+            .send(UpstreamMessage::Text(
+                r#"{"type":"response.create","response":{"model":"gpt-test","input":"hello"}}"#
+                    .into(),
+            ))
+            .await
+            .expect("send request");
+
+        let mut output = String::new();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), client.next())
+                .await
+                .expect("client response timeout")
+                .expect("client closed")
+                .expect("client websocket error");
+            if let UpstreamMessage::Text(text) = message {
+                output.push_str(&text);
+                if text.contains("response.completed") {
+                    break;
+                }
+            }
+        }
+
+        assert!(output.contains("after OAuth refresh"));
+        assert!(!output.contains("expired access token"));
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            observed_headers
+                .lock()
+                .expect("observed headers")
+                .as_slice(),
+            [
+                (
+                    Some("Bearer old-access".to_string()),
+                    Some("stale-workspace".to_string()),
+                ),
+                (
+                    Some("Bearer new-access".to_string()),
+                    Some("workspace-after-refresh".to_string()),
+                ),
+            ]
+        );
+
+        let _ = client.close(None).await;
+        upstream.abort();
+        relay.abort();
     }
 
     #[test]

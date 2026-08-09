@@ -1,10 +1,11 @@
 use crate::auth::resolve_auth_token;
 use crate::codex_oauth::ensure_codex_auth_snapshot;
+use crate::http::read_response_bytes_limited;
 use crate::types::ProviderUsageQueryTestInput;
 use chrono::{DateTime, Local, Utc};
 use codex_companion_core::{
-    CompanionError, ProviderAccountInfo, ProviderConfig, ProviderKind, ProviderQuotaWindow,
-    ProviderUsageQueryTemplate, Result,
+    redact_sensitive_text, CompanionError, ProviderAccountInfo, ProviderConfig, ProviderKind,
+    ProviderQuotaWindow, ProviderUsageQueryTemplate, Result,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, REFERER, USER_AGENT};
 use rquickjs::{Context, Function, Runtime};
@@ -20,6 +21,8 @@ const CHATGPT_WEB_REFERER: &str = "https://chatgpt.com/";
 const CHATGPT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 const DEFAULT_USAGE_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const DEFAULT_USAGE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const USAGE_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+const RESPONSE_ERROR_DETAIL_MAX_CHARS: usize = 512;
 
 #[derive(Debug, Clone, Default)]
 struct AccountProfile {
@@ -105,11 +108,8 @@ pub async fn refresh_official_codex_account(
         .map_err(|source| {
             CompanionError::InvalidConfig(format!("创建 Codex 额度客户端失败: {source}"))
         })?;
-    let account_id = provider
-        .account
-        .as_ref()
-        .and_then(|account| account.account_id.clone())
-        .or_else(|| auth.account_id.clone());
+    let auth_account_id = auth.account_id.as_deref().and_then(normalize_optional);
+    let account_id = preferred_official_account_id(provider, auth.account_id.as_deref());
     let mut account = provider.account.clone().unwrap_or_default();
     if account.email.is_none() {
         account.email = auth.email.clone();
@@ -117,7 +117,9 @@ pub async fn refresh_official_codex_account(
     if account.display_name.is_none() {
         account.display_name = auth.name.clone().or_else(|| auth.email.clone());
     }
-    if account.account_id.is_none() {
+    if let Some(auth_account_id) = auth_account_id {
+        account.account_id = Some(auth_account_id);
+    } else if account.account_id.is_none() {
         account.account_id = account_id.clone();
     }
     if account.subscription_type.is_none() {
@@ -154,6 +156,19 @@ pub async fn refresh_official_codex_account(
     apply_usage_to_account(&mut account, usage);
     account.last_refresh_at = Some(Utc::now().to_rfc3339());
     Ok(account)
+}
+
+fn preferred_official_account_id(
+    provider: &ProviderConfig,
+    auth_account_id: Option<&str>,
+) -> Option<String> {
+    auth_account_id.and_then(normalize_optional).or_else(|| {
+        provider
+            .account
+            .as_ref()
+            .and_then(|account| account.account_id.as_deref())
+            .and_then(normalize_optional)
+    })
 }
 
 pub async fn refresh_api_key_usage(
@@ -252,8 +267,6 @@ struct UsageScriptRequest {
 
 const USAGE_SCRIPT_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const USAGE_SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const USAGE_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
-
 pub fn usage_query_preset(template: ProviderUsageQueryTemplate) -> String {
     match template {
         ProviderUsageQueryTemplate::General | ProviderUsageQueryTemplate::Custom => r#"({
@@ -353,21 +366,15 @@ async fn fetch_configured_usage(
     if let Some(body) = request.body {
         outgoing = outgoing.body(body);
     }
-    let mut response = outgoing.send().await.map_err(|source| {
+    let response = outgoing.send().await.map_err(|source| {
         CompanionError::InvalidConfig(format!("余额查询网络请求失败: {source}"))
     })?;
     let status = response.status();
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|source| {
-        CompanionError::InvalidConfig(format!("读取余额查询响应失败: {source}"))
-    })? {
-        if body.len().saturating_add(chunk.len()) > USAGE_RESPONSE_LIMIT_BYTES {
-            return Err(CompanionError::InvalidConfig(
-                "余额查询响应超过 1 MiB 限制".to_string(),
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
+    let body = read_response_bytes_limited(response, USAGE_RESPONSE_LIMIT_BYTES)
+        .await
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("读取余额查询响应失败: {source}"))
+        })?;
     if !status.is_success() {
         return Err(CompanionError::InvalidConfig(format!(
             "余额查询接口返回 {status} [body_len:{}]",
@@ -748,10 +755,12 @@ async fn fetch_api_usage_once(
             retryable: true,
         })?;
     let status = response.status();
-    let body = response.text().await.map_err(|source| UsageFetchError {
-        message: format!("读取响应失败: {source}"),
-        retryable: true,
-    })?;
+    let body = read_response_bytes_limited(response, USAGE_RESPONSE_LIMIT_BYTES)
+        .await
+        .map_err(|source| UsageFetchError {
+            message: format!("读取响应失败: {source}"),
+            retryable: true,
+        })?;
     if !status.is_success() {
         return Err(UsageFetchError {
             message: format!("{status} [body_len:{}]", body.len()),
@@ -759,7 +768,7 @@ async fn fetch_api_usage_once(
         });
     }
     let value =
-        serde_json::from_str::<serde_json::Value>(&body).map_err(|source| UsageFetchError {
+        serde_json::from_slice::<serde_json::Value>(&body).map_err(|source| UsageFetchError {
             message: format!("解析 JSON 失败: {source}"),
             retryable: false,
         })?;
@@ -775,9 +784,10 @@ async fn fetch_api_usage_once(
         let message = value
             .get("message")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("余量接口返回失败");
+            .map(response_error_detail)
+            .unwrap_or_else(|| "余量接口返回失败".to_string());
         return Err(UsageFetchError {
-            message: message.to_string(),
+            message,
             retryable: false,
         });
     }
@@ -841,8 +851,7 @@ async fn fetch_account_profile_once(
         .await
         .map_err(|error| format!("请求账号信息失败: {error}"))?;
     let status = response.status();
-    let body = response
-        .text()
+    let body = read_response_bytes_limited(response, USAGE_RESPONSE_LIMIT_BYTES)
         .await
         .map_err(|error| format!("读取账号信息响应失败: {error}"))?;
     if !status.is_success() {
@@ -851,7 +860,7 @@ async fn fetch_account_profile_once(
             body.len()
         ));
     }
-    let value = serde_json::from_str::<serde_json::Value>(&body)
+    let value = serde_json::from_slice::<serde_json::Value>(&body)
         .map_err(|error| format!("账号信息 JSON 解析失败: {error}"))?;
     Ok(parse_account_profile(&value, account_id))
 }
@@ -891,8 +900,7 @@ async fn fetch_usage_once(
         .await
         .map_err(|source| (format!("请求 Codex 额度失败: {source}"), true))?;
     let status = response.status();
-    let body = response
-        .text()
+    let body = read_response_bytes_limited(response, USAGE_RESPONSE_LIMIT_BYTES)
         .await
         .map_err(|source| (format!("读取 Codex 额度响应失败: {source}"), true))?;
     if !status.is_success() {
@@ -907,7 +915,7 @@ async fn fetch_usage_once(
             status.as_u16() == 429 || status.is_server_error(),
         ));
     }
-    serde_json::from_str::<UsageResponse>(&body)
+    serde_json::from_slice::<UsageResponse>(&body)
         .map_err(|source| (format!("解析 Codex 额度 JSON 失败: {source}"), false))
 }
 
@@ -1632,8 +1640,8 @@ fn reset_at_iso(window: &WindowInfo) -> Option<String> {
     DateTime::<Utc>::from_timestamp(timestamp, 0).map(|date| date.to_rfc3339())
 }
 
-fn extract_error_code(body: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+fn extract_error_code(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
     pick_first_string(
         &[&value],
         &[
@@ -1643,6 +1651,14 @@ fn extract_error_code(body: &str) -> Option<String> {
             &["error_code"],
         ],
     )
+    .map(|value| response_error_detail(&value))
+}
+
+fn response_error_detail(value: &str) -> String {
+    redact_sensitive_text(value)
+        .chars()
+        .take(RESPONSE_ERROR_DETAIL_MAX_CHARS)
+        .collect()
 }
 
 fn api_usage_endpoints(base_url: &str) -> Vec<String> {
@@ -1817,6 +1833,23 @@ fn get_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refreshed_auth_workspace_takes_precedence_over_stale_provider_metadata() {
+        let mut provider = provider_config(
+            "https://chatgpt.com/backend-api/codex",
+            ProviderKind::OfficialCodex,
+        );
+        provider.account = Some(ProviderAccountInfo {
+            account_id: Some("stale-workspace".to_string()),
+            ..ProviderAccountInfo::default()
+        });
+
+        assert_eq!(
+            preferred_official_account_id(&provider, Some("workspace-after-refresh")),
+            Some("workspace-after-refresh".to_string())
+        );
+    }
 
     #[test]
     fn parses_configured_new_api_balance_in_usd() {

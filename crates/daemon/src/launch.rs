@@ -1,15 +1,19 @@
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
-    default_codex_dir, provider_endpoint_is_chat_completions, CliLaunchOutcome, CliLaunchRequest,
-    CodexInstallStatus, CodexLaunchMode, CodexLaunchOutcome, CompanionConfig, CompanionError,
-    GroupPolicy, ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode, RelayConfig,
-    RepairOptions, RepairOutcome, RepairPlan, Result, TerminalKind, COMPANION_PROVIDER_ID,
+    default_codex_dir, provider_direct_auth_ref, provider_endpoint_is_chat_completions,
+    provider_relay_auth_ref, CliLaunchOutcome, CliLaunchRequest, CodexInstallStatus,
+    CodexLaunchMode, CodexLaunchOutcome, CompanionConfig, CompanionError, GroupPolicy,
+    ProviderConfig, ProviderGroup, ProviderKind, ProviderLaunchMode, RelayConfig, RepairOptions,
+    RepairOutcome, RepairPlan, Result, TerminalKind, COMPANION_PROVIDER_ID,
 };
-use codex_companion_provider::{provider_uses_agent_identity, selected_providers_for_group};
+use codex_companion_provider::{
+    provider_uses_agent_identity, provider_uses_codex_oauth, selected_providers_for_group,
+};
 use codex_companion_state::{
     companion_model_catalog_path, doctor, install_companion_provider_for_relay,
-    install_direct_provider_with_options, official_codex_auth_is_resolvable, repair_state,
-    CodexInstallSnapshot, CodexOfficialAuthStatus, DirectInstallOptions,
+    install_direct_provider_with_options, official_codex_auth_is_resolvable,
+    official_codex_oauth_is_resolvable, repair_state, CodexInstallSnapshot,
+    CodexOfficialAuthStatus, DirectInstallOptions,
 };
 use std::collections::BTreeSet;
 use std::env;
@@ -155,6 +159,15 @@ impl CompanionDaemon {
                 CompanionError::InvalidConfig(format!("unknown provider: {provider_id}"))
             })?;
         let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
+        // Older config files persisted `direct` for every official account.
+        // OAuth and Agent Identity are relay-only now, so normalize that legacy
+        // value at the daemon boundary as well as in the UI/TUI.
+        let mode =
+            if matches!(mode, ProviderLaunchMode::Direct) && provider_requires_relay(&provider) {
+                ProviderLaunchMode::Relay
+            } else {
+                mode
+            };
 
         let should_direct = match mode {
             ProviderLaunchMode::Direct => {
@@ -173,7 +186,9 @@ impl CompanionDaemon {
                 true
             }
             ProviderLaunchMode::Relay => false,
-            ProviderLaunchMode::Auto => provider_can_direct_connect(&provider),
+            ProviderLaunchMode::Auto => {
+                !provider_auto_prefers_relay(&provider) && provider_can_direct_connect(&provider)
+            }
         };
 
         if should_direct {
@@ -331,6 +346,17 @@ impl CompanionDaemon {
             let provider = config.providers.get(provider_id).cloned().ok_or_else(|| {
                 CompanionError::InvalidConfig(format!("unknown provider: {provider_id}"))
             })?;
+            if config
+                .app
+                .provider_launch_modes
+                .get(provider_id)
+                .is_some_and(|mode| matches!(mode, ProviderLaunchMode::Direct))
+            {
+                config
+                    .app
+                    .provider_launch_modes
+                    .insert(provider_id.to_string(), ProviderLaunchMode::Relay);
+            }
             let group = single_provider_group(&provider);
             config.groups.insert(group.id.clone(), group.clone());
             config.relay.active_group_id = group.id.clone();
@@ -349,10 +375,7 @@ fn same_direct_install_target(current: &ProviderConfig, expected: &ProviderConfi
 }
 
 fn effective_direct_auth_ref(provider: &ProviderConfig) -> Option<&str> {
-    provider
-        .direct_auth_ref
-        .as_deref()
-        .or(provider.auth_ref.as_deref())
+    provider_direct_auth_ref(provider)
 }
 
 fn ensure_relay_install_is_current(
@@ -621,16 +644,23 @@ fn launch_cli_terminal(
 }
 
 pub fn provider_can_direct_connect(provider: &ProviderConfig) -> bool {
-    !provider_uses_agent_identity(provider)
+    !provider_requires_relay(provider)
+        && (provider.kind != ProviderKind::OfficialCodex
+            || official_codex_auth_is_resolvable(provider))
         && !provider_endpoint_is_chat_completions(&provider.base_url)
-        && provider
-            .direct_auth_ref
-            .as_deref()
-            .or(provider.auth_ref.as_deref())
-            .is_none_or(|auth_ref| {
-                let auth_ref = auth_ref.trim();
-                auth_ref.is_empty() || auth_ref.starts_with("env:") || auth_ref.starts_with("file:")
-            })
+        && provider_direct_auth_ref(provider).is_none_or(|auth_ref| {
+            let auth_ref = auth_ref.trim();
+            auth_ref.is_empty() || auth_ref.starts_with("env:") || auth_ref.starts_with("file:")
+        })
+}
+
+pub fn provider_auto_prefers_relay(provider: &ProviderConfig) -> bool {
+    provider_requires_relay(provider)
+}
+
+fn provider_requires_relay(provider: &ProviderConfig) -> bool {
+    matches!(provider.kind, ProviderKind::OfficialCodex)
+        && (provider_uses_codex_oauth(provider) || provider_uses_agent_identity(provider))
 }
 
 pub fn provider_relay_reason(provider: &ProviderConfig) -> &'static str {
@@ -638,10 +668,11 @@ pub fn provider_relay_reason(provider: &ProviderConfig) -> &'static str {
         if provider_uses_agent_identity(provider) {
             return "Agent Identity 仅通过 Companion API 服务动态签名，不写入 Codex auth.json";
         }
-        "本地代理由 Companion 续期 OAuth token 并注入 Codex headers"
-    } else if provider
-        .auth_ref
-        .as_deref()
+        if provider_uses_codex_oauth(provider) {
+            return "本地代理由 Companion 续期 OAuth token 并注入 Codex headers";
+        }
+        "本地代理由 Companion 注入官方个人访问令牌"
+    } else if provider_relay_auth_ref(provider)
         .is_some_and(|auth_ref| auth_ref.starts_with("file:"))
     {
         "密钥保存在 Companion auth 文件中，需要 relay 注入 Authorization"
@@ -651,10 +682,7 @@ pub fn provider_relay_reason(provider: &ProviderConfig) -> &'static str {
 }
 
 fn provider_relay_token_source(provider: &ProviderConfig) -> String {
-    let source = provider
-        .auth_ref
-        .as_deref()
-        .or(provider.direct_auth_ref.as_deref())
+    let source = provider_relay_auth_ref(provider)
         .map(str::trim)
         .filter(|auth_ref| !auth_ref.is_empty());
     if matches!(provider.kind, ProviderKind::OfficialCodex) {
@@ -730,7 +758,7 @@ pub(crate) fn relay_official_auth_provider(
     if !selected_official.is_empty() {
         return selected_official
             .into_iter()
-            .find(|provider| official_codex_auth_is_resolvable(provider))
+            .find(|provider| official_codex_oauth_is_resolvable(provider))
             .cloned();
     }
 
@@ -740,7 +768,7 @@ pub(crate) fn relay_official_auth_provider(
         .filter(|provider| provider.enabled)
         .filter(|provider| matches!(provider.kind, ProviderKind::OfficialCodex));
     let only = enabled_official.next()?.clone();
-    (enabled_official.next().is_none() && official_codex_auth_is_resolvable(&only)).then_some(only)
+    (enabled_official.next().is_none() && official_codex_oauth_is_resolvable(&only)).then_some(only)
 }
 
 fn append_relay_auth_status(
@@ -1304,8 +1332,8 @@ fn start_codex(target: &CodexLaunchTarget) -> bool {
 mod tests {
     use super::*;
     use codex_companion_core::{
-        default_refresh_interval_seconds, ConfigStore, HealthStatusKind, ProviderHealth,
-        DEFAULT_GROUP_ID,
+        default_refresh_interval_seconds, ConfigStore, HealthStatusKind, ProviderAccountInfo,
+        ProviderHealth, DEFAULT_GROUP_ID,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1346,9 +1374,55 @@ mod tests {
     }
 
     #[test]
-    fn official_provider_file_auth_can_direct_connect() {
+    fn official_provider_file_auth_requires_relay_for_token_lifetime_management() {
         let provider = provider(ProviderKind::OfficialCodex, Some("file:/tmp/auth.json"));
-        assert!(provider_can_direct_connect(&provider));
+        assert!(!provider_can_direct_connect(&provider));
+    }
+
+    #[test]
+    fn official_provider_auto_mode_prefers_relay_for_token_lifetime_management() {
+        let official = provider(ProviderKind::OfficialCodex, Some("file:/tmp/auth.json"));
+        assert!(provider_auto_prefers_relay(&official));
+        assert!(!provider_auto_prefers_relay(&provider(
+            ProviderKind::OpenAiCompatible,
+            None
+        )));
+    }
+
+    #[test]
+    fn official_pat_can_use_direct_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("pat.json");
+        fs::write(
+            &auth_path,
+            r#"{"auth_mode":"pat","tokens":{"access_token":"personal-token"}}"#,
+        )
+        .expect("PAT auth");
+        let mut pat = provider(
+            ProviderKind::OfficialCodex,
+            Some(&format!("file:{}", auth_path.display())),
+        );
+        pat.account = Some(ProviderAccountInfo {
+            auth_mode: Some("pat".to_string()),
+            ..ProviderAccountInfo::default()
+        });
+
+        assert!(provider_can_direct_connect(&pat));
+        assert!(!provider_auto_prefers_relay(&pat));
+    }
+
+    #[test]
+    fn official_pat_without_resolvable_credentials_cannot_direct_connect() {
+        let mut pat = provider(
+            ProviderKind::OfficialCodex,
+            Some("file:/tmp/missing-pat.json"),
+        );
+        pat.account = Some(ProviderAccountInfo {
+            auth_mode: Some("pat".to_string()),
+            ..ProviderAccountInfo::default()
+        });
+
+        assert!(!provider_can_direct_connect(&pat));
     }
 
     #[test]

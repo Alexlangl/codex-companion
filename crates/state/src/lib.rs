@@ -5,9 +5,11 @@ mod token_usage;
 
 use chrono::Local;
 use codex_companion_core::{
-    atomic_write_private_file, default_codex_dir, CodexInstallStatus, CompanionError,
-    ProviderConfig, ProviderKind, RelayConfig, RepairOptions, RepairOutcome, RepairPlan, Result,
-    COMPANION_PROVIDER_ID, COMPANION_PROVIDER_NAME,
+    atomic_write_private_file, default_codex_dir, official_access_token_from_auth_json,
+    official_auth_mode_from_account, official_auth_mode_from_auth_json, provider_direct_auth_ref,
+    provider_relay_auth_ref, CodexInstallStatus, CompanionError, OfficialAuthMode, ProviderConfig,
+    ProviderKind, RelayConfig, RepairOptions, RepairOutcome, RepairPlan, Result,
+    COMPANION_OFFICIAL_AUTH_MODE_FIELD, COMPANION_PROVIDER_ID, COMPANION_PROVIDER_NAME,
 };
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -32,7 +34,7 @@ const COMPANION_RELAY_BEARER_TOKEN: &str = "CODEX_COMPANION_RELAY";
 #[cfg(all(target_os = "macos", not(test)))]
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const COMPANION_MARKER_TABLE: &str = "codex_companion";
-const COMPANION_MARKER_VERSION: i64 = 3;
+const COMPANION_MARKER_VERSION: i64 = 4;
 const COMPANION_STATE_RELATIVE_PATH: &str = "backups/codex-companion/managed-state.json";
 const REPAIR_BACKUP_RETENTION: usize = 10;
 
@@ -94,7 +96,8 @@ pub fn relay_preserved_official_auth_is_ready(codex_dir: &Path) -> Result<bool> 
             CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
         })?;
     let auth = read_json_value(&auth_path)?;
-    let official_auth_ready = classify_codex_auth_shape(&auth) == CodexAuthShape::OfficialOAuth
+    let official_auth_ready = official_auth_mode_from_auth_json(&auth)
+        == Some(OfficialAuthMode::OAuth)
         && auth.get("auth_mode").and_then(Value::as_str) == Some(CODEX_CHATGPT_AUTH_MODE)
         && normalize_codex_oauth_auth(&auth).is_some();
     let provider = config
@@ -317,6 +320,13 @@ pub fn install_direct_provider_with_options(
     options: DirectInstallOptions,
 ) -> Result<CodexInstallStatus> {
     let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
+    let direct_auth = resolve_direct_auth(provider)?;
+    if matches!(&direct_auth, DirectAuthMaterial::CodexOAuth(_)) {
+        return Err(CompanionError::InvalidConfig(format!(
+            "官方 Codex OAuth 账号 {} 必须通过 Companion 本地代理连接，以持续刷新 token",
+            provider.name
+        )));
+    }
     fs::create_dir_all(&codex_dir).map_err(|source| CompanionError::io(&codex_dir, source))?;
     let config_path = codex_dir.join("config.toml");
     let current = if config_path.exists() {
@@ -333,7 +343,6 @@ pub fn install_direct_provider_with_options(
     let auth_rollback = AuthRollback::capture(&codex_dir)?;
     let mut backup = prepare_config_write(&codex_dir, &config_path, &mut doc)?;
     let auth_shape_before = detect_codex_auth_shape(&codex_dir)?;
-    let direct_auth = resolve_direct_auth(provider)?;
     let mut token_source = direct_auth.token_source();
     let preserve_api_key_in_config = options.preserve_official_codex_auth
         && !matches!(provider.kind, ProviderKind::OfficialCodex)
@@ -344,11 +353,14 @@ pub fn install_direct_provider_with_options(
     let mut effective_model_provider = provider.id.clone();
     let mut keychain_warning = None;
     if matches!(provider.kind, ProviderKind::OfficialCodex) {
-        let DirectAuthMaterial::CodexAuth(auth) = direct_auth else {
-            return Err(CompanionError::InvalidConfig(format!(
-                "官方 Codex 账号 {} 缺少可直连的 OAuth access_token",
-                provider.name
-            )));
+        let auth = match direct_auth {
+            DirectAuthMaterial::CodexOAuth(auth) | DirectAuthMaterial::OfficialPat(auth) => auth,
+            _ => {
+                return Err(CompanionError::InvalidConfig(format!(
+                    "官方 Codex 账号 {} 缺少可直连的 access_token",
+                    provider.name
+                )));
+            }
         };
         write_official_codex_config(&mut doc, managed_target_provider.as_deref());
         restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
@@ -399,7 +411,7 @@ pub fn install_direct_provider_with_options(
                     record_auth_write(&mut backup, &codex_dir)?;
                 }
             }
-            DirectAuthMaterial::CodexAuth(auth) => {
+            DirectAuthMaterial::CodexOAuth(auth) | DirectAuthMaterial::OfficialPat(auth) => {
                 provider_table["env_key"] = Item::None;
                 provider_table["experimental_bearer_token"] = Item::None;
                 restore_prior_auth_write_if_managed(&mut backup, &codex_dir)?;
@@ -434,6 +446,9 @@ pub fn install_direct_provider_with_options(
         &direct_model_slugs,
         &auth_rollback,
     )?;
+    // A direct installation must not leave a Relay-era OAuth mirror binding
+    // behind. The next Relay activation establishes a fresh, verified source.
+    backup.official_auth_provider_id = None;
     let marker = companion_marker(
         &doc,
         &backup,
@@ -472,7 +487,8 @@ pub fn install_direct_provider_with_options(
 enum DirectAuthMaterial {
     EnvKey(String),
     ApiKey(String),
-    CodexAuth(Value),
+    CodexOAuth(Value),
+    OfficialPat(Value),
     None,
 }
 
@@ -481,8 +497,11 @@ impl DirectAuthMaterial {
         match self {
             DirectAuthMaterial::EnvKey(env_var) => format!("environment variable {env_var}"),
             DirectAuthMaterial::ApiKey(_) => "API key file copied into Codex auth.json".to_string(),
-            DirectAuthMaterial::CodexAuth(_) => {
+            DirectAuthMaterial::CodexOAuth(_) => {
                 "official Codex OAuth auth file merged into Codex auth.json".to_string()
+            }
+            DirectAuthMaterial::OfficialPat(_) => {
+                "official Codex personal access token merged into Codex auth.json".to_string()
             }
             DirectAuthMaterial::None => {
                 "existing Codex auth.json or Codex default auth resolution".to_string()
@@ -493,16 +512,15 @@ impl DirectAuthMaterial {
     fn writes_auth_json(&self) -> bool {
         matches!(
             self,
-            DirectAuthMaterial::ApiKey(_) | DirectAuthMaterial::CodexAuth(_)
+            DirectAuthMaterial::ApiKey(_)
+                | DirectAuthMaterial::CodexOAuth(_)
+                | DirectAuthMaterial::OfficialPat(_)
         )
     }
 }
 
 fn resolve_direct_auth(provider: &ProviderConfig) -> Result<DirectAuthMaterial> {
-    let Some(auth_ref) = provider
-        .direct_auth_ref
-        .as_deref()
-        .or(provider.auth_ref.as_deref())
+    let Some(auth_ref) = provider_direct_auth_ref(provider)
         .map(str::trim)
         .filter(|auth_ref| !auth_ref.is_empty())
     else {
@@ -513,6 +531,9 @@ fn resolve_direct_auth(provider: &ProviderConfig) -> Result<DirectAuthMaterial> 
         .map(str::trim)
         .filter(|env_var| !env_var.is_empty())
     {
+        if provider.kind == ProviderKind::OfficialCodex {
+            return resolve_official_env_auth(provider, env_var);
+        }
         return Ok(DirectAuthMaterial::EnvKey(env_var.to_string()));
     }
     if let Some(path) = auth_ref.strip_prefix("file:") {
@@ -525,13 +546,26 @@ fn resolve_direct_auth(provider: &ProviderConfig) -> Result<DirectAuthMaterial> 
             ))
         })?;
         if matches!(provider.kind, ProviderKind::OfficialCodex) {
-            let auth = normalize_codex_oauth_auth(&value).ok_or_else(|| {
+            let mode = official_auth_mode_from_auth_json(&value)
+                .or_else(|| official_auth_mode_from_account(provider))
+                .unwrap_or(OfficialAuthMode::OAuth);
+            if mode == OfficialAuthMode::AgentIdentity {
+                return Err(CompanionError::InvalidConfig(format!(
+                    "官方 Codex Agent Identity 账号仅能通过本地代理连接: {}",
+                    path.display()
+                )));
+            }
+            let auth = normalize_codex_auth(&value, mode).ok_or_else(|| {
                 CompanionError::InvalidConfig(format!(
                     "官方 Codex 账号 auth 文件缺少 access_token: {}",
                     path.display()
                 ))
             })?;
-            return Ok(DirectAuthMaterial::CodexAuth(auth));
+            return Ok(match mode {
+                OfficialAuthMode::OAuth => DirectAuthMaterial::CodexOAuth(auth),
+                OfficialAuthMode::Pat => DirectAuthMaterial::OfficialPat(auth),
+                OfficialAuthMode::AgentIdentity => unreachable!("handled above"),
+            });
         }
         let api_key = pick_json_string(
             &value,
@@ -554,15 +588,79 @@ fn resolve_direct_auth(provider: &ProviderConfig) -> Result<DirectAuthMaterial> 
     Ok(DirectAuthMaterial::None)
 }
 
+fn resolve_official_env_auth(
+    provider: &ProviderConfig,
+    env_var: &str,
+) -> Result<DirectAuthMaterial> {
+    let mode = official_auth_mode_from_account(provider).unwrap_or(OfficialAuthMode::OAuth);
+    match mode {
+        OfficialAuthMode::OAuth => Err(CompanionError::InvalidConfig(format!(
+            "官方 Codex OAuth 账号需要可刷新的 file: auth_ref，不能直接使用环境变量 {env_var}"
+        ))),
+        OfficialAuthMode::AgentIdentity => Err(CompanionError::InvalidConfig(format!(
+            "官方 Codex Agent Identity 账号仅能通过本地代理连接，不能直接使用环境变量 {env_var}"
+        ))),
+        OfficialAuthMode::Pat => {
+            let access_token = std::env::var(env_var).map_err(|_| {
+                CompanionError::InvalidConfig(format!(
+                    "官方 Codex PAT 环境变量 {env_var} 未设置，无法直连"
+                ))
+            })?;
+            let access_token = access_token.trim();
+            if access_token.is_empty() {
+                return Err(CompanionError::InvalidConfig(format!(
+                    "官方 Codex PAT 环境变量 {env_var} 为空，无法直连"
+                )));
+            }
+            let mut source = serde_json::Map::new();
+            source.insert(
+                "auth_mode".to_string(),
+                Value::String(OfficialAuthMode::Pat.as_str().to_string()),
+            );
+            source.insert(
+                "personal_access_token".to_string(),
+                Value::String(access_token.to_string()),
+            );
+            if let Some(account_id) = provider
+                .account
+                .as_ref()
+                .and_then(|account| account.account_id.as_deref())
+                .map(str::trim)
+                .filter(|account_id| !account_id.is_empty())
+            {
+                source.insert(
+                    "chatgpt_account_id".to_string(),
+                    Value::String(account_id.to_string()),
+                );
+            }
+            let auth = normalize_codex_auth(&Value::Object(source), OfficialAuthMode::Pat)
+                .expect("non-empty personal access token normalizes into Codex auth");
+            Ok(DirectAuthMaterial::OfficialPat(auth))
+        }
+    }
+}
+
 pub fn official_codex_auth_is_resolvable(provider: &ProviderConfig) -> bool {
     matches!(provider.kind, ProviderKind::OfficialCodex)
         && matches!(
             resolve_direct_auth(provider),
-            Ok(DirectAuthMaterial::CodexAuth(_))
+            Ok(DirectAuthMaterial::CodexOAuth(_) | DirectAuthMaterial::OfficialPat(_))
+        )
+}
+
+pub fn official_codex_oauth_is_resolvable(provider: &ProviderConfig) -> bool {
+    matches!(provider.kind, ProviderKind::OfficialCodex)
+        && matches!(
+            resolve_direct_auth(provider),
+            Ok(DirectAuthMaterial::CodexOAuth(_))
         )
 }
 
 fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
+    normalize_codex_auth(value, OfficialAuthMode::OAuth)
+}
+
+fn normalize_codex_auth(value: &Value, mode: OfficialAuthMode) -> Option<Value> {
     let null = Value::Null;
     let candidate = oauth_account_candidate(value);
     let tokens_source = candidate
@@ -587,49 +685,91 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
         value,
     ];
 
-    let access_token = pick_first_json_string(
-        &sources,
-        &[
-            &["access_token"],
-            &["accessToken"],
-            &["token"],
-            &["credentials", "access_token"],
-            &["tokens", "access_token"],
-        ],
-    );
-    let id_token = pick_first_json_string(
-        &sources,
-        &[
-            &["id_token"],
-            &["idToken"],
-            &["credentials", "id_token"],
-            &["tokens", "id_token"],
-        ],
-    );
-    let session_token = pick_first_json_string(
-        &sources,
-        &[
-            &["session_token"],
-            &["sessionToken"],
-            &["credentials", "session_token"],
-            &["tokens", "session_token"],
-        ],
-    );
-    let refresh_token = pick_first_json_string(
-        &sources,
-        &[
-            &["refresh_token"],
-            &["refreshToken"],
-            &["credentials", "refresh_token"],
-            &["tokens", "refresh_token"],
-        ],
-    );
+    let access_token = official_access_token_from_auth_json(value, Some(mode));
+    let (id_token, session_token, refresh_token, expires_at, expired, last_refresh) = if mode
+        == OfficialAuthMode::Pat
+    {
+        // A PAT must never inherit stale OAuth state from a mixed export.
+        // Besides making its lifecycle misleading, those fields can cause
+        // a later import to route the account through the OAuth refresher.
+        (None, None, None, None, None, None)
+    } else {
+        let id_token = pick_first_json_string(
+            &sources,
+            &[
+                &["id_token"],
+                &["idToken"],
+                &["credentials", "id_token"],
+                &["tokens", "id_token"],
+            ],
+        );
+        let session_token = pick_first_json_string(
+            &sources,
+            &[
+                &["session_token"],
+                &["sessionToken"],
+                &["credentials", "session_token"],
+                &["tokens", "session_token"],
+            ],
+        );
+        let refresh_token = pick_first_json_string(
+            &sources,
+            &[
+                &["refresh_token"],
+                &["refreshToken"],
+                &["credentials", "refresh_token"],
+                &["tokens", "refresh_token"],
+            ],
+        );
+        let source_expired = pick_first_json_value(
+            &sources,
+            &[
+                &["expired"],
+                &["tokens", "expired"],
+                &["credentials", "expired"],
+            ],
+        );
+        // Some legacy exports overloaded `expired` with an expiry timestamp.
+        // Preserve a real timestamp as `expires_at`, but only retain an actual
+        // boolean under `expired` so the OAuth refresher can distinguish the two.
+        let expires_at = pick_first_json_value(
+            &sources,
+            &[
+                &["expires_at"],
+                &["expiresAt"],
+                &["tokens", "expires_at"],
+                &["tokens", "expiresAt"],
+                &["credentials", "expires_at"],
+                &["credentials", "expiresAt"],
+            ],
+        )
+        .or_else(|| {
+            source_expired
+                .as_ref()
+                .filter(|value| is_timestamp_value(value))
+                .cloned()
+        });
+        let expired = source_expired.filter(Value::is_boolean);
+        let last_refresh = pick_first_json_string(&sources, &[&["last_refresh"], &["lastRefresh"]]);
+        (
+            id_token,
+            session_token,
+            refresh_token,
+            expires_at,
+            expired,
+            last_refresh,
+        )
+    };
     access_token.as_ref()?;
 
-    let mut tokens = tokens_source
-        .as_object()
-        .cloned()
-        .unwrap_or_else(serde_json::Map::new);
+    let mut tokens = if mode == OfficialAuthMode::Pat {
+        serde_json::Map::new()
+    } else {
+        tokens_source
+            .as_object()
+            .cloned()
+            .unwrap_or_else(serde_json::Map::new)
+    };
     insert_optional_json_string(&mut tokens, "access_token", access_token);
     insert_optional_json_string(&mut tokens, "id_token", id_token);
     insert_optional_json_string(&mut tokens, "session_token", session_token);
@@ -661,6 +801,8 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
             ],
         ),
     );
+    insert_optional_json_value(&mut tokens, "expires_at", expires_at.clone());
+    insert_optional_json_value(&mut tokens, "expired", expired.clone());
     insert_optional_json_string(
         &mut tokens,
         "name",
@@ -694,18 +836,17 @@ fn normalize_codex_oauth_auth(value: &Value) -> Option<Value> {
         "auth_mode".to_string(),
         Value::String(CODEX_CHATGPT_AUTH_MODE.to_string()),
     );
+    if mode == OfficialAuthMode::Pat {
+        auth.insert(
+            COMPANION_OFFICIAL_AUTH_MODE_FIELD.to_string(),
+            Value::String(OfficialAuthMode::Pat.as_str().to_string()),
+        );
+    }
     auth.insert("OPENAI_API_KEY".to_string(), Value::Null);
     auth.insert("tokens".to_string(), Value::Object(tokens));
-    insert_optional_json_string(
-        &mut auth,
-        "expired",
-        pick_first_json_string(&sources, &[&["expired"], &["expires_at"], &["expiresAt"]]),
-    );
-    insert_optional_json_string(
-        &mut auth,
-        "last_refresh",
-        pick_first_json_string(&sources, &[&["last_refresh"], &["lastRefresh"]]),
-    );
+    insert_optional_json_value(&mut auth, "expires_at", expires_at);
+    insert_optional_json_value(&mut auth, "expired", expired);
+    insert_optional_json_string(&mut auth, "last_refresh", last_refresh);
     Some(Value::Object(auth))
 }
 
@@ -720,29 +861,34 @@ fn resolve_official_codex_auth(
     } else {
         None
     };
-    let normalized_current = current.as_ref().and_then(normalize_codex_oauth_auth);
+    let normalized_current = current.as_ref().and_then(|auth| {
+        (official_auth_mode_from_auth_json(auth) == Some(OfficialAuthMode::OAuth))
+            .then(|| normalize_codex_oauth_auth(auth))
+            .flatten()
+    });
     let current_is_pure_chatgpt = current.as_ref().is_some_and(|auth| {
         classify_codex_auth_shape(auth) == CodexAuthShape::OfficialOAuth
+            && official_auth_mode_from_auth_json(auth) == Some(OfficialAuthMode::OAuth)
             && auth.get("auth_mode").and_then(Value::as_str) == Some(CODEX_CHATGPT_AUTH_MODE)
             && normalized_current.is_some()
     });
 
-    let (material, source_provider_id) = if current_is_pure_chatgpt {
-        (current.clone().expect("current auth checked above"), None)
-    } else if let Some(provider) = source_provider {
+    let (material, source_provider_id) = if let Some(provider) = source_provider {
         if !matches!(provider.kind, ProviderKind::OfficialCodex) {
             return Err(CompanionError::InvalidConfig(format!(
                 "provider {} 不是官方 Codex OAuth 账号",
                 provider.id
             )));
         }
-        let DirectAuthMaterial::CodexAuth(material) = resolve_direct_auth(provider)? else {
+        let DirectAuthMaterial::CodexOAuth(material) = resolve_direct_auth(provider)? else {
             return Err(CompanionError::InvalidConfig(format!(
                 "官方 Codex 账号 {} 缺少可恢复的 OAuth access_token",
                 provider.name
             )));
         };
         (material, Some(provider.id.clone()))
+    } else if current_is_pure_chatgpt {
+        (current.clone().expect("current auth checked above"), None)
     } else if let Some(material) = normalized_current {
         (material, None)
     } else {
@@ -764,6 +910,7 @@ fn prepare_relay_official_codex_auth(
     }
     let Some((material, source_provider_id)) = resolved else {
         finish_prior_auth_write_for_config_only(backup, codex_dir)?;
+        backup.official_auth_provider_id = None;
         return Ok(CodexOfficialAuthStatus::default());
     };
 
@@ -773,18 +920,38 @@ fn prepare_relay_official_codex_auth(
     } else {
         None
     };
+    // Reinstalling Relay sees the managed auth.json as a normal ChatGPT
+    // session. Retain the original provider binding only when its exact
+    // Companion-written snapshot is still present; a user or Codex change
+    // must always stop future mirroring rather than being overwritten.
+    let retained_source_provider_id =
+        if source_provider_id.is_none() && managed_auth_write_matches(backup, codex_dir)? {
+            backup.official_auth_provider_id.clone()
+        } else {
+            None
+        };
+    let source_provider_id = source_provider_id.or(retained_source_provider_id);
     let changed = current.as_ref() != Some(&material);
     ensure_auth_backup(backup, codex_dir)?;
     if changed {
         write_optional_json(&auth_path, Some(&material))?;
     }
     record_auth_write(backup, codex_dir)?;
+    backup.official_auth_provider_id = source_provider_id.clone();
 
     Ok(CodexOfficialAuthStatus {
         ready: true,
         changed,
         source_provider_id,
     })
+}
+
+fn managed_auth_write_matches(backup: &ManagedConfigBackup, codex_dir: &Path) -> Result<bool> {
+    let Some(expected_hash) = backup.auth_write_hash.as_deref() else {
+        return Ok(false);
+    };
+    let auth_path = codex_dir.join("auth.json");
+    Ok(auth_path.is_file() && hash_file(&auth_path)? == expected_hash)
 }
 
 fn write_official_codex_config(doc: &mut DocumentMut, managed_target_provider: Option<&str>) {
@@ -958,10 +1125,62 @@ fn write_codex_auth_json(codex_dir: &Path, material: &Value) -> Result<()> {
         Value::Object(Default::default())
     };
     merge_codex_auth(&mut auth, material)?;
+    if official_auth_mode_from_auth_json(material) == Some(OfficialAuthMode::Pat) {
+        clear_stale_oauth_refresh_state(&mut auth);
+    }
     let text = serde_json::to_string_pretty(&auth).map_err(|source| {
         CompanionError::InvalidConfig(format!("序列化 Codex auth.json 失败: {source}"))
     })?;
     atomic_write_private_file(&auth_path, format!("{text}\n").as_bytes())
+}
+
+fn clear_stale_oauth_refresh_state(auth: &mut Value) {
+    const OAUTH_ROOT_FIELDS: &[&str] = &[
+        "refresh_token",
+        "refreshToken",
+        "id_token",
+        "idToken",
+        "session_token",
+        "sessionToken",
+        "expires_at",
+        "expiresAt",
+        "expired",
+        "last_refresh",
+        "lastRefresh",
+        "last_refresh_at",
+        "lastRefreshAt",
+        "refreshed_at",
+        "refreshedAt",
+    ];
+    const OAUTH_TOKEN_FIELDS: &[&str] = &[
+        "refresh_token",
+        "refreshToken",
+        "id_token",
+        "idToken",
+        "session_token",
+        "sessionToken",
+        "expires_at",
+        "expiresAt",
+        "expired",
+        "last_refresh",
+        "lastRefresh",
+        "last_refresh_at",
+        "lastRefreshAt",
+        "refreshed_at",
+        "refreshedAt",
+    ];
+    let Some(root) = auth.as_object_mut() else {
+        return;
+    };
+    for field in OAUTH_ROOT_FIELDS {
+        root.remove(*field);
+    }
+    let Some(tokens) = root.get_mut("tokens").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for field in OAUTH_TOKEN_FIELDS {
+        tokens.remove(*field);
+    }
 }
 
 fn merge_codex_auth(target: &mut Value, source: &Value) -> Result<()> {
@@ -1065,6 +1284,38 @@ fn insert_optional_json_string(
     if let Some(value) = value {
         object.insert(key.to_string(), Value::String(value));
     }
+}
+
+fn insert_optional_json_value(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<Value>,
+) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), value);
+    }
+}
+
+fn pick_first_json_value(sources: &[&Value], paths: &[&[&str]]) -> Option<Value> {
+    sources.iter().find_map(|source| {
+        paths.iter().find_map(|path| {
+            let mut cursor = *source;
+            for key in *path {
+                cursor = cursor.get(*key)?;
+            }
+            (!cursor.is_null()).then(|| cursor.clone())
+        })
+    })
+}
+
+fn is_timestamp_value(value: &Value) -> bool {
+    if value.as_i64().is_some() {
+        return true;
+    }
+    let Some(text) = value.as_str().map(str::trim) else {
+        return false;
+    };
+    text.parse::<i64>().is_ok() || chrono::DateTime::parse_from_rfc3339(text).is_ok()
 }
 
 fn pick_json_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
@@ -1246,6 +1497,7 @@ struct ManagedConfigBackup {
     previous_model_provider: Option<String>,
     auth_write_hash: Option<String>,
     auth_write_snapshot: Option<String>,
+    official_auth_provider_id: Option<String>,
     model_catalog_write_hash: Option<String>,
 }
 
@@ -1268,6 +1520,7 @@ struct CompanionConfigMarker {
     config_hash: Option<String>,
     auth_write_hash: Option<String>,
     auth_write_snapshot: Option<String>,
+    official_auth_provider_id: Option<String>,
     model_catalog_write_hash: Option<String>,
 }
 
@@ -1346,6 +1599,10 @@ impl CompanionConfigMarker {
                 .get("auth_write_snapshot")
                 .and_then(Item::as_str)
                 .map(ToOwned::to_owned),
+            official_auth_provider_id: marker
+                .get("official_auth_provider_id")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
             model_catalog_write_hash: marker
                 .get("model_catalog_write_hash")
                 .and_then(Item::as_str)
@@ -1382,6 +1639,107 @@ fn write_companion_state(codex_dir: &Path, marker: &CompanionConfigMarker) -> Re
     fs::rename(&temporary_path, &path).map_err(|source| CompanionError::io(&path, source))
 }
 
+/// Mirrors a refreshed Companion OAuth file into Codex's native `auth.json`
+/// only while Companion can prove that it still owns that exact file.
+///
+/// Relay itself injects credentials from the provider auth file, so this
+/// mirror is not required for an in-flight request to recover. It keeps
+/// Codex's locally stored login state fresh as well, without overwriting a
+/// later login performed by the user or Codex.
+pub fn sync_managed_official_oauth_auth(
+    codex_dir: Option<PathBuf>,
+    provider: &ProviderConfig,
+) -> Result<bool> {
+    if provider.kind != ProviderKind::OfficialCodex {
+        return Ok(false);
+    }
+    let Some(source_path) = provider_relay_auth_ref(provider)
+        .and_then(|auth_ref| auth_ref.strip_prefix("file:"))
+        .map(PathBuf::from)
+    else {
+        return Ok(false);
+    };
+    let source_auth = read_json_value(&source_path)?;
+    if official_auth_mode_from_auth_json(&source_auth) != Some(OfficialAuthMode::OAuth) {
+        return Ok(false);
+    }
+    let Some(material) = normalize_codex_oauth_auth(&source_auth) else {
+        return Ok(false);
+    };
+
+    let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
+    let config_path = codex_dir.join("config.toml");
+    if !config_path.is_file() {
+        return Ok(false);
+    }
+    let config = fs::read_to_string(&config_path)
+        .map_err(|source| CompanionError::io(&config_path, source))?
+        .parse::<DocumentMut>()
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
+        })?;
+    let Some(mut marker) = load_companion_marker(&codex_dir, &config) else {
+        return Ok(false);
+    };
+    if marker.install_kind.as_deref() != Some(CompanionInstallKind::Relay.as_str())
+        || marker.target_provider.as_deref() != Some(COMPANION_PROVIDER_ID)
+        || marker.official_auth_provider_id.as_deref() != Some(provider.id.as_str())
+    {
+        return Ok(false);
+    }
+    let Some(expected_hash) = marker.auth_write_hash.as_deref() else {
+        return Ok(false);
+    };
+    let Some(snapshot_path) = marker
+        .auth_write_snapshot
+        .as_deref()
+        .map(|path| resolve_codex_relative(&codex_dir, path))
+        .and_then(|path| canonical_existing_path_within_codex_dir(&codex_dir, &path))
+    else {
+        return Ok(false);
+    };
+    let auth_path = codex_dir.join("auth.json");
+    let Some(auth_path) = canonical_existing_path_within_codex_dir(&codex_dir, &auth_path) else {
+        return Ok(false);
+    };
+    if !auth_path.is_file()
+        || hash_file(&auth_path)? != expected_hash
+        || hash_file(&snapshot_path)? != expected_hash
+    {
+        return Ok(false);
+    }
+    if read_json_value(&auth_path)? == material {
+        return Ok(false);
+    }
+
+    let auth_rollback = AuthRollback::capture(&codex_dir)?;
+    let snapshot_rollback = ConfigRollback::capture(&snapshot_path)?;
+    let state_path = companion_state_path(&codex_dir);
+    let state_rollback = ConfigRollback::capture(&state_path)?;
+
+    write_optional_json(&auth_path, Some(&material))?;
+    if let Err(error) = fs::copy(&auth_path, &snapshot_path)
+        .map_err(|source| CompanionError::io(&snapshot_path, source))
+    {
+        let _ = auth_rollback.restore(&codex_dir);
+        return Err(error);
+    }
+    marker.auth_write_hash = Some(hash_file(&auth_path)?);
+    marker.written_at = Some(Local::now().to_rfc3339());
+    if let Err(error) = write_companion_state(&codex_dir, &marker) {
+        let auth_error = auth_rollback.restore(&codex_dir).err();
+        let snapshot_error = snapshot_rollback.restore(&snapshot_path).err();
+        let state_error = state_rollback.restore(&state_path).err();
+        if let Some(rollback_error) = auth_error.or(snapshot_error).or(state_error) {
+            return Err(CompanionError::InvalidConfig(format!(
+                "同步 Codex OAuth 登录态失败: {error}；回滚镜像状态也失败: {rollback_error}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(true)
+}
+
 fn remove_companion_state(codex_dir: &Path) -> Result<()> {
     let path = companion_state_path(codex_dir);
     if path.exists() {
@@ -1413,6 +1771,7 @@ fn prepare_config_write(
                 previous_model_provider: marker.previous_model_provider,
                 auth_write_hash: marker.auth_write_hash,
                 auth_write_snapshot: marker.auth_write_snapshot,
+                official_auth_provider_id: marker.official_auth_provider_id,
                 model_catalog_write_hash: marker.model_catalog_write_hash,
             });
         }
@@ -1442,6 +1801,7 @@ fn prepare_config_write(
             .map(ToOwned::to_owned),
         auth_write_hash: None,
         auth_write_snapshot: None,
+        official_auth_provider_id: None,
         model_catalog_write_hash: None,
     })
 }
@@ -1815,6 +2175,7 @@ fn companion_marker(
         config_hash: Some(config_doc_hash(doc)),
         auth_write_hash: backup.auth_write_hash.clone(),
         auth_write_snapshot: backup.auth_write_snapshot.clone(),
+        official_auth_provider_id: backup.official_auth_provider_id.clone(),
         model_catalog_write_hash: backup.model_catalog_write_hash.clone(),
     }
 }
@@ -3268,6 +3629,17 @@ fn resolve_codex_relative(codex_dir: &Path, path: &str) -> PathBuf {
     }
 }
 
+/// Resolves an existing Companion-managed artifact only when its canonical
+/// target remains inside the canonical Codex directory. Markers are persisted
+/// data, so a lexical `starts_with` check is insufficient: both `..` segments
+/// and symlinks can otherwise redirect a later OAuth mirror write elsewhere.
+fn canonical_existing_path_within_codex_dir(codex_dir: &Path, path: &Path) -> Option<PathBuf> {
+    let canonical_codex_dir = codex_dir.canonicalize().ok()?;
+    let canonical_path = path.canonicalize().ok()?;
+    (canonical_path.is_file() && canonical_path.starts_with(canonical_codex_dir))
+        .then_some(canonical_path)
+}
+
 fn managed_model_catalog_pointer(codex_dir: &Path, value: &str) -> bool {
     let pointer = Path::new(value);
     pointer == Path::new(MANAGED_MODEL_CATALOG_FILENAME)
@@ -3350,6 +3722,7 @@ fn write_config_and_state_with_auth_rollback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_companion_core::ProviderAccountInfo;
 
     fn api_key_provider(
         auth_ref: Option<String>,
@@ -3472,6 +3845,10 @@ mod tests {
             ("token_source", marker.token_source),
             ("auth_write_hash", marker.auth_write_hash),
             ("auth_write_snapshot", marker.auth_write_snapshot),
+            (
+                "official_auth_provider_id",
+                marker.official_auth_provider_id,
+            ),
             ("model_catalog_write_hash", marker.model_catalog_write_hash),
             ("written_at", marker.written_at),
         ] {
@@ -3998,7 +4375,7 @@ mod tests {
     }
 
     #[test]
-    fn preserved_third_party_after_official_direct_keeps_official_oauth_unchanged() {
+    fn preserved_third_party_after_official_relay_keeps_official_oauth_unchanged() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("config.toml"),
@@ -4023,11 +4400,16 @@ mod tests {
             .to_string(),
         )
         .expect("official auth");
-        install_direct_provider(
+        let official = official_provider(&official_auth_path);
+        install_companion_provider_for_relay(
             Some(temp.path().to_path_buf()),
-            &official_provider(&official_auth_path),
+            &RelayConfig::default(),
+            None,
+            &[],
+            Some(&official),
+            false,
         )
-        .expect("activate official account");
+        .expect("activate official relay");
         let official_live_auth = fs::read(temp.path().join("auth.json")).expect("live oauth");
 
         let third_party_auth_path = temp.path().join("third-party-auth.json");
@@ -4079,7 +4461,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_after_official_direct_keeps_official_oauth_unchanged() {
+    fn relay_reinstall_keeps_official_oauth_unchanged() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("auth.json"),
@@ -4099,11 +4481,16 @@ mod tests {
             .to_string(),
         )
         .expect("official auth");
-        install_direct_provider(
+        let official = official_provider(&official_auth_path);
+        install_companion_provider_for_relay(
             Some(temp.path().to_path_buf()),
-            &official_provider(&official_auth_path),
+            &RelayConfig::default(),
+            None,
+            &[],
+            Some(&official),
+            false,
         )
-        .expect("activate official account");
+        .expect("activate official relay");
         let official_live_auth = fs::read(temp.path().join("auth.json")).expect("live oauth");
 
         install_companion_provider(Some(temp.path().to_path_buf()), &RelayConfig::default())
@@ -4121,7 +4508,7 @@ mod tests {
     }
 
     #[test]
-    fn official_direct_clears_stale_api_key_auth_mode() {
+    fn official_relay_clears_stale_api_key_auth_mode() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("auth.json"),
@@ -4141,11 +4528,16 @@ mod tests {
         )
         .expect("official auth");
 
-        install_direct_provider(
+        let official = official_provider(&official_auth_path);
+        install_companion_provider_for_relay(
             Some(temp.path().to_path_buf()),
-            &official_provider(&official_auth_path),
+            &RelayConfig::default(),
+            None,
+            &[],
+            Some(&official),
+            false,
         )
-        .expect("activate official account");
+        .expect("activate official relay");
 
         let auth = read_json_value(&temp.path().join("auth.json")).expect("live oauth");
         assert_eq!(auth["auth_mode"], CODEX_CHATGPT_AUTH_MODE, "{auth}");
@@ -4268,6 +4660,257 @@ mod tests {
     }
 
     #[test]
+    fn relay_install_prefers_selected_managed_oauth_over_existing_native_auth() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": null,
+                "tokens": {
+                    "access_token": "native-access",
+                    "refresh_token": "native-refresh"
+                }
+            })
+            .to_string(),
+        )
+        .expect("native auth");
+        let source_auth_path = temp.path().join("managed-source.json");
+        fs::write(
+            &source_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "source-access-one",
+                    "refresh_token": "source-refresh-one",
+                    "chatgpt_account_id": "workspace-one"
+                }
+            })
+            .to_string(),
+        )
+        .expect("managed source auth");
+        let provider = official_provider(&source_auth_path);
+
+        let outcome = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            Some(&provider),
+            false,
+        )
+        .expect("install relay");
+
+        assert_eq!(
+            outcome.official_auth.source_provider_id.as_deref(),
+            Some("official-account")
+        );
+        let installed_auth =
+            read_json_value(&temp.path().join("auth.json")).expect("installed auth");
+        assert_eq!(
+            installed_auth["tokens"]["access_token"],
+            "source-access-one"
+        );
+        assert_eq!(
+            read_companion_state(temp.path())
+                .and_then(|marker| marker.official_auth_provider_id)
+                .as_deref(),
+            Some("official-account")
+        );
+
+        fs::write(
+            &source_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "source-access-two",
+                    "refresh_token": "source-refresh-two",
+                    "chatgpt_account_id": "workspace-two"
+                }
+            })
+            .to_string(),
+        )
+        .expect("refreshed source auth");
+
+        assert!(
+            sync_managed_official_oauth_auth(Some(temp.path().to_path_buf()), &provider)
+                .expect("sync native auth")
+        );
+        let mirrored_auth = read_json_value(&temp.path().join("auth.json")).expect("mirrored auth");
+        assert_eq!(mirrored_auth["tokens"]["access_token"], "source-access-two");
+        assert_eq!(
+            mirrored_auth["tokens"]["chatgpt_account_id"],
+            "workspace-two"
+        );
+    }
+
+    #[test]
+    fn managed_relay_oauth_mirror_tracks_refreshes_without_overwriting_user_auth() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_auth_path = temp.path().join("official-source.json");
+        fs::write(
+            &source_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "source-access-one",
+                    "refresh_token": "source-refresh-one",
+                    "chatgpt_account_id": "workspace-one",
+                    "last_refresh": "2026-08-01T00:00:00Z"
+                }
+            })
+            .to_string(),
+        )
+        .expect("source auth");
+        let provider = official_provider(&source_auth_path);
+
+        install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            Some(&provider),
+            false,
+        )
+        .expect("install relay");
+        assert_eq!(
+            read_companion_state(temp.path())
+                .and_then(|marker| marker.official_auth_provider_id)
+                .as_deref(),
+            Some("official-account")
+        );
+
+        fs::write(
+            &source_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "source-access-two",
+                    "refresh_token": "source-refresh-two",
+                    "chatgpt_account_id": "workspace-two",
+                    "last_refresh": "2026-08-02T00:00:00Z"
+                }
+            })
+            .to_string(),
+        )
+        .expect("refreshed source auth");
+
+        assert!(
+            sync_managed_official_oauth_auth(Some(temp.path().to_path_buf()), &provider)
+                .expect("sync native auth")
+        );
+        let mirrored = read_json_value(&temp.path().join("auth.json")).expect("mirrored auth");
+        assert_eq!(mirrored["tokens"]["access_token"], "source-access-two");
+        assert_eq!(mirrored["tokens"]["chatgpt_account_id"], "workspace-two");
+
+        let user_auth = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "access_token": "user-access",
+                "refresh_token": "user-refresh"
+            }
+        });
+        write_optional_json(&temp.path().join("auth.json"), Some(&user_auth)).expect("user login");
+        fs::write(
+            &source_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "source-access-three",
+                    "refresh_token": "source-refresh-three"
+                }
+            })
+            .to_string(),
+        )
+        .expect("next source refresh");
+
+        assert!(
+            !sync_managed_official_oauth_auth(Some(temp.path().to_path_buf()), &provider)
+                .expect("user auth must win")
+        );
+        assert_eq!(
+            read_json_value(&temp.path().join("auth.json")).expect("user auth remains"),
+            user_auth
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_relay_oauth_mirror_rejects_escaped_snapshot_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("codex tempdir");
+        let source_auth_path = temp.path().join("official-source.json");
+        fs::write(
+            &source_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "source-access-one",
+                    "refresh_token": "source-refresh-one"
+                }
+            })
+            .to_string(),
+        )
+        .expect("source auth");
+        let provider = official_provider(&source_auth_path);
+
+        install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            Some(&provider),
+            false,
+        )
+        .expect("install relay");
+        let marker = read_companion_state(temp.path()).expect("managed state");
+        let managed_snapshot = marker
+            .auth_write_snapshot
+            .as_deref()
+            .map(|path| resolve_codex_relative(temp.path(), path))
+            .expect("managed auth snapshot");
+        let parent = temp.path().parent().expect("codex temp parent");
+        let outside = tempfile::tempdir_in(parent).expect("outside tempdir");
+        let outside_snapshot = outside.path().join("managed-auth.json");
+        fs::copy(&managed_snapshot, &outside_snapshot).expect("copy managed snapshot");
+
+        let linked_snapshot = temp.path().join("snapshot-link.json");
+        symlink(&outside_snapshot, &linked_snapshot).expect("snapshot symlink");
+        let mut marker = read_companion_state(temp.path()).expect("managed state");
+        marker.auth_write_snapshot = Some("snapshot-link.json".to_string());
+        write_companion_state(temp.path(), &marker).expect("write marker");
+
+        fs::write(
+            &source_auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "source-access-two",
+                    "refresh_token": "source-refresh-two"
+                }
+            })
+            .to_string(),
+        )
+        .expect("refreshed source auth");
+        assert!(
+            !sync_managed_official_oauth_auth(Some(temp.path().to_path_buf()), &provider)
+                .expect("symlink target outside Codex must be rejected")
+        );
+        assert_eq!(
+            read_json_value(&outside_snapshot).expect("outside snapshot"),
+            read_json_value(&managed_snapshot).expect("managed snapshot unchanged")
+        );
+
+        let sibling_name = outside
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("sibling directory name");
+        let mut marker = read_companion_state(temp.path()).expect("managed state");
+        marker.auth_write_snapshot = Some(format!("../{sibling_name}/managed-auth.json"));
+        write_companion_state(temp.path(), &marker).expect("write traversal marker");
+        assert!(
+            !sync_managed_official_oauth_auth(Some(temp.path().to_path_buf()), &provider)
+                .expect("traversal target outside Codex must be rejected")
+        );
+    }
+
+    #[test]
     fn relay_auth_restore_keeps_existing_pure_chatgpt_login() {
         let temp = tempfile::tempdir().expect("tempdir");
         let auth = serde_json::json!({
@@ -4302,6 +4945,92 @@ mod tests {
             read_json_value(&temp.path().join("auth.json")).expect("live auth"),
             auth
         );
+    }
+
+    #[test]
+    fn relay_install_does_not_reclassify_existing_pat_as_oauth() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth = serde_json::json!({
+            "auth_mode": "chatgpt",
+            COMPANION_OFFICIAL_AUTH_MODE_FIELD: "pat",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "access_token": "at-personal-token",
+                "chatgpt_account_id": "workspace-1"
+            }
+        });
+        fs::write(
+            temp.path().join("auth.json"),
+            serde_json::to_vec_pretty(&auth).expect("serialize auth"),
+        )
+        .expect("auth");
+
+        let outcome = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            None,
+            false,
+        )
+        .expect("install relay");
+
+        assert_eq!(outcome.official_auth, CodexOfficialAuthStatus::default());
+        assert_eq!(
+            read_json_value(&temp.path().join("auth.json")).expect("live auth"),
+            auth
+        );
+    }
+
+    #[test]
+    fn normalize_codex_oauth_auth_preserves_expiry_without_overloading_expired() {
+        let normalized = normalize_codex_oauth_auth(&serde_json::json!({
+            "tokens": {
+                "access_token": "opaque-access",
+                "refresh_token": "refresh-token",
+                "expires_at": 1_900_000_000,
+                "expired": false
+            }
+        }))
+        .expect("OAuth auth");
+
+        assert_eq!(normalized["expires_at"], 1_900_000_000);
+        assert_eq!(normalized["tokens"]["expires_at"], 1_900_000_000);
+        assert_eq!(normalized["expired"], false);
+        assert_eq!(normalized["tokens"]["expired"], false);
+    }
+
+    #[test]
+    fn normalize_codex_pat_drops_mixed_oauth_lifecycle_state() {
+        let normalized = normalize_codex_auth(
+            &serde_json::json!({
+                "auth_mode": "pat",
+                "personal_access_token": "at-personal-token",
+                "refresh_token": "stale-refresh-token",
+                "id_token": "stale-id-token",
+                "session_token": "stale-session-token",
+                "expires_at": 1_900_000_000,
+                "expired": true,
+                "last_refresh": "2026-08-01T00:00:00Z"
+            }),
+            OfficialAuthMode::Pat,
+        )
+        .expect("PAT auth");
+
+        assert_eq!(normalized["tokens"]["access_token"], "at-personal-token");
+        for field in [
+            "refresh_token",
+            "id_token",
+            "session_token",
+            "expires_at",
+            "expired",
+            "last_refresh",
+        ] {
+            assert!(
+                normalized.get(field).is_none() && normalized["tokens"].get(field).is_none(),
+                "PAT normalization should remove {field}: {normalized}"
+            );
+        }
     }
 
     #[test]
@@ -5380,7 +6109,7 @@ mod tests {
     }
 
     #[test]
-    fn install_direct_official_provider_writes_codex_oauth_tokens() {
+    fn relay_install_writes_official_oauth_tokens() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("config.toml"),
@@ -5428,15 +6157,26 @@ base_url = "https://keep.example/v1"
             account: None,
         };
 
-        let status = install_direct_provider(Some(temp.path().to_path_buf()), &provider)
-            .expect("install direct");
+        let status = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            Some(&provider),
+            false,
+        )
+        .expect("install relay")
+        .codex;
 
         assert!(status.installed);
-        assert_eq!(status.model_provider.as_deref(), Some("openai"));
+        assert_eq!(
+            status.model_provider.as_deref(),
+            Some(COMPANION_PROVIDER_ID)
+        );
         let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
-        assert!(config.contains("model_provider = \"openai\""));
+        assert!(config.contains("model_provider = \"codex-companion\""));
         assert!(config.contains("[model_providers.old-direct]"));
-        assert!(!config.contains("[model_providers.official-mark]"));
+        assert!(config.contains("[model_providers.codex-companion]"));
         assert!(config.contains("[model_providers.keep-me]"));
         assert!(!config.contains("openai_base_url"));
         let auth = fs::read_to_string(temp.path().join("auth.json")).expect("codex auth");
@@ -5444,5 +6184,125 @@ base_url = "https://keep.example/v1"
         assert!(auth.contains("\"access_token\": \"access-token\""));
         assert!(auth.contains("\"refresh_token\": \"refresh-token\""));
         assert!(auth.contains("\"chatgpt_account_id\": \"account-id\""));
+    }
+
+    #[test]
+    fn direct_install_rejects_official_oauth_before_touching_codex_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("official-auth.json");
+        fs::write(
+            &auth_path,
+            r#"{"tokens":{"access_token":"access-token","refresh_token":"refresh-token"}}"#,
+        )
+        .expect("auth");
+
+        let error = install_direct_provider(
+            Some(temp.path().to_path_buf()),
+            &official_provider(&auth_path),
+        )
+        .expect_err("official OAuth must use relay");
+
+        assert!(error.to_string().contains("必须通过 Companion 本地代理"));
+        assert!(!temp.path().join("config.toml").exists());
+        assert!(!temp.path().join("auth.json").exists());
+    }
+
+    #[test]
+    fn install_direct_official_pat_marks_native_codex_auth_for_reimport() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let provider_auth = temp.path().join("provider-pat.json");
+        fs::write(
+            &provider_auth,
+            r#"{"auth_mode":"pat","access_token":"stale-access-token","personal_access_token":"at-personal-token","chatgpt_account_id":"workspace-1"}"#,
+        )
+        .expect("provider auth");
+        let provider = official_provider(&provider_auth);
+
+        install_direct_provider(Some(temp.path().to_path_buf()), &provider)
+            .expect("install direct");
+
+        let auth = read_json_value(&temp.path().join("auth.json")).expect("Codex auth");
+        assert_eq!(auth["auth_mode"], CODEX_CHATGPT_AUTH_MODE);
+        assert_eq!(
+            auth[COMPANION_OFFICIAL_AUTH_MODE_FIELD],
+            OfficialAuthMode::Pat.as_str()
+        );
+        assert_eq!(auth["tokens"]["access_token"], "at-personal-token");
+        assert_eq!(auth["tokens"]["chatgpt_account_id"], "workspace-1");
+    }
+
+    #[test]
+    fn direct_official_pat_clears_stale_oauth_refresh_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "expires_at": 1_900_000_000,
+                "last_refresh": "2026-08-01T00:00:00Z",
+                "tokens": {
+                    "access_token": "old-oauth-access",
+                    "refresh_token": "old-oauth-refresh",
+                    "id_token": "old-oauth-id",
+                    "expires_at": 1_900_000_000,
+                    "expired": false
+                }
+            })
+            .to_string(),
+        )
+        .expect("existing OAuth auth");
+        let provider_auth = temp.path().join("provider-pat.json");
+        fs::write(
+            &provider_auth,
+            r#"{"auth_mode":"pat","personal_access_token":"at-personal-token"}"#,
+        )
+        .expect("provider PAT");
+
+        install_direct_provider(
+            Some(temp.path().to_path_buf()),
+            &official_provider(&provider_auth),
+        )
+        .expect("install direct PAT");
+
+        let auth = read_json_value(&temp.path().join("auth.json")).expect("Codex auth");
+        assert_eq!(auth["tokens"]["access_token"], "at-personal-token");
+        for field in [
+            "refresh_token",
+            "id_token",
+            "expires_at",
+            "expired",
+            "last_refresh",
+        ] {
+            assert!(
+                auth.get(field).is_none() && auth["tokens"].get(field).is_none(),
+                "stale OAuth field {field} should be removed: {auth}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_direct_official_pat_from_env_marks_native_codex_auth() {
+        const PAT_ENV: &str = "CODEX_COMPANION_TEST_OFFICIAL_PAT";
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut provider = official_provider(&temp.path().join("unused.json"));
+        provider.auth_ref = Some(format!("env:{PAT_ENV}"));
+        provider.account = Some(ProviderAccountInfo {
+            auth_mode: Some("pat".to_string()),
+            account_id: Some("workspace-from-env".to_string()),
+            ..ProviderAccountInfo::default()
+        });
+        std::env::set_var(PAT_ENV, "at-personal-token");
+        let result = install_direct_provider(Some(temp.path().to_path_buf()), &provider);
+        std::env::remove_var(PAT_ENV);
+        result.expect("install direct PAT from env");
+
+        let auth = read_json_value(&temp.path().join("auth.json")).expect("Codex auth");
+        assert_eq!(
+            auth[COMPANION_OFFICIAL_AUTH_MODE_FIELD],
+            OfficialAuthMode::Pat.as_str()
+        );
+        assert_eq!(auth["tokens"]["access_token"], "at-personal-token");
+        assert_eq!(auth["tokens"]["chatgpt_account_id"], "workspace-from-env");
     }
 }

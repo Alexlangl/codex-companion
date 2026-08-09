@@ -1,3 +1,4 @@
+mod auth;
 mod constants;
 mod diagnostics;
 mod error;
@@ -8,6 +9,11 @@ mod provider_url;
 mod store;
 mod types;
 
+pub use auth::{
+    official_access_token_from_auth_json, official_auth_mode_from_account,
+    official_auth_mode_from_auth_json, parse_official_auth_mode, provider_direct_auth_ref,
+    provider_relay_auth_ref, OfficialAuthMode, COMPANION_OFFICIAL_AUTH_MODE_FIELD,
+};
 pub use constants::*;
 pub use diagnostics::*;
 pub use error::{CompanionError, Result};

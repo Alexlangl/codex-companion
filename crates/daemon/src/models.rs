@@ -1,11 +1,13 @@
 use crate::runtime::CompanionDaemon;
 use chrono::{DateTime, Utc};
 use codex_companion_core::{
-    default_codex_dir, provider_api_base_url, ModelMatrixModel, ModelMatrixSnapshot,
-    ModelMatrixSource, ModelSourceKind, ModelSourceStatus, ProviderConfig, ProviderKind, Result,
+    default_codex_dir, provider_api_base_url, redact_sensitive_text, ModelMatrixModel,
+    ModelMatrixSnapshot, ModelMatrixSource, ModelSourceKind, ModelSourceStatus, ProviderConfig,
+    ProviderKind, Result,
 };
 use codex_companion_provider::{
-    ensure_codex_auth_snapshot, provider_uses_agent_identity, resolve_auth_token,
+    ensure_codex_auth_snapshot, provider_uses_agent_identity, provider_uses_codex_oauth,
+    resolve_auth_token,
 };
 use reqwest::{header, Client, Response, StatusCode, Url};
 use serde_json::Value;
@@ -205,7 +207,13 @@ async fn discover_provider_models(
     active_group: bool,
 ) -> SourceDiscovery {
     let kind = if provider.kind == ProviderKind::OfficialCodex {
-        ModelSourceKind::OfficialOauth
+        if provider_uses_codex_oauth(&provider) {
+            ModelSourceKind::OfficialOauth
+        } else if provider_uses_agent_identity(&provider) {
+            ModelSourceKind::Relay
+        } else {
+            ModelSourceKind::OfficialPat
+        }
     } else {
         ModelSourceKind::Relay
     };
@@ -254,21 +262,34 @@ async fn fetch_provider_model_response(
         if provider_uses_agent_identity(provider) {
             return Err("该官方账号不是 OAuth 认证，未查询模型目录".to_string());
         }
-        let auth = ensure_codex_auth_snapshot(provider)
-            .await
-            .map_err(|error| format!("OAuth 认证不可用: {error}"))?;
+        let auth = if provider_uses_codex_oauth(provider) {
+            ensure_codex_auth_snapshot(provider)
+                .await
+                .map_err(|error| format!("OAuth 认证不可用: {error}"))?
+        } else {
+            let access_token = resolve_auth_token(provider)
+                .ok_or_else(|| "官方 PAT 缺少 access_token".to_string())?;
+            codex_companion_provider::CodexAuthSnapshot {
+                access_token,
+                account_id: None,
+                email: None,
+                name: None,
+                plan_type: None,
+            }
+        };
         let url = format!(
             "{}/models?client_version={}",
             provider.base_url.trim_end_matches('/'),
             env!("CARGO_PKG_VERSION")
         );
-        let account_id = provider
-            .account
-            .as_ref()
-            .and_then(|account| account.account_id.as_deref())
-            .filter(|account_id| !account_id.trim().is_empty())
-            .map(str::to_string)
-            .or(auth.account_id);
+        let account_id = auth.account_id.or_else(|| {
+            provider
+                .account
+                .as_ref()
+                .and_then(|account| account.account_id.as_deref())
+                .filter(|account_id| !account_id.trim().is_empty())
+                .map(str::to_string)
+        });
         let mut request = client
             .get(&url)
             .bearer_auth(auth.access_token)
@@ -414,7 +435,7 @@ fn response_error_message(value: &Value) -> Option<String> {
     .into_iter()
     .flatten()
     .find_map(Value::as_str)
-    .map(|message| message.chars().take(180).collect())
+    .map(|message| redact_sensitive_text(message).chars().take(180).collect())
 }
 
 fn parse_model_response(
@@ -722,6 +743,22 @@ mod tests {
                 .expect("versioned base URL"),
             vec!["https://api.example.com/api/v4/models"]
         );
+    }
+
+    #[test]
+    fn redacts_and_bounds_provider_error_messages() {
+        let message = format!(
+            "Authorization: Bearer upstream-secret refresh_token=refresh-secret {}",
+            "x".repeat(256)
+        );
+        let error = response_error_message(&json!({
+            "error": { "message": message }
+        }))
+        .expect("error message");
+
+        assert!(!error.contains("upstream-secret"));
+        assert!(!error.contains("refresh-secret"));
+        assert!(error.chars().count() <= 180);
     }
 
     #[test]

@@ -76,6 +76,8 @@ struct OAuthTokenResponse {
     id_token: Option<String>,
     #[serde(default)]
     refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
 }
 
 fn state_lock() -> &'static Mutex<Option<OAuthState>> {
@@ -715,6 +717,12 @@ pub async fn complete(
             return Err("OAuth 响应缺少 refresh_token，无法保存可续期账号".to_string());
         }
     };
+    let now = Utc::now();
+    let expires_at = tokens
+        .expires_in
+        .filter(|value| *value > 0)
+        .map(|expires_in| now.timestamp().saturating_add(expires_in));
+    let now_text = now.to_rfc3339();
     let mut token_map = serde_json::Map::new();
     token_map.insert(
         "access_token".to_string(),
@@ -727,15 +735,30 @@ pub async fn complete(
         "refresh_token".to_string(),
         serde_json::Value::String(refresh_token),
     );
+    if let Some(expires_at) = expires_at {
+        token_map.insert(
+            "expires_at".to_string(),
+            serde_json::Value::Number(expires_at.into()),
+        );
+    }
     token_map.insert(
         "last_refresh".to_string(),
-        serde_json::Value::String(Utc::now().to_rfc3339()),
+        serde_json::Value::String(now_text.clone()),
     );
-    let auth = serde_json::json!({
-        "tokens": token_map,
-        "expired": false,
-        "last_refresh": Utc::now().to_rfc3339(),
-    });
+    let mut auth = serde_json::Map::new();
+    auth.insert("tokens".to_string(), serde_json::Value::Object(token_map));
+    if let Some(expires_at) = expires_at {
+        auth.insert(
+            "expires_at".to_string(),
+            serde_json::Value::Number(expires_at.into()),
+        );
+    }
+    auth.insert("expired".to_string(), serde_json::Value::Bool(false));
+    auth.insert(
+        "last_refresh".to_string(),
+        serde_json::Value::String(now_text),
+    );
+    let auth = serde_json::Value::Object(auth);
     let outcome = daemon
         .import_provider_json(&auth.to_string(), None, None)
         .map_err(|error| format!("OAuth 已完成，但保存账号失败，请重新授权: {error}"));

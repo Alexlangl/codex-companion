@@ -1,10 +1,10 @@
 use crate::launch::{
-    direct_repair_target_provider_id, relay_model_slugs, relay_official_auth_provider,
-    restart_codex_if_running,
+    direct_repair_target_provider_id, provider_can_direct_connect, relay_model_slugs,
+    relay_official_auth_provider, restart_codex_if_running,
 };
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
-    default_codex_dir, AppSettings, CodexLaunchMode, CompanionConfig, CompanionError,
+    default_codex_dir, AppSettings, CodexLaunchMode, CompanionConfig, CompanionError, ProviderKind,
     ProviderLaunchMode, ProviderViewMode, RepairOptions, RepairOutcome, Result, ThemeMode,
     TokenUsageSummary, TokenUsageSyncStatus, COMPANION_PROVIDER_ID,
 };
@@ -162,6 +162,18 @@ impl CompanionDaemon {
         mode: ProviderLaunchMode,
     ) -> Result<ProviderLaunchMode> {
         self.store.update(|config| {
+            if matches!(mode, ProviderLaunchMode::Direct) {
+                if let Some(provider) = config.providers.get(&provider_id) {
+                    if !provider_can_direct_connect(provider) {
+                        let message = if provider.kind == ProviderKind::OfficialCodex {
+                            "官方 OAuth / Agent Identity 账号必须使用 Companion 本地代理，不能保存为直连模式"
+                        } else {
+                            "该 provider 当前不满足直连条件，不能保存为直连模式"
+                        };
+                        return Err(CompanionError::InvalidConfig(message.to_string()));
+                    }
+                }
+            }
             let previous_mode = config
                 .app
                 .provider_launch_modes

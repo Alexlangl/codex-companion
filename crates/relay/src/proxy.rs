@@ -5,6 +5,7 @@ use crate::events::{append_event, record_health_success, update_health};
 use crate::state::{apply_group_policy, AffinityBindContext, RelayState};
 use crate::upstream::{
     send_upstream, stream_response, text_response, upstream_url, UpstreamRequest,
+    UpstreamRequestError,
 };
 use crate::{RequestAttemptFinish, RequestAttemptStart, RequestLogFinish, RequestLogStart};
 use axum::{
@@ -528,10 +529,10 @@ async fn proxy_dispatch(
         )
         .await
         .unwrap_or_else(|_| {
-            Err(format!(
+            Err(UpstreamRequestError::from(format!(
                 "上游网络等待响应超时（Provider {}）",
                 provider.name
-            ))
+            )))
         });
         match upstream_result {
             Ok(mut response) if response.status().is_success() => {
@@ -705,6 +706,8 @@ async fn proxy_dispatch(
             }
             Ok(response) => {
                 let status = response.status();
+                let oauth_refresh_error = response.oauth_refresh_error().map(str::to_string);
+                let oauth_refresh_failure = response.oauth_refresh_failure().cloned();
                 let body_text = match tokio::time::timeout(
                     UPSTREAM_ERROR_BODY_TIMEOUT,
                     response.text(),
@@ -715,7 +718,8 @@ async fn proxy_dispatch(
                     Ok(Err(error)) => format!("读取上游错误响应失败: {error}"),
                     Err(_) => "读取上游错误响应超时".to_string(),
                 };
-                let failure = classify_failure(Some(status.as_u16()), &body_text);
+                let failure = oauth_refresh_failure
+                    .unwrap_or_else(|| classify_failure(Some(status.as_u16()), &body_text));
                 let upstream_payload_too_large = status == StatusCode::PAYLOAD_TOO_LARGE;
                 let request_incompatible = status == StatusCode::BAD_REQUEST;
                 let compact_unsupported = compact_request
@@ -734,6 +738,13 @@ async fn proxy_dispatch(
                     format!(
                         "上游 Provider {} 不支持 Responses Compact API（HTTP {status}）",
                         provider.name
+                    )
+                } else if let Some(refresh_error) = oauth_refresh_error {
+                    format!(
+                        "上游返回 {}；{}：{}",
+                        status,
+                        refresh_error,
+                        compact_error_body(&body_text)
                     )
                 } else {
                     format!("上游返回 {}: {}", status, compact_error_body(&body_text))
@@ -802,8 +813,11 @@ async fn proxy_dispatch(
                 ));
             }
             Err(error) => {
-                let failure = classify_failure(None, &error);
-                let message = compact_error_body(&error);
+                let failure = error
+                    .failure()
+                    .cloned()
+                    .unwrap_or_else(|| classify_failure(None, error.message_text()));
+                let message = compact_error_body(error.message_text());
                 record_provider_failure(
                     &state,
                     &config,

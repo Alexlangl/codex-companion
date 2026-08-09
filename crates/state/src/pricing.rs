@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-pub const PRICING_AS_OF: &str = "2026-07-15";
+pub const PRICING_AS_OF: &str = "2026-08-09";
 const TOKENS_PER_MILLION: u64 = 1_000_000;
 
 #[derive(Debug, Clone)]
@@ -62,18 +62,34 @@ struct PricingOverride {
     #[serde(default)]
     models: Vec<ModelPricingOverride>,
     #[serde(default)]
-    provider_multipliers: BTreeMap<String, String>,
+    provider_multipliers: BTreeMap<String, PricingDecimal>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PricingDecimal {
+    String(String),
+    Number(serde_json::Number),
+}
+
+impl std::fmt::Display for PricingDecimal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::String(value) => value.fmt(formatter),
+            Self::Number(value) => value.fmt(formatter),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelPricingOverride {
     model: String,
-    input_per_million: String,
-    cached_input_per_million: String,
+    input_per_million: PricingDecimal,
+    cached_input_per_million: PricingDecimal,
     #[serde(default)]
-    cache_write_input_per_million: Option<String>,
-    output_per_million: String,
+    cache_write_input_per_million: Option<PricingDecimal>,
+    output_per_million: PricingDecimal,
     #[serde(default)]
     aliases: Vec<String>,
 }
@@ -88,8 +104,8 @@ impl PricingCatalog {
         for (model, input, cached_input, cache_write_input, output) in [
             ("gpt-5.6-sol", "5.00", "0.50", "6.25", "30.00"),
             ("gpt-5.6", "5.00", "0.50", "6.25", "30.00"),
-            ("gpt-5.6-terra", "2.50", "0.25", "3.125", "15.00"),
-            ("gpt-5.6-luna", "1.00", "0.10", "1.25", "6.00"),
+            ("gpt-5.6-terra", "2.00", "0.20", "2.50", "12.00"),
+            ("gpt-5.6-luna", "0.20", "0.02", "0.25", "1.20"),
             ("gpt-5.5", "5.00", "0.50", "5.00", "30.00"),
             ("gpt-5.4", "2.50", "0.25", "2.50", "15.00"),
             ("gpt-5.4-mini", "0.75", "0.075", "0.75", "4.50"),
@@ -122,25 +138,30 @@ impl PricingCatalog {
                 path,
                 &model.model,
                 "inputPerMillion",
-                &model.input_per_million,
+                &model.input_per_million.to_string(),
             )?;
             let cached_input = parse_nonnegative_decimal(
                 path,
                 &model.model,
                 "cachedInputPerMillion",
-                &model.cached_input_per_million,
+                &model.cached_input_per_million.to_string(),
             )?;
             let output = parse_nonnegative_decimal(
                 path,
                 &model.model,
                 "outputPerMillion",
-                &model.output_per_million,
+                &model.output_per_million.to_string(),
             )?;
             let cache_write_input = model
                 .cache_write_input_per_million
-                .as_deref()
+                .as_ref()
                 .map(|raw| {
-                    parse_nonnegative_decimal(path, &model.model, "cacheWriteInputPerMillion", raw)
+                    parse_nonnegative_decimal(
+                        path,
+                        &model.model,
+                        "cacheWriteInputPerMillion",
+                        &raw.to_string(),
+                    )
                 })
                 .transpose()?
                 .unwrap_or(input);
@@ -154,7 +175,8 @@ impl PricingCatalog {
             );
         }
         for (provider_id, raw_multiplier) in value.provider_multipliers {
-            let multiplier = Decimal::from_str(raw_multiplier.trim()).map_err(|source| {
+            let raw_multiplier = raw_multiplier.to_string();
+            let multiplier = parse_decimal(raw_multiplier.trim()).map_err(|source| {
                 CompanionError::InvalidConfig(format!(
                     "invalid pricing multiplier for provider {provider_id} in {}: {source}",
                     path.display()
@@ -306,7 +328,7 @@ fn strip_model_date_suffix(model: &str) -> String {
 }
 
 fn parse_nonnegative_decimal(path: &Path, model: &str, field: &str, raw: &str) -> Result<Decimal> {
-    let value = Decimal::from_str(raw.trim()).map_err(|source| {
+    let value = parse_decimal(raw.trim()).map_err(|source| {
         CompanionError::InvalidConfig(format!(
             "invalid {field} for model {model} in {}: {source}",
             path.display()
@@ -319,6 +341,10 @@ fn parse_nonnegative_decimal(path: &Path, model: &str, field: &str, raw: &str) -
         )));
     }
     Ok(value)
+}
+
+fn parse_decimal(raw: &str) -> std::result::Result<Decimal, rust_decimal::Error> {
+    Decimal::from_str(raw).or_else(|_| Decimal::from_scientific(raw))
 }
 
 fn decimal(raw: &str) -> Decimal {
@@ -378,6 +404,23 @@ mod tests {
     }
 
     #[test]
+    fn current_openai_snapshot_prices_terra_and_luna() {
+        let catalog = PricingCatalog::builtin();
+        for (model, input, cached_input, cache_write_input, output) in [
+            ("gpt-5.6-terra", "2.00", "0.20", "2.50", "12.00"),
+            ("gpt-5.6-luna", "0.20", "0.02", "0.25", "1.20"),
+        ] {
+            let (_, cost) = catalog
+                .estimate(model, None, 1_000_000, 1_000_000, 1_000_000, 1_000_000)
+                .expect("pricing");
+            assert_eq!(cost.fresh_input_usd, decimal(input));
+            assert_eq!(cost.cached_input_usd, decimal(cached_input));
+            assert_eq!(cost.cache_write_input_usd, decimal(cache_write_input));
+            assert_eq!(cost.output_usd, decimal(output));
+        }
+    }
+
+    #[test]
     fn override_adds_alias_and_provider_multiplier() {
         let temp = tempfile::tempdir().expect("temp");
         let path = temp.path().join("model-pricing.json");
@@ -414,6 +457,109 @@ mod tests {
         assert_eq!(pricing.model, "custom-model");
         assert_eq!(cost.total_usd(), decimal("4.5"));
         assert_eq!(catalog.override_path.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn override_accepts_json_numeric_prices_and_multipliers() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("model-pricing.json");
+        fs::write(
+            &path,
+            r#"{
+              "models": [{
+                "model": "numeric-model",
+                "inputPerMillion": 2,
+                "cachedInputPerMillion": 0,
+                "outputPerMillion": 3
+              }],
+              "providerMultipliers": {
+                "numeric-provider": 1.5
+              }
+            }"#,
+        )
+        .expect("pricing file");
+
+        let catalog = PricingCatalog::builtin()
+            .load_override(&path)
+            .expect("numeric override");
+        let (_, cost) = catalog
+            .estimate(
+                "numeric-model",
+                Some("numeric-provider"),
+                1_000_000,
+                0,
+                0,
+                1_000_000,
+            )
+            .expect("numeric pricing");
+
+        assert_eq!(cost.total_usd(), decimal("7.5"));
+    }
+
+    #[test]
+    fn override_accepts_scientific_json_numbers() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("model-pricing.json");
+        fs::write(
+            &path,
+            r#"{
+              "models": [{
+                "model": "scientific-model",
+                "inputPerMillion": 1e-6,
+                "cachedInputPerMillion": 0,
+                "outputPerMillion": 2e-6
+              }]
+            }"#,
+        )
+        .expect("pricing file");
+
+        let catalog = PricingCatalog::builtin()
+            .load_override(&path)
+            .expect("scientific override");
+        let (_, cost) = catalog
+            .estimate("scientific-model", None, 1_000_000, 0, 0, 1_000_000)
+            .expect("scientific pricing");
+
+        assert_eq!(cost.total_usd(), decimal("0.000003"));
+    }
+
+    #[test]
+    fn override_replaces_builtin_model_price() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("model-pricing.json");
+        fs::write(
+            &path,
+            r#"{
+              "models": [{
+                "model": "gpt-5.6-terra",
+                "inputPerMillion": "9",
+                "cachedInputPerMillion": "0.9",
+                "cacheWriteInputPerMillion": "1.1",
+                "outputPerMillion": "18"
+              }]
+            }"#,
+        )
+        .expect("pricing file");
+
+        let catalog = PricingCatalog::builtin()
+            .load_override(&path)
+            .expect("override");
+        let (pricing, cost) = catalog
+            .estimate(
+                "openai/gpt-5.6-terra-2026-08-09@high",
+                None,
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                1_000_000,
+            )
+            .expect("overridden pricing");
+
+        assert_eq!(pricing.model, "gpt-5.6-terra");
+        assert_eq!(cost.fresh_input_usd, decimal("9"));
+        assert_eq!(cost.cached_input_usd, decimal("0.9"));
+        assert_eq!(cost.cache_write_input_usd, decimal("1.1"));
+        assert_eq!(cost.output_usd, decimal("18"));
     }
 
     #[test]

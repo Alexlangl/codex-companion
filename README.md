@@ -341,7 +341,7 @@ codex-companion-tui
 }
 ```
 
-价格单位为每百万 Token 的美元估算值。未匹配价格的模型会显示为“未定价”，不会静默当作 `$0`。
+价格单位为每百万 Token 的美元估算值。价格和倍率可写为 JSON 数字或十进制字符串；字符串更适合需要精确保留小数位的配置。`models` 中的 `model` 如果与内置模型相同，就会覆盖该模型的内置价格；因此也可以手动修正 OpenAI 降价或中转站实际价格。`cacheWriteInputPerMillion` 可省略，省略时按普通输入价格计算。修改文件后重新刷新或重建用量统计即可生效。未匹配价格的模型会显示为“未定价”，不会静默当作 `$0`。内置 OpenAI 价格快照截至 `2026-08-09`，来源为 [官方 API 定价表](https://developers.openai.com/api/docs/pricing)。
 
 </details>
 

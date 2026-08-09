@@ -2,7 +2,9 @@ use crate::types::{ProviderExportFormat, ProviderExportOutput};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{SecondsFormat, TimeZone, Utc};
 use codex_companion_core::{
-    CompanionError, ConfigStore, ProviderAccountInfo, ProviderConfig, ProviderKind, Result,
+    official_access_token_from_auth_json, official_auth_mode_from_account,
+    official_auth_mode_from_auth_json, provider_relay_auth_ref, CompanionError, ConfigStore,
+    OfficialAuthMode, ProviderAccountInfo, ProviderConfig, ProviderKind, Result,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -63,22 +65,20 @@ fn export_official_provider(
     provider: &ProviderConfig,
     format: ProviderExportFormat,
 ) -> Result<Value> {
-    let auth = read_auth_value(provider.auth_ref.as_deref())?;
+    let auth = read_auth_value(provider_relay_auth_ref(provider))?;
     if is_agent_identity_auth(&auth) {
         return export_agent_identity_provider(provider, &auth, format);
     }
-    let access_token = pick_json_string(
-        &auth,
-        &[
-            &["tokens", "access_token"],
-            &["credentials", "access_token"],
-            &["access_token"],
-            &["token"],
-        ],
-    )
-    .ok_or_else(|| {
-        CompanionError::InvalidConfig("官方账号缺少 access_token，无法导出".to_string())
-    })?;
+    let auth_mode = exported_official_auth_mode(provider, &auth);
+    let fallback_mode = Some(if auth_mode == "pat" {
+        OfficialAuthMode::Pat
+    } else {
+        OfficialAuthMode::OAuth
+    });
+    let access_token =
+        official_access_token_from_auth_json(&auth, fallback_mode).ok_or_else(|| {
+            CompanionError::InvalidConfig("官方账号缺少 access_token，无法导出".to_string())
+        })?;
     let id_token = pick_json_string(
         &auth,
         &[
@@ -96,34 +96,47 @@ fn export_official_provider(
         ],
     );
     let account = provider.account.as_ref();
-    let account_id = account
-        .and_then(|info| info.account_id.clone())
-        .or_else(|| {
-            pick_json_string(
-                &auth,
-                &[
-                    &["tokens", "chatgpt_account_id"],
-                    &["tokens", "account_id"],
-                    &["credentials", "chatgpt_account_id"],
-                    &["credentials", "account_id"],
-                    &["chatgpt_account_id"],
-                    &["account_id"],
-                ],
-            )
-        })
-        .unwrap_or_default();
-    let email = account_email_or_name(account, provider);
-    let expired = pick_json_string(
+    // The auth file is refreshed in place while provider metadata is a
+    // snapshot captured at import time. Prefer the former so exports never
+    // revive a stale workspace id after an OAuth token rotation.
+    let account_id = pick_json_string(
         &auth,
         &[
-            &["tokens", "expired"],
-            &["expired"],
-            &["credentials", "expires_at"],
-            &["expires_at"],
+            &["tokens", "chatgpt_account_id"],
+            &["tokens", "account_id"],
+            &["credentials", "chatgpt_account_id"],
+            &["credentials", "account_id"],
+            &["chatgpt_account_id"],
+            &["account_id"],
         ],
     )
-    .or_else(|| jwt_expiry_iso(&access_token))
+    .or_else(|| account.and_then(|info| info.account_id.clone()))
     .unwrap_or_default();
+    let email = account_email_or_name(account, provider);
+    let expires_at = pick_json_value(
+        &auth,
+        &[
+            &["tokens", "expires_at"],
+            &["tokens", "expiresAt"],
+            &["credentials", "expires_at"],
+            &["credentials", "expiresAt"],
+            &["expires_at"],
+            &["expiresAt"],
+        ],
+    )
+    .or_else(|| {
+        pick_json_value(
+            &auth,
+            &[
+                &["tokens", "expired"],
+                &["expired"],
+                &["credentials", "expired"],
+            ],
+        )
+        .filter(|value| !value.is_boolean())
+    })
+    .or_else(|| jwt_expiry_iso(&access_token).map(Value::String))
+    .unwrap_or_else(|| Value::String(String::new()));
     let last_refresh = pick_json_string(
         &auth,
         &[
@@ -134,13 +147,32 @@ fn export_official_provider(
     )
     .or_else(|| account.and_then(|info| info.last_refresh_at.clone()))
     .unwrap_or_else(now_iso);
+    let (id_token, refresh_token, expires_at, last_refresh) = if auth_mode == "pat" {
+        // Never export stale OAuth lifecycle data alongside a personal access
+        // token. It is both misleading and can make a later importer classify
+        // the PAT as a refreshable OAuth account.
+        (None, None, Value::Null, String::new())
+    } else {
+        (id_token, refresh_token, expires_at, last_refresh)
+    };
 
     match format {
         ProviderExportFormat::Sub2api => {
             let mut credentials = Map::new();
+            credentials.insert(
+                "auth_mode".to_string(),
+                Value::String(auth_mode.to_string()),
+            );
+            let personal_access_token = (auth_mode == "pat").then(|| access_token.clone());
             credentials.insert("access_token".to_string(), Value::String(access_token));
-            if !expired.is_empty() {
-                credentials.insert("expires_at".to_string(), Value::String(expired));
+            if let Some(personal_access_token) = personal_access_token {
+                credentials.insert(
+                    "personal_access_token".to_string(),
+                    Value::String(personal_access_token),
+                );
+            }
+            if !is_empty_export_value(&expires_at) {
+                credentials.insert("expires_at".to_string(), expires_at.clone());
             }
             insert_optional(&mut credentials, "refresh_token", refresh_token);
             insert_optional(&mut credentials, "id_token", id_token);
@@ -194,7 +226,7 @@ fn export_official_provider(
                 "accounts": [{
                     "name": provider.account.as_ref().and_then(|info| info.display_name.clone()).unwrap_or_else(|| provider.name.clone()),
                     "platform": "openai",
-                    "type": "oauth",
+                    "type": if auth_mode == "pat" { "pat" } else { "oauth" },
                     "credentials": Value::Object(credentials),
                     "concurrency": 0,
                     "priority": 0
@@ -204,34 +236,40 @@ fn export_official_provider(
             }))
         }
         ProviderExportFormat::CodexCompanion => Ok(Value::Array(vec![portable_token_storage(
-            provider,
             access_token,
             id_token,
             refresh_token,
             account_id,
             last_refresh,
             email,
-            expired,
+            expires_at,
+            auth_mode,
         )])),
         ProviderExportFormat::Cpa => Ok(portable_token_storage(
-            provider,
             access_token,
             id_token,
             refresh_token,
             account_id,
             last_refresh,
             email,
-            expired,
+            expires_at,
+            auth_mode,
         )),
     }
 }
 
 fn is_agent_identity_auth(auth: &Value) -> bool {
-    pick_json_string(
-        auth,
-        &[&["auth_mode"], &["authMode"], &["openai_auth_mode"]],
-    )
-    .is_some_and(|mode| mode.eq_ignore_ascii_case("agentIdentity"))
+    official_auth_mode_from_auth_json(auth) == Some(OfficialAuthMode::AgentIdentity)
+}
+
+fn exported_official_auth_mode(provider: &ProviderConfig, auth: &Value) -> &'static str {
+    match official_auth_mode_from_auth_json(auth)
+        .or_else(|| official_auth_mode_from_account(provider))
+    {
+        Some(OfficialAuthMode::Pat) => "pat",
+        Some(OfficialAuthMode::AgentIdentity) => "agentIdentity",
+        Some(OfficialAuthMode::OAuth) | None => "oauth",
+    }
 }
 
 fn export_agent_identity_provider(
@@ -308,35 +346,47 @@ fn export_agent_identity_provider(
 
 #[allow(clippy::too_many_arguments)]
 fn portable_token_storage(
-    _provider: &ProviderConfig,
     access_token: String,
     id_token: Option<String>,
     refresh_token: Option<String>,
     account_id: String,
     last_refresh: String,
     email: String,
-    expired: String,
+    expires_at: Value,
+    auth_mode: &str,
 ) -> Value {
-    json!({
-        "id_token": id_token.unwrap_or_default(),
-        "access_token": access_token,
-        "refresh_token": refresh_token.unwrap_or_default(),
-        "account_id": account_id,
-        "last_refresh": last_refresh,
-        "email": email,
-        "type": "codex",
-        "expired": expired
-    })
+    let mut storage = Map::new();
+    storage.insert(
+        "auth_mode".to_string(),
+        Value::String(auth_mode.to_string()),
+    );
+    storage.insert(
+        "access_token".to_string(),
+        Value::String(access_token.clone()),
+    );
+    storage.insert("account_id".to_string(), Value::String(account_id));
+    storage.insert("email".to_string(), Value::String(email));
+    storage.insert("type".to_string(), Value::String("codex".to_string()));
+    if auth_mode == "pat" {
+        storage.insert(
+            "personal_access_token".to_string(),
+            Value::String(access_token),
+        );
+    } else {
+        insert_optional(&mut storage, "id_token", id_token);
+        insert_optional(&mut storage, "refresh_token", refresh_token);
+        insert_optional(&mut storage, "last_refresh", Some(last_refresh));
+        if !is_empty_export_value(&expires_at) {
+            storage.insert("expired".to_string(), expires_at);
+        }
+    }
+    Value::Object(storage)
 }
 
 fn resolve_api_key(provider: &ProviderConfig) -> Result<String> {
-    let auth_ref = provider
-        .auth_ref
-        .as_deref()
-        .or(provider.direct_auth_ref.as_deref())
-        .ok_or_else(|| {
-            CompanionError::InvalidConfig("API Key provider 缺少 auth_ref".to_string())
-        })?;
+    let auth_ref = provider_relay_auth_ref(provider).ok_or_else(|| {
+        CompanionError::InvalidConfig("API Key provider 缺少 auth_ref".to_string())
+    })?;
     if let Some(name) = auth_ref.strip_prefix("env:") {
         return std::env::var(name).map_err(|_| {
             CompanionError::InvalidConfig(format!(
@@ -416,6 +466,30 @@ fn pick_json_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
         }
     }
     None
+}
+
+fn pick_json_value(value: &Value, paths: &[&[&str]]) -> Option<Value> {
+    for path in paths {
+        let mut cursor = value;
+        let mut found = true;
+        for key in *path {
+            match cursor.get(*key) {
+                Some(next) => cursor = next,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found && !cursor.is_null() {
+            return Some(cursor.clone());
+        }
+    }
+    None
+}
+
+fn is_empty_export_value(value: &Value) -> bool {
+    value.is_null() || value.as_str().is_some_and(str::is_empty)
 }
 
 fn jwt_expiry_iso(token: &str) -> Option<String> {
@@ -552,7 +626,7 @@ mod tests {
                 format!("file:{}", auth_path.display()),
                 Some(ProviderAccountInfo {
                     email: Some("codex@example.com".to_string()),
-                    account_id: Some("acc-1".to_string()),
+                    account_id: Some("stale-acc".to_string()),
                     subscription_type: Some("TEAM".to_string()),
                     ..ProviderAccountInfo::default()
                 }),
@@ -595,6 +669,170 @@ mod tests {
         assert_eq!(
             sub2api_value["accounts"][0]["credentials"]["plan_type"],
             "TEAM"
+        );
+    }
+
+    #[test]
+    fn exports_personal_access_token_as_a_pat_and_round_trips_its_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let auth_path = temp.path().join("pat.json");
+        fs::write(
+            &auth_path,
+            r#"{"auth_mode":"pat","tokens":{"access_token":"at-personal-token","chatgpt_account_id":"workspace-1"}}"#,
+        )
+        .expect("auth");
+        add_provider(
+            &store,
+            provider(
+                "personal-token-provider",
+                ProviderKind::OfficialCodex,
+                format!("file:{}", auth_path.display()),
+                Some(ProviderAccountInfo {
+                    auth_mode: Some("pat".to_string()),
+                    account_id: Some("workspace-1".to_string()),
+                    ..ProviderAccountInfo::default()
+                }),
+            ),
+        )
+        .expect("add");
+
+        let exported = export_provider_json(
+            &store,
+            "personal-token-provider",
+            Some(ProviderExportFormat::Sub2api),
+        )
+        .expect("export");
+        let value = serde_json::from_str::<Value>(&exported.json_content).expect("export json");
+
+        assert_eq!(value["accounts"][0]["type"], "pat");
+        assert_eq!(value["accounts"][0]["credentials"]["auth_mode"], "pat");
+        assert_eq!(
+            value["accounts"][0]["credentials"]["personal_access_token"],
+            "at-personal-token"
+        );
+
+        let imported_store = ConfigStore::new(temp.path().join("imported.json"));
+        let outcome =
+            crate::import_provider_json(&imported_store, &exported.json_content, None, None)
+                .expect("re-import");
+        assert_eq!(
+            outcome
+                .provider
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("pat")
+        );
+    }
+
+    #[test]
+    fn pat_exports_omit_stale_oauth_lifecycle_fields_in_every_format() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let auth_path = temp.path().join("pat.json");
+        fs::write(
+            &auth_path,
+            r#"{
+                "auth_mode":"pat",
+                "access_token":"stale-oauth-access",
+                "personal_access_token":"at-personal-token",
+                "id_token":"stale-id-token",
+                "session_token":"stale-session-token",
+                "refresh_token":"stale-refresh-token",
+                "expires_at":1900000000,
+                "expired":true,
+                "last_refresh":"2026-08-01T00:00:00Z"
+            }"#,
+        )
+        .expect("auth");
+        add_provider(
+            &store,
+            provider(
+                "personal-token-provider",
+                ProviderKind::OfficialCodex,
+                format!("file:{}", auth_path.display()),
+                Some(ProviderAccountInfo {
+                    auth_mode: Some("pat".to_string()),
+                    ..ProviderAccountInfo::default()
+                }),
+            ),
+        )
+        .expect("add");
+
+        for format in [
+            ProviderExportFormat::CodexCompanion,
+            ProviderExportFormat::Cpa,
+            ProviderExportFormat::Sub2api,
+        ] {
+            let exported = export_provider_json(&store, "personal-token-provider", Some(format))
+                .expect("export");
+            let value = serde_json::from_str::<Value>(&exported.json_content).expect("export json");
+            let credentials = match format {
+                ProviderExportFormat::CodexCompanion => &value[0],
+                ProviderExportFormat::Cpa => &value,
+                ProviderExportFormat::Sub2api => &value["accounts"][0]["credentials"],
+            };
+
+            assert_eq!(credentials["auth_mode"], "pat");
+            assert_eq!(credentials["personal_access_token"], "at-personal-token");
+            for field in [
+                "id_token",
+                "session_token",
+                "refresh_token",
+                "expires_at",
+                "expired",
+                "last_refresh",
+            ] {
+                assert!(
+                    credentials.get(field).is_none(),
+                    "PAT {format:?} export should not include {field}: {credentials}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exports_explicit_pat_in_preference_to_a_stale_access_token() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let auth_path = temp.path().join("pat.json");
+        fs::write(
+            &auth_path,
+            r#"{
+                "codex_companion_auth_mode":"pat",
+                "tokens":{
+                    "access_token":"stale-access-token",
+                    "personal_access_token":"at-personal-token"
+                }
+            }"#,
+        )
+        .expect("auth");
+        add_provider(
+            &store,
+            provider(
+                "personal-token-provider",
+                ProviderKind::OfficialCodex,
+                format!("file:{}", auth_path.display()),
+                Some(ProviderAccountInfo {
+                    auth_mode: Some("pat".to_string()),
+                    ..ProviderAccountInfo::default()
+                }),
+            ),
+        )
+        .expect("add");
+
+        let exported = export_provider_json(
+            &store,
+            "personal-token-provider",
+            Some(ProviderExportFormat::Sub2api),
+        )
+        .expect("export");
+        let value = serde_json::from_str::<Value>(&exported.json_content).expect("export json");
+
+        assert_eq!(
+            value["accounts"][0]["credentials"]["personal_access_token"],
+            "at-personal-token"
         );
     }
 }

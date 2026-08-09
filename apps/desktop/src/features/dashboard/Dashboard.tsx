@@ -89,6 +89,7 @@ export function Dashboard({
                 healthStatus={status.config.health[provider.id]?.status}
                 index={index}
                 key={provider.id}
+                directConnectionAvailable={status.directConnectProviderIds?.includes(provider.id)}
                 provider={provider}
               />
             ))}
@@ -120,11 +121,13 @@ function launchReadinessLabel(isConnected: boolean, canLaunch: boolean): string 
 
 function DashboardProviderCard({
   compact,
+  directConnectionAvailable,
   healthStatus,
   index,
   provider,
 }: {
   compact: boolean;
+  directConnectionAvailable?: boolean;
   healthStatus?: string;
   index: number;
   provider: ProviderConfig;
@@ -135,6 +138,7 @@ function DashboardProviderCard({
   const showPlanBadge = provider.kind === "official_codex" && Boolean(provider.account?.subscriptionType);
   const accountSubtitle = providerAccountSubtitle(provider);
   const compactSubtitle = provider.kind === "official_codex" ? accountSubtitle : provider.name;
+  const runMode = providerRunMode(provider, directConnectionAvailable);
   if (compact) {
     return (
       <div className="dashboard-provider-mini dashboard-provider-simple">
@@ -159,7 +163,7 @@ function DashboardProviderCard({
       </div>
       <span>{accountSubtitle}</span>
       <div className="provider-mini-foot">
-        <Badge tone={providerRunMode(provider).includes("直连") ? "info" : "accent"}>{providerRunMode(provider)}</Badge>
+        <Badge tone={runMode.includes("直连") ? "info" : "accent"}>{runMode}</Badge>
         <Badge tone={providerHealthTone(healthStatus)}>{providerHealthLabel(healthStatus)}</Badge>
         {showQuota ? <Badge tone={quota.tone}>{`${quota.label} ${quota.percentLabel}`}</Badge> : null}
         <span>{subscriptionLabel(provider)}</span>

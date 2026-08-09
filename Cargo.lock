@@ -723,11 +723,13 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "codex-companion-core",
  "codex-companion-health",
  "crypto_box",
  "ed25519-dalek",
+ "futures-util",
  "reqwest 0.12.28",
  "rquickjs",
  "serde",

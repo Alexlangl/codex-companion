@@ -355,6 +355,8 @@ pub fn collect_token_usage(codex_dir: PathBuf) -> Result<TokenUsageSummary> {
         all_events.extend(parsed.events);
     }
     apply_inherited_pricing_models(&mut all_events, &replay_catalog);
+    let pricing_path = default_pricing_override_path(&codex_dir.join("cache"));
+    let catalog = PricingCatalog::builtin().load_override(&pricing_path)?;
     Ok(summarize_token_events(
         TokenUsageSummaryInput {
             codex_dir,
@@ -363,7 +365,7 @@ pub fn collect_token_usage(codex_dir: PathBuf) -> Result<TokenUsageSummary> {
             suspected_duplicates,
             events: all_events,
         },
-        &PricingCatalog::builtin(),
+        &catalog,
         &TokenUsageDateRange::default(),
         &TokenUsageFilters::default(),
     ))
@@ -2579,7 +2581,107 @@ mod tests {
         assert_eq!(summary.cached_input_tokens, 20);
         assert_eq!(summary.cache_write_input_tokens, 30);
         assert_eq!(summary.total_tokens, 110);
-        assert_eq!(summary.cost.cache_write_input_usd, "0.0000375");
+        assert_eq!(summary.cost.cache_write_input_usd, "0.0000075");
+    }
+
+    #[test]
+    fn cached_scan_applies_manual_pricing_override() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        let override_path = temp.path().join("model-pricing.json");
+        fs::write(
+            &override_path,
+            r#"{
+              "models": [{
+                "model": "gpt-5.6-terra",
+                "inputPerMillion": "9",
+                "cachedInputPerMillion": "0.9",
+                "cacheWriteInputPerMillion": "1.1",
+                "outputPerMillion": "18"
+              }]
+            }"#,
+        )
+        .expect("pricing file");
+        fs::write(
+            day.join("manual-pricing.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"manual-pricing"}}"#.to_string()
+                + "\n"
+                + r#"{"type":"turn_context","payload":{"model":"gpt-5.6-terra"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":10}}}}"#
+                + "\n",
+        )
+        .expect("session");
+
+        let summary =
+            collect_token_usage_cached(temp.path().to_path_buf(), temp.path().join("cache"))
+                .expect("summary");
+
+        assert_eq!(
+            summary.pricing_override_path.as_deref(),
+            Some(override_path.as_path())
+        );
+        assert_eq!(summary.priced_events, 1);
+        assert_eq!(summary.cost.fresh_input_usd, "0.00045");
+        assert_eq!(summary.cost.cached_input_usd, "0.000018");
+        assert_eq!(summary.cost.cache_write_input_usd, "0.000033");
+        assert_eq!(summary.cost.output_usd, "0.00018");
+        assert_eq!(summary.cost.total_usd, "0.000681");
+    }
+
+    #[test]
+    fn non_cached_scan_applies_manual_pricing_override() {
+        let temp = tempfile::tempdir().expect("temp");
+        let day = temp
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
+        fs::create_dir_all(&day).expect("mkdir");
+        let override_path = temp.path().join("model-pricing.json");
+        fs::write(
+            &override_path,
+            r#"{
+              "models": [{
+                "model": "gpt-5.6-terra",
+                "inputPerMillion": "9",
+                "cachedInputPerMillion": "0.9",
+                "cacheWriteInputPerMillion": "1.1",
+                "outputPerMillion": "18"
+              }]
+            }"#,
+        )
+        .expect("pricing file");
+        fs::write(
+            day.join("manual-pricing.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"manual-pricing"}}"#.to_string()
+                + "\n"
+                + r#"{"type":"turn_context","payload":{"model":"gpt-5.6-terra"}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-07-10T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":10}}}}"#
+                + "\n",
+        )
+        .expect("session");
+
+        let summary = collect_token_usage(temp.path().to_path_buf()).expect("summary");
+
+        assert_eq!(
+            summary.pricing_override_path.as_deref(),
+            Some(override_path.as_path())
+        );
+        assert_eq!(summary.priced_events, 1);
+        assert_eq!(summary.cost.fresh_input_usd, "0.00045");
+        assert_eq!(summary.cost.cached_input_usd, "0.000018");
+        assert_eq!(summary.cost.cache_write_input_usd, "0.000033");
+        assert_eq!(summary.cost.output_usd, "0.00018");
+        assert_eq!(summary.cost.total_usd, "0.000681");
     }
 
     #[test]

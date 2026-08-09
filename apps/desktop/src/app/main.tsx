@@ -28,7 +28,11 @@ import { Dashboard } from "../features/dashboard/Dashboard";
 import { Groups } from "../features/groups/Groups";
 import { Models } from "../features/models/Models";
 import { Providers } from "../features/providers/Providers";
-import { canDirectLaunch, directLaunchWritesAuthJson } from "../features/providers/provider-launch";
+import {
+  canDirectLaunch,
+  directLaunchWritesAuthJson,
+  resolveProviderLaunchMode,
+} from "../features/providers/provider-launch";
 import { Relay } from "../features/relay/Relay";
 import { Repair } from "../features/repair/Repair";
 import { Sessions } from "../features/sessions/Sessions";
@@ -207,8 +211,13 @@ function App() {
       await actions.launchProvider(id, mode);
       return;
     }
-    const resolvedMode = mode ?? status.config.app.providerLaunchModes[id] ?? "auto";
-    const willDirect = resolvedMode === "direct" || (resolvedMode === "auto" && canDirectLaunch(provider));
+    const resolvedMode = resolveProviderLaunchMode(
+      provider,
+      mode ?? status.config.app.providerLaunchModes[id],
+      status.directConnectProviderIds,
+    );
+    const canDirect = canDirectLaunch(provider, status.directConnectProviderIds);
+    const willDirect = canDirect && (resolvedMode === "direct" || resolvedMode === "auto");
     if (willDirect && directLaunchWritesAuthJson(provider, status.config.app.preserveOfficialCodexAuth)) {
       setPendingProviderLaunch({ mode: resolvedMode, provider });
       return;

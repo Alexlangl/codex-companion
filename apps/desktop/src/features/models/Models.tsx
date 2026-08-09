@@ -2,6 +2,7 @@ import {
   AlertTriangle,
   Check,
   Database,
+  KeyRound,
   Minus,
   RefreshCw,
   Search,
@@ -373,6 +374,8 @@ function sourceKindLabel(kind: ModelSourceKind) {
       return "models_cache.json";
     case "official_oauth":
       return "官方 OAuth";
+    case "official_pat":
+      return "官方 PAT";
     case "relay":
       return "/v1/models";
   }
@@ -384,6 +387,8 @@ function sourceIcon(kind: ModelSourceKind) {
       return <Database aria-hidden="true" size={15} />;
     case "official_oauth":
       return <ShieldCheck aria-hidden="true" size={15} />;
+    case "official_pat":
+      return <KeyRound aria-hidden="true" size={15} />;
     case "relay":
       return <Server aria-hidden="true" size={15} />;
   }

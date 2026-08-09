@@ -70,9 +70,19 @@ export function providerSecondaryLine(provider: ProviderConfig) {
     .join(" · ");
 }
 
-export function providerRunMode(provider: ProviderConfig) {
+export function providerRunMode(provider: ProviderConfig, directConnectionAvailable?: boolean) {
   if (providerEndpointIsChatCompletions(provider.baseUrl)) return "仅代理（Chat Completions）";
-  if (provider.kind === "official_codex") return "可直连";
+  if (provider.kind === "official_codex") {
+    const authMode = provider.account?.authMode?.trim().toLowerCase();
+    if (providerUsesAgentIdentity(provider)) return "仅代理（Agent Identity）";
+    if (isOfficialPatMode(authMode)) {
+      if (directConnectionAvailable === false) return "仅代理（PAT 凭据不可用）";
+      return "可直连（PAT）";
+    }
+    return "仅代理（OAuth 保活）";
+  }
+  if (directConnectionAvailable === false) return "可本地代理";
+  if (directConnectionAvailable === true) return "可直连";
   const directAuthRef = provider.directAuthRef?.trim();
   const authRef = provider.authRef?.trim();
   const directRef = directAuthRef || authRef;
@@ -86,7 +96,12 @@ export function providerTypeLabel(provider: ProviderConfig) {
 }
 
 export function providerUsesAgentIdentity(provider: ProviderConfig): boolean {
-  return provider.account?.authMode?.trim().toLowerCase() === "agentidentity";
+  const authMode = provider.account?.authMode?.trim().toLowerCase();
+  return authMode === "agentidentity" || authMode === "agent_identity";
+}
+
+function isOfficialPatMode(mode?: string): boolean {
+  return ["pat", "personal_access_token", "personalaccesstoken", "token", "apikey", "api_key"].includes(mode || "");
 }
 
 export function providerUsesWebSocket(provider: ProviderConfig): boolean {

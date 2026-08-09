@@ -6,14 +6,15 @@ use axum::{
 };
 use bytes::Bytes;
 use codex_companion_core::{
-    provider_base_url_is_endpoint, provider_endpoint_is_chat_completions, ConfigStore,
-    ProviderConfig, ProviderKind,
+    provider_base_url_is_endpoint, provider_endpoint_is_chat_completions, redact_sensitive_text,
+    ConfigStore, ProviderConfig, ProviderKind,
 };
-use codex_companion_health::{classify_failure, mark_failure};
+use codex_companion_health::{classify_failure, mark_failure, FailureClassification};
 use codex_companion_provider::{
-    ensure_agent_identity_authorization, ensure_codex_auth_snapshot,
-    is_agent_identity_task_invalid, provider_uses_agent_identity, redact_agent_identity_body,
-    resolve_auth_token,
+    ensure_agent_identity_authorization, ensure_codex_auth_snapshot_with_status_detailed,
+    is_agent_identity_task_invalid, provider_uses_agent_identity, provider_uses_codex_oauth,
+    redact_agent_identity_body, refresh_codex_auth_snapshot_after_unauthorized_detailed,
+    resolve_auth_token, CodexOAuthError,
 };
 use futures_util::{stream, Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
@@ -31,6 +32,26 @@ const STREAM_PREFLIGHT_MAX_DURATION: Duration = Duration::from_secs(120);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_STREAM_PREFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+// These protocol bridges must materialize the full upstream response before
+// returning anything to the client. Keep that exceptional path bounded while
+// leaving ordinary SSE and passthrough responses streaming.
+const MAX_BUFFERED_SUCCESS_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+// Chat Completions responses need to retain generated text and tool arguments
+// until their terminal Responses events can be emitted. Bound that retained
+// state separately from a single SSE frame.
+const MAX_CHAT_SSE_RETAINED_OUTPUT_BYTES: usize = MAX_BUFFERED_SUCCESS_RESPONSE_BYTES;
+// A single upstream transport chunk can contain many valid SSE frames. The
+// transformer emits several Responses events for some frames, so cap the
+// queued output as well when downstream backpressure prevents it from being
+// drained. The larger budget leaves room for terminal protocol events, which
+// repeat retained text and tool arguments by design.
+const MAX_CHAT_SSE_PENDING_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_CHAT_SSE_TOOL_CALLS: usize = 512;
+const MAX_UPSTREAM_ERROR_RESPONSE_BYTES: usize = 128 * 1024;
+const MAX_UPSTREAM_ERROR_MESSAGE_CHARS: usize = 512;
+const UPSTREAM_ERROR_RESPONSE_TRUNCATED: &[u8] = b"\n[upstream error response truncated]\n";
+const UPSTREAM_ERROR_RESPONSE_OMITTED: &[u8] =
+    b"[upstream error response omitted: exceeded 128 KiB limit]";
 
 pub(crate) struct UpstreamResponse {
     response: Option<reqwest::Response>,
@@ -39,6 +60,8 @@ pub(crate) struct UpstreamResponse {
     opaque_event_stream: bool,
     status: StatusCode,
     headers: HeaderMap,
+    oauth_refresh_error: Option<String>,
+    oauth_refresh_failure: Option<FailureClassification>,
     transform: ResponseTransform,
     tool_context: ChatToolContext,
     chat_messages: Vec<Value>,
@@ -77,23 +100,32 @@ impl UpstreamResponse {
         self.status
     }
 
+    pub(crate) fn oauth_refresh_error(&self) -> Option<&str> {
+        self.oauth_refresh_error.as_deref()
+    }
+
+    pub(crate) fn oauth_refresh_failure(&self) -> Option<&FailureClassification> {
+        self.oauth_refresh_failure.as_ref()
+    }
+
     pub(crate) async fn text(mut self) -> Result<String, String> {
         let mut bytes = Vec::new();
         while let Some(chunk) = self.prefetched_body.pop_front() {
-            bytes.extend_from_slice(&chunk);
+            if append_limited_error_response_chunk(&mut bytes, &chunk) {
+                return Ok(String::from_utf8_lossy(&bytes).into_owned());
+            }
         }
         if let Some(body) = self.buffered_body.take() {
-            bytes.extend_from_slice(&body);
+            append_limited_error_response_chunk(&mut bytes, &body);
             return Ok(String::from_utf8_lossy(&bytes).into_owned());
         }
-        let tail = self
+        let response = self
             .response
             .take()
-            .ok_or_else(|| "upstream response body is unavailable".to_string())?
-            .text()
+            .ok_or_else(|| "upstream response body is unavailable".to_string())?;
+        append_limited_error_response_body(response, &mut bytes)
             .await
             .map_err(|error| error.to_string())?;
-        bytes.extend_from_slice(tail.as_bytes());
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
@@ -245,6 +277,62 @@ impl UpstreamResponse {
         }
     }
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct UpstreamRequestError {
+    message: String,
+    failure: Option<FailureClassification>,
+}
+
+impl UpstreamRequestError {
+    fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            failure: None,
+        }
+    }
+
+    fn oauth(error: CodexOAuthError) -> Self {
+        let failure = error.failure_classification();
+        Self {
+            message: error.message,
+            failure: Some(failure),
+        }
+    }
+
+    fn upstream(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            failure: Some(classify_failure(
+                Some(StatusCode::BAD_GATEWAY.as_u16()),
+                &message,
+            )),
+            message,
+        }
+    }
+
+    pub(crate) fn message_text(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) fn failure(&self) -> Option<&FailureClassification> {
+        self.failure.as_ref()
+    }
+}
+
+impl From<String> for UpstreamRequestError {
+    fn from(message: String) -> Self {
+        Self::message(message)
+    }
+}
+
+impl fmt::Display for UpstreamRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+impl std::error::Error for UpstreamRequestError {}
 
 fn preflight_buffered_sse(
     body: &[u8],
@@ -533,7 +621,7 @@ pub(crate) async fn send_upstream(
     client: &reqwest::Client,
     api_service: &ApiServiceStore,
     request: UpstreamRequest<'_>,
-) -> std::result::Result<UpstreamResponse, String> {
+) -> std::result::Result<UpstreamResponse, UpstreamRequestError> {
     let UpstreamRequest {
         provider,
         method,
@@ -559,6 +647,7 @@ pub(crate) async fn send_upstream(
     };
     let mut authorization = None;
     let mut agent_identity_task_id = None;
+    let mut official_oauth = false;
     let mut chatgpt_account_id = None;
     if provider.kind == ProviderKind::OfficialCodex {
         chatgpt_account_id = provider
@@ -572,12 +661,15 @@ pub(crate) async fn send_upstream(
                 .map_err(|error| error.to_string())?;
             agent_identity_task_id = Some(auth.task_id);
             authorization = Some(auth.header);
-        } else {
-            let auth = ensure_codex_auth_snapshot(provider)
+        } else if provider_uses_codex_oauth(provider) {
+            official_oauth = true;
+            let (auth, _) = ensure_codex_auth_snapshot_with_status_detailed(provider)
                 .await
-                .map_err(|error| error.to_string())?;
-            chatgpt_account_id = chatgpt_account_id.or(auth.account_id);
+                .map_err(UpstreamRequestError::oauth)?;
+            chatgpt_account_id = auth.account_id.or(chatgpt_account_id);
             authorization = Some(format!("Bearer {}", auth.access_token));
+        } else {
+            authorization = resolve_auth_token(provider).map(|token| format!("Bearer {token}"));
         }
     } else if let Some(token) = resolve_auth_token(provider) {
         authorization = Some(format!("Bearer {token}"));
@@ -626,10 +718,7 @@ pub(crate) async fn send_upstream(
             .expect("agent identity task checked above");
         let status = response.status();
         let response_headers = response.headers().clone();
-        let error_body = response
-            .bytes()
-            .await
-            .map_err(|error| format!("读取 Agent Identity 失败响应失败: {error}"))?;
+        let error_body = read_auth_error_response_body(response, "Agent Identity").await?;
         let error_text = String::from_utf8_lossy(&error_body).into_owned();
         if is_agent_identity_task_invalid(status, &error_text) {
             let auth = ensure_agent_identity_authorization(client, provider, Some(task_id))
@@ -661,6 +750,82 @@ pub(crate) async fn send_upstream(
                 opaque_event_stream: false,
                 status,
                 headers: response_headers,
+                oauth_refresh_error: None,
+                oauth_refresh_failure: None,
+                transform,
+                tool_context,
+                chat_messages,
+            });
+        }
+    }
+    if official_oauth && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let failed_access_token = authorization
+            .as_deref()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if let Some(failed_access_token) = failed_access_token {
+            match refresh_codex_auth_snapshot_after_unauthorized_detailed(
+                provider,
+                failed_access_token,
+            )
+            .await
+            {
+                Ok(auth) => {
+                    chatgpt_account_id = auth.account_id.or(chatgpt_account_id);
+                    authorization = Some(format!("Bearer {}", auth.access_token));
+                    drop(response);
+                    response = build_upstream_request(
+                        client,
+                        &reqwest_method,
+                        &upstream,
+                        headers,
+                        UpstreamRequestHeaders {
+                            official_codex: true,
+                            authorization: authorization.as_deref(),
+                            chatgpt_account_id: chatgpt_account_id.as_deref(),
+                            session_identity: session_identity.as_deref(),
+                        },
+                    )
+                    .body(body.clone())
+                    .send()
+                    .await
+                    .map_err(|error| format_upstream_request_error(&error, &upstream))?;
+                }
+                Err(refresh_error) => {
+                    let refresh_failure = refresh_error.failure_classification();
+                    let error_body = read_auth_error_response_body(response, "官方 OAuth").await?;
+                    return Ok(UpstreamResponse {
+                        response: None,
+                        buffered_body: Some(error_body),
+                        prefetched_body: VecDeque::new(),
+                        opaque_event_stream: false,
+                        status,
+                        headers: response_headers,
+                        oauth_refresh_error: Some(format!(
+                            "官方 OAuth 401 后刷新失败: {refresh_error}"
+                        )),
+                        oauth_refresh_failure: Some(refresh_failure),
+                        transform,
+                        tool_context,
+                        chat_messages,
+                    });
+                }
+            }
+        } else {
+            let error_body = read_auth_error_response_body(response, "官方 OAuth").await?;
+            return Ok(UpstreamResponse {
+                response: None,
+                buffered_body: Some(error_body),
+                prefetched_body: VecDeque::new(),
+                opaque_event_stream: false,
+                status,
+                headers: response_headers,
+                oauth_refresh_error: None,
+                oauth_refresh_failure: None,
                 transform,
                 tool_context,
                 chat_messages,
@@ -676,10 +841,7 @@ pub(crate) async fn send_upstream(
             .is_some_and(|value| is_responses_generation_url(value.as_str()))
         && !is_event_stream(&headers);
     let (response, buffered_body) = if inspect_body {
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| format!("读取上游成功响应失败: {error}"))?;
+        let body = read_limited_success_response_body(response).await?;
         validate_successful_responses_body(transform, &body)?;
         (None, Some(body))
     } else {
@@ -692,10 +854,155 @@ pub(crate) async fn send_upstream(
         opaque_event_stream: false,
         status,
         headers,
+        oauth_refresh_error: None,
+        oauth_refresh_failure: None,
         transform,
         tool_context,
         chat_messages,
     })
+}
+
+async fn read_auth_error_response_body(
+    response: reqwest::Response,
+    credential_kind: &str,
+) -> std::result::Result<Bytes, UpstreamRequestError> {
+    let mut body = Vec::new();
+    append_limited_error_response_body(response, &mut body)
+        .await
+        .map_err(|error| {
+            UpstreamRequestError::message(format!("读取 {credential_kind} 失败响应失败: {error}"))
+        })?;
+    Ok(Bytes::from(body))
+}
+
+async fn read_limited_success_response_body(
+    response: reqwest::Response,
+) -> std::result::Result<Bytes, UpstreamRequestError> {
+    read_limited_success_response_body_with_limit(response, MAX_BUFFERED_SUCCESS_RESPONSE_BYTES)
+        .await
+}
+
+async fn read_limited_success_response_body_with_limit(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> std::result::Result<Bytes, UpstreamRequestError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(UpstreamRequestError::upstream(
+            success_response_too_large_message(max_bytes),
+        ));
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(max_bytes as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| UpstreamRequestError::message(format!("读取上游成功响应失败: {error}")))?
+    {
+        append_limited_success_response_chunk_with_limit(&mut body, &chunk, max_bytes)
+            .map_err(UpstreamRequestError::upstream)?;
+    }
+    Ok(Bytes::from(body))
+}
+
+fn append_limited_success_response_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
+    append_limited_success_response_chunk_with_limit(
+        body,
+        chunk,
+        MAX_BUFFERED_SUCCESS_RESPONSE_BYTES,
+    )
+}
+
+fn append_limited_success_response_chunk_with_limit(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), String> {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return Err(success_response_too_large_message(max_bytes));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn success_response_too_large_message(max_bytes: usize) -> String {
+    format!(
+        "上游成功响应超过 {} 本地缓冲上限",
+        display_byte_limit(max_bytes)
+    )
+}
+
+fn display_byte_limit(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = 1024 * KIB;
+
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        return format!("{} MiB", bytes / MIB);
+    }
+    if bytes >= KIB && bytes.is_multiple_of(KIB) {
+        return format!("{} KiB", bytes / KIB);
+    }
+    format!("{bytes} 字节")
+}
+
+/// Appends an upstream error response without allowing a misbehaving server to
+/// make local error reporting allocate an unbounded body. The caller owns any
+/// already-buffered prefix so the same limit also covers prefetched data.
+async fn append_limited_error_response_body(
+    mut response: reqwest::Response,
+    body: &mut Vec<u8>,
+) -> std::result::Result<(), reqwest::Error> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_UPSTREAM_ERROR_RESPONSE_BYTES as u64)
+    {
+        append_omitted_error_response_marker(body);
+        return Ok(());
+    }
+
+    while let Some(chunk) = response.chunk().await? {
+        if append_limited_error_response_chunk(body, &chunk) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn append_limited_error_response_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let content_limit =
+        MAX_UPSTREAM_ERROR_RESPONSE_BYTES.saturating_sub(UPSTREAM_ERROR_RESPONSE_TRUNCATED.len());
+    let remaining = content_limit.saturating_sub(body.len());
+    let chunk_prefix_len = remaining.min(chunk.len());
+    body.extend_from_slice(&chunk[..chunk_prefix_len]);
+    if chunk_prefix_len == chunk.len() {
+        return false;
+    }
+
+    append_truncated_error_response_marker(body);
+    true
+}
+
+fn append_truncated_error_response_marker(body: &mut Vec<u8>) {
+    let content_limit =
+        MAX_UPSTREAM_ERROR_RESPONSE_BYTES.saturating_sub(UPSTREAM_ERROR_RESPONSE_TRUNCATED.len());
+    body.truncate(content_limit);
+    if !body.ends_with(UPSTREAM_ERROR_RESPONSE_TRUNCATED) {
+        body.extend_from_slice(UPSTREAM_ERROR_RESPONSE_TRUNCATED);
+    }
+}
+
+fn append_omitted_error_response_marker(body: &mut Vec<u8>) {
+    if body.is_empty() {
+        body.extend_from_slice(UPSTREAM_ERROR_RESPONSE_OMITTED);
+        return;
+    }
+    append_truncated_error_response_marker(body);
 }
 
 fn format_upstream_request_error(error: &reqwest::Error, upstream: &str) -> String {
@@ -733,6 +1040,11 @@ fn build_upstream_request(
             *name,
             header::HOST | header::AUTHORIZATION | header::CONTENT_LENGTH | header::ACCEPT_ENCODING
         ) || name.as_str() == "x-api-key"
+            || (official_codex
+                && matches!(
+                    name.as_str(),
+                    "chatgpt-account-id" | "originator" | "version"
+                ))
         {
             continue;
         }
@@ -1083,6 +1395,8 @@ pub(crate) async fn stream_response(
         opaque_event_stream,
         status,
         headers,
+        oauth_refresh_error: _,
+        oauth_refresh_failure: _,
         transform,
         tool_context,
         chat_messages,
@@ -1221,7 +1535,8 @@ async fn collect_response_bytes(
     let mut bytes = Vec::new();
     let mut stream = response_byte_stream(response, buffered_body, prefetched_body);
     while let Some(chunk) = stream.next().await {
-        bytes.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        append_limited_success_response_chunk(&mut bytes, &chunk)?;
     }
     Ok(Bytes::from(bytes))
 }
@@ -1685,7 +2000,7 @@ pub(crate) fn semantic_failure_message(value: &Value) -> Option<String> {
 }
 
 fn compact_json_error(value: &Value) -> String {
-    value
+    let message = value
         .get("message")
         .and_then(Value::as_str)
         .or_else(|| value.pointer("/error/message").and_then(Value::as_str))
@@ -1695,7 +2010,11 @@ fn compact_json_error(value: &Value) -> String {
                 .and_then(Value::as_str)
         })
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| value.to_string())
+        .unwrap_or_else(|| value.to_string());
+    redact_sensitive_text(&message)
+        .chars()
+        .take(MAX_UPSTREAM_ERROR_MESSAGE_CHARS)
+        .collect()
 }
 
 fn response_transform(provider: &ProviderConfig, method: &Method, uri: &Uri) -> ResponseTransform {
@@ -3303,7 +3622,7 @@ fn chat_sse_to_responses_stream(
         (state, upstream),
         |(mut state, mut upstream)| async move {
             loop {
-                if let Some(bytes) = state.pending.pop_front() {
+                if let Some(bytes) = state.take_pending() {
                     return Some((Ok(bytes), (state, upstream)));
                 }
                 if state.stop_upstream {
@@ -3315,14 +3634,14 @@ fn chat_sse_to_responses_stream(
                     }
                     Some(Err(error)) => {
                         state.fail_incomplete_with_message(&format!("上游流读取失败: {error}"));
-                        if let Some(bytes) = state.pending.pop_front() {
+                        if let Some(bytes) = state.take_pending() {
                             return Some((Ok(bytes), (state, upstream)));
                         }
                         return None;
                     }
                     None => {
                         state.finish_stream();
-                        if let Some(bytes) = state.pending.pop_front() {
+                        if let Some(bytes) = state.take_pending() {
                             return Some((Ok(bytes), (state, upstream)));
                         }
                         return None;
@@ -3337,7 +3656,12 @@ fn chat_sse_to_responses_stream(
 struct ChatSseTransformState {
     buffer: Vec<u8>,
     pending: VecDeque<Bytes>,
+    pending_bytes: usize,
     max_frame_bytes: usize,
+    max_pending_bytes: usize,
+    max_retained_output_bytes: usize,
+    retained_output_bytes: usize,
+    pending_overflowed: bool,
     stop_upstream: bool,
     response_id: String,
     model: String,
@@ -3376,7 +3700,12 @@ impl ChatSseTransformState {
         Self {
             buffer: Vec::new(),
             pending: VecDeque::new(),
+            pending_bytes: 0,
             max_frame_bytes: MAX_SSE_FRAME_BYTES,
+            max_pending_bytes: MAX_CHAT_SSE_PENDING_OUTPUT_BYTES,
+            max_retained_output_bytes: MAX_CHAT_SSE_RETAINED_OUTPUT_BYTES,
+            retained_output_bytes: 0,
+            pending_overflowed: false,
             stop_upstream: false,
             response_id: "resp_codex_companion".to_string(),
             model: String::new(),
@@ -3397,6 +3726,18 @@ impl ChatSseTransformState {
     #[cfg(test)]
     fn with_frame_limit(mut self, max_frame_bytes: usize) -> Self {
         self.max_frame_bytes = max_frame_bytes;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_retained_output_limit(mut self, max_retained_output_bytes: usize) -> Self {
+        self.max_retained_output_bytes = max_retained_output_bytes;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_pending_limit(mut self, max_pending_bytes: usize) -> Self {
+        self.max_pending_bytes = max_pending_bytes;
         self
     }
 
@@ -3440,6 +3781,9 @@ impl ChatSseTransformState {
     }
 
     fn process_block(&mut self, block: &str) {
+        if self.completed {
+            return;
+        }
         let data = block
             .split(['\r', '\n'])
             .filter_map(|line| {
@@ -3485,19 +3829,25 @@ impl ChatSseTransformState {
         if let Some(delta) = choice.and_then(|choice| choice.get("delta")) {
             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                 if !text.is_empty() {
-                    self.ensure_started();
+                    if !self.ensure_started() || !self.reserve_retained_output_bytes(text.len()) {
+                        return;
+                    }
                     self.text.push_str(text);
-                    self.emit(json!({
+                    if !self.emit(json!({
                         "type": "response.output_text.delta",
                         "output_index": 0,
                         "content_index": 0,
                         "delta": text
-                    }));
+                    })) {
+                        return;
+                    }
                 }
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for tool_call in tool_calls {
-                    self.append_tool_call_delta(tool_call);
+                    if !self.append_tool_call_delta(tool_call) {
+                        return;
+                    }
                 }
             }
         }
@@ -3534,8 +3884,18 @@ impl ChatSseTransformState {
         self.buffer.clear();
         self.stop_upstream = true;
         self.fail_incomplete_with_message(&format!(
-            "上游 SSE 单帧达到 {} MiB 本地转换上限",
-            self.max_frame_bytes / (1024 * 1024)
+            "上游 SSE 单帧达到 {} 本地转换上限",
+            display_byte_limit(self.max_frame_bytes)
+        ));
+    }
+
+    fn fail_retained_output_limit(&mut self) {
+        self.buffer.clear();
+        self.stop_upstream = true;
+        self.clear_retained_output();
+        self.fail_incomplete_with_message(&format!(
+            "上游 Chat Completions 输出达到 {} 本地转换上限",
+            display_byte_limit(self.max_retained_output_bytes)
         ));
     }
 
@@ -3543,17 +3903,21 @@ impl ChatSseTransformState {
         if self.completed {
             return;
         }
-        self.ensure_started();
+        if !self.ensure_started() {
+            return;
+        }
         self.completed = true;
         let mut response = self.response_object("failed");
         response["error"] = json!({
             "code": "upstream_stream_incomplete",
             "message": detail
         });
-        self.emit(json!({
+        if !self.emit(json!({
             "type": "response.failed",
             "response": response
-        }));
+        })) {
+            return;
+        }
         if let Some((store, api_service, request_id)) = self.observer.as_ref() {
             let message = format!("[{request_id}] upstream_stream_incomplete: {detail}");
             let failure = classify_failure(None, &message);
@@ -3569,32 +3933,102 @@ impl ChatSseTransformState {
         }
     }
 
-    fn append_tool_call_delta(&mut self, tool_call: &Value) {
+    fn append_tool_call_delta(&mut self, tool_call: &Value) -> bool {
         let index = tool_call
             .get("index")
             .and_then(Value::as_u64)
-            .unwrap_or(self.tools.len() as u64) as usize;
+            .and_then(|index| usize::try_from(index).ok())
+            .unwrap_or(self.tools.len());
+        let call_id = tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|call_id| !call_id.is_empty());
+        let function = tool_call.get("function");
+        let name = function
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty());
+        let arguments = function
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str);
+
+        if call_id.is_none() && name.is_none() && arguments.is_none() {
+            return true;
+        }
+        let existing = self.tools.get(&index);
+        if existing.is_none() && self.tools.len() >= MAX_CHAT_SSE_TOOL_CALLS {
+            self.fail_retained_output_limit();
+            return false;
+        }
+        let existing = existing.cloned().unwrap_or_default();
+        let next_call_id_len = call_id.map_or(existing.call_id.len(), str::len);
+        let next_name_len = name.map_or(existing.name.len(), str::len);
+        let Some(next_arguments_len) = existing
+            .arguments
+            .len()
+            .checked_add(arguments.map_or(0, str::len))
+        else {
+            self.fail_retained_output_limit();
+            return false;
+        };
+        let previous_bytes = existing
+            .call_id
+            .len()
+            .saturating_add(existing.name.len())
+            .saturating_add(existing.arguments.len());
+        let next_bytes = next_call_id_len
+            .saturating_add(next_name_len)
+            .saturating_add(next_arguments_len);
+        let Some(retained_output_bytes) = self
+            .retained_output_bytes
+            .saturating_sub(previous_bytes)
+            .checked_add(next_bytes)
+        else {
+            self.fail_retained_output_limit();
+            return false;
+        };
+        if retained_output_bytes > self.max_retained_output_bytes {
+            self.fail_retained_output_limit();
+            return false;
+        }
+
         let state = self.tools.entry(index).or_default();
-        if let Some(call_id) = tool_call.get("id").and_then(Value::as_str) {
-            if !call_id.is_empty() {
-                state.call_id = call_id.to_string();
-            }
+        if let Some(call_id) = call_id {
+            state.call_id = call_id.to_string();
         }
-        if let Some(function) = tool_call.get("function") {
-            if let Some(name) = function.get("name").and_then(Value::as_str) {
-                if !name.is_empty() {
-                    state.name = name.to_string();
-                }
-            }
-            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                state.arguments.push_str(arguments);
-            }
+        if let Some(name) = name {
+            state.name = name.to_string();
         }
+        if let Some(arguments) = arguments {
+            state.arguments.push_str(arguments);
+        }
+        self.retained_output_bytes = retained_output_bytes;
+        true
     }
 
-    fn ensure_started(&mut self) {
+    fn reserve_retained_output_bytes(&mut self, additional_bytes: usize) -> bool {
+        let Some(retained_output_bytes) = self.retained_output_bytes.checked_add(additional_bytes)
+        else {
+            self.fail_retained_output_limit();
+            return false;
+        };
+        if retained_output_bytes > self.max_retained_output_bytes {
+            self.fail_retained_output_limit();
+            return false;
+        }
+        self.retained_output_bytes = retained_output_bytes;
+        true
+    }
+
+    fn clear_retained_output(&mut self) {
+        self.text = String::new();
+        self.tools.clear();
+        self.retained_output_bytes = 0;
+    }
+
+    fn ensure_started(&mut self) -> bool {
         if self.started {
-            return;
+            return !self.completed;
         }
         if self.response_id == "resp_codex_companion" {
             self.response_id = stable_response_id(&json!({
@@ -3604,15 +4038,19 @@ impl ChatSseTransformState {
             }));
         }
         self.started = true;
-        self.emit(json!({
+        if !self.emit(json!({
             "type": "response.created",
             "response": self.response_object("in_progress")
-        }));
-        self.emit(json!({
+        })) {
+            return false;
+        }
+        if !self.emit(json!({
             "type": "response.output_item.added",
             "output_index": 0,
             "item": self.message_item(false)
-        }));
+        })) {
+            return false;
+        }
         self.emit(json!({
             "type": "response.content_part.added",
             "output_index": 0,
@@ -3622,22 +4060,25 @@ impl ChatSseTransformState {
                 "text": "",
                 "annotations": []
             }
-        }));
+        }))
     }
 
     fn finish(&mut self) {
         if self.completed {
             return;
         }
-        self.ensure_started();
-        self.completed = true;
-        self.emit(json!({
+        if !self.ensure_started() {
+            return;
+        }
+        if !self.emit(json!({
             "type": "response.output_text.done",
             "output_index": 0,
             "content_index": 0,
             "text": self.text
-        }));
-        self.emit(json!({
+        })) {
+            return;
+        }
+        if !self.emit(json!({
             "type": "response.content_part.done",
             "output_index": 0,
             "content_index": 0,
@@ -3646,18 +4087,28 @@ impl ChatSseTransformState {
                 "text": self.text,
                 "annotations": []
             }
-        }));
-        self.emit(json!({
+        })) {
+            return;
+        }
+        if !self.emit(json!({
             "type": "response.output_item.done",
             "output_index": 0,
             "item": self.message_item(true)
-        }));
-        self.emit_completed_tools();
-        self.store_history();
-        self.emit(json!({
+        })) {
+            return;
+        }
+        if !self.emit_completed_tools() {
+            return;
+        }
+        if !self.emit(json!({
             "type": "response.completed",
             "response": self.response_object("completed")
-        }));
+        })) {
+            return;
+        }
+        self.completed = true;
+        self.stop_upstream = true;
+        self.store_history();
         if let Some((_, api_service, request_id)) = self.observer.as_ref() {
             let _ = api_service.record_stream_outcome(request_id, "succeeded", None);
         }
@@ -3708,7 +4159,7 @@ impl ChatSseTransformState {
         );
     }
 
-    fn emit_completed_tools(&mut self) {
+    fn emit_completed_tools(&mut self) -> bool {
         let tools = self
             .tools
             .iter()
@@ -3729,11 +4180,13 @@ impl ChatSseTransformState {
                 "in_progress",
                 &self.tool_context,
             );
-            self.emit(json!({
+            if !self.emit(json!({
                 "type": "response.output_item.added",
                 "output_index": output_index,
                 "item": pending_item
-            }));
+            })) {
+                return false;
+            }
 
             let completed_item = response_tool_call_item(
                 &call_id,
@@ -3748,45 +4201,95 @@ impl ChatSseTransformState {
                 .is_some_and(|spec| spec.kind == ChatToolKind::Custom)
             {
                 let input = custom_tool_input(&state.arguments);
-                if !input.is_empty() {
-                    self.emit(json!({
+                if !input.is_empty()
+                    && !self.emit(json!({
                         "type": "response.custom_tool_call_input.delta",
                         "item_id": format!("ctc_{call_id}"),
                         "output_index": output_index,
                         "delta": input
-                    }));
+                    }))
+                {
+                    return false;
                 }
-                self.emit(json!({
+                if !self.emit(json!({
                     "type": "response.custom_tool_call_input.done",
                     "item_id": format!("ctc_{call_id}"),
                     "output_index": output_index,
                     "input": custom_tool_input(&state.arguments)
-                }));
+                })) {
+                    return false;
+                }
             } else {
-                self.emit(json!({
+                if !self.emit(json!({
                     "type": "response.function_call_arguments.delta",
                     "item_id": format!("fc_{call_id}"),
                     "output_index": output_index,
                     "delta": state.arguments
-                }));
-                self.emit(json!({
+                })) {
+                    return false;
+                }
+                if !self.emit(json!({
                     "type": "response.function_call_arguments.done",
                     "item_id": format!("fc_{call_id}"),
                     "output_index": output_index,
                     "arguments": state.arguments
-                }));
+                })) {
+                    return false;
+                }
             }
-            self.emit(json!({
+            if !self.emit(json!({
                 "type": "response.output_item.done",
                 "output_index": output_index,
                 "item": completed_item
-            }));
+            })) {
+                return false;
+            }
         }
+        true
     }
 
-    fn emit(&mut self, value: Value) {
-        self.pending
-            .push_back(Bytes::from(format!("data: {value}\n\n")));
+    fn take_pending(&mut self) -> Option<Bytes> {
+        let bytes = self.pending.pop_front()?;
+        self.pending_bytes = self.pending_bytes.saturating_sub(bytes.len());
+        Some(bytes)
+    }
+
+    fn emit(&mut self, value: Value) -> bool {
+        let bytes = Bytes::from(format!("data: {value}\n\n"));
+        let Some(pending_bytes) = self.pending_bytes.checked_add(bytes.len()) else {
+            self.fail_pending_output_limit();
+            return false;
+        };
+        if pending_bytes > self.max_pending_bytes {
+            self.fail_pending_output_limit();
+            return false;
+        }
+        self.pending_bytes = pending_bytes;
+        self.pending.push_back(bytes);
+        true
+    }
+
+    fn fail_pending_output_limit(&mut self) {
+        if self.pending_overflowed {
+            return;
+        }
+        self.pending_overflowed = true;
+        self.buffer.clear();
+        self.stop_upstream = true;
+        self.pending.clear();
+        self.pending_bytes = 0;
+        self.clear_retained_output();
+
+        // Make the terminal failure deliverable even when the ordinary queue
+        // limit is deliberately tiny in a test or has just been exhausted.
+        let max_pending_bytes = self.max_pending_bytes;
+        self.max_pending_bytes = usize::MAX;
+        self.completed = false;
+        self.fail_incomplete_with_message(&format!(
+            "上游 Chat Completions 事件输出达到 {} 本地排队上限",
+            display_byte_limit(max_pending_bytes)
+        ));
+        self.max_pending_bytes = max_pending_bytes;
     }
 
     fn response_object(&self, status: &str) -> Value {
@@ -3959,11 +4462,13 @@ fn append_client_version(mut url: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_companion_core::{default_refresh_interval_seconds, HealthFailureKind, ProviderKind};
+    use codex_companion_core::{
+        default_refresh_interval_seconds, HealthFailureKind, ProviderAccountInfo, ProviderKind,
+    };
     use std::collections::BTreeMap;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     #[tokio::test]
@@ -3985,6 +4490,289 @@ mod tests {
         assert!(message.starts_with("上游网络连接失败"));
         assert!(message.contains("127.0.0.1"));
         assert!(!message.contains("error sending request"));
+    }
+
+    #[tokio::test]
+    async fn official_401_preserves_refresh_failure_for_proxy_diagnostics() {
+        use axum::{http::StatusCode, routing::any, Router};
+
+        let app = Router::new().route(
+            "/{*path}",
+            any(|| async { (StatusCode::UNAUTHORIZED, "expired access token") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"tokens":{"access_token":"expired-access"}}"#,
+        )
+        .expect("auth");
+        let mut provider = official_provider(&format!("http://{address}/backend-api/codex"));
+        provider.auth_ref = Some(format!("file:{}", auth_path.display()));
+        provider.account = Some(ProviderAccountInfo {
+            account_id: Some("stale-workspace".to_string()),
+            ..ProviderAccountInfo::default()
+        });
+        let store = codex_companion_core::ConfigStore::new(temp.path().join("config.json"));
+        let api_service = ApiServiceStore::from_config_store(&store);
+        let uri: Uri = "/v1/models".parse().expect("uri");
+
+        let response = send_upstream(
+            &reqwest::Client::new(),
+            &api_service,
+            UpstreamRequest::new(
+                &provider,
+                &Method::GET,
+                &uri,
+                &HeaderMap::new(),
+                Bytes::new(),
+                &upstream_url(&provider, &uri),
+            ),
+        )
+        .await
+        .expect("upstream response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response
+            .oauth_refresh_error()
+            .is_some_and(|message| message.contains("缺少 refresh_token")));
+        assert_eq!(response.text().await.expect("body"), "expired access token");
+    }
+
+    #[tokio::test]
+    async fn official_oauth_retries_after_a_large_401_response() {
+        use axum::{routing::any, Router};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "old-access",
+                    "refresh_token": "refresh-token",
+                    "last_refresh": chrono::Utc::now().to_rfc3339(),
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth file");
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_headers = Arc::new(Mutex::new(Vec::new()));
+        let handler_auth_path = auth_path.clone();
+        let handler_attempts = attempts.clone();
+        let handler_headers = observed_headers.clone();
+        let app = Router::new().route(
+            "/{*path}",
+            any(move |headers: HeaderMap| {
+                let auth_path = handler_auth_path.clone();
+                let attempts = handler_attempts.clone();
+                let observed_headers = handler_headers.clone();
+                async move {
+                    let authorization = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    let account_id = headers
+                        .get("ChatGPT-Account-Id")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    observed_headers
+                        .lock()
+                        .expect("observed headers")
+                        .push((authorization, account_id));
+
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::fs::write(
+                            auth_path,
+                            serde_json::json!({
+                                "tokens": {
+                                    "access_token": "new-access",
+                                    "refresh_token": "refresh-token",
+                                    "chatgpt_account_id": "workspace-after-refresh",
+                                    "last_refresh": chrono::Utc::now().to_rfc3339(),
+                                }
+                            })
+                            .to_string(),
+                        )
+                        .expect("rotate auth file");
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            "x".repeat(MAX_UPSTREAM_ERROR_RESPONSE_BYTES + 1),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            r#"{"object":"response","status":"completed","output":[]}"#.to_string(),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut provider = official_provider(&format!("http://{address}/backend-api/codex"));
+        provider.auth_ref = Some(format!("file:{}", auth_path.display()));
+        provider.account = Some(ProviderAccountInfo {
+            account_id: Some("stale-workspace".to_string()),
+            ..ProviderAccountInfo::default()
+        });
+        let store = codex_companion_core::ConfigStore::new(temp.path().join("config.json"));
+        let api_service = ApiServiceStore::from_config_store(&store);
+        let uri: Uri = "/v1/models".parse().expect("uri");
+        let response = send_upstream(
+            &reqwest::Client::new(),
+            &api_service,
+            UpstreamRequest::new(
+                &provider,
+                &Method::GET,
+                &uri,
+                &HeaderMap::new(),
+                Bytes::new(),
+                &upstream_url(&provider, &uri),
+            ),
+        )
+        .await
+        .expect("upstream response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("body"),
+            r#"{"object":"response","status":"completed","output":[]}"#
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            observed_headers
+                .lock()
+                .expect("observed headers")
+                .as_slice(),
+            [
+                (
+                    Some("Bearer old-access".to_string()),
+                    Some("stale-workspace".to_string()),
+                ),
+                (
+                    Some("Bearer new-access".to_string()),
+                    Some("workspace-after-refresh".to_string()),
+                ),
+            ]
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn non_official_large_streaming_error_response_is_limited() {
+        use axum::{body::Body, http::StatusCode, response::Response, routing::any, Router};
+        use std::convert::Infallible;
+
+        let oversized_chunk = Bytes::from("x".repeat(MAX_UPSTREAM_ERROR_RESPONSE_BYTES + 1));
+        let app = Router::new().route(
+            "/{*path}",
+            any(move || {
+                let oversized_chunk = oversized_chunk.clone();
+                async move {
+                    let body = Body::from_stream(stream::iter([
+                        Ok::<_, Infallible>(Bytes::from_static(b"provider failed: ")),
+                        Ok(oversized_chunk),
+                    ]));
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(body)
+                        .expect("streaming error response")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut provider = official_provider(&format!("http://{address}/v1"));
+        provider.kind = ProviderKind::OpenAiCompatible;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = codex_companion_core::ConfigStore::new(temp.path().join("config.json"));
+        let api_service = ApiServiceStore::from_config_store(&store);
+        let uri: Uri = "/v1/models".parse().expect("uri");
+        let response = send_upstream(
+            &reqwest::Client::new(),
+            &api_service,
+            UpstreamRequest::new(
+                &provider,
+                &Method::GET,
+                &uri,
+                &HeaderMap::new(),
+                Bytes::new(),
+                &upstream_url(&provider, &uri),
+            ),
+        )
+        .await
+        .expect("upstream response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.text().await.expect("limited error body");
+        assert!(body.starts_with("provider failed: "));
+        assert!(body.ends_with(
+            std::str::from_utf8(UPSTREAM_ERROR_RESPONSE_TRUNCATED).expect("marker text")
+        ));
+        assert!(body.len() <= MAX_UPSTREAM_ERROR_RESPONSE_BYTES);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn buffered_success_response_rejects_an_oversized_chunked_body() {
+        use axum::{body::Body, response::Response, routing::get, Router};
+        use std::convert::Infallible;
+
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                Response::builder()
+                    .body(Body::from_stream(stream::once(async {
+                        Ok::<_, Infallible>(Bytes::from("x".repeat(1_025)))
+                    })))
+                    .expect("response")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("response");
+        let error = read_limited_success_response_body_with_limit(response, 1_024)
+            .await
+            .expect_err("chunked body should exceed the limit");
+
+        assert!(error.message_text().contains("1 KiB"));
+        assert!(error.failure().is_some());
+        server.abort();
     }
 
     fn official_provider(base_url: &str) -> ProviderConfig {
@@ -4091,6 +4879,23 @@ mod tests {
             "output": [{"type": "message"}]
         }))
         .is_none());
+    }
+
+    #[test]
+    fn semantic_failure_messages_are_redacted_and_bounded() {
+        let detail = format!(
+            "AgentAssertion assertion-secret refresh_token=refresh-secret {}",
+            "x".repeat(MAX_UPSTREAM_ERROR_MESSAGE_CHARS * 2)
+        );
+        let message = semantic_failure_message(&json!({
+            "type": "error",
+            "message": detail
+        }))
+        .expect("semantic failure");
+
+        assert!(!message.contains("assertion-secret"));
+        assert!(!message.contains("refresh-secret"));
+        assert!(message.chars().count() <= MAX_UPSTREAM_ERROR_MESSAGE_CHARS);
     }
 
     #[test]
@@ -5406,6 +6211,115 @@ mod tests {
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert!(output.contains("response.failed"));
         assert!(output.contains("upstream_stream_incomplete"));
+        assert!(output.len() < 4 * 1024);
+    }
+
+    #[tokio::test]
+    async fn chat_sse_transform_stops_after_completion_and_drains_pending_events() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let upstream_polls = polls.clone();
+        let upstream = stream::unfold(0_u8, move |step| {
+            let upstream_polls = upstream_polls.clone();
+            async move {
+                upstream_polls.fetch_add(1, Ordering::SeqCst);
+                match step {
+                    0 => Some((
+                        Ok::<Bytes, io::Error>(Bytes::from_static(
+                            br#"data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+                        )),
+                        1,
+                    )),
+                    1 => Some((
+                        Ok(Bytes::from_static(
+                            br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"ignored","arguments":"{}"}}]}}]}
+
+"#,
+                        )),
+                        2,
+                    )),
+                    _ => None,
+                }
+            }
+        });
+
+        let output = chat_sse_to_responses_stream(upstream, ChatSseTransformState::default())
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| String::from_utf8_lossy(&chunk.expect("chunk")).into_owned())
+            .collect::<String>();
+
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(output.contains("response.completed"));
+        assert!(output.contains("done"));
+        assert!(!output.contains("ignored"));
+    }
+
+    #[test]
+    fn chat_sse_transform_bounds_retained_text_and_tool_arguments() {
+        let mut state = ChatSseTransformState::default().with_retained_output_limit(16);
+        state.push_chunk(
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{"delta": {"content": "hello"}}]
+                })
+            )
+            .as_bytes(),
+        );
+        state.push_chunk(
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call",
+                        "function": {"name": "tool", "arguments": "12345678"}
+                    }]}}]
+                })
+            )
+            .as_bytes(),
+        );
+
+        let output = state
+            .pending
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect::<String>();
+        assert!(state.stop_upstream);
+        assert_eq!(state.retained_output_bytes, 0);
+        assert!(state.text.is_empty());
+        assert!(state.tools.is_empty());
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("Chat Completions 输出达到 16 字节"));
+        assert!(!output.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn chat_sse_transform_bounds_pending_output_events() {
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{"delta": {"content": "x".repeat(64)}}]
+            })
+        );
+        let upstream = stream::iter([Ok::<Bytes, io::Error>(Bytes::from(frame.repeat(64)))]);
+        let state = ChatSseTransformState::default().with_pending_limit(4 * 1024);
+
+        let output = chat_sse_to_responses_stream(upstream, state)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| String::from_utf8_lossy(&chunk.expect("chunk")).into_owned())
+            .collect::<String>();
+
+        assert!(output.contains("response.failed"));
+        assert!(output.contains("事件输出达到 4 KiB"));
+        assert!(!output.contains("response.completed"));
         assert!(output.len() < 4 * 1024);
     }
 

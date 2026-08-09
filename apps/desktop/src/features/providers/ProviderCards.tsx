@@ -20,6 +20,7 @@ import type { CompanionStatus, ProviderConfig, ProviderLaunchMode } from "../../
 import {
   canDirectLaunch,
   launchModeLabel,
+  providerUsesOfficialPat,
   resolveProviderLaunchMode,
 } from "./provider-launch";
 
@@ -51,7 +52,7 @@ export function ProviderCompactItem({
   const health = status.config.health[provider.id];
   const active = currentProviderId(currentApplication(status)) === provider.id;
   const quota = quotaInfo(provider.account);
-  const effectiveLaunchMode = resolveProviderLaunchMode(provider, launchMode);
+  const effectiveLaunchMode = resolveProviderLaunchMode(provider, launchMode, status.directConnectProviderIds);
   const canEdit = provider.kind !== "official_codex";
   const showPlanBadge = provider.kind === "official_codex" && Boolean(provider.account?.subscriptionType);
   const showQuota = hasQuotaInfo(quota);
@@ -76,6 +77,7 @@ export function ProviderCompactItem({
       {usesWebSocket ? <Badge tone="info">WebSocket</Badge> : null}
       <LaunchModeControl
         compact
+        directConnectProviderIds={status.directConnectProviderIds}
         disabled={disabled}
         mode={effectiveLaunchMode}
         preserveOfficialCodexAuth={Boolean(status.config.app.preserveOfficialCodexAuth)}
@@ -132,7 +134,7 @@ export function ProviderCard({
   const active = currentProviderId(currentApplication(status)) === provider.id;
   const account = provider.account;
   const quota = quotaInfo(account);
-  const effectiveLaunchMode = resolveProviderLaunchMode(provider, launchMode);
+  const effectiveLaunchMode = resolveProviderLaunchMode(provider, launchMode, status.directConnectProviderIds);
   const validity = validityLabel(account?.validUntil);
   const resetAt = quota.resetAt ? formatTime(quota.resetAt) : "待刷新";
   const showQuota = hasQuotaInfo(quota);
@@ -200,6 +202,7 @@ export function ProviderCard({
 
         <div className="provider-mode-cell">
           <LaunchModeControl
+            directConnectProviderIds={status.directConnectProviderIds}
             disabled={disabled}
             mode={effectiveLaunchMode}
             preserveOfficialCodexAuth={Boolean(status.config.app.preserveOfficialCodexAuth)}
@@ -246,6 +249,7 @@ function providerBalanceDetail({
 
 function LaunchModeControl({
   compact,
+  directConnectProviderIds,
   disabled,
   mode,
   preserveOfficialCodexAuth,
@@ -253,61 +257,69 @@ function LaunchModeControl({
   onChange,
 }: {
   compact?: boolean;
+  directConnectProviderIds?: readonly string[];
   disabled: boolean;
   mode: ProviderLaunchMode;
   preserveOfficialCodexAuth: boolean;
   provider: ProviderConfig;
   onChange: (mode: ProviderLaunchMode) => void;
 }) {
-  const canDirect = canDirectLaunch(provider);
+  const canDirect = canDirectLaunch(provider, directConnectProviderIds);
+  const usesAgentIdentity = providerUsesAgentIdentity(provider);
+  const isOfficialPat = providerUsesOfficialPat(provider);
   let directTitle = "直连需要 API Key 文件、官方账号 auth 文件或环境变量";
-  if (providerEndpointIsChatCompletions(provider.baseUrl)) {
+  if (provider.kind === "official_codex") {
+    if (canDirect) {
+      directTitle = "官方个人访问令牌可直连；选择本地代理可由 Companion 注入账号材料";
+    } else if (isOfficialPat) {
+      directTitle = "PAT 凭据当前不可用；请重新导入或配置有效的个人访问令牌";
+    } else if (usesAgentIdentity) {
+      directTitle = "Agent Identity 固定使用 Companion 本地代理动态签名，不写入 Codex auth.json";
+    } else {
+      directTitle = "官方 OAuth 固定使用 Companion 本地代理；Companion 后台续期并管理 Codex auth.json 中的登录态";
+    }
+  } else if (providerEndpointIsChatCompletions(provider.baseUrl)) {
     directTitle =
       "该地址只接受 Chat Completions；ChatGPT / Codex 直连发送 Responses 请求，需使用 Companion 本地代理转换协议";
-  } else if (provider.kind === "official_codex") {
-    directTitle = "直连会把官方账号 OAuth token 合并写入 Codex auth.json，启动后需要重启 ChatGPT / Codex";
   } else if (canDirect && preserveOfficialCodexAuth) {
     directTitle = "直连只把 API key 写入 provider-scoped config.toml，不改现有 Codex auth.json";
   } else if (canDirect) {
     directTitle = "直连会写入 Codex 配置；API key 文件会合并进 auth.json，并可能影响官方登录态";
   }
-  const relayTitle =
-    provider.kind === "official_codex"
-      ? "本地代理由 Companion 续期并注入官方账号 headers，不写入 Codex auth.json"
-      : "本地代理由 Companion 注入账号材料，不写入 Codex auth.json";
+  let relayTitle = "本地代理由 Companion 注入账号材料，不写入 Codex auth.json";
+  if (provider.kind === "official_codex") {
+    if (canDirect) {
+      relayTitle = "本地代理由 Companion 注入官方个人访问令牌，不写入 OAuth 登录材料";
+    } else if (usesAgentIdentity) {
+      relayTitle = "本地代理为 Agent Identity 动态签名，不写入 Codex auth.json";
+    } else {
+      relayTitle = "本地代理由 Companion 后台续期 OAuth，并管理 Codex auth.json 中的官方登录态";
+    }
+  }
   return (
-    <div className={`launch-mode-toggle ${compact ? "launch-mode-compact" : ""}`} role="radiogroup" aria-label="启动方式">
+    <div aria-label="启动方式" className={`launch-mode-toggle ${compact ? "launch-mode-compact" : ""}`} role="group">
       <div className="launch-mode-options">
         <button
-          aria-checked={mode === "direct"}
+          aria-pressed={mode === "direct"}
           className={mode === "direct" ? "launch-mode-option launch-mode-selected" : "launch-mode-option"}
           disabled={disabled || !canDirect}
           onClick={() => onChange("direct")}
-          role="radio"
           title={directTitle}
           type="button"
         >
           直连
         </button>
         <button
-          aria-checked={mode === "relay"}
+          aria-pressed={mode === "relay"}
           className={mode === "relay" ? "launch-mode-option launch-mode-selected" : "launch-mode-option"}
           disabled={disabled}
           onClick={() => onChange("relay")}
-          role="radio"
           title={relayTitle}
           type="button"
         >
           代理
         </button>
       </div>
-      <input
-        aria-hidden="true"
-        className="sr-only"
-        disabled={disabled}
-        readOnly
-        value={mode}
-      />
     </div>
   );
 }

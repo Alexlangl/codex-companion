@@ -1,11 +1,11 @@
-use crate::launch::{relay_model_slugs, relay_official_auth_provider};
+use crate::launch::{provider_can_direct_connect, relay_model_slugs, relay_official_auth_provider};
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
     default_codex_dir, CompanionConfig, CompanionStatus, DataRootStatus, ProviderConfig,
     ProviderGroup, RelayEvent, Result,
 };
 use codex_companion_health::repair_legacy_auth_misclassification;
-use codex_companion_provider::{active_group, selected_providers};
+use codex_companion_provider::{active_group, selected_providers, sync_official_auth_mode};
 use codex_companion_relay::read_recent_events;
 use codex_companion_state::{
     doctor, install_companion_provider_for_relay, uninstall_companion_provider,
@@ -17,10 +17,17 @@ impl CompanionDaemon {
         let config = self.load_config_with_repaired_legacy_health()?;
         let codex_dir = default_codex_dir()?;
         let codex = doctor(codex_dir, &config.relay)?;
+        let direct_connect_provider_ids = config
+            .providers
+            .values()
+            .filter(|provider| provider_can_direct_connect(provider))
+            .map(|provider| provider.id.clone())
+            .collect();
         Ok(CompanionStatus {
             relay_base_url: config.relay.base_url(),
             active_group: active_group(&config),
             active_providers: selected_providers(&config),
+            direct_connect_provider_ids,
             data_dir: self.store.data_dir(),
             config_path: self.store.path().to_path_buf(),
             config,
@@ -35,11 +42,14 @@ impl CompanionDaemon {
 
     fn load_config_with_repaired_legacy_health(&self) -> Result<CompanionConfig> {
         let mut config = self.store.load()?;
-        if !repair_legacy_health(&mut config) {
+        let repaired_health = repair_legacy_health(&mut config);
+        let synced_auth_mode = sync_official_auth_modes(&mut config);
+        if !repaired_health && !synced_auth_mode {
             return Ok(config);
         }
         self.store.update(|current| {
             repair_legacy_health(current);
+            sync_official_auth_modes(current);
             Ok(current.clone())
         })
     }
@@ -95,6 +105,14 @@ fn repair_legacy_health(config: &mut CompanionConfig) -> bool {
     repaired
 }
 
+fn sync_official_auth_modes(config: &mut CompanionConfig) -> bool {
+    let mut synced = false;
+    for provider in config.providers.values_mut() {
+        synced |= sync_official_auth_mode(provider);
+    }
+    synced
+}
+
 #[allow(dead_code)]
 fn _keep_types(_: Option<ProviderGroup>, _: Vec<ProviderConfig>) {}
 
@@ -103,7 +121,7 @@ mod tests {
     use super::*;
     use codex_companion_core::{
         default_refresh_interval_seconds, ConfigStore, HealthFailureKind, HealthStatusKind,
-        ProviderHealth, ProviderKind, DEFAULT_GROUP_ID,
+        ProviderAccountInfo, ProviderHealth, ProviderKind, DEFAULT_GROUP_ID,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -188,6 +206,183 @@ mod tests {
         assert_eq!(
             store.load().expect("persisted config").health["relay"].status,
             HealthStatusKind::QuotaExhausted
+        );
+    }
+
+    #[test]
+    fn status_backfills_agent_identity_auth_mode_from_auth_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("companion.json"));
+        let auth_path = temp.path().join("agent-auth.json");
+        fs::write(&auth_path, r#"{"auth_mode":"agentIdentity"}"#).expect("auth");
+        store
+            .update(|config| {
+                config.providers.insert(
+                    "agent".to_string(),
+                    ProviderConfig {
+                        id: "agent".to_string(),
+                        name: "Agent".to_string(),
+                        kind: ProviderKind::OfficialCodex,
+                        base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                        websocket_url: None,
+                        auth_ref: Some(format!("file:{}", auth_path.display())),
+                        direct_auth_ref: None,
+                        model_map: BTreeMap::new(),
+                        priority: 0,
+                        enabled: true,
+                        refresh_interval_seconds: default_refresh_interval_seconds(),
+                        account: None,
+                    },
+                );
+                Ok(())
+            })
+            .expect("seed config");
+
+        let config = CompanionDaemon::new(store.clone())
+            .load_config_with_repaired_legacy_health()
+            .expect("status config");
+
+        assert_eq!(
+            config.providers["agent"]
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("agentIdentity")
+        );
+        assert_eq!(
+            store.load().expect("persisted config").providers["agent"]
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("agentIdentity")
+        );
+    }
+
+    #[test]
+    fn status_syncs_file_auth_mode_over_stale_pat_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("companion.json"));
+        let auth_path = temp.path().join("oauth-auth.json");
+        fs::write(
+            &auth_path,
+            r#"{"tokens":{"access_token":"oauth-access","refresh_token":"oauth-refresh"}}"#,
+        )
+        .expect("oauth auth");
+        store
+            .update(|config| {
+                config.providers.insert(
+                    "oauth".to_string(),
+                    ProviderConfig {
+                        id: "oauth".to_string(),
+                        name: "OAuth".to_string(),
+                        kind: ProviderKind::OfficialCodex,
+                        base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                        websocket_url: None,
+                        auth_ref: Some(format!("file:{}", auth_path.display())),
+                        direct_auth_ref: None,
+                        model_map: BTreeMap::new(),
+                        priority: 0,
+                        enabled: true,
+                        refresh_interval_seconds: default_refresh_interval_seconds(),
+                        account: Some(ProviderAccountInfo {
+                            auth_mode: Some("pat".to_string()),
+                            ..ProviderAccountInfo::default()
+                        }),
+                    },
+                );
+                Ok(())
+            })
+            .expect("seed config");
+
+        let config = CompanionDaemon::new(store.clone())
+            .load_config_with_repaired_legacy_health()
+            .expect("status config");
+
+        assert_eq!(
+            config.providers["oauth"]
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("oauth")
+        );
+        assert_eq!(
+            store.load().expect("persisted config").providers["oauth"]
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("oauth")
+        );
+    }
+
+    #[test]
+    fn status_backfills_auth_modes_for_every_official_provider() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::new(temp.path().join("companion.json"));
+        let agent_auth_path = temp.path().join("agent-auth.json");
+        let pat_auth_path = temp.path().join("pat-auth.json");
+        fs::write(&agent_auth_path, r#"{"auth_mode":"agentIdentity"}"#).expect("agent auth");
+        fs::write(
+            &pat_auth_path,
+            r#"{"codex_companion_auth_mode":"pat","tokens":{"access_token":"pat-token"}}"#,
+        )
+        .expect("pat auth");
+        store
+            .update(|config| {
+                for (id, auth_path) in [("agent", &agent_auth_path), ("pat", &pat_auth_path)] {
+                    config.providers.insert(
+                        id.to_string(),
+                        ProviderConfig {
+                            id: id.to_string(),
+                            name: id.to_string(),
+                            kind: ProviderKind::OfficialCodex,
+                            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                            websocket_url: None,
+                            auth_ref: Some(format!("file:{}", auth_path.display())),
+                            direct_auth_ref: None,
+                            model_map: BTreeMap::new(),
+                            priority: 0,
+                            enabled: true,
+                            refresh_interval_seconds: default_refresh_interval_seconds(),
+                            account: None,
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .expect("seed config");
+
+        let config = CompanionDaemon::new(store.clone())
+            .load_config_with_repaired_legacy_health()
+            .expect("status config");
+
+        assert_eq!(
+            config.providers["agent"]
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("agentIdentity")
+        );
+        assert_eq!(
+            config.providers["pat"]
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("pat")
+        );
+        let persisted = store.load().expect("persisted config");
+        assert_eq!(
+            persisted.providers["agent"]
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("agentIdentity")
+        );
+        assert_eq!(
+            persisted.providers["pat"]
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("pat")
         );
     }
 }

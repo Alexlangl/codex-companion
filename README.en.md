@@ -339,7 +339,7 @@ Create `model-pricing.json` in the Companion data directory:
 }
 ```
 
-Prices are USD estimates per million tokens. Models without a matching price are marked unpriced instead of silently appearing as `$0`.
+Prices are USD estimates per million tokens. Prices and multipliers accept either JSON numbers or decimal strings; strings are best when preserving exact decimal precision matters. If `model` matches a built-in model, the entry overrides that built-in price, so you can correct for provider-specific pricing or future OpenAI price changes manually. `cacheWriteInputPerMillion` is optional and defaults to the regular input price. Refresh or rebuild usage statistics after editing the file. Models without a matching price are marked unpriced instead of silently appearing as `$0`. The built-in OpenAI snapshot is dated `2026-08-09`, based on the [official API pricing table](https://developers.openai.com/api/docs/pricing).
 
 </details>
 

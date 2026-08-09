@@ -286,7 +286,7 @@ export interface ProviderGroup {
   priorityFailbackTargetProviderId?: string | null;
 }
 
-export type ModelSourceKind = "local_cache" | "official_oauth" | "relay";
+export type ModelSourceKind = "local_cache" | "official_oauth" | "official_pat" | "relay";
 export type ModelSourceStatus = "available" | "failed" | "skipped";
 
 export interface ModelMatrixSource {
@@ -367,6 +367,7 @@ export interface CompanionStatus {
   relayBaseUrl: string;
   activeGroup?: ProviderGroup | null;
   activeProviders: ProviderConfig[];
+  directConnectProviderIds?: string[];
   codex: CodexInstallStatus;
   recentEvents: RelayEvent[];
   dataRoots: DataRootStatus;

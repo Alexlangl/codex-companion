@@ -1,19 +1,26 @@
 use crate::account_refresh::{
     provider_supports_api_key_usage, refresh_api_key_usage, refresh_official_codex_account,
 };
+use crate::agent_identity::{ensure_agent_identity_authorization, provider_uses_agent_identity};
 use crate::auth::resolve_auth_token;
-use crate::codex_oauth::ensure_codex_auth_snapshot;
+use crate::codex_oauth::{ensure_codex_auth_snapshot_detailed, provider_uses_codex_oauth};
+use crate::http::read_response_bytes_limited;
 use chrono::Utc;
 use codex_companion_core::{
-    append_diagnostic_log, provider_api_base_url, CompanionError, ConfigStore, ProviderConfig,
-    ProviderHealth, ProviderKind, Result,
+    append_diagnostic_log, provider_api_base_url, redact_sensitive_text, CompanionError,
+    ConfigStore, HealthFailureKind, ProviderConfig, ProviderHealth, ProviderKind, Result,
 };
-use codex_companion_health::{classify_failure, mark_failure, mark_success};
+
+const PROVIDER_TEST_RESPONSE_LIMIT_BYTES: usize = 128 * 1024;
+use codex_companion_health::{
+    classification_for_kind, classify_failure, mark_failure, mark_success, FailureClassification,
+};
 
 #[derive(Debug, Clone)]
 pub struct ProviderTestFailure {
     pub status: Option<u16>,
     pub message: String,
+    pub classification: Option<FailureClassification>,
 }
 
 impl ProviderTestFailure {
@@ -21,6 +28,24 @@ impl ProviderTestFailure {
         Self {
             status: None,
             message,
+            classification: None,
+        }
+    }
+
+    fn auth(message: impl Into<String>) -> Self {
+        Self {
+            status: None,
+            message: message.into(),
+            classification: Some(classification_for_kind(HealthFailureKind::AuthFailed)),
+        }
+    }
+
+    fn oauth(error: crate::codex_oauth::CodexOAuthError) -> Self {
+        let classification = error.failure_classification();
+        Self {
+            status: error.status,
+            message: error.message,
+            classification: Some(classification),
         }
     }
 }
@@ -82,10 +107,38 @@ pub async fn test_provider_detailed(
     provider: &ProviderConfig,
 ) -> std::result::Result<(), ProviderTestFailure> {
     if provider.kind == ProviderKind::OfficialCodex {
-        return ensure_codex_auth_snapshot(provider)
-            .await
+        if provider_uses_agent_identity(provider) {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .map_err(|error| {
+                    ProviderTestFailure::network(format!(
+                        "Agent Identity network client failed: {error}"
+                    ))
+                })?;
+            return ensure_agent_identity_authorization(&client, provider, None)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    let message = error.to_string();
+                    ProviderTestFailure {
+                        status: None,
+                        classification: Some(classify_failure(None, &message)),
+                        message,
+                    }
+                });
+        }
+        if provider_uses_codex_oauth(provider) {
+            return ensure_codex_auth_snapshot_detailed(provider)
+                .await
+                .map(|_| ())
+                .map_err(ProviderTestFailure::oauth);
+        }
+        return resolve_auth_token(provider)
+            .filter(|token| !token.trim().is_empty())
             .map(|_| ())
-            .map_err(|error| ProviderTestFailure::network(error.to_string()));
+            .ok_or_else(|| ProviderTestFailure::auth("官方 PAT 缺少 access_token"));
     }
 
     let client = reqwest::Client::builder()
@@ -109,10 +162,14 @@ pub async fn test_provider_detailed(
         Ok(())
     } else {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = read_response_bytes_limited(response, PROVIDER_TEST_RESPONSE_LIMIT_BYTES)
+            .await
+            .map(|body| redact_sensitive_text(&String::from_utf8_lossy(&body)))
+            .unwrap_or_else(|error| format!("[{error}]"));
         Err(ProviderTestFailure {
             status: Some(status.as_u16()),
             message: format!("provider returned {status}: {body}"),
+            classification: None,
         })
     }
 }
@@ -124,7 +181,7 @@ pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<Pr
     let mut api_usage_error = None;
     let result = if provider.kind == ProviderKind::OfficialCodex {
         let health_result = test_provider_detailed(&provider).await;
-        if health_result.is_ok() {
+        if health_result.is_ok() && provider_uses_codex_oauth(&provider) {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(35),
                 refresh_official_codex_account(&provider),
@@ -215,7 +272,9 @@ fn persist_refresh_outcome(
                 }
             }
             Err(failure) => {
-                let classification = classify_failure(failure.status, &failure.message);
+                let classification = failure
+                    .classification
+                    .unwrap_or_else(|| classify_failure(failure.status, &failure.message));
                 mark_failure(health, &classification, failure.message);
                 if let Some(account) = account_result {
                     if let Some(provider) = config.providers.get_mut(id) {
@@ -288,10 +347,12 @@ fn clear_api_key_usage(account: &mut codex_companion_core::ProviderAccountInfo) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose, Engine as _};
     use codex_companion_core::{
         default_refresh_interval_seconds, HealthFailureKind, HealthStatusKind, ProviderAccountInfo,
         ProviderQuotaWindow,
     };
+    use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 
     fn official_provider(auth_path: &std::path::Path) -> ProviderConfig {
         ProviderConfig {
@@ -340,6 +401,35 @@ mod tests {
         test_provider_detailed(&official_provider(&auth_path))
             .await
             .expect("valid local OAuth snapshot is healthy");
+    }
+
+    #[tokio::test]
+    async fn agent_identity_health_check_builds_an_authorization_without_a_pat() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let private_key =
+            general_purpose::STANDARD.encode(signing_key.to_pkcs8_der().expect("pkcs8").as_bytes());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("agent.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::json!({
+                "auth_mode": "agentIdentity",
+                "agent_runtime_id": "runtime-1",
+                "agent_private_key": private_key,
+                "task_id": "task-1"
+            })
+            .to_string(),
+        )
+        .expect("agent auth");
+        let mut provider = official_provider(&auth_path);
+        provider.account = Some(ProviderAccountInfo {
+            auth_mode: Some("agentIdentity".to_string()),
+            ..ProviderAccountInfo::default()
+        });
+
+        test_provider_detailed(&provider)
+            .await
+            .expect("Agent Identity should use its local signing material");
     }
 
     #[tokio::test]
@@ -570,6 +660,7 @@ mod tests {
             Err(ProviderTestFailure {
                 status: Some(401),
                 message: "provider returned 401 Unauthorized".to_string(),
+                classification: None,
             }),
             Some(ProviderAccountInfo {
                 usage_available: Some(88.0),

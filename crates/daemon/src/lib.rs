@@ -10,5 +10,5 @@ mod runtime;
 mod sessions;
 mod status;
 
-pub use launch::provider_can_direct_connect;
+pub use launch::{provider_auto_prefers_relay, provider_can_direct_connect};
 pub use runtime::CompanionDaemon;

@@ -12,9 +12,10 @@ use crate::types::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use codex_companion_core::{
-    default_codex_dir, default_refresh_interval_seconds, redact_sensitive_text, CompanionError,
-    ConfigStore, ProviderAccountInfo, ProviderImportProgress, ProviderKind, ProviderQuotaWindow,
-    Result, COMPANION_PROVIDER_ID,
+    default_codex_dir, default_refresh_interval_seconds, official_access_token_from_auth_json,
+    official_auth_mode_from_auth_json, redact_sensitive_text, CompanionError, ConfigStore,
+    OfficialAuthMode, ProviderAccountInfo, ProviderImportProgress, ProviderKind,
+    ProviderQuotaWindow, Result, COMPANION_PROVIDER_ID,
 };
 use ed25519_dalek::{pkcs8::DecodePrivateKey, SigningKey};
 use serde::{Deserialize, Serialize};
@@ -100,9 +101,15 @@ fn prepare_provider_import(
             provider_name,
         });
     }
-    if is_auth_mode_api_key(value)
-        || is_newapi_channel_connection(value)
-        || extract_api_key(value).is_some()
+    let official_auth = extract_codex_oauth_auth(value);
+    let is_official_pat = official_auth
+        .as_ref()
+        .and_then(official_auth_mode_from_auth_json)
+        .is_some_and(|mode| mode == OfficialAuthMode::Pat);
+    if !is_official_pat
+        && (is_auth_mode_api_key(value)
+            || is_newapi_channel_connection(value)
+            || extract_api_key(value).is_some())
     {
         return prepare_api_key_provider_from_json(
             value,
@@ -119,7 +126,7 @@ fn prepare_provider_import(
             draft.provider_id = existing_id;
         }
     }
-    let auth = extract_codex_oauth_auth(value).ok_or_else(unsupported_import_error)?;
+    let auth = official_auth.ok_or_else(unsupported_import_error)?;
     let account = extract_provider_account_info(value, &auth);
     Ok(ProviderImportPlan::OAuth {
         draft,
@@ -444,7 +451,11 @@ fn provider_import_review_item(
             provider_name: redact_sensitive_text(&draft.provider_name),
             provider_kind: ProviderKind::OfficialCodex,
             import_kind: draft.import_kind.clone(),
-            credential_kind: "OAuth tokens".to_string(),
+            credential_kind: if oauth_plan_is_pat(plan) {
+                "Personal access token".to_string()
+            } else {
+                "OAuth tokens".to_string()
+            },
             base_url: redact_sensitive_text(&draft.base_url),
             websocket_url: None,
             model: draft.model.as_deref().map(redact_sensitive_text),
@@ -483,6 +494,13 @@ fn provider_import_review_item(
             will_overwrite,
         },
     }
+}
+
+fn oauth_plan_is_pat(plan: &ProviderImportPlan) -> bool {
+    let ProviderImportPlan::OAuth { auth, .. } = plan else {
+        return false;
+    };
+    official_auth_mode_from_auth_json(auth) == Some(OfficialAuthMode::Pat)
 }
 
 fn import_item_label(value: &serde_json::Value, index: usize) -> String {
@@ -870,7 +888,12 @@ pub fn import_local_codex_provider(
         };
         return Ok(outcome);
     }
-    if is_auth_mode_api_key(&value) {
+    let official_auth = extract_codex_oauth_auth(&value);
+    let is_official_pat = official_auth
+        .as_ref()
+        .and_then(official_auth_mode_from_auth_json)
+        .is_some_and(|mode| mode == OfficialAuthMode::Pat);
+    if is_auth_mode_api_key(&value) && !is_official_pat {
         let api_key = extract_api_key(&value).ok_or_else(|| {
             CompanionError::InvalidConfig("auth.json 缺少 OPENAI_API_KEY".to_string())
         })?;
@@ -895,7 +918,7 @@ pub fn import_local_codex_provider(
         );
     }
 
-    if value.get("tokens").is_some() {
+    if value.get("tokens").is_some() || is_official_pat {
         let live_auth_ref = format!("file:{}", auth_path.display());
         let config = store.load()?;
         let existing_local_provider_id = config
@@ -922,19 +945,20 @@ pub fn import_local_codex_provider(
                         outcome.provider.id
                     ))
                 })?;
-            provider.auth_ref = Some(live_auth_ref.clone());
-            provider.direct_auth_ref = Some(live_auth_ref);
             if let Some(model) = config_provider.model.as_ref() {
                 provider.model_map.insert(model.clone(), model.clone());
             }
             Ok(provider.clone())
         })?;
         outcome.provider = provider;
-        outcome.auth_path = auth_path;
-        outcome.message = if outcome.created {
-            "已导入本地 Codex 账号，并跟随 live auth.json 自动续期".to_string()
+        outcome.message = if is_official_pat && outcome.created {
+            "已导入本机 Codex 个人访问令牌到 Companion 受管存储".to_string()
+        } else if is_official_pat {
+            "已更新本机 Codex 个人访问令牌到 Companion 受管存储".to_string()
+        } else if outcome.created {
+            "已导入本机 Codex 账号到 Companion 受管存储；后台自动续期".to_string()
         } else {
-            "已更新本地 Codex 账号，并切换为 live auth.json 自动续期".to_string()
+            "已更新本机 Codex 账号到 Companion 受管存储；后台自动续期".to_string()
         };
         return Ok(outcome);
     }
@@ -1160,20 +1184,6 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
 
     let credentials = candidate.get("credentials").unwrap_or(candidate);
     let extra = candidate.get("extra").unwrap_or(value);
-    let access_token = pick_first_string(
-        &[credentials, candidate, value],
-        &[
-            &["access_token"],
-            &["accessToken"],
-            &["personal_access_token"],
-            &["personalAccessToken"],
-            &["tokens", "access_token"],
-            &["tokens", "accessToken"],
-            &["tokens", "personal_access_token"],
-            &["tokens", "personalAccessToken"],
-            &["token"],
-        ],
-    );
     let id_token = pick_first_string(
         &[credentials, candidate, value],
         &[
@@ -1202,6 +1212,40 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
         ],
     );
 
+    let explicit_auth_mode = pick_first_string(
+        &[credentials, candidate, value],
+        &[&["auth_mode"], &["authMode"], &["openai_auth_mode"]],
+    )
+    .map(|mode| mode.to_ascii_lowercase());
+    let source_type =
+        pick_first_string(&[candidate, value], &[&["type"]]).map(|kind| kind.to_ascii_lowercase());
+    let personal_access_token = pick_first_string(
+        &[credentials, candidate, value],
+        &[
+            &["personal_access_token"],
+            &["personalAccessToken"],
+            &["pat"],
+        ],
+    );
+    let is_pat = official_auth_mode_from_auth_json(candidate)
+        .or_else(|| official_auth_mode_from_auth_json(value))
+        .is_some_and(|mode| mode == OfficialAuthMode::Pat)
+        || explicit_auth_mode
+            .as_deref()
+            .is_some_and(|mode| matches!(mode, "pat" | "personal_access_token" | "token"))
+        || source_type
+            .as_deref()
+            .is_some_and(|kind| matches!(kind, "pat" | "personal_access_token" | "token"))
+        || personal_access_token.is_some();
+    let auth_mode = if is_pat { "pat" } else { "oauth" };
+    let fallback_mode = Some(if is_pat {
+        OfficialAuthMode::Pat
+    } else {
+        OfficialAuthMode::OAuth
+    });
+    let access_token = official_access_token_from_auth_json(candidate, fallback_mode)
+        .or_else(|| official_access_token_from_auth_json(value, fallback_mode));
+
     if access_token.is_none()
         && id_token.is_none()
         && session_token.is_none()
@@ -1209,6 +1253,15 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
     {
         return None;
     }
+
+    let (id_token, session_token, refresh_token) = if is_pat {
+        // A PAT sometimes gets exported next to a stale OAuth session. Do not
+        // carry OAuth-only material into Companion's normalized auth file:
+        // doing so would make later exports and mode detection ambiguous.
+        (None, None, None)
+    } else {
+        (id_token, session_token, refresh_token)
+    };
 
     let token_claims = [id_token.as_deref(), access_token.as_deref()]
         .into_iter()
@@ -1265,16 +1318,54 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
             &["tokens", "plan_type"],
         ],
     );
-    let expired = pick_first_string(
-        &[credentials, extra, candidate, value],
-        &[&["expired"], &["expires_at"], &["expiresAt"]],
-    );
-    let last_refresh = pick_first_string(
-        &[credentials, extra, candidate, value],
-        &[&["last_refresh"], &["lastRefresh"]],
-    );
+    let (expires_at, expired, last_refresh) = if is_pat {
+        (None, None, None)
+    } else {
+        let metadata_sources = [credentials, extra, candidate, value];
+        let source_expired = pick_first_json_value(&metadata_sources, &[&["expired"]]);
+        // `expired` was historically used by several exporters to carry the
+        // access-token expiry timestamp. Keep accepting that shape, but persist a
+        // real `expires_at` field so the OAuth refresher does not confuse it with
+        // a boolean expired flag.
+        let expires_at = pick_first_json_value(
+            &metadata_sources,
+            &[
+                &["expires_at"],
+                &["expiresAt"],
+                &["tokens", "expires_at"],
+                &["tokens", "expiresAt"],
+            ],
+        )
+        .or_else(|| {
+            source_expired
+                .as_ref()
+                .filter(|value| is_timestamp_value(value))
+                .cloned()
+        });
+        // Keep `expired` strictly boolean. Older exporters overloaded it with
+        // an expiry timestamp, which we normalized into `expires_at` above;
+        // persisting that timestamp back into `expired` makes the OAuth
+        // refresher treat its schema as ambiguous.
+        let expired = source_expired.filter(serde_json::Value::is_boolean);
+        let last_refresh = pick_first_json_value(
+            &metadata_sources,
+            &[
+                &["last_refresh"],
+                &["lastRefresh"],
+                &["last_refresh_at"],
+                &["lastRefreshAt"],
+                &["tokens", "last_refresh"],
+                &["tokens", "lastRefresh"],
+            ],
+        );
+        (expires_at, expired, last_refresh)
+    };
 
     let mut tokens = serde_json::Map::new();
+    tokens.insert(
+        "auth_mode".to_string(),
+        serde_json::Value::String(auth_mode.to_string()),
+    );
     insert_optional_string(&mut tokens, "access_token", access_token);
     insert_optional_string(&mut tokens, "id_token", id_token);
     insert_optional_string(&mut tokens, "refresh_token", refresh_token);
@@ -1286,14 +1377,20 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
     insert_optional_string(&mut tokens, "email", email.clone());
     insert_optional_string(&mut tokens, "name", name);
     insert_optional_string(&mut tokens, "plan_type", plan_type);
-    insert_optional_string(&mut tokens, "expired", expired.clone());
-    insert_optional_string(&mut tokens, "last_refresh", last_refresh.clone());
+    insert_optional_value(&mut tokens, "expires_at", expires_at.clone());
+    insert_optional_value(&mut tokens, "expired", expired.clone());
+    insert_optional_value(&mut tokens, "last_refresh", last_refresh.clone());
 
     let mut auth = serde_json::Map::new();
+    auth.insert(
+        "auth_mode".to_string(),
+        serde_json::Value::String(auth_mode.to_string()),
+    );
     auth.insert("OPENAI_API_KEY".to_string(), serde_json::Value::Null);
     auth.insert("tokens".to_string(), serde_json::Value::Object(tokens));
-    insert_optional_string(&mut auth, "expired", expired);
-    insert_optional_string(&mut auth, "last_refresh", last_refresh);
+    insert_optional_value(&mut auth, "expires_at", expires_at);
+    insert_optional_value(&mut auth, "expired", expired);
+    insert_optional_value(&mut auth, "last_refresh", last_refresh);
     Some(serde_json::Value::Object(auth))
 }
 
@@ -1640,15 +1737,14 @@ fn extract_provider_account_info(
     );
 
     ProviderAccountInfo {
-        auth_mode: pick_first_string(
-            &sources,
-            &[&["auth_mode"], &["authMode"], &["openai_auth_mode"]],
-        )
-        .or_else(|| {
-            auth.get("agent_runtime_id")
-                .is_some()
-                .then(|| "agentIdentity".to_string())
-        }),
+        auth_mode: official_auth_mode_from_auth_json(auth)
+            .or_else(|| official_auth_mode_from_auth_json(value))
+            .map(|mode| mode.as_str().to_string())
+            .or_else(|| {
+                auth.get("agent_runtime_id")
+                    .is_some()
+                    .then(|| "agentIdentity".to_string())
+            }),
         display_name,
         email,
         team_name,
@@ -1928,6 +2024,48 @@ fn insert_optional_string(
     }
 }
 
+fn insert_optional_value(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<serde_json::Value>,
+) {
+    if let Some(value) = value {
+        map.insert(key.to_string(), value);
+    }
+}
+
+fn pick_first_json_value(
+    sources: &[&serde_json::Value],
+    paths: &[&[&str]],
+) -> Option<serde_json::Value> {
+    sources
+        .iter()
+        .find_map(|source| {
+            paths
+                .iter()
+                .find_map(|path| get_json_path(source, path).filter(|value| !value.is_null()))
+        })
+        .cloned()
+}
+
+fn get_json_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    Some(cursor)
+}
+
+fn is_timestamp_value(value: &serde_json::Value) -> bool {
+    if value.as_i64().is_some() {
+        return true;
+    }
+    let Some(text) = value.as_str().map(str::trim) else {
+        return false;
+    };
+    text.parse::<i64>().is_ok() || chrono::DateTime::parse_from_rfc3339(text).is_ok()
+}
+
 fn normalize_non_empty(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -2151,10 +2289,105 @@ mod tests {
             Some("workspace-from-header")
         );
         assert_eq!(auth["tokens"]["access_token"], "at-cockpit-token");
+        assert_eq!(auth["auth_mode"], "pat");
+        assert_eq!(
+            outcome
+                .provider
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("pat")
+        );
         assert_eq!(
             auth["tokens"]["chatgpt_account_id"],
             "workspace-from-header"
         );
+    }
+
+    #[test]
+    fn imports_cockpit_pat_marked_as_api_key_as_an_official_account() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let value = serde_json::json!({
+            "auth_mode": "api_key",
+            "personal_access_token": "at-cockpit-token",
+            "chatgpt_account_id": "workspace-id"
+        });
+
+        let outcome = import_provider_json(&store, &value.to_string(), None, None)
+            .expect("personal access token import");
+
+        assert_eq!(outcome.provider.kind, ProviderKind::OfficialCodex);
+        assert_eq!(outcome.import_kind, "openai_account");
+        assert_eq!(
+            outcome
+                .provider
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("pat")
+        );
+    }
+
+    #[test]
+    fn cockpit_pat_import_prefers_personal_token_over_mixed_access_tokens() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let value = serde_json::json!({
+            "auth_mode": "api_key",
+            "api_key": "wrong-api-key",
+            "access_token": "stale-access-token",
+            "personal_access_token": "at-cockpit-token",
+            "chatgpt_account_id": "workspace-id"
+        });
+
+        let outcome = import_provider_json(&store, &value.to_string(), None, None)
+            .expect("personal access token import");
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&outcome.auth_path).expect("auth file"))
+                .expect("auth json");
+
+        assert_eq!(auth["auth_mode"], "pat");
+        assert_eq!(auth["tokens"]["access_token"], "at-cockpit-token");
+    }
+
+    #[test]
+    fn pat_import_discards_mixed_oauth_lifecycle_fields() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let value = serde_json::json!({
+            "auth_mode": "pat",
+            "access_token": "stale-oauth-access",
+            "personal_access_token": "at-cockpit-token",
+            "id_token": "stale-id-token",
+            "session_token": "stale-session-token",
+            "refresh_token": "stale-refresh-token",
+            "expires_at": 1_900_000_000,
+            "expired": true,
+            "last_refresh": "2026-08-01T00:00:00Z"
+        });
+
+        let outcome = import_provider_json(&store, &value.to_string(), None, None)
+            .expect("personal access token import");
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&outcome.auth_path).expect("auth file"))
+                .expect("auth json");
+
+        assert_eq!(auth["auth_mode"], "pat");
+        assert_eq!(auth["tokens"]["access_token"], "at-cockpit-token");
+        for field in [
+            "id_token",
+            "session_token",
+            "refresh_token",
+            "expires_at",
+            "expired",
+            "last_refresh",
+        ] {
+            assert!(
+                auth.get(field).is_none() && auth["tokens"].get(field).is_none(),
+                "PAT auth should not retain {field}: {auth}"
+            );
+        }
     }
 
     #[test]
@@ -2177,6 +2410,38 @@ mod tests {
         let account = extract_provider_account_info(&value, &auth);
 
         assert_eq!(account.valid_until.as_deref(), Some("2027-01-02T03:04:05Z"));
+    }
+
+    #[test]
+    fn normalizes_oauth_token_expiry_without_turning_it_into_expired_text() {
+        let value = serde_json::json!({
+            "access_token": "opaque-access-token",
+            "refresh_token": "refresh-token",
+            "expires_at": 1_900_000_000
+        });
+
+        let auth = extract_codex_oauth_auth(&value).expect("oauth auth");
+
+        assert_eq!(auth["expires_at"], 1_900_000_000);
+        assert_eq!(auth["tokens"]["expires_at"], 1_900_000_000);
+        assert!(auth.get("expired").is_none());
+        assert!(auth["tokens"].get("expired").is_none());
+    }
+
+    #[test]
+    fn accepts_legacy_expired_timestamp_as_oauth_expiry() {
+        let value = serde_json::json!({
+            "access_token": "opaque-access-token",
+            "refresh_token": "refresh-token",
+            "expired": "2030-01-02T03:04:05Z"
+        });
+
+        let auth = extract_codex_oauth_auth(&value).expect("oauth auth");
+
+        assert_eq!(auth["expires_at"], "2030-01-02T03:04:05Z");
+        assert_eq!(auth["tokens"]["expires_at"], "2030-01-02T03:04:05Z");
+        assert!(auth.get("expired").is_none());
+        assert!(auth["tokens"].get("expired").is_none());
     }
 
     #[test]
@@ -2501,12 +2766,15 @@ mod tests {
 
         let outcome = import_local_codex_provider(&store, Some(codex_dir.clone())).expect("import");
         assert_eq!(outcome.provider.kind, ProviderKind::OfficialCodex);
-        assert_eq!(outcome.auth_path, codex_dir.join("auth.json"));
+        assert_ne!(outcome.auth_path, codex_dir.join("auth.json"));
+        assert!(outcome
+            .auth_path
+            .starts_with(store.data_dir().join("auth/accounts")));
         assert_eq!(
             outcome.provider.auth_ref.as_deref(),
-            Some(format!("file:{}", codex_dir.join("auth.json").display()).as_str())
+            Some(format!("file:{}", outcome.auth_path.display()).as_str())
         );
-        assert_eq!(outcome.provider.auth_ref, outcome.provider.direct_auth_ref);
+        assert_eq!(outcome.provider.direct_auth_ref, None);
         assert_eq!(
             outcome
                 .provider
@@ -2519,6 +2787,7 @@ mod tests {
         let repeated =
             import_local_codex_provider(&store, Some(codex_dir.clone())).expect("reimport");
         assert_eq!(repeated.provider.id, provider_id);
+        assert_eq!(repeated.auth_path, outcome.auth_path);
         assert_eq!(store.load().expect("config").providers.len(), 1);
         assert_eq!(
             outcome
@@ -2527,6 +2796,56 @@ mod tests {
                 .and_then(|account| account.account_id),
             Some("local-account".to_string())
         );
+        let managed_auth = fs::read(&outcome.auth_path).expect("managed auth");
+        fs::write(
+            codex_dir.join("auth.json"),
+            serde_json::json!({
+                "tokens": {
+                    "access_token": "native-access-changed",
+                    "refresh_token": "native-refresh-changed"
+                }
+            })
+            .to_string(),
+        )
+        .expect("change native auth");
+        assert_eq!(
+            fs::read(&outcome.auth_path).expect("managed auth remains isolated"),
+            managed_auth
+        );
+    }
+
+    #[test]
+    fn imports_local_codex_pat_without_claiming_auto_refresh() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("companion").join("config.json"));
+        let codex_dir = temp.path().join("codex");
+        fs::create_dir_all(&codex_dir).expect("codex dir");
+        fs::write(
+            codex_dir.join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "codex_companion_auth_mode": "pat",
+                "OPENAI_API_KEY": null,
+                "tokens": {
+                    "access_token": "at-personal-token",
+                    "chatgpt_account_id": "workspace-1"
+                }
+            })
+            .to_string(),
+        )
+        .expect("auth");
+
+        let outcome = import_local_codex_provider(&store, Some(codex_dir)).expect("import");
+
+        assert_eq!(
+            outcome
+                .provider
+                .account
+                .as_ref()
+                .and_then(|account| account.auth_mode.as_deref()),
+            Some("pat")
+        );
+        assert!(!outcome.message.contains("自动续期"));
     }
 
     #[test]
