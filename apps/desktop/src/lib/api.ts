@@ -70,6 +70,12 @@ let mockStatus = createMockStatus();
 let mockApiService = createMockApiServiceSnapshot();
 let mockOAuthPending: (CodexOAuthStartResponse & { callbackReceived: boolean }) | null = null;
 let mockSessionProviderPreferences: Record<string, string> = {};
+let mockDiagnosticInfo: DiagnosticInfo = {
+  logDirectory: `${MOCK_DATA_DIR}/logs`,
+  currentLogPath: `${MOCK_DATA_DIR}/logs/companion.log.jsonl`,
+  retainedFiles: 1,
+  totalBytes: 12_480,
+};
 
 export function getStatus() {
   if (!isTauri()) return Promise.resolve(mockStatus);
@@ -128,19 +134,16 @@ export function getProviderImportProgress() {
 }
 
 export function getDiagnosticInfo() {
-  if (!isTauri()) {
-    return Promise.resolve<DiagnosticInfo>({
-      logDirectory: `${MOCK_DATA_DIR}/logs`,
-      currentLogPath: `${MOCK_DATA_DIR}/logs/companion.log.jsonl`,
-      retainedFiles: 1,
-      totalBytes: 12_480,
-    });
-  }
+  if (!isTauri()) return Promise.resolve(structuredClone(mockDiagnosticInfo));
   return invoke<DiagnosticInfo>("get_diagnostic_info");
 }
 
 export function clearDiagnosticLogs() {
-  if (!isTauri()) return Promise.resolve(1);
+  if (!isTauri()) {
+    const removed = mockDiagnosticInfo.retainedFiles;
+    mockDiagnosticInfo = { ...mockDiagnosticInfo, retainedFiles: 0, totalBytes: 0 };
+    return Promise.resolve(removed);
+  }
   return invoke<number>("clear_diagnostic_logs");
 }
 
@@ -324,6 +327,7 @@ export function clearApiRequestLogs() {
   if (!isTauri()) {
     const count = mockApiService.recentRequests.length;
     mockApiService = { ...mockApiService, recentRequests: [] };
+    mockStatus = { ...mockStatus, recentEvents: [] };
     return Promise.resolve(count);
   }
   return invoke<number>("clear_api_request_logs");

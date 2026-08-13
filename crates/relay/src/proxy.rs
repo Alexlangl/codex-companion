@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(300);
 const UPSTREAM_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) async fn proxy(

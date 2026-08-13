@@ -4,7 +4,7 @@ use codex_companion_core::{
     ApiServiceSelfTest, ApiServiceSnapshot, CompanionError, HealthStatusKind, RelayConfig,
     RelaySettingsUpdate, Result,
 };
-use codex_companion_relay::ApiServiceStore;
+use codex_companion_relay::{clear_event_logs, ApiServiceStore};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -56,7 +56,10 @@ impl CompanionDaemon {
     }
 
     pub fn clear_api_request_logs(&self) -> Result<usize> {
-        self.api_service_store()?.clear_request_logs()
+        let cleared_requests = self.api_service_store()?.clear_request_logs()?;
+        clear_event_logs(&self.store.data_dir())
+            .map_err(|source| CompanionError::io(self.store.data_dir().join("relay"), source))?;
+        Ok(cleared_requests)
     }
 
     pub fn session_provider_preferences(
@@ -268,6 +271,7 @@ fn elapsed_ms(started_at: Instant) -> u64 {
 mod tests {
     use super::*;
     use codex_companion_core::{ConfigStore, ProviderConfig, ProviderKind};
+    use codex_companion_relay::RequestLogStart;
     use std::collections::BTreeMap;
 
     #[test]
@@ -302,6 +306,37 @@ mod tests {
         assert!(validate_relay_auth_scope(&relay, false).is_err());
         assert!(validate_relay_auth_scope(&relay, true).is_ok());
         assert!(validate_relay_auth_scope(&RelayConfig::default(), false).is_ok());
+    }
+
+    #[test]
+    fn clearing_api_logs_also_clears_relay_events() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let daemon = CompanionDaemon::new(store.clone());
+        let api_service = daemon.api_service_store().expect("API service");
+        api_service
+            .record_request_start(RequestLogStart {
+                request_id: "request-1",
+                method: "POST",
+                path: "/v1/responses",
+                model: Some("gpt-test"),
+                reasoning_effort: None,
+                service_tier: None,
+                client_id: None,
+            })
+            .expect("request log");
+        let events_dir = store.data_dir().join("relay");
+        std::fs::create_dir_all(&events_dir).expect("events directory");
+        std::fs::write(events_dir.join("events.jsonl"), "event\n").expect("event log");
+        std::fs::write(events_dir.join("events.previous.jsonl"), "previous\n")
+            .expect("previous event log");
+
+        assert_eq!(daemon.clear_api_request_logs().expect("clear logs"), 1);
+        assert!(daemon
+            .api_request_logs(100)
+            .expect("request logs")
+            .is_empty());
+        assert!(daemon.relay_events().is_empty());
     }
 
     #[test]

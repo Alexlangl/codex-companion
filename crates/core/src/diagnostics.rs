@@ -66,6 +66,10 @@ pub fn diagnostic_info(data_dir: &Path) -> DiagnosticInfo {
 }
 
 pub fn clear_diagnostic_logs(data_dir: &Path) -> Result<usize> {
+    let _guard = LOG_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| CompanionError::InvalidConfig("diagnostic log lock poisoned".to_string()))?;
     let log_directory = diagnostic_log_directory(data_dir);
     let Ok(entries) = fs::read_dir(&log_directory) else {
         return Ok(0);
@@ -272,5 +276,19 @@ mod tests {
         assert!(current.exists());
         assert!(log_dir.join("companion.log.4.jsonl").exists());
         assert!(!log_dir.join("companion.log.5.jsonl").exists());
+    }
+
+    #[test]
+    fn clear_removes_current_and_rotated_diagnostic_logs() {
+        let temp = tempfile::tempdir().expect("temp");
+        append_diagnostic_log(temp.path(), "info", "test", "current").expect("append");
+        let log_dir = diagnostic_log_directory(temp.path());
+        fs::write(log_dir.join("companion.log.1.jsonl"), "rotated\n").expect("rotated log");
+
+        assert_eq!(clear_diagnostic_logs(temp.path()).expect("clear logs"), 2);
+        let info = diagnostic_info(temp.path());
+        assert_eq!(info.retained_files, 0);
+        assert_eq!(info.total_bytes, 0);
+        assert_eq!(clear_diagnostic_logs(temp.path()).expect("clear empty"), 0);
     }
 }

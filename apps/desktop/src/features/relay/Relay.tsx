@@ -80,6 +80,7 @@ export function Relay({ active, status }: RelayProps) {
   const [relayEvents, setRelayEvents] = useState<RelayEvent[]>(status.recentEvents);
   const [logsRefreshing, setLogsRefreshing] = useState(false);
   const logRefreshInFlightRef = useRef(false);
+  const logRefreshRevisionRef = useRef(0);
 
   const loadSnapshot = useCallback(async () => {
     setLoading(true);
@@ -101,9 +102,11 @@ export function Relay({ active, status }: RelayProps) {
   const loadLogs = useCallback(async (showLoading: boolean): Promise<void> => {
     if (logRefreshInFlightRef.current) return;
     logRefreshInFlightRef.current = true;
+    const revision = logRefreshRevisionRef.current;
     if (showLoading) setLogsRefreshing(true);
     try {
       const [requests, events] = await Promise.all([getApiRequestLogs(), getRelayEvents()]);
+      if (revision !== logRefreshRevisionRef.current) return;
       setSnapshot((current) => {
         if (!current || apiRequestLogsEqual(current.recentRequests, requests)) return current;
         return { ...current, recentRequests: requests };
@@ -201,6 +204,9 @@ export function Relay({ active, status }: RelayProps) {
     if (!window.confirm("清空本地 API 请求日志？client 和配置不会被删除。")) return;
     void runAction("clear-logs", async () => {
       await clearApiRequestLogs();
+      logRefreshRevisionRef.current += 1;
+      setSnapshot((current) => current ? { ...current, recentRequests: [] } : current);
+      setRelayEvents([]);
     });
   }
 
@@ -463,7 +469,7 @@ export function Relay({ active, status }: RelayProps) {
             <Button disabled={logsRefreshing} onClick={handleRefreshLogs} variant="ghost">
               <RefreshCw aria-hidden="true" className={logsRefreshing ? "spin-icon" : undefined} size={14} /> 刷新日志
             </Button>
-            <Button disabled={requests.length === 0 || action !== null} onClick={handleClearLogs} variant="ghost">
+            <Button disabled={(requests.length === 0 && relayEvents.length === 0) || action !== null} onClick={handleClearLogs} variant="ghost">
               <Trash2 aria-hidden="true" size={14} /> 清空日志
             </Button>
           </div>

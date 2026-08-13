@@ -191,6 +191,27 @@ pub fn read_recent_events(data_dir: &Path, limit: usize) -> Vec<RelayEvent> {
     events
 }
 
+pub fn clear_event_logs(data_dir: &Path) -> std::io::Result<usize> {
+    let _guard = RELAY_EVENT_LOG_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let events_dir = data_dir.join("relay");
+    let paths = [
+        events_dir.join("events.previous.jsonl"),
+        events_dir.join("events.jsonl"),
+    ];
+    let mut cleared = 0;
+    for path in paths {
+        match fs::remove_file(&path) {
+            Ok(()) => cleared += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(cleared)
+}
+
 fn append_event_to_path(
     path: &Path,
     event: &RelayEvent,
@@ -280,6 +301,19 @@ mod tests {
                 .len()
                 <= 512
         );
+    }
+
+    #[test]
+    fn clear_event_logs_removes_current_and_previous_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let events_dir = temp.path().join("relay");
+        fs::create_dir_all(&events_dir).expect("events dir");
+        fs::write(events_dir.join("events.jsonl"), "current\n").expect("current log");
+        fs::write(events_dir.join("events.previous.jsonl"), "previous\n").expect("previous log");
+
+        assert_eq!(clear_event_logs(temp.path()).expect("clear event logs"), 2);
+        assert!(read_recent_events(temp.path(), 100).is_empty());
+        assert_eq!(clear_event_logs(temp.path()).expect("clear empty logs"), 0);
     }
 
     #[test]
