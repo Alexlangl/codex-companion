@@ -4,8 +4,8 @@ use crate::http::read_response_bytes_limited;
 use crate::types::ProviderUsageQueryTestInput;
 use chrono::{DateTime, Local, Utc};
 use codex_companion_core::{
-    redact_sensitive_text, CompanionError, ProviderAccountInfo, ProviderConfig, ProviderKind,
-    ProviderQuotaWindow, ProviderUsageQueryTemplate, Result,
+    http_client_builder, redact_sensitive_text, CompanionError, ProviderAccountInfo,
+    ProviderConfig, ProviderKind, ProviderQuotaWindow, ProviderUsageQueryTemplate, Result,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, REFERER, USER_AGENT};
 use rquickjs::{Context, Function, Runtime};
@@ -101,7 +101,7 @@ pub async fn refresh_official_codex_account(
     }
 
     let auth = ensure_codex_auth_snapshot(provider).await?;
-    let client = reqwest::Client::builder()
+    let client = http_client_builder()
         .timeout(DEFAULT_USAGE_HTTP_TIMEOUT)
         .connect_timeout(DEFAULT_USAGE_CONNECT_TIMEOUT)
         .build()
@@ -183,7 +183,7 @@ pub async fn refresh_api_key_usage(
     account.subscription_status = Some("连接正常".to_string());
 
     if let Some(query) = account.usage_query.clone() {
-        let client = reqwest::Client::builder()
+        let client = http_client_builder()
             .timeout(std::time::Duration::from_secs(
                 query.timeout_seconds.clamp(2, 30),
             ))
@@ -205,7 +205,7 @@ pub async fn refresh_api_key_usage(
     let token = resolve_auth_token(provider).ok_or_else(|| {
         CompanionError::InvalidConfig(format!("provider {} 缺少 API key", provider.id))
     })?;
-    let client = reqwest::Client::builder()
+    let client = http_client_builder()
         .timeout(DEFAULT_USAGE_HTTP_TIMEOUT)
         .connect_timeout(DEFAULT_USAGE_CONNECT_TIMEOUT)
         .build()
@@ -616,7 +616,7 @@ pub async fn test_configured_usage_query(
             .unwrap_or_else(|| usage_query_preset(input.usage_query.template)),
         timeout_seconds: input.usage_query.timeout_seconds.clamp(2, 30),
     };
-    let client = reqwest::Client::builder()
+    let client = http_client_builder()
         .timeout(std::time::Duration::from_secs(query.timeout_seconds))
         .redirect(reqwest::redirect::Policy::none())
         .build()

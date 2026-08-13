@@ -4,9 +4,9 @@ use base64::{
 };
 use chrono::Utc;
 use codex_companion_core::{
-    official_auth_mode_from_account, official_auth_mode_from_auth_json, provider_relay_auth_ref,
-    redact_sensitive_text, CompanionError, HealthFailureKind, OfficialAuthMode, ProviderConfig,
-    ProviderKind, Result,
+    http_client_builder, official_auth_mode_from_account, official_auth_mode_from_auth_json,
+    provider_relay_auth_ref, redact_sensitive_text, CompanionError, HealthFailureKind,
+    OfficialAuthMode, ProviderConfig, ProviderKind, Result,
 };
 use codex_companion_health::{classification_for_kind, FailureClassification};
 use serde::Deserialize;
@@ -243,7 +243,7 @@ async fn refresh_tokens_at(
     refresh_token: &str,
     token_endpoint: &str,
 ) -> std::result::Result<TokenRefreshResponse, CodexOAuthError> {
-    let client = reqwest::Client::builder()
+    let client = http_client_builder()
         .timeout(TOKEN_REFRESH_TIMEOUT)
         .connect_timeout(TOKEN_CONNECT_TIMEOUT)
         .build()

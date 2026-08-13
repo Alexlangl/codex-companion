@@ -7,7 +7,7 @@ use axum::{
     routing::{any, get, post},
     Router,
 };
-use codex_companion_core::{ConfigStore, RelayConfig};
+use codex_companion_core::{http_client_builder, ConfigStore, RelayConfig};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tower_http::cors::{AllowHeaders, AllowOrigin, Any, CorsLayer};
@@ -52,7 +52,7 @@ impl BoundRelay {
     }
 
     pub async fn serve(self) -> anyhow::Result<RelayStartOutcome> {
-        let client = reqwest::Client::builder()
+        let client = http_client_builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()?;
         let state = RelayState::new_with_api_key_floor(self.store, client, self.enforce_api_key);

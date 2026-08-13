@@ -3,6 +3,7 @@ mod constants;
 mod diagnostics;
 mod error;
 mod events;
+mod http_client;
 mod paths;
 mod private_file;
 mod provider_url;
@@ -18,6 +19,7 @@ pub use constants::*;
 pub use diagnostics::*;
 pub use error::{CompanionError, Result};
 pub use events::now_event;
+pub use http_client::http_client_builder;
 pub use paths::{default_codex_dir, default_config_path, default_data_dir};
 pub use private_file::atomic_write_private_file;
 pub use provider_url::{

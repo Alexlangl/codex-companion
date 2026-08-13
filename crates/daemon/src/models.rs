@@ -1,9 +1,9 @@
 use crate::runtime::CompanionDaemon;
 use chrono::{DateTime, Utc};
 use codex_companion_core::{
-    default_codex_dir, provider_api_base_url, redact_sensitive_text, ModelMatrixModel,
-    ModelMatrixSnapshot, ModelMatrixSource, ModelSourceKind, ModelSourceStatus, ProviderConfig,
-    ProviderKind, Result,
+    default_codex_dir, http_client_builder, provider_api_base_url, redact_sensitive_text,
+    ModelMatrixModel, ModelMatrixSnapshot, ModelMatrixSource, ModelSourceKind, ModelSourceStatus,
+    ProviderConfig, ProviderKind, Result,
 };
 use codex_companion_provider::{
     ensure_codex_auth_snapshot, provider_uses_agent_identity, provider_uses_codex_oauth,
@@ -60,7 +60,7 @@ impl CompanionDaemon {
             .map(|group| group.provider_order.iter().cloned().collect::<HashSet<_>>())
             .unwrap_or_default();
         let providers = ordered_providers(&config.providers, &active_provider_ids);
-        let client = Client::builder()
+        let client = http_client_builder()
             .timeout(MODEL_REQUEST_TIMEOUT)
             .connect_timeout(MODEL_CONNECT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())

@@ -7,8 +7,9 @@ use crate::codex_oauth::{ensure_codex_auth_snapshot_detailed, provider_uses_code
 use crate::http::read_response_bytes_limited;
 use chrono::Utc;
 use codex_companion_core::{
-    append_diagnostic_log, provider_api_base_url, redact_sensitive_text, CompanionError,
-    ConfigStore, HealthFailureKind, ProviderConfig, ProviderHealth, ProviderKind, Result,
+    append_diagnostic_log, http_client_builder, provider_api_base_url, redact_sensitive_text,
+    CompanionError, ConfigStore, HealthFailureKind, ProviderConfig, ProviderHealth, ProviderKind,
+    Result,
 };
 
 const PROVIDER_TEST_RESPONSE_LIMIT_BYTES: usize = 128 * 1024;
@@ -108,7 +109,7 @@ pub async fn test_provider_detailed(
 ) -> std::result::Result<(), ProviderTestFailure> {
     if provider.kind == ProviderKind::OfficialCodex {
         if provider_uses_agent_identity(provider) {
-            let client = reqwest::Client::builder()
+            let client = http_client_builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .build()
@@ -141,7 +142,7 @@ pub async fn test_provider_detailed(
             .ok_or_else(|| ProviderTestFailure::auth("官方 PAT 缺少 access_token"));
     }
 
-    let client = reqwest::Client::builder()
+    let client = http_client_builder()
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
