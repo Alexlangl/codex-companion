@@ -17,7 +17,7 @@ use axum::{
 use bytes::Bytes;
 use codex_companion_core::{
     provider_endpoint_is_chat_completions, redact_sensitive_text, ApiClient, CompanionConfig,
-    GroupPolicy, HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderGroup,
+    GroupPolicy, HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderGroup, ProviderKind,
 };
 use codex_companion_health::{
     classify_failure, cooldown_active, mark_failure, mark_model_failure,
@@ -276,7 +276,14 @@ async fn proxy_dispatch(
     {
         selected.push(preferred_provider.clone());
     }
-    if method == Method::GET && uri.path() == "/v1/models" {
+    let official_model_catalog_request = method == Method::GET
+        && uri.path() == "/v1/models"
+        && selected
+            .iter()
+            .any(|provider| matches!(provider.kind, ProviderKind::OfficialCodex));
+    // Third-party model maps remain useful for third-party-only groups, but
+    // they must not replace the native catalog of an official account.
+    if method == Method::GET && uri.path() == "/v1/models" && !official_model_catalog_request {
         let models = selected
             .iter()
             .flat_map(|provider| provider.model_map.keys().cloned())
@@ -428,6 +435,12 @@ async fn proxy_dispatch(
             )
         });
         candidates.extend(cooldown_probes);
+    }
+    if official_model_catalog_request {
+        // Catalog discovery is group-wide rather than session-affine. Keep an
+        // available official account authoritative after every generic route
+        // ordering step, including temporary-cooldown fallback placement.
+        candidates.sort_by_key(|provider| !matches!(provider.kind, ProviderKind::OfficialCodex));
     }
     if !group.fallback_enabled {
         candidates.truncate(1);
@@ -1514,6 +1527,83 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(value["object"], "list");
         assert_eq!(value["data"][0]["id"], "gpt-live");
+    }
+
+    #[tokio::test]
+    async fn official_model_catalog_wins_over_third_party_model_maps() {
+        let third_party_hits = Arc::new(AtomicUsize::new(0));
+        let official_hits = Arc::new(AtomicUsize::new(0));
+        let third_party_url = spawn_mock_server(
+            StatusCode::OK,
+            r#"{"data":[{"id":"gpt-third-party"}]}"#,
+            Some(third_party_hits.clone()),
+        )
+        .await;
+        let official_url = spawn_mock_server(
+            StatusCode::OK,
+            r#"{"models":[{"slug":"gpt-official"}]}"#,
+            Some(official_hits.clone()),
+        )
+        .await;
+        let store = store_with_group(vec![
+            provider("third-party", &third_party_url),
+            provider("official", &official_url),
+        ]);
+        let auth_path = store.data_dir().join("official-models-auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"tokens":{"access_token":"opaque-valid-token"}}"#,
+        )
+        .expect("official auth");
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .get_mut("third-party")
+                    .expect("third-party provider")
+                    .model_map
+                    .insert("gpt-5.6-sol".to_string(), "gpt-5.6-sol".to_string());
+                let official = config
+                    .providers
+                    .get_mut("official")
+                    .expect("official provider");
+                official.kind = ProviderKind::OfficialCodex;
+                official.auth_ref = Some(format!("file:{}", auth_path.display()));
+                config.health.insert(
+                    "official".to_string(),
+                    ProviderHealth {
+                        status: HealthStatusKind::Cooldown,
+                        cooldown_until: Some(Utc::now() + ChronoDuration::minutes(5)),
+                        ..ProviderHealth::default()
+                    },
+                );
+                Ok(())
+            })
+            .expect("configure providers");
+
+        let response = proxy_inner(
+            RelayState::new(store, reqwest::Client::new()),
+            Method::GET,
+            "/v1/models".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("models");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-codex-companion-provider")
+                .and_then(|value| value.to_str().ok()),
+            Some("official")
+        );
+        assert_eq!(official_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(third_party_hits.load(Ordering::SeqCst), 0);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["models"][0]["slug"], "gpt-official");
     }
 
     #[tokio::test]

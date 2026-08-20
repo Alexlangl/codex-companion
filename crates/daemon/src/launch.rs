@@ -193,24 +193,46 @@ impl CompanionDaemon {
 
         if should_direct {
             let install_snapshot = CodexInstallSnapshot::capture(&codex_dir)?;
-            let codex = install_direct_provider_with_options(
+            let client_target = CodexLaunchTarget::from_env();
+            let manage_client = manages_client_for_codex_dir(&codex_dir);
+            let client_was_running =
+                manage_client && !client_target.skip_restart && codex_running(&client_target);
+            if client_was_running {
+                stop_codex_and_wait(&client_target);
+            }
+            let codex = match install_direct_provider_with_options(
                 Some(codex_dir.clone()),
                 &provider,
                 DirectInstallOptions {
                     preserve_official_codex_auth: config_snapshot.app.preserve_official_codex_auth,
                 },
-            )?;
+            ) {
+                Ok(codex) => codex,
+                Err(error) => {
+                    restart_client_after_direct_failure(&client_target, client_was_running);
+                    return Err(error);
+                }
+            };
             if let Err(error) = self.commit_direct_provider_launch(
                 &provider,
                 config_snapshot.app.preserve_official_codex_auth,
             ) {
-                return Err(rollback_launch_install(install_snapshot, error));
+                let error = rollback_launch_install(install_snapshot, error);
+                restart_client_after_direct_failure(&client_target, client_was_running);
+                return Err(error);
             }
             let target_provider_id = direct_repair_target_provider_id(&provider);
-            stop_codex_before_repair(true);
             let repair = repair_for_launch(&codex_dir, target_provider_id.clone());
             let restart_required = true;
-            let codex_launch = restart_codex();
+            // Let the config/auth writes settle before launching the desktop
+            // client. The old process is already gone, so it cannot write its
+            // stale in-memory settings back over the direct provider.
+            thread::sleep(Duration::from_millis(750));
+            let codex_launch = if manage_client {
+                ensure_codex_started(true)
+            } else {
+                CodexProcessLaunch::none()
+            };
             return Ok(CodexLaunchOutcome {
                 mode: CodexLaunchMode::ProviderDirect,
                 target_id: provider.id.clone(),
@@ -732,6 +754,14 @@ fn group_relay_token_source(group: &ProviderGroup, providers: &[ProviderConfig])
 }
 
 pub(crate) fn relay_model_slugs(providers: &[ProviderConfig]) -> Vec<String> {
+    // A mixed group with an official account must keep Codex's native catalog
+    // authoritative; third-party aliases must not collapse the model picker.
+    if providers
+        .iter()
+        .any(|provider| matches!(provider.kind, ProviderKind::OfficialCodex))
+    {
+        return Vec::new();
+    }
     let mut seen = BTreeSet::new();
     let mut models = Vec::new();
     for model in providers
@@ -932,10 +962,6 @@ fn codex_process_action(restart_required: bool, codex_running: bool) -> CodexPro
     }
 }
 
-fn restart_codex() -> CodexProcessLaunch {
-    ensure_codex_started(true)
-}
-
 pub(crate) fn restart_codex_if_running() -> bool {
     let target = CodexLaunchTarget::from_env();
     if target.skip_restart || !codex_running(&target) {
@@ -988,6 +1014,28 @@ fn stop_codex_before_repair(restart_required: bool) {
     }
     stop_codex(&target);
     thread::sleep(Duration::from_millis(650));
+}
+
+fn stop_codex_and_wait(target: &CodexLaunchTarget) {
+    stop_codex(target);
+    for _ in 0..12 {
+        thread::sleep(Duration::from_millis(100));
+        if !codex_running(target) {
+            return;
+        }
+    }
+}
+
+fn manages_client_for_codex_dir(codex_dir: &Path) -> bool {
+    default_codex_dir().is_ok_and(|default| default == codex_dir)
+}
+
+fn restart_client_after_direct_failure(target: &CodexLaunchTarget, client_was_running: bool) {
+    if !client_was_running || target.skip_restart {
+        return;
+    }
+    thread::sleep(Duration::from_millis(300));
+    let _ = start_codex(target);
 }
 
 fn direct_launch_message(provider_name: &str, codex_launch: CodexProcessLaunch) -> String {
@@ -1661,6 +1709,17 @@ mod tests {
             relay_model_slugs(&[first, second]),
             vec!["gpt-5.6-sol", "gpt-5.6-terra"]
         );
+    }
+
+    #[test]
+    fn relay_group_with_official_account_uses_the_native_model_catalog() {
+        let official = provider(ProviderKind::OfficialCodex, None);
+        let mut relay = provider(ProviderKind::RelayProvider, None);
+        relay
+            .model_map
+            .insert("gpt-5.6-sol".to_string(), "gpt-5.6-sol".to_string());
+
+        assert!(relay_model_slugs(&[official, relay]).is_empty());
     }
 
     #[test]

@@ -13,6 +13,16 @@ pub(crate) fn managed_model_catalog_path(codex_dir: &Path) -> PathBuf {
     codex_dir.join(MANAGED_MODEL_CATALOG_FILENAME)
 }
 
+pub(crate) fn visible_cached_model_slugs(codex_dir: &Path) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    load_cached_models(codex_dir)
+        .into_iter()
+        .filter(|model| model.get("visibility").and_then(Value::as_str) != Some("hide"))
+        .filter_map(|model| model_slug(&model).map(str::trim).map(str::to_string))
+        .filter(|slug| !slug.is_empty() && seen.insert(slug.clone()))
+        .collect()
+}
+
 pub(crate) fn normalized_model_slugs(
     requested: &[String],
     configured_model: Option<&str>,
@@ -183,6 +193,25 @@ mod tests {
         );
 
         assert_eq!(models, vec!["gpt-5.6-sol", "gpt-5.6-terra"]);
+    }
+
+    #[test]
+    fn visible_cached_models_exclude_hidden_and_duplicate_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join(MODELS_CACHE_FILENAME),
+            json!({
+                "models": [
+                    {"slug": "gpt-visible", "visibility": "list"},
+                    {"slug": "gpt-hidden", "visibility": "hide"},
+                    {"slug": "gpt-visible", "visibility": "list"}
+                ]
+            })
+            .to_string(),
+        )
+        .expect("cache");
+
+        assert_eq!(visible_cached_model_slugs(temp.path()), vec!["gpt-visible"]);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use walkdir::WalkDir;
 
 use model_catalog::{
     build_model_catalog, managed_model_catalog_path, normalized_model_slugs,
-    MANAGED_MODEL_CATALOG_FILENAME,
+    visible_cached_model_slugs, MANAGED_MODEL_CATALOG_FILENAME,
 };
 
 const CODEX_STATE_DB_FILENAME: &str = "state_5.sqlite";
@@ -213,6 +213,9 @@ pub fn install_companion_provider_for_relay(
         let mut doc = current.parse::<DocumentMut>().map_err(|source| {
             CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
         })?;
+        let model_settings_before_reactivation =
+            managed_provider_is_no_longer_active(&codex_dir, &doc)
+                .then(|| ModelSettingsSnapshot::capture(&doc));
         let managed_target_provider =
             load_companion_marker(&codex_dir, &doc).and_then(|marker| marker.target_provider);
         let auth_rollback = AuthRollback::capture(&codex_dir)?;
@@ -256,6 +259,7 @@ pub fn install_companion_provider_for_relay(
             &mut backup,
             model_slugs,
             &auth_rollback,
+            model_settings_before_reactivation,
         )?;
         let managed_model_catalog = backup.model_catalog_write_hash.is_some()
             && doc
@@ -338,6 +342,8 @@ pub fn install_direct_provider_with_options(
     let mut doc = current.parse::<DocumentMut>().map_err(|source| {
         CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
     })?;
+    let model_settings_before_reactivation = managed_provider_is_no_longer_active(&codex_dir, &doc)
+        .then(|| ModelSettingsSnapshot::capture(&doc));
     let managed_target_provider =
         load_companion_marker(&codex_dir, &doc).and_then(|marker| marker.target_provider);
     let auth_rollback = AuthRollback::capture(&codex_dir)?;
@@ -445,6 +451,7 @@ pub fn install_direct_provider_with_options(
         &mut backup,
         &direct_model_slugs,
         &auth_rollback,
+        model_settings_before_reactivation,
     )?;
     // A direct installation must not leave a Relay-era OAuth mirror binding
     // behind. The next Relay activation establishes a fresh, verified source.
@@ -1485,6 +1492,33 @@ impl CodexInstallSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ModelSettingsSnapshot {
+    model_provider: Option<String>,
+    model: Option<String>,
+    model_catalog_json: Option<String>,
+}
+
+impl ModelSettingsSnapshot {
+    fn capture(doc: &DocumentMut) -> Self {
+        Self {
+            model_provider: doc
+                .get("model_provider")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            model: doc
+                .get("model")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+            model_catalog_json: doc
+                .get("model_catalog_json")
+                .and_then(Item::as_str)
+                .map(ToOwned::to_owned),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ManagedConfigBackup {
     backup_root: String,
@@ -1499,6 +1533,7 @@ struct ManagedConfigBackup {
     auth_write_snapshot: Option<String>,
     official_auth_provider_id: Option<String>,
     model_catalog_write_hash: Option<String>,
+    model_settings_before_reactivation: Option<ModelSettingsSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1522,6 +1557,7 @@ struct CompanionConfigMarker {
     auth_write_snapshot: Option<String>,
     official_auth_provider_id: Option<String>,
     model_catalog_write_hash: Option<String>,
+    model_settings_before_reactivation: Option<ModelSettingsSnapshot>,
 }
 
 impl CompanionConfigMarker {
@@ -1607,6 +1643,7 @@ impl CompanionConfigMarker {
                 .get("model_catalog_write_hash")
                 .and_then(Item::as_str)
                 .map(ToOwned::to_owned),
+            model_settings_before_reactivation: None,
         })
     }
 }
@@ -1748,6 +1785,15 @@ fn remove_companion_state(codex_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn managed_provider_is_no_longer_active(codex_dir: &Path, doc: &DocumentMut) -> bool {
+    let Some(managed_target) =
+        load_companion_marker(codex_dir, doc).and_then(|marker| marker.target_provider)
+    else {
+        return false;
+    };
+    doc.get("model_provider").and_then(Item::as_str) != Some(managed_target.as_str())
+}
+
 fn prepare_config_write(
     codex_dir: &Path,
     config_path: &Path,
@@ -1773,6 +1819,7 @@ fn prepare_config_write(
                 auth_write_snapshot: marker.auth_write_snapshot,
                 official_auth_provider_id: marker.official_auth_provider_id,
                 model_catalog_write_hash: marker.model_catalog_write_hash,
+                model_settings_before_reactivation: marker.model_settings_before_reactivation,
             });
         }
     }
@@ -1803,6 +1850,7 @@ fn prepare_config_write(
         auth_write_snapshot: None,
         official_auth_provider_id: None,
         model_catalog_write_hash: None,
+        model_settings_before_reactivation: None,
     })
 }
 
@@ -1838,6 +1886,7 @@ fn install_managed_model_catalog(
     backup: &mut ManagedConfigBackup,
     requested_models: &[String],
     auth_rollback: &AuthRollback,
+    model_settings_before_reactivation: Option<ModelSettingsSnapshot>,
 ) -> Result<ConfigRollback> {
     let catalog_path = managed_model_catalog_path(codex_dir);
     let catalog_rollback = match ConfigRollback::capture(&catalog_path) {
@@ -1852,16 +1901,29 @@ fn install_managed_model_catalog(
         }
     };
 
+    let reclaim_model_settings = if let Some(settings) = model_settings_before_reactivation {
+        backup.model_settings_before_reactivation = Some(settings);
+        true
+    } else {
+        false
+    };
     let result = (|| -> Result<()> {
+        let released_unmanaged_catalog = reclaim_model_settings_if_needed(
+            codex_dir,
+            doc,
+            requested_models,
+            reclaim_model_settings,
+        );
         let has_explicit_models = requested_models.iter().any(|model| {
             let model = model.trim();
             !model.is_empty() && model != "default"
         });
         if !has_explicit_models {
-            let managed_catalog_is_live = doc
-                .get("model_catalog_json")
-                .and_then(Item::as_str)
-                .is_some_and(|path| managed_model_catalog_pointer(codex_dir, path));
+            let managed_catalog_is_live = released_unmanaged_catalog
+                || doc
+                    .get("model_catalog_json")
+                    .and_then(Item::as_str)
+                    .is_some_and(|path| managed_model_catalog_pointer(codex_dir, path));
             if managed_catalog_is_live && backup.model_catalog_write_hash.is_some() {
                 let restored = restore_model_catalog_contents(
                     codex_dir,
@@ -1931,6 +1993,46 @@ fn install_managed_model_catalog(
     }
 
     Ok(catalog_rollback)
+}
+
+fn reclaim_model_settings_if_needed(
+    codex_dir: &Path,
+    doc: &mut DocumentMut,
+    requested_models: &[String],
+    reclaim: bool,
+) -> bool {
+    if !reclaim {
+        return false;
+    }
+    let unmanaged_catalog_is_live = doc
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .is_some_and(|pointer| !managed_model_catalog_pointer(codex_dir, pointer));
+    if unmanaged_catalog_is_live {
+        // Reclaim only the config pointer. The referenced user file is preserved.
+        doc.as_table_mut().remove("model_catalog_json");
+    }
+    let mut target_models = requested_models
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty() && *model != "default")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if target_models.is_empty() {
+        target_models = visible_cached_model_slugs(codex_dir);
+    }
+    let Some(default_model) = target_models.first() else {
+        doc.as_table_mut().remove("model");
+        return unmanaged_catalog_is_live;
+    };
+    let configured_model_is_valid = doc
+        .get("model")
+        .and_then(Item::as_str)
+        .is_some_and(|model| target_models.iter().any(|candidate| candidate == model));
+    if !configured_model_is_valid {
+        doc["model"] = value(default_model);
+    }
+    unmanaged_catalog_is_live
 }
 
 fn restore_prior_auth_write_if_managed(
@@ -2177,6 +2279,7 @@ fn companion_marker(
         auth_write_snapshot: backup.auth_write_snapshot.clone(),
         official_auth_provider_id: backup.official_auth_provider_id.clone(),
         model_catalog_write_hash: backup.model_catalog_write_hash.clone(),
+        model_settings_before_reactivation: backup.model_settings_before_reactivation.clone(),
     }
 }
 
@@ -2456,8 +2559,18 @@ fn restore_changed_config_from_marker(
         .get("model_provider")
         .and_then(Item::as_str)
         .map(ToOwned::to_owned);
+    let model_settings_before_reactivation = (live_provider.as_deref()
+        == marker.target_provider.as_deref())
+    .then_some(marker.model_settings_before_reactivation.as_ref())
+    .flatten();
     if live_provider.as_deref() == marker.target_provider.as_deref() {
-        if let Some(original_provider) = original_doc
+        if let Some(settings) = model_settings_before_reactivation {
+            restore_optional_config_string(
+                &mut current_doc,
+                "model_provider",
+                settings.model_provider.as_deref(),
+            );
+        } else if let Some(original_provider) = original_doc
             .as_ref()
             .and_then(|doc| doc.get("model_provider"))
         {
@@ -2487,18 +2600,27 @@ fn restore_changed_config_from_marker(
             current_doc["openai_base_url"] = original_base_url.clone();
         }
     }
-    let managed_catalog_is_live = current_doc
-        .get("model_catalog_json")
-        .and_then(Item::as_str)
-        .is_some_and(|path| managed_model_catalog_pointer(codex_dir, path));
-    if managed_catalog_is_live {
-        if let Some(original_catalog) = original_doc
-            .as_ref()
-            .and_then(|doc| doc.get("model_catalog_json"))
-        {
-            current_doc["model_catalog_json"] = original_catalog.clone();
-        } else {
-            current_doc.as_table_mut().remove("model_catalog_json");
+    if let Some(settings) = model_settings_before_reactivation {
+        restore_optional_config_string(&mut current_doc, "model", settings.model.as_deref());
+        restore_optional_config_string(
+            &mut current_doc,
+            "model_catalog_json",
+            settings.model_catalog_json.as_deref(),
+        );
+    } else {
+        let managed_catalog_is_live = current_doc
+            .get("model_catalog_json")
+            .and_then(Item::as_str)
+            .is_some_and(|path| managed_model_catalog_pointer(codex_dir, path));
+        if managed_catalog_is_live {
+            if let Some(original_catalog) = original_doc
+                .as_ref()
+                .and_then(|doc| doc.get("model_catalog_json"))
+            {
+                current_doc["model_catalog_json"] = original_catalog.clone();
+            } else {
+                current_doc.as_table_mut().remove("model_catalog_json");
+            }
         }
     }
     let managed_file_auth_store = current_doc
@@ -2527,6 +2649,14 @@ fn restore_changed_config_from_marker(
     }
     fs::write(config_path, current_doc.to_string())
         .map_err(|source| CompanionError::io(config_path, source))
+}
+
+fn restore_optional_config_string(doc: &mut DocumentMut, key: &str, previous: Option<&str>) {
+    if let Some(previous) = previous {
+        doc[key] = value(previous);
+    } else {
+        doc.as_table_mut().remove(key);
+    }
 }
 
 fn read_original_config_doc(
@@ -3875,6 +4005,74 @@ mod tests {
         assert!(text.contains("base_url = \"http://127.0.0.1:17687/v1\""));
         assert!(!text.contains("model_catalog_json"));
         assert!(!managed_model_catalog_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn install_reclaims_model_settings_when_managed_provider_is_no_longer_active() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("models_cache.json"),
+            serde_json::json!({
+                "models": [
+                    {"slug": "gpt-official", "visibility": "list"},
+                    {"slug": "gpt-hidden", "visibility": "hide"}
+                ]
+            })
+            .to_string(),
+        )
+        .expect("official model cache");
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"openai\"\nmodel = \"gpt-official\"\n",
+        )
+        .expect("initial config");
+        install_companion_provider_with_token_source_and_models(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &["gpt-old-companion".to_string()],
+        )
+        .expect("initial Companion install");
+        assert!(managed_model_catalog_path(temp.path()).is_file());
+
+        fs::write(
+            temp.path().join("user-model-catalog.json"),
+            br#"{"models":[{"slug":"gpt-custom"}]}"#,
+        )
+        .expect("user catalog");
+        let user_config = r#"model_provider = "custom"
+model = "gpt-custom"
+model_catalog_json = "user-model-catalog.json"
+
+[model_providers.custom]
+name = "Custom OpenAI Provider"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+"#;
+        fs::write(temp.path().join("config.toml"), user_config).expect("user config change");
+
+        install_companion_provider(Some(temp.path().to_path_buf()), &RelayConfig::default())
+            .expect("install");
+
+        let installed = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(installed.contains("model_provider = \"codex-companion\""));
+        assert!(installed.contains("model = \"gpt-official\""));
+        assert!(!installed.contains("model_catalog_json"));
+        assert!(temp.path().join("user-model-catalog.json").is_file());
+        assert!(!managed_model_catalog_path(temp.path()).exists());
+        assert!(read_companion_state(temp.path())
+            .expect("managed state")
+            .model_catalog_write_hash
+            .is_none());
+
+        uninstall_companion_provider(Some(temp.path().to_path_buf())).expect("uninstall");
+        let restored =
+            fs::read_to_string(temp.path().join("config.toml")).expect("restored config");
+        assert!(restored.contains("model_provider = \"custom\""));
+        assert!(restored.contains("model = \"gpt-custom\""));
+        assert!(restored.contains("model_catalog_json = \"user-model-catalog.json\""));
+        assert!(restored.contains("Custom OpenAI Provider"));
+        assert!(temp.path().join("user-model-catalog.json").is_file());
     }
 
     #[test]
