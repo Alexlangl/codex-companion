@@ -152,6 +152,14 @@ export function openDiagnosticDirectory() {
   return invoke<boolean>("open_diagnostic_directory");
 }
 
+export function openExternalUrl(url: string): Promise<void> {
+  if (!isTauri()) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return Promise.resolve();
+  }
+  return invoke<void>("open_external_url", { url });
+}
+
 export function reportFrontendError(
   message: string,
   stack?: string | null,

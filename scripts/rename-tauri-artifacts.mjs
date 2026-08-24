@@ -63,6 +63,8 @@ function artifactExtension(file) {
   if (name.endsWith(".tar.gz")) return ".tar.gz";
   if (name.endsWith(".AppImage.sig")) return ".AppImage.sig";
   if (name.endsWith(".AppImage")) return ".AppImage";
+  if (name.endsWith(".deb.sig")) return ".deb.sig";
+  if (name.endsWith(".rpm.sig")) return ".rpm.sig";
   if (name.endsWith(".exe.sig")) return ".exe.sig";
   if (name.endsWith(".msi.sig")) return ".msi.sig";
   return path.extname(name);

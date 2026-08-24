@@ -11,12 +11,14 @@ use codex_companion_provider::{
     ProviderUpsert, ProviderUsageQueryTestInput,
 };
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, Runtime,
 };
+use url::Url;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ICON_ID: &str = "main-tray";
@@ -517,6 +519,34 @@ fn open_diagnostic_directory() -> Result<bool, String> {
     daemon()?
         .open_diagnostic_directory()
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let parsed = Url::parse(url.trim()).map_err(|error| format!("Invalid URL: {error}"))?;
+    let is_github_url = matches!(parsed.scheme(), "https")
+        && matches!(
+            parsed.host_str(),
+            Some("github.com") | Some("www.github.com")
+        );
+    if !is_github_url {
+        return Err("Only HTTPS GitHub URLs can be opened from the updater".to_string());
+    }
+
+    let status = if cfg!(target_os = "macos") {
+        Command::new("open").arg(parsed.as_str()).status()
+    } else if cfg!(target_os = "windows") {
+        Command::new("explorer").arg(parsed.as_str()).status()
+    } else {
+        Command::new("xdg-open").arg(parsed.as_str()).status()
+    }
+    .map_err(|error| format!("Failed to open browser: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Browser exited with status {status}"))
+    }
 }
 
 #[tauri::command]
@@ -1132,6 +1162,7 @@ pub fn run() {
             get_diagnostic_info,
             clear_diagnostic_logs,
             open_diagnostic_directory,
+            open_external_url,
             report_frontend_error,
             create_api_client,
             update_api_client,

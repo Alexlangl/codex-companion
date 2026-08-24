@@ -256,6 +256,23 @@ jobs:
           CODEX_COMPANION_VERSION: ${{ needs.prepare.outputs.version }}
         run: node scripts/generate-updater-manifest.mjs
 
+      - name: Validate updater manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '
+            .platforms["darwin-aarch64"] and
+            .platforms["darwin-x86_64"] and
+            .platforms["windows-x86_64-msi"] and
+            .platforms["windows-x86_64-nsis"] and
+            .platforms["linux-aarch64-appimage"] and
+            .platforms["linux-aarch64-deb"] and
+            .platforms["linux-aarch64-rpm"] and
+            .platforms["linux-x86_64-appimage"] and
+            .platforms["linux-x86_64-deb"] and
+            .platforms["linux-x86_64-rpm"]
+          ' release-assets/latest.json > /dev/null
+
       - name: Generate checksums
         shell: bash
         run: |
@@ -270,11 +287,38 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: Codex Companion ${{ needs.prepare.outputs.tag }}
           generate_release_notes: true
-          draft: false
+          draft: true
           prerelease: ${{ needs.prepare.outputs.prerelease }}
           fail_on_unmatched_files: true
           preserve_order: true
           files: release-assets/*
+
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+            gh release edit "${RELEASE_TAG}" --draft=false --prerelease
+          else
+            gh release edit "${RELEASE_TAG}" --draft=false --prerelease=false --latest
+          fi
+
+      - name: Verify published updater state
+        env:
+          CODEX_COMPANION_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+            export CODEX_COMPANION_LATEST_BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          fi
+          node scripts/verify-published-updater.mjs
 
   homebrew:
     name: Update Homebrew tap

@@ -3,6 +3,7 @@ import {
   Cable,
   Clipboard,
   Download,
+  ExternalLink,
   FileText,
   FolderOpen,
   Play,
@@ -87,7 +88,7 @@ export function Settings(props: SettingsProps) {
   const [cliBusy, setCliBusy] = useState(false);
   const disabled = busy !== "idle";
   const update = appUpdater.state;
-  const updateBusy = update.status === "checking" || update.status === "downloading";
+  const updateBusy = ["checking", "downloading", "installing"].includes(update.status);
   const updateStatus = appUpdateStatusLabel(update);
 
   useEffect(() => {
@@ -140,6 +141,17 @@ export function Settings(props: SettingsProps) {
 
   function handleInstallUpdate(): void {
     void appUpdater.installUpdate();
+  }
+
+  function handleOpenUpdateDownload(): void {
+    if (update.status !== "available" && update.status !== "install-error") {
+      return;
+    }
+    void appUpdater.openDownloadUrl(update.downloadUrl);
+  }
+
+  function handleRestartUpdate(): void {
+    void appUpdater.restartApp();
   }
 
   function handleWorkingDirectoryChange(event: ChangeEvent<HTMLInputElement>): void {
@@ -308,8 +320,28 @@ export function Settings(props: SettingsProps) {
               <RefreshCw aria-hidden="true" size={15} /> 检查更新
             </Button>
             {update.status === "available" ? (
-              <Button disabled={disabled || updateBusy} onClick={handleInstallUpdate}>
-                <Download aria-hidden="true" size={15} /> 下载并安装 v{update.nextVersion}
+              <>
+                <Button disabled={disabled || updateBusy} onClick={handleOpenUpdateDownload} variant="secondary">
+                  <ExternalLink aria-hidden="true" size={15} /> 打开下载页
+                </Button>
+                <Button disabled={disabled || updateBusy} onClick={handleInstallUpdate}>
+                  <Download aria-hidden="true" size={15} /> 下载并安装 v{update.nextVersion}
+                </Button>
+              </>
+            ) : null}
+            {update.status === "install-error" ? (
+              <>
+                <Button disabled={disabled} onClick={handleOpenUpdateDownload} variant="secondary">
+                  <Download aria-hidden="true" size={15} /> 手动下载
+                </Button>
+                <Button disabled={disabled} onClick={handleInstallUpdate}>
+                  <RefreshCw aria-hidden="true" size={15} /> 重试安装
+                </Button>
+              </>
+            ) : null}
+            {update.status === "restart-error" ? (
+              <Button disabled={disabled} onClick={handleRestartUpdate}>
+                <RefreshCw aria-hidden="true" size={15} /> 立即重启
               </Button>
             ) : null}
           </div>
@@ -389,15 +421,22 @@ function appUpdateStatusLabel(state: AppUpdateState): string {
     case "unsupported":
       return "浏览器开发模式不执行更新";
     case "checking":
-      return "正在检查更新";
+      return state.retryAttempt && state.retryTotal
+        ? `网络波动，正在重试检查（${state.retryAttempt}/${state.retryTotal}）`
+        : "正在检查更新";
     case "latest":
       return "当前已是最新版本";
     case "available":
       return `发现 v${state.nextVersion}`;
     case "downloading":
+      if (state.retryAttempt && state.retryTotal) {
+        return `下载遇到网络波动，正在重试（${state.retryAttempt}/${state.retryTotal}）`;
+      }
       return state.progress === null
         ? `正在下载 v${state.nextVersion}`
         : `正在下载 v${state.nextVersion}（${state.progress}%）`;
+    case "installing":
+      return `正在安装 v${state.nextVersion}`;
     case "check-error":
     case "install-error":
     case "restart-error":
