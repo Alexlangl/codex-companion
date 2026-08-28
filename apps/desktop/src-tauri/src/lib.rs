@@ -706,8 +706,9 @@ fn import_local_codex_provider(
 }
 
 #[tauri::command]
-fn start_codex_oauth() -> Result<codex_oauth::OAuthStartResponse, String> {
+fn start_codex_oauth(app: AppHandle) -> Result<codex_oauth::OAuthStartResponse, String> {
     let daemon = daemon()?;
+    codex_oauth::configure_event_emitter(&app);
     codex_oauth::start(daemon.store().data_dir())
 }
 
@@ -1007,6 +1008,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            codex_oauth::configure_event_emitter(app.handle());
             if let Ok(daemon) = daemon() {
                 let refresh_daemon = daemon.clone();
                 tauri::async_runtime::spawn(async move {

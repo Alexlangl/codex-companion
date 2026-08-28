@@ -1,6 +1,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Select from "@radix-ui/react-select";
 import * as Tabs from "@radix-ui/react-tabs";
+import { listen } from "@tauri-apps/api/event";
 import {
   Check,
   CircleCheck,
@@ -23,6 +24,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -1095,13 +1097,88 @@ function CodexOAuthPanel({
   onComplete: (loginId: string) => Promise<void>;
 }) {
   const [flow, setFlow] = useState<OAuthFlowState>({ phase: "idle" });
+  const flowRef = useRef<OAuthFlowState>({ phase: "idle" });
   const [callbackUrl, setCallbackUrl] = useState("");
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const statusRevisionRef = useRef(0);
+  const completionLoginIdRef = useRef<string | null>(null);
+  const completionAttemptedLoginIdRef = useRef<string | null>(null);
+  const onCompleteRef = useRef(onComplete);
   const session = "session" in flow ? flow.session : null;
   const isWorking = flow.phase === "starting" || flow.phase === "completing";
   const callbackReceived = flow.phase === "ready" || flow.phase === "completing";
+  const completionError = flow.phase === "ready" && Boolean(error);
+  let startIcon = <Globe2 aria-hidden="true" size={15} />;
+  if (flow.phase === "starting") {
+    startIcon = <LoaderCircle aria-hidden="true" className="spin-icon" size={15} />;
+  }
+  let statusIcon = <LoaderCircle aria-hidden="true" className="spin-icon" size={19} />;
+  if (callbackReceived) {
+    statusIcon = <CircleCheck aria-hidden="true" size={19} />;
+  }
+  let completionIcon = <ShieldCheck aria-hidden="true" size={15} />;
+  if (flow.phase === "completing") {
+    completionIcon = <LoaderCircle aria-hidden="true" className="spin-icon" size={15} />;
+  }
+  let statusTitle = "等待浏览器授权";
+  let statusDescription = "授权会话将在 5 分钟后失效。";
+  let completionButtonLabel = "完成并添加账号";
+  if (flow.phase === "completing") {
+    statusTitle = "授权已收到，正在导入账号";
+    statusDescription = "正在交换令牌并刷新账号信息，请稍候。";
+    completionButtonLabel = "正在导入...";
+  } else if (completionError) {
+    statusTitle = "授权已收到，但导入失败";
+    statusDescription = "可以先重试；如果授权会话已失效，再重新授权。";
+    completionButtonLabel = "重试导入账号";
+  } else if (callbackReceived) {
+    statusTitle = "授权回调已收到";
+    statusDescription = "账号会自动保存到 Companion。";
+  }
+
+  const updateFlow = useCallback((next: OAuthFlowState): void => {
+    flowRef.current = next;
+    setFlow(next);
+  }, []);
+
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
+
+  const completeSession = useCallback(
+    async function completeSession(
+      targetSession: CodexOAuthStartResponse,
+      automatic = false,
+    ): Promise<void> {
+      if (completionLoginIdRef.current === targetSession.loginId) return;
+      if (
+        automatic &&
+        completionAttemptedLoginIdRef.current === targetSession.loginId
+      ) {
+        return;
+      }
+      completionAttemptedLoginIdRef.current = targetSession.loginId;
+      completionLoginIdRef.current = targetSession.loginId;
+      statusRevisionRef.current += 1;
+      setError("");
+      updateFlow({ phase: "completing", session: targetSession });
+      try {
+        await onCompleteRef.current(targetSession.loginId);
+        completionLoginIdRef.current = null;
+        updateFlow({ phase: "idle" });
+        setCallbackUrl("");
+        setCopied(false);
+      } catch (unknownError) {
+        completionLoginIdRef.current = null;
+        updateFlow({ phase: "ready", session: targetSession });
+        setError(userFacingError(unknownError));
+      } finally {
+        statusRevisionRef.current += 1;
+      }
+    },
+    [updateFlow],
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -1117,18 +1194,27 @@ function CodexOAuthPanel({
         if (status?.error) {
           setError(status.error);
         }
-        setFlow((current) => {
-          if (current.phase === "starting" || current.phase === "completing") {
-            return current;
-          }
-          if (!status) {
-            return current.phase === "idle" ? current : { phase: "idle" };
-          }
-          const nextSession = oauthSessionFromStatus(status);
-          return status.callbackReceived
-            ? { phase: "ready", session: nextSession }
-            : { phase: "waiting", session: nextSession };
-        });
+        const current = flowRef.current;
+        if (current.phase === "starting" || current.phase === "completing") {
+          return;
+        }
+        if (!status) {
+          if (current.phase !== "idle") updateFlow({ phase: "idle" });
+          return;
+        }
+        const nextSession = oauthSessionFromStatus(status);
+        if (!status.callbackReceived) {
+          updateFlow({ phase: "waiting", session: nextSession });
+          return;
+        }
+        if (
+          completionLoginIdRef.current === status.loginId ||
+          completionAttemptedLoginIdRef.current === status.loginId
+        ) {
+          updateFlow({ phase: "ready", session: nextSession });
+          return;
+        }
+        void completeSession(nextSession, true);
       } catch (unknownError) {
         if (!disposed) {
           setError(userFacingError(unknownError));
@@ -1144,18 +1230,55 @@ function CodexOAuthPanel({
       disposed = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [completeSession, updateFlow]);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return undefined;
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listen<{ loginId?: string }>("codex-oauth-login-completed", (event) => {
+      if (disposed) return;
+      const loginId = event.payload?.loginId;
+      const current = flowRef.current;
+      const targetSession = "session" in current ? current.session : null;
+      if (
+        !loginId ||
+        !targetSession ||
+        targetSession.loginId !== loginId ||
+        current.phase === "starting" ||
+        current.phase === "completing"
+      ) {
+        return;
+      }
+      void completeSession(targetSession, true);
+    })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else stopListening = unlisten;
+      })
+      .catch((unknownError: unknown) => {
+        if (!disposed) {
+          console.error("Failed to register Codex OAuth completion listener", unknownError);
+        }
+      });
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, [completeSession]);
 
   async function handleStart(): Promise<void> {
     statusRevisionRef.current += 1;
+    completionLoginIdRef.current = null;
+    completionAttemptedLoginIdRef.current = null;
     setError("");
     setCopied(false);
-    setFlow({ phase: "starting" });
+    updateFlow({ phase: "starting" });
     try {
       const nextSession = await startCodexOAuth();
-      setFlow({ phase: "waiting", session: nextSession });
+      updateFlow({ phase: "waiting", session: nextSession });
     } catch (unknownError) {
-      setFlow({ phase: "idle" });
+      updateFlow({ phase: "idle" });
       setError(userFacingError(unknownError));
     } finally {
       statusRevisionRef.current += 1;
@@ -1191,8 +1314,8 @@ function CodexOAuthPanel({
     setError("");
     try {
       await submitCodexOAuthCallback(session.loginId, callbackUrl);
-      setFlow({ phase: "ready", session });
       setCallbackUrl("");
+      await completeSession(session);
     } catch (unknownError) {
       setError(userFacingError(unknownError));
     } finally {
@@ -1202,17 +1325,7 @@ function CodexOAuthPanel({
 
   async function handleComplete(): Promise<void> {
     if (!session || !callbackReceived) return;
-    statusRevisionRef.current += 1;
-    setError("");
-    setFlow({ phase: "completing", session });
-    try {
-      await onComplete(session.loginId);
-    } catch (unknownError) {
-      setFlow({ phase: "ready", session });
-      setError(userFacingError(unknownError));
-    } finally {
-      statusRevisionRef.current += 1;
-    }
+    await completeSession(session);
   }
 
   async function handleCancel(): Promise<void> {
@@ -1220,7 +1333,9 @@ function CodexOAuthPanel({
     setError("");
     try {
       await cancelCodexOAuth(session?.loginId);
-      setFlow({ phase: "idle" });
+      completionLoginIdRef.current = null;
+      completionAttemptedLoginIdRef.current = null;
+      updateFlow({ phase: "idle" });
       setCallbackUrl("");
       setCopied(false);
     } catch (unknownError) {
@@ -1246,9 +1361,7 @@ function CodexOAuthPanel({
         {error ? <p className="field-error" role="alert">{error}</p> : null}
         <div className="actions oauth-primary-action">
           <Button disabled={disabled || isWorking} onClick={handleStart}>
-            {flow.phase === "starting"
-              ? <LoaderCircle aria-hidden="true" className="spin-icon" size={15} />
-              : <Globe2 aria-hidden="true" size={15} />}
+            {startIcon}
             {flow.phase === "starting" ? "正在准备..." : "开始 OAuth 授权"}
           </Button>
         </div>
@@ -1258,13 +1371,15 @@ function CodexOAuthPanel({
 
   return (
     <div className="oauth-flow">
-      <div className={callbackReceived ? "oauth-status oauth-status-ready" : "oauth-status"} aria-live="polite">
-        {callbackReceived
-          ? <CircleCheck aria-hidden="true" size={19} />
-          : <LoaderCircle aria-hidden="true" className="spin-icon" size={19} />}
+      <div
+        aria-busy={flow.phase === "completing"}
+        aria-live="polite"
+        className={callbackReceived ? "oauth-status oauth-status-ready" : "oauth-status"}
+      >
+        {statusIcon}
         <div>
-          <strong>{callbackReceived ? "授权回调已收到" : "等待浏览器授权"}</strong>
-          <span>{callbackReceived ? "可以保存这个账号。" : "授权会话将在 5 分钟后失效。"}</span>
+          <strong>{statusTitle}</strong>
+          <span>{statusDescription}</span>
         </div>
       </div>
 
@@ -1317,10 +1432,8 @@ function CodexOAuthPanel({
 
       <div className="actions oauth-actions">
         <Button disabled={disabled || isWorking || !callbackReceived} onClick={handleComplete}>
-          {flow.phase === "completing"
-            ? <LoaderCircle aria-hidden="true" className="spin-icon" size={15} />
-            : <ShieldCheck aria-hidden="true" size={15} />}
-          {flow.phase === "completing" ? "正在保存..." : "完成并添加账号"}
+          {completionIcon}
+          {completionButtonLabel}
         </Button>
         <Button disabled={disabled || isWorking} onClick={handleCancel} variant="secondary">
           取消授权

@@ -1,27 +1,28 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
-use codex_companion_core::atomic_write_private_file;
+use codex_companion_core::{atomic_write_private_file, http_client_builder, redact_sensitive_text};
 use codex_companion_daemon::CompanionDaemon;
 use codex_companion_provider::ProviderImportOutcome;
 use rand::random;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+use tauri::{AppHandle, Emitter, Runtime};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use url::Url;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTH_ENDPOINT: &str = "https://auth.openai.com/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
-const SCOPES: &str = "openid profile email offline_access";
-const ORIGINATOR: &str = "codex_vscode";
+const SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+const ORIGINATOR: &str = "Codex Desktop";
 const CALLBACK_PORT: u16 = 1455;
 const CALLBACK_PATH: &str = "/auth/callback";
 const PENDING_FILE: &str = "pending.json";
@@ -33,6 +34,8 @@ const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 static OAUTH_STATE: OnceLock<Mutex<Option<OAuthState>>> = OnceLock::new();
 static ACTIVE_LISTENER: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static ACTIVE_COMPLETION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+type OAuthEventEmitter = Arc<dyn Fn(String) + Send + Sync>;
+static OAUTH_EVENT_EMITTER: OnceLock<Mutex<Option<OAuthEventEmitter>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OAuthState {
@@ -69,6 +72,12 @@ pub struct OAuthStatusResponse {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthCallbackEvent {
+    pub login_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
@@ -90,6 +99,33 @@ fn listener_lock() -> &'static Mutex<Option<String>> {
 
 fn completion_lock() -> &'static Mutex<Option<String>> {
     ACTIVE_COMPLETION.get_or_init(|| Mutex::new(None))
+}
+
+fn event_emitter_lock() -> &'static Mutex<Option<OAuthEventEmitter>> {
+    OAUTH_EVENT_EMITTER.get_or_init(|| Mutex::new(None))
+}
+
+pub fn configure_event_emitter<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    let emitter: OAuthEventEmitter = Arc::new(move |login_id| {
+        let _ = app.emit(
+            "codex-oauth-login-completed",
+            OAuthCallbackEvent { login_id },
+        );
+    });
+    if let Ok(mut guard) = event_emitter_lock().lock() {
+        *guard = Some(emitter);
+    }
+}
+
+fn emit_callback_received(login_id: &str) {
+    let emitter = event_emitter_lock()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    if let Some(emitter) = emitter {
+        emitter(login_id.to_string());
+    }
 }
 
 fn now() -> i64 {
@@ -362,7 +398,7 @@ fn handle_callback_request(request: Request, expected: &OAuthState) {
         Ok(()) => respond_to_callback(
             request,
             200,
-            "授权已完成，可以关闭此窗口并返回 Codex Companion。",
+            "授权已完成，账号正在导入，可以关闭此窗口并返回 Codex Companion。",
         ),
         Err(_) => respond_to_callback(request, 400, "OAuth 回调无效，请返回应用重试。"),
     }
@@ -483,7 +519,12 @@ fn apply_callback(expected: &OAuthState, callback: &Url) -> Result<(), String> {
         .ok_or_else(|| "回调地址缺少 code 参数".to_string())?;
     current.code = Some(code.to_string());
     current.error = None;
-    persist_pending(Some(current))
+    let result = persist_pending(Some(current));
+    drop(guard);
+    if result.is_ok() {
+        emit_callback_received(&expected.login_id);
+    }
+    result
 }
 
 fn clear_state_if_matches(expected: &OAuthState) -> Result<(), String> {
@@ -773,7 +814,16 @@ async fn exchange_code(
     verifier: &str,
     redirect_uri: &str,
 ) -> Result<OAuthTokenResponse, String> {
-    let client = Client::builder()
+    exchange_code_at(TOKEN_ENDPOINT, code, verifier, redirect_uri).await
+}
+
+async fn exchange_code_at(
+    token_endpoint: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<OAuthTokenResponse, String> {
+    let client = http_client_builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -787,7 +837,7 @@ async fn exchange_code(
         ("code_verifier", verifier),
     ];
     let mut response = client
-        .post(TOKEN_ENDPOINT)
+        .post(token_endpoint)
         .form(&params)
         .send()
         .await
@@ -811,9 +861,12 @@ async fn exchange_code(
         body.extend_from_slice(&chunk);
     }
     if !status.is_success() {
+        let detail = oauth_token_error_detail(&body)
+            .map(|value| format!(": {value}"))
+            .unwrap_or_default();
         return Err(format!(
-            "OAuth token 接口返回 {status} [body_len:{}]",
-            body.len()
+            "OAuth token 接口返回 {status} [body_len:{}]{detail}",
+            body.len(),
         ));
     }
     let tokens = serde_json::from_slice::<OAuthTokenResponse>(&body)
@@ -822,6 +875,31 @@ async fn exchange_code(
         return Err("OAuth 响应缺少 access_token".to_string());
     }
     Ok(tokens)
+}
+
+fn oauth_token_error_detail(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    let code = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.get("type").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("error").and_then(serde_json::Value::as_str));
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("error_description")
+                .and_then(serde_json::Value::as_str)
+        });
+    let detail = match (code, message) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => return None,
+    };
+    Some(redact_sensitive_text(&detail).chars().take(160).collect())
 }
 
 pub fn restore_listener(data_dir: PathBuf) -> Result<(), String> {
@@ -883,9 +961,101 @@ mod tests {
                 .map(|value| value.as_ref()),
             Some("S256")
         );
+        assert_eq!(
+            query.get("originator").map(|value| value.as_ref()),
+            Some(ORIGINATOR)
+        );
+        assert_eq!(
+            query.get("client_id").map(|value| value.as_ref()),
+            Some(CLIENT_ID)
+        );
+        assert_eq!(query.get("scope").map(|value| value.as_ref()), Some(SCOPES));
+        assert_eq!(
+            query
+                .get("id_token_add_organizations")
+                .map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            query
+                .get("codex_cli_simplified_flow")
+                .map(|value| value.as_ref()),
+            Some("true")
+        );
         assert!(query
             .get("code_challenge")
             .is_some_and(|value| !value.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_uses_official_authorization_code_shape() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("token listener");
+        let address = listener.local_addr().expect("token listener address");
+        let server = Server::from_listener(listener, None).expect("token server");
+        let handle = thread::spawn(move || {
+            let mut request = server.recv().expect("token request");
+            assert_eq!(request.method(), &Method::Post);
+            assert_eq!(request.url(), "/oauth/token");
+            assert!(request
+                .headers()
+                .iter()
+                .all(|header| !header.field.equiv("originator")));
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("token request body");
+            let form = url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(form.len(), 5);
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("authorization_code")
+            );
+            assert_eq!(form.get("code").map(String::as_str), Some("test-code"));
+            assert_eq!(
+                form.get("redirect_uri").map(String::as_str),
+                Some("http://localhost:1455/auth/callback")
+            );
+            assert_eq!(form.get("client_id").map(String::as_str), Some(CLIENT_ID));
+            assert_eq!(
+                form.get("code_verifier").map(String::as_str),
+                Some("test-verifier")
+            );
+            request
+                .respond(Response::from_string(
+                    r#"{"access_token":"access","id_token":"id","refresh_token":"refresh","expires_in":3600}"#,
+                ))
+                .expect("token response");
+        });
+
+        let tokens = exchange_code_at(
+            &format!("http://{address}/oauth/token"),
+            "test-code",
+            "test-verifier",
+            "http://localhost:1455/auth/callback",
+        )
+        .await
+        .expect("token exchange");
+        assert_eq!(tokens.access_token, "access");
+        assert_eq!(tokens.id_token.as_deref(), Some("id"));
+        assert_eq!(tokens.refresh_token.as_deref(), Some("refresh"));
+        handle.join().expect("token server thread");
+    }
+
+    #[test]
+    fn token_error_detail_is_bounded_and_redacted() {
+        let body = br#"{
+            "error": {
+                "code": "request_forbidden",
+                "message": "unsupported_country_region_territory refresh_token=secret-refresh"
+            }
+        }"#;
+        let detail = oauth_token_error_detail(body).expect("error detail");
+        assert!(detail.starts_with("request_forbidden: unsupported_country_region_territory"));
+        assert!(!detail.contains("secret-refresh"));
+        assert!(detail.chars().count() <= 160);
     }
 
     #[test]
