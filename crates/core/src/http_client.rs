@@ -2,6 +2,7 @@ use reqwest::ClientBuilder;
 
 /// Builds an HTTP client that honors environment proxy variables and, for a
 /// sandboxed macOS GUI process, the system HTTP/HTTPS proxy configuration.
+#[allow(clippy::needless_return)]
 pub fn http_client_builder() -> ClientBuilder {
     let builder = reqwest::Client::builder();
 

@@ -249,9 +249,14 @@ pub fn install_companion_provider_for_relay(
             doc["cli_auth_credentials_store"] = value("file");
         }
         let provider_table = ensure_model_provider_table(&mut doc, COMPANION_PROVIDER_ID);
-        provider_table["name"] = value(COMPANION_PROVIDER_NAME);
+        provider_table["name"] = value(if preserve_official_auth {
+            "OpenAI"
+        } else {
+            COMPANION_PROVIDER_NAME
+        });
         provider_table["base_url"] = value(relay.base_url());
         provider_table["wire_api"] = value("responses");
+        provider_table["supports_websockets"] = value(true);
         if preserve_official_auth || official_auth.ready {
             provider_table["requires_openai_auth"] = value(true);
             provider_table["experimental_bearer_token"] = value(COMPANION_RELAY_BEARER_TOKEN);
@@ -339,12 +344,6 @@ pub fn install_direct_provider_with_options(
 ) -> Result<CodexInstallStatus> {
     let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
     let direct_auth = resolve_direct_auth(provider)?;
-    if matches!(&direct_auth, DirectAuthMaterial::CodexOAuth(_)) {
-        return Err(CompanionError::InvalidConfig(format!(
-            "官方 Codex OAuth 账号 {} 必须通过 Companion 本地代理连接，以持续刷新 token",
-            provider.name
-        )));
-    }
     fs::create_dir_all(&codex_dir).map_err(|source| CompanionError::io(&codex_dir, source))?;
     let config_path = codex_dir.join("config.toml");
     let current = if config_path.exists() {
@@ -5333,6 +5332,7 @@ wire_api = "responses"
         );
         let config = fs::read_to_string(temp.path().join("config.toml")).expect("relay config");
         assert!(config.contains("model_provider = \"codex-companion\""));
+        assert!(config.contains("name = \"OpenAI\""));
         assert!(config.contains("requires_openai_auth = true"));
         assert!(config.contains("supports_websockets = true"));
         assert!(config.contains(COMPANION_RELAY_BEARER_TOKEN));
@@ -6469,7 +6469,7 @@ base_url = "https://keep.example/v1"
     }
 
     #[test]
-    fn direct_install_rejects_official_oauth_before_touching_codex_files() {
+    fn direct_install_preserves_official_oauth_for_native_codex() {
         let temp = tempfile::tempdir().expect("tempdir");
         let auth_path = temp.path().join("official-auth.json");
         fs::write(
@@ -6478,15 +6478,16 @@ base_url = "https://keep.example/v1"
         )
         .expect("auth");
 
-        let error = install_direct_provider(
+        install_direct_provider(
             Some(temp.path().to_path_buf()),
             &official_provider(&auth_path),
         )
-        .expect_err("official OAuth must use relay");
-
-        assert!(error.to_string().contains("必须通过 Companion 本地代理"));
-        assert!(!temp.path().join("config.toml").exists());
-        assert!(!temp.path().join("auth.json").exists());
+        .expect("official OAuth native install");
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("config");
+        assert!(config.contains("model_provider = \"openai\""));
+        let auth = read_json_value(&temp.path().join("auth.json")).expect("auth");
+        assert_eq!(auth["tokens"]["access_token"], "access-token");
+        assert_eq!(auth["tokens"]["refresh_token"], "refresh-token");
     }
 
     #[test]
