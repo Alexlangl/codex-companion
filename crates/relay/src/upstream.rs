@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
+
 use std::{
     fmt, io,
     time::{Duration, Instant},
@@ -1060,11 +1061,73 @@ fn build_upstream_request(
         request = request.header("session_id", session_identity);
     }
     if official_codex {
-        request = request
-            .header("originator", "codex_cli_rs")
-            .header("version", "0.144.1");
+        let originator = incoming_codex_originator(headers).unwrap_or("codex_cli_rs");
+        request = request.header("originator", originator);
+        if let Some(version) =
+            client_version_from_url(upstream).or_else(|| incoming_codex_client_version(headers))
+        {
+            request = request.header("version", version);
+        }
     }
     request
+}
+
+fn incoming_codex_originator(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("originator")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "codex_cli_rs" | "codex_vscode"))
+        .or_else(|| {
+            let user_agent = headers
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())?;
+            if user_agent.contains("codex_vscode") {
+                Some("codex_vscode")
+            } else if user_agent.contains("codex_cli_rs") || user_agent.contains("codex-cli") {
+                Some("codex_cli_rs")
+            } else {
+                None
+            }
+        })
+}
+
+fn incoming_codex_client_version(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| valid_codex_client_version(value))
+        .or_else(|| {
+            let user_agent = headers
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())?;
+            user_agent
+                .split_ascii_whitespace()
+                .find_map(|part| {
+                    part.strip_prefix("codex_cli_rs/")
+                        .or_else(|| part.strip_prefix("codex_vscode/"))
+                        .or_else(|| part.strip_prefix("codex-cli/"))
+                })
+                .filter(|value| valid_codex_client_version(value))
+        })
+}
+
+fn client_version_from_url(url: &str) -> Option<&str> {
+    let query = url.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "client_version" && valid_codex_client_version(value)).then_some(value)
+    })
+}
+
+fn valid_codex_client_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.bytes().any(|byte| byte == b'.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
 }
 
 fn normalize_official_responses_input(
@@ -4442,20 +4505,6 @@ pub(crate) fn upstream_url(provider: &ProviderConfig, uri: &Uri) -> String {
         url.push('?');
         url.push_str(query);
     }
-    if provider.kind == ProviderKind::OfficialCodex {
-        url = append_client_version(url);
-    }
-    url
-}
-
-fn append_client_version(mut url: String) -> String {
-    if url.contains("client_version=") {
-        return url;
-    }
-    let separator = if url.contains('?') { '&' } else { '?' };
-    url.push(separator);
-    url.push_str("client_version=");
-    url.push_str(env!("CARGO_PKG_VERSION"));
     url
 }
 
@@ -4863,6 +4912,71 @@ mod tests {
             sent.get("x-session-id")
                 .and_then(|value| value.to_str().ok()),
             Some("thread-1")
+        );
+    }
+
+    #[test]
+    fn official_request_forwards_the_real_codex_client_version() {
+        let client = reqwest::Client::new();
+        let mut headers = HeaderMap::new();
+        headers.insert("originator", HeaderValue::from_static("codex_vscode"));
+        headers.insert("version", HeaderValue::from_static("0.153.4"));
+
+        let request = build_upstream_request(
+            &client,
+            &reqwest::Method::POST,
+            "https://chatgpt.com/backend-api/codex/responses",
+            &headers,
+            UpstreamRequestHeaders {
+                official_codex: true,
+                authorization: Some("Bearer upstream-token"),
+                chatgpt_account_id: None,
+                session_identity: None,
+            },
+        )
+        .build()
+        .expect("request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("originator")
+                .and_then(|value| value.to_str().ok()),
+            Some("codex_vscode")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("version")
+                .and_then(|value| value.to_str().ok()),
+            Some("0.153.4")
+        );
+    }
+
+    #[test]
+    fn official_request_uses_client_version_from_request_url_when_header_is_missing() {
+        let client = reqwest::Client::new();
+        let request = build_upstream_request(
+            &client,
+            &reqwest::Method::POST,
+            "https://chatgpt.com/backend-api/codex/responses?client_version=0.154.0",
+            &HeaderMap::new(),
+            UpstreamRequestHeaders {
+                official_codex: true,
+                authorization: Some("Bearer upstream-token"),
+                chatgpt_account_id: None,
+                session_identity: None,
+            },
+        )
+        .build()
+        .expect("request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("version")
+                .and_then(|value| value.to_str().ok()),
+            Some("0.154.0")
         );
     }
 
@@ -6484,7 +6598,7 @@ data: [DONE]
     }
 
     #[test]
-    fn official_codex_url_gets_client_version() {
+    fn official_codex_url_preserves_the_real_client_version() {
         let provider = ProviderConfig {
             id: "p".to_string(),
             name: "Provider".to_string(),
@@ -6499,13 +6613,12 @@ data: [DONE]
             refresh_interval_seconds: default_refresh_interval_seconds(),
             account: None,
         };
-        let uri: Uri = "/v1/models?foo=bar".parse().expect("uri");
+        let uri: Uri = "/v1/models?foo=bar&client_version=0.153.4"
+            .parse()
+            .expect("uri");
         assert_eq!(
             upstream_url(&provider, &uri),
-            format!(
-                "https://chatgpt.com/backend-api/codex/models?foo=bar&client_version={}",
-                env!("CARGO_PKG_VERSION")
-            )
+            "https://chatgpt.com/backend-api/codex/models?foo=bar&client_version=0.153.4"
         );
     }
 

@@ -10,6 +10,7 @@ use codex_companion_core::{
     provider_relay_auth_ref, CodexInstallStatus, CompanionError, OfficialAuthMode, ProviderConfig,
     ProviderKind, RelayConfig, RepairOptions, RepairOutcome, RepairPlan, Result,
     COMPANION_OFFICIAL_AUTH_MODE_FIELD, COMPANION_PROVIDER_ID, COMPANION_PROVIDER_NAME,
+    COMPANION_RELAY_BEARER_TOKEN,
 };
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,6 @@ const CODEX_STATE_DB_FILENAME: &str = "state_5.sqlite";
 const CODEX_OPENAI_PROVIDER_ID: &str = "openai";
 const CODEX_API_KEY_AUTH_MODE: &str = "apikey";
 const CODEX_CHATGPT_AUTH_MODE: &str = "chatgpt";
-const COMPANION_RELAY_BEARER_TOKEN: &str = "CODEX_COMPANION_RELAY";
 #[cfg(all(target_os = "macos", not(test)))]
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const COMPANION_MARKER_TABLE: &str = "codex_companion";
@@ -84,8 +84,7 @@ pub fn companion_managed_model_catalog_is_active(codex_dir: &Path) -> Result<boo
 
 pub fn relay_preserved_official_auth_is_ready(codex_dir: &Path) -> Result<bool> {
     let config_path = codex_dir.join("config.toml");
-    let auth_path = codex_dir.join("auth.json");
-    if !config_path.exists() || !auth_path.exists() {
+    if !config_path.exists() {
         return Ok(false);
     }
 
@@ -95,43 +94,56 @@ pub fn relay_preserved_official_auth_is_ready(codex_dir: &Path) -> Result<bool> 
         .map_err(|source| {
             CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
         })?;
-    let auth = read_json_value(&auth_path)?;
-    let official_auth_ready = official_auth_mode_from_auth_json(&auth)
-        == Some(OfficialAuthMode::OAuth)
-        && auth.get("auth_mode").and_then(Value::as_str) == Some(CODEX_CHATGPT_AUTH_MODE)
-        && normalize_codex_oauth_auth(&auth).is_some();
+    let marker = load_companion_marker(codex_dir, &config);
+    let auth_path = codex_dir.join("auth.json");
+    let native_auth_ready = auth_path.is_file()
+        && read_json_value(&auth_path).ok().is_some_and(|auth| {
+            official_auth_mode_from_auth_json(&auth) == Some(OfficialAuthMode::OAuth)
+                && auth.get("auth_mode").and_then(Value::as_str) == Some(CODEX_CHATGPT_AUTH_MODE)
+                && normalize_codex_oauth_auth(&auth).is_some()
+        });
     let provider = config
         .get("model_providers")
         .and_then(Item::as_table)
         .and_then(|providers| providers.get(COMPANION_PROVIDER_ID))
         .and_then(Item::as_table);
-    let desktop = config.get("desktop").and_then(Item::as_table);
-    let ultra_effort_enabled = desktop
-        .and_then(|desktop| desktop.get("enabled-reasoning-efforts"))
-        .map(|efforts| {
-            efforts.as_array().is_some_and(|efforts| {
-                efforts
-                    .iter()
-                    .any(|effort| effort.as_str() == Some("ultra"))
-            })
-        })
-        .unwrap_or(true);
+    Ok(
+        config.get("model_provider").and_then(Item::as_str) == Some(COMPANION_PROVIDER_ID)
+            && provider
+                .and_then(|provider| provider.get("requires_openai_auth"))
+                .and_then(Item::as_bool)
+                == Some(true)
+            && provider
+                .and_then(|provider| provider.get("experimental_bearer_token"))
+                .and_then(Item::as_str)
+                == Some(COMPANION_RELAY_BEARER_TOKEN)
+            && (native_auth_ready
+                || marker.as_ref().is_some_and(|marker| {
+                    marker.auth_write_hash.is_none()
+                        && marker.auth_write_snapshot.is_none()
+                        && marker.official_auth_provider_id.is_none()
+                })),
+    )
+}
 
-    Ok(official_auth_ready
-        && config.get("model_provider").and_then(Item::as_str) == Some(COMPANION_PROVIDER_ID)
-        && provider
-            .and_then(|provider| provider.get("requires_openai_auth"))
-            .and_then(Item::as_bool)
-            == Some(true)
-        && provider
-            .and_then(|provider| provider.get("experimental_bearer_token"))
-            .and_then(Item::as_str)
-            == Some(COMPANION_RELAY_BEARER_TOKEN)
-        && desktop
-            .and_then(|desktop| desktop.get("show-ultra-in-model-picker-slider"))
-            .and_then(Item::as_bool)
-            == Some(true)
-        && ultra_effort_enabled)
+pub fn relay_auth_has_legacy_mirror_ownership(codex_dir: &Path) -> Result<bool> {
+    let config_path = codex_dir.join("config.toml");
+    if !config_path.is_file() {
+        return Ok(false);
+    }
+    let config = fs::read_to_string(&config_path)
+        .map_err(|source| CompanionError::io(&config_path, source))?
+        .parse::<DocumentMut>()
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
+        })?;
+    Ok(
+        load_companion_marker(codex_dir, &config).is_some_and(|marker| {
+            marker.install_kind.as_deref() == Some(CompanionInstallKind::Relay.as_str())
+                && marker.target_provider.as_deref() == Some(COMPANION_PROVIDER_ID)
+                && marker.auth_write_hash.is_some()
+        }),
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -197,7 +209,7 @@ pub fn install_companion_provider_for_relay(
     token_source_override: Option<&str>,
     model_slugs: &[String],
     official_auth_provider: Option<&ProviderConfig>,
-    require_official_auth: bool,
+    preserve_official_auth: bool,
 ) -> Result<CompanionRelayInstallOutcome> {
     let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
     fs::create_dir_all(&codex_dir).map_err(|source| CompanionError::io(&codex_dir, source))?;
@@ -220,14 +232,11 @@ pub fn install_companion_provider_for_relay(
             load_companion_marker(&codex_dir, &doc).and_then(|marker| marker.target_provider);
         let auth_rollback = AuthRollback::capture(&codex_dir)?;
         let mut backup = prepare_config_write(&codex_dir, &config_path, &mut doc)?;
-        let official_auth =
-            prepare_relay_official_codex_auth(&codex_dir, &mut backup, official_auth_provider)?;
-        if require_official_auth && !official_auth.ready {
-            return Err(CompanionError::InvalidConfig(
-                "未找到可确定恢复的官方 Codex OAuth：请把官方账号加入当前分组，或只保留一个启用的官方账号"
-                    .to_string(),
-            ));
-        }
+        let official_auth = if preserve_official_auth {
+            prepare_relay_config_only_auth(&codex_dir, &mut doc, &mut backup)?
+        } else {
+            prepare_relay_official_codex_auth(&codex_dir, &mut backup, official_auth_provider)?
+        };
         let auth_shape = detect_codex_auth_shape(&codex_dir)?;
 
         remove_previous_managed_provider_table(
@@ -236,14 +245,14 @@ pub fn install_companion_provider_for_relay(
             COMPANION_PROVIDER_ID,
         );
         doc["model_provider"] = value(COMPANION_PROVIDER_ID);
-        if official_auth.ready {
+        if !preserve_official_auth && official_auth.ready {
             doc["cli_auth_credentials_store"] = value("file");
         }
         let provider_table = ensure_model_provider_table(&mut doc, COMPANION_PROVIDER_ID);
         provider_table["name"] = value(COMPANION_PROVIDER_NAME);
         provider_table["base_url"] = value(relay.base_url());
         provider_table["wire_api"] = value("responses");
-        if official_auth.ready {
+        if preserve_official_auth || official_auth.ready {
             provider_table["requires_openai_auth"] = value(true);
             provider_table["experimental_bearer_token"] = value(COMPANION_RELAY_BEARER_TOKEN);
         } else {
@@ -283,11 +292,16 @@ pub fn install_companion_provider_for_relay(
             &codex_dir,
         )?;
         let mut codex = doctor(codex_dir.clone(), relay)?;
-        if official_auth.ready {
-            codex.message = format!("{}，官方 ChatGPT OAuth 已纳入受管 auth.json", codex.message);
+        codex.message = if preserve_official_auth {
+            format!(
+                "{}，auth.json 保持为 Codex 原生登录态，Companion 不接管写入",
+                codex.message
+            )
+        } else if official_auth.ready {
+            format!("{}，官方 ChatGPT OAuth 已纳入受管 auth.json", codex.message)
         } else {
-            codex.message = format!("{}，auth.json 未被本地代理写入", codex.message);
-        }
+            format!("{}，auth.json 未被本地代理写入", codex.message)
+        };
         Ok(CompanionRelayInstallOutcome {
             codex,
             official_auth,
@@ -927,10 +941,6 @@ fn prepare_relay_official_codex_auth(
     } else {
         None
     };
-    // Reinstalling Relay sees the managed auth.json as a normal ChatGPT
-    // session. Retain the original provider binding only when its exact
-    // Companion-written snapshot is still present; a user or Codex change
-    // must always stop future mirroring rather than being overwritten.
     let retained_source_provider_id =
         if source_provider_id.is_none() && managed_auth_write_matches(backup, codex_dir)? {
             backup.official_auth_provider_id.clone()
@@ -959,6 +969,42 @@ fn managed_auth_write_matches(backup: &ManagedConfigBackup, codex_dir: &Path) ->
     };
     let auth_path = codex_dir.join("auth.json");
     Ok(auth_path.is_file() && hash_file(&auth_path)? == expected_hash)
+}
+
+fn prepare_relay_config_only_auth(
+    codex_dir: &Path,
+    doc: &mut DocumentMut,
+    backup: &mut ManagedConfigBackup,
+) -> Result<CodexOfficialAuthStatus> {
+    let had_managed_auth = backup.auth_write_hash.is_some();
+    let changed = finish_prior_auth_write_for_config_only(backup, codex_dir)?;
+    if had_managed_auth {
+        restore_managed_cli_auth_store(doc, codex_dir, backup.config_backup.as_deref());
+    }
+    backup.official_auth_provider_id = None;
+
+    Ok(CodexOfficialAuthStatus {
+        ready: codex_auth_has_official_credentials(codex_dir)?,
+        changed,
+        source_provider_id: None,
+    })
+}
+
+fn restore_managed_cli_auth_store(
+    doc: &mut DocumentMut,
+    codex_dir: &Path,
+    config_backup: Option<&str>,
+) {
+    if doc.get("cli_auth_credentials_store").and_then(Item::as_str) != Some("file") {
+        return;
+    }
+    let original = read_config_backup_doc(codex_dir, config_backup)
+        .and_then(|original| original.get("cli_auth_credentials_store").cloned());
+    if let Some(original) = original {
+        doc["cli_auth_credentials_store"] = original;
+    } else {
+        doc.as_table_mut().remove("cli_auth_credentials_store");
+    }
 }
 
 fn write_official_codex_config(doc: &mut DocumentMut, managed_target_provider: Option<&str>) {
@@ -1676,13 +1722,9 @@ fn write_companion_state(codex_dir: &Path, marker: &CompanionConfigMarker) -> Re
     fs::rename(&temporary_path, &path).map_err(|source| CompanionError::io(&path, source))
 }
 
-/// Mirrors a refreshed Companion OAuth file into Codex's native `auth.json`
-/// only while Companion can prove that it still owns that exact file.
-///
-/// Relay itself injects credentials from the provider auth file, so this
-/// mirror is not required for an in-flight request to recover. It keeps
-/// Codex's locally stored login state fresh as well, without overwriting a
-/// later login performed by the user or Codex.
+/// Mirrors a refreshed Companion OAuth file only for an older relay install
+/// that explicitly owns the exact live auth file. Config-only takeover never
+/// records this ownership, so preserved native logins cannot enter this path.
 pub fn sync_managed_official_oauth_auth(
     codex_dir: Option<PathBuf>,
     provider: &ProviderConfig,
@@ -5263,14 +5305,14 @@ wire_api = "responses"
     }
 
     #[test]
-    fn required_relay_oauth_failure_restores_entire_install_state() {
+    fn preserved_relay_does_not_require_or_replace_official_auth() {
         let temp = tempfile::tempdir().expect("tempdir");
         let original_config = "model_provider = \"openai\"\n";
         let original_auth = r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-third-party"}"#;
         fs::write(temp.path().join("config.toml"), original_config).expect("config");
         fs::write(temp.path().join("auth.json"), original_auth).expect("auth");
 
-        let error = install_companion_provider_for_relay(
+        let outcome = install_companion_provider_for_relay(
             Some(temp.path().to_path_buf()),
             &RelayConfig::default(),
             None,
@@ -5278,19 +5320,56 @@ wire_api = "responses"
             None,
             true,
         )
-        .expect_err("official OAuth is required");
+        .expect("config-only relay install");
 
-        assert!(error.to_string().contains("未找到可确定恢复"));
-        assert_eq!(
-            fs::read_to_string(temp.path().join("config.toml")).expect("restored config"),
-            original_config
-        );
+        assert!(!outcome.official_auth.ready);
         assert_eq!(
             fs::read_to_string(temp.path().join("auth.json")).expect("restored auth"),
             original_auth
         );
-        assert!(!managed_model_catalog_path(temp.path()).exists());
-        assert!(!companion_state_path(temp.path()).exists());
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("relay config");
+        assert!(config.contains("model_provider = \"codex-companion\""));
+        assert!(config.contains("requires_openai_auth = true"));
+        assert!(config.contains(COMPANION_RELAY_BEARER_TOKEN));
+        let marker = read_companion_state(temp.path()).expect("managed state");
+        assert!(marker.auth_write_hash.is_none());
+        assert!(marker.auth_write_snapshot.is_none());
+        assert!(marker.official_auth_provider_id.is_none());
+    }
+
+    #[test]
+    fn config_only_relay_install_keeps_native_auth_byte_for_byte() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let original_auth = concat!(
+            "{\n",
+            "  \"auth_mode\": \"chatgpt\",\n",
+            "  \"OPENAI_API_KEY\": null,\n",
+            "  \"tokens\": {\n",
+            "    \"access_token\": \"native-access\",\n",
+            "    \"refresh_token\": \"native-refresh\"\n",
+            "  }\n",
+            "}\n"
+        );
+        fs::write(temp.path().join("auth.json"), original_auth).expect("native auth");
+        let before = fs::read(temp.path().join("auth.json")).expect("read auth");
+
+        install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            None,
+            true,
+        )
+        .expect("config-only relay");
+
+        assert_eq!(
+            fs::read(temp.path().join("auth.json")).expect("read auth"),
+            before
+        );
+        let config = fs::read_to_string(temp.path().join("config.toml")).expect("relay config");
+        assert!(config.contains("model_provider = \"codex-companion\""));
+        assert!(config.contains("experimental_bearer_token = \"CODEX_COMPANION_RELAY\""));
     }
 
     #[test]

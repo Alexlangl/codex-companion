@@ -16,19 +16,11 @@ export function canDirectLaunch(provider: ProviderConfig, directConnectProviderI
   if (directConnectProviderIds !== undefined) {
     return directConnectProviderIds.includes(provider.id);
   }
-  if (provider.kind === "official_codex" && officialProviderUsesOAuth(provider)) {
-    return false;
-  }
   if (providerEndpointIsChatCompletions(provider.baseUrl)) {
     return false;
   }
   const authRef = directAuthRef(provider);
   return !authRef || authRef.startsWith("env:") || authRef.startsWith("file:");
-}
-
-function officialProviderUsesOAuth(provider: ProviderConfig) {
-  if (provider.kind !== "official_codex") return false;
-  return !providerUsesOfficialPat(provider);
 }
 
 export function providerUsesOfficialPat(provider: ProviderConfig): boolean {

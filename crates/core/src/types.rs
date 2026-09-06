@@ -585,7 +585,7 @@ pub struct AppSettings {
     pub last_codex_target_provider_id: Option<String>,
     #[serde(default)]
     pub codex_restart_required_on_next_relay: bool,
-    #[serde(default)]
+    #[serde(default = "default_preserve_official_codex_auth")]
     pub preserve_official_codex_auth: bool,
     #[serde(default = "default_token_usage_refresh_interval_seconds")]
     pub token_usage_refresh_interval_seconds: u64,
@@ -604,12 +604,16 @@ impl Default for AppSettings {
             last_codex_launch_mode: None,
             last_codex_target_provider_id: None,
             codex_restart_required_on_next_relay: false,
-            preserve_official_codex_auth: false,
+            preserve_official_codex_auth: default_preserve_official_codex_auth(),
             token_usage_refresh_interval_seconds: default_token_usage_refresh_interval_seconds(),
             preferred_terminal: TerminalKind::Auto,
             recent_working_directories: Vec::new(),
         }
     }
+}
+
+fn default_preserve_official_codex_auth() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

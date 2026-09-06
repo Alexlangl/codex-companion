@@ -10,6 +10,7 @@ use axum::{
 };
 use codex_companion_core::{
     ApiClient, HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderKind,
+    COMPANION_RELAY_BEARER_TOKEN,
 };
 use codex_companion_health::{
     classify_failure, cooldown_active, mark_failure, normalize_expired_cooldown,
@@ -168,6 +169,12 @@ fn authenticate_websocket_client(
         .transpose()
         .map_err(|error| WebSocketAuthError::internal(error.to_string()))?
         .flatten();
+    let trusted_local_codex = !state.enforce_api_key
+        && !headers.contains_key(header::ORIGIN)
+        && token == Some(COMPANION_RELAY_BEARER_TOKEN);
+    if trusted_local_codex {
+        return Ok(None);
+    }
     if api_client.is_none()
         && (config.relay.require_api_key
             || state.enforce_api_key
@@ -634,11 +641,30 @@ fn websocket_request_with_account_id(
         request
             .headers_mut()
             .insert("originator", HeaderValue::from_static("codex_cli_rs"));
-        request
-            .headers_mut()
-            .insert("version", HeaderValue::from_static("0.144.1"));
+        if let Some(version) = websocket_client_version(url) {
+            request.headers_mut().insert(
+                "version",
+                HeaderValue::from_str(version)
+                    .map_err(|_| "WebSocket client_version 无效".to_string())?,
+            );
+        }
     }
     Ok(request)
+}
+
+fn websocket_client_version(url: &str) -> Option<&str> {
+    let query = url.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "client_version"
+            && !value.is_empty()
+            && value.len() <= 32
+            && value.bytes().any(|byte| byte == b'.')
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')))
+        .then_some(value)
+    })
 }
 
 enum WebSocketBridgeEvent {
@@ -2101,7 +2127,9 @@ mod tests {
     fn official_websocket_request_contains_identity_headers() {
         let mut provider = provider(
             "official",
-            Some("wss://chatgpt.com/backend-api/codex/responses".to_string()),
+            Some(
+                "wss://chatgpt.com/backend-api/codex/responses?client_version=0.154.0".to_string(),
+            ),
         );
         provider.kind = ProviderKind::OfficialCodex;
         provider.account = Some(ProviderAccountInfo {
@@ -2138,7 +2166,7 @@ mod tests {
                 .headers()
                 .get("version")
                 .and_then(|value| value.to_str().ok()),
-            Some("0.144.1")
+            Some("0.154.0")
         );
     }
 
@@ -2433,6 +2461,31 @@ mod tests {
                 .expect("header"),
         );
         authenticate_websocket_client(&state, &headers).expect("valid key");
+    }
+
+    #[test]
+    fn websocket_takeover_token_is_trusted_only_on_loopback() {
+        let state = state_with_group(Vec::new());
+        state
+            .store
+            .update(|config| {
+                config.relay.require_api_key = true;
+                Ok(())
+            })
+            .expect("strict mode");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer CODEX_COMPANION_RELAY"),
+        );
+
+        authenticate_websocket_client(&state, &headers).expect("loopback Codex token");
+
+        let public =
+            RelayState::new_with_api_key_floor(state.store.clone(), reqwest::Client::new(), true);
+        let error = authenticate_websocket_client(&public, &headers)
+            .expect_err("public listener must reject the fixed local token");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
     }
 
     #[test]

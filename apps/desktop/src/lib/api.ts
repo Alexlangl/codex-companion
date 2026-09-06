@@ -1879,17 +1879,10 @@ function isTauri() {
 }
 
 function providerCanDirectConnect(provider: ProviderConfig) {
-  if (provider.kind === "official_codex" && officialProviderUsesOAuth(provider)) return false;
   if (provider.account?.authMode?.trim().toLowerCase() === "agentidentity") return false;
   if (providerEndpointIsChatCompletions(provider.baseUrl)) return false;
   const authRef = directAuthRef(provider);
   return !authRef || authRef.startsWith("env:") || authRef.startsWith("file:");
-}
-
-function officialProviderUsesOAuth(provider: ProviderConfig) {
-  if (provider.kind !== "official_codex") return false;
-  const mode = provider.account?.authMode?.trim().toLowerCase();
-  return !mode || !isOfficialPatMode(mode);
 }
 
 function directAuthRef(provider: ProviderConfig): string {
@@ -2309,7 +2302,7 @@ function defaultAppSettings(): AppSettings {
     lastCodexLaunchMode: null,
     lastCodexTargetProviderId: null,
     codexRestartRequiredOnNextRelay: false,
-    preserveOfficialCodexAuth: false,
+    preserveOfficialCodexAuth: true,
     tokenUsageRefreshIntervalSeconds: 30,
     preferredTerminal: "auto",
     recentWorkingDirectories: [],

@@ -242,11 +242,11 @@ export function Settings(props: SettingsProps) {
             type="checkbox"
           />
           <span>
-            <ShieldCheck aria-hidden="true" size={15} /> 第三方直连时保留官方登录
+            <ShieldCheck aria-hidden="true" size={15} /> 切换 Provider 时保留官方登录
           </span>
         </label>
         <p className="field-hint" id="preserve-official-codex-auth-hint">
-          第三方 API Key 只写入 provider 配置；本地代理会保留或恢复可确定的 ChatGPT OAuth。
+          第三方 API Key 和本地代理凭据只写入对应 Provider 配置；Companion 不接管 Codex auth.json。
         </p>
         <div className="actions">
           <Button disabled={disabled} onClick={() => void onInstall()}>

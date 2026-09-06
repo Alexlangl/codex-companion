@@ -97,6 +97,7 @@ impl CompanionDaemon {
             &token_source,
             &models,
             official_auth_provider.as_ref(),
+            previous_config.app.preserve_official_codex_auth,
         )?;
         let RelayInstallOutcome {
             codex,
@@ -159,9 +160,9 @@ impl CompanionDaemon {
                 CompanionError::InvalidConfig(format!("unknown provider: {provider_id}"))
             })?;
         let codex_dir = codex_dir.unwrap_or(default_codex_dir()?);
-        // Older config files persisted `direct` for every official account.
-        // OAuth and Agent Identity are relay-only now, so normalize that legacy
-        // value at the daemon boundary as well as in the UI/TUI.
+        // Agent Identity requires Companion's runtime signer. OAuth and PAT
+        // accounts can use Codex's native direct path and must not be silently
+        // coerced back to the local relay.
         let mode =
             if matches!(mode, ProviderLaunchMode::Direct) && provider_requires_relay(&provider) {
                 ProviderLaunchMode::Relay
@@ -264,6 +265,7 @@ impl CompanionDaemon {
             &token_source,
             &models,
             official_auth_provider.as_ref(),
+            config_snapshot.app.preserve_official_codex_auth,
         )?;
         let RelayInstallOutcome {
             codex,
@@ -457,6 +459,7 @@ fn install_relay_for_launch(
     token_source: &str,
     model_slugs: &[String],
     official_auth_provider: Option<&ProviderConfig>,
+    preserve_official_auth: bool,
 ) -> Result<RelayInstallOutcome> {
     let before = CodexClientStartupState::capture(codex_dir)?;
     let snapshot = CodexInstallSnapshot::capture(codex_dir)?;
@@ -467,7 +470,7 @@ fn install_relay_for_launch(
             Some(token_source),
             model_slugs,
             official_auth_provider,
-            false,
+            preserve_official_auth,
         )?;
         let mut codex = outcome.codex;
         append_relay_auth_status(
@@ -681,8 +684,7 @@ pub fn provider_auto_prefers_relay(provider: &ProviderConfig) -> bool {
 }
 
 fn provider_requires_relay(provider: &ProviderConfig) -> bool {
-    matches!(provider.kind, ProviderKind::OfficialCodex)
-        && (provider_uses_codex_oauth(provider) || provider_uses_agent_identity(provider))
+    matches!(provider.kind, ProviderKind::OfficialCodex) && provider_uses_agent_identity(provider)
 }
 
 pub fn provider_relay_reason(provider: &ProviderConfig) -> &'static str {
@@ -806,14 +808,12 @@ fn append_relay_auth_status(
     status: &CodexOfficialAuthStatus,
     managed_model_catalog: bool,
 ) {
-    if status.ready {
-        if status.changed {
-            message.push_str("；已恢复官方 ChatGPT OAuth");
-        } else {
-            message.push_str("；官方 ChatGPT OAuth 已就绪");
-        }
+    if status.changed {
+        message.push_str("；已解除旧版 auth.json 接管，官方 ChatGPT 登录保持独立");
+    } else if status.ready {
+        message.push_str("；官方 ChatGPT 登录保持原样，代理不会写入 auth.json");
     } else {
-        message.push_str("；未找到唯一可恢复的官方 ChatGPT OAuth，Ultra 仍受当前登录状态限制");
+        message.push_str("；代理不会写入 auth.json，官方登录由 Codex 自身管理");
     }
     if managed_model_catalog {
         message.push_str("；已为中转模型启用 Ultra");
@@ -1422,19 +1422,71 @@ mod tests {
     }
 
     #[test]
-    fn official_provider_file_auth_requires_relay_for_token_lifetime_management() {
-        let provider = provider(ProviderKind::OfficialCodex, Some("file:/tmp/auth.json"));
-        assert!(!provider_can_direct_connect(&provider));
+    fn official_oauth_can_use_codex_native_direct_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_ref = write_official_auth(temp.path(), "official");
+        let provider = provider(ProviderKind::OfficialCodex, Some(&auth_ref));
+
+        assert!(provider_can_direct_connect(&provider));
     }
 
     #[test]
-    fn official_provider_auto_mode_prefers_relay_for_token_lifetime_management() {
-        let official = provider(ProviderKind::OfficialCodex, Some("file:/tmp/auth.json"));
-        assert!(provider_auto_prefers_relay(&official));
+    fn official_oauth_auto_mode_prefers_codex_native_direct_mode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_ref = write_official_auth(temp.path(), "official");
+        let official = provider(ProviderKind::OfficialCodex, Some(&auth_ref));
+
+        assert!(!provider_auto_prefers_relay(&official));
         assert!(!provider_auto_prefers_relay(&provider(
             ProviderKind::OpenAiCompatible,
             None
         )));
+    }
+
+    #[test]
+    fn official_oauth_direct_launch_uses_native_openai_without_localhost_relay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_dir = temp.path().join("codex");
+        fs::create_dir_all(&codex_dir).expect("codex dir");
+        fs::write(
+            codex_dir.join("config.toml"),
+            "model_provider = \"legacy\"\n",
+        )
+        .expect("initial config");
+        let auth_ref = write_official_auth(temp.path(), "official");
+        let mut official = provider(ProviderKind::OfficialCodex, Some(&auth_ref));
+        official.id = "official".to_string();
+        official.name = "Official Account".to_string();
+        let store = ConfigStore::new(temp.path().join("companion.json"));
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .insert(official.id.clone(), official.clone());
+                Ok(())
+            })
+            .expect("provider config");
+        let daemon = CompanionDaemon::new(store);
+
+        let outcome = daemon
+            .launch_provider_with_mode(
+                &official.id,
+                Some(codex_dir.clone()),
+                ProviderLaunchMode::Direct,
+            )
+            .expect("native direct launch");
+
+        assert_eq!(outcome.mode, CodexLaunchMode::ProviderDirect);
+        assert_eq!(outcome.target_provider_id, CODEX_OPENAI_PROVIDER_ID);
+        let config = fs::read_to_string(codex_dir.join("config.toml")).expect("direct config");
+        assert!(config.contains("model_provider = \"openai\""), "{config}");
+        assert!(!config.contains("codex-companion"), "{config}");
+        assert!(!config.contains("127.0.0.1"), "{config}");
+        let auth: serde_json::Value =
+            serde_json::from_slice(&fs::read(codex_dir.join("auth.json")).expect("native auth"))
+                .expect("auth json");
+        assert_eq!(auth["tokens"]["access_token"], "official-access");
+        assert_eq!(auth["tokens"]["refresh_token"], "official-refresh");
     }
 
     #[test]
@@ -1633,7 +1685,7 @@ mod tests {
             true,
         );
 
-        assert!(message.contains("已恢复官方 ChatGPT OAuth"));
+        assert!(message.contains("官方 ChatGPT 登录保持独立"));
         assert!(message.contains("已为中转模型启用 Ultra"));
     }
 
@@ -1650,7 +1702,7 @@ mod tests {
             false,
         );
 
-        assert!(message.contains("官方 ChatGPT OAuth 已就绪"));
+        assert!(message.contains("官方 ChatGPT 登录保持原样"));
         assert!(message.contains("模型列表与 Ultra 由 Codex 官方或用户目录决定"));
         assert!(!message.contains("已为中转模型启用 Ultra"));
     }
@@ -1809,16 +1861,16 @@ mod tests {
         let relay = RelayConfig::default();
         let sol = vec!["gpt-5.6-sol".to_string()];
 
-        let first = install_relay_for_launch(temp.path(), &relay, "test", &sol, None)
+        let first = install_relay_for_launch(temp.path(), &relay, "test", &sol, None, true)
             .expect("first install");
         assert!(first.client_restart_required);
 
-        let second = install_relay_for_launch(temp.path(), &relay, "test", &sol, None)
+        let second = install_relay_for_launch(temp.path(), &relay, "test", &sol, None, true)
             .expect("same install");
         assert!(!second.client_restart_required);
 
         let terra = vec!["gpt-5.6-terra".to_string()];
-        let changed = install_relay_for_launch(temp.path(), &relay, "test", &terra, None)
+        let changed = install_relay_for_launch(temp.path(), &relay, "test", &terra, None, true)
             .expect("changed catalog");
         assert!(changed.client_restart_required);
     }

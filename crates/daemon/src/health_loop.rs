@@ -7,7 +7,6 @@ use codex_companion_health::{mark_failure, mark_success};
 use codex_companion_provider::{
     ensure_codex_auth_snapshot_detailed, provider_uses_codex_oauth, refresh_provider_status,
 };
-use codex_companion_state::sync_managed_official_oauth_auth;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -20,8 +19,6 @@ static REFRESH_COORDINATOR: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static OAUTH_KEEPALIVE_ERRORS: OnceLock<Mutex<HashMap<(PathBuf, String), String>>> =
     OnceLock::new();
 static OAUTH_KEEPALIVE_BACKOFF: OnceLock<Mutex<HashMap<(PathBuf, String), OAuthKeepaliveBackoff>>> =
-    OnceLock::new();
-static OAUTH_NATIVE_AUTH_MIRROR_ERRORS: OnceLock<Mutex<HashMap<(PathBuf, String), String>>> =
     OnceLock::new();
 
 const OAUTH_KEEPALIVE_MAX_BACKOFF_SECONDS: i64 = 15 * 60;
@@ -269,7 +266,6 @@ async fn keep_official_oauth_alive(store: &ConfigStore, config: &CompanionConfig
                 let Some(current) = current_provider_if_unchanged(store, &provider) else {
                     continue;
                 };
-                sync_managed_oauth_auth(store, &current);
                 clear_oauth_keepalive_error(store, &current.id);
                 clear_oauth_keepalive_health_failure(store, &current.id);
             }
@@ -305,26 +301,6 @@ fn current_provider_if_unchanged(
     let config = store.load().ok()?;
     let current = config.providers.get(&expected.id)?;
     (current == expected).then(|| current.clone())
-}
-
-fn sync_managed_oauth_auth(store: &ConfigStore, provider: &ProviderConfig) {
-    match sync_managed_official_oauth_auth(None, provider) {
-        Ok(_) => clear_oauth_native_auth_mirror_error(store, &provider.id),
-        Err(error) => {
-            let message = error.to_string();
-            if should_log_oauth_native_auth_mirror_error(store, &provider.id, &message) {
-                let _ = append_diagnostic_log(
-                    &store.data_dir(),
-                    "warn",
-                    "oauth",
-                    &format!(
-                        "Provider {} OAuth 已刷新，但未同步受管 Codex auth.json: {message}",
-                        provider.id
-                    ),
-                );
-            }
-        }
-    }
 }
 
 fn persist_oauth_keepalive_failure(
@@ -383,33 +359,6 @@ fn clear_oauth_keepalive_error(store: &ConfigStore, provider_id: &str) {
         .lock()
     {
         backoff.remove(&key);
-    }
-}
-
-fn should_log_oauth_native_auth_mirror_error(
-    store: &ConfigStore,
-    provider_id: &str,
-    message: &str,
-) -> bool {
-    let key = (store.data_dir(), provider_id.to_string());
-    let errors = OAUTH_NATIVE_AUTH_MIRROR_ERRORS.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut errors) = errors.lock() else {
-        return true;
-    };
-    if errors.get(&key).is_some_and(|previous| previous == message) {
-        return false;
-    }
-    errors.insert(key, message.to_string());
-    true
-}
-
-fn clear_oauth_native_auth_mirror_error(store: &ConfigStore, provider_id: &str) {
-    let key = (store.data_dir(), provider_id.to_string());
-    if let Ok(mut errors) = OAUTH_NATIVE_AUTH_MIRROR_ERRORS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-    {
-        errors.remove(&key);
     }
 }
 

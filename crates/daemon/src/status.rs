@@ -68,7 +68,7 @@ impl CompanionDaemon {
             None,
             &models,
             official_auth_provider.as_ref(),
-            false,
+            config.app.preserve_official_codex_auth,
         )?
         .codex)
     }

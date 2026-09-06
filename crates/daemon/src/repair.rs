@@ -12,8 +12,9 @@ use codex_companion_provider::selected_providers;
 use codex_companion_state::{
     collect_token_usage_cached, collect_token_usage_cached_with_filters,
     companion_managed_model_catalog_is_active, doctor, install_companion_provider_for_relay,
-    rebuild_token_usage_cached_with_filters, relay_preserved_official_auth_is_ready, repair_state,
-    CodexInstallSnapshot, TokenUsageDateRange, TokenUsageFilters,
+    rebuild_token_usage_cached_with_filters, relay_auth_has_legacy_mirror_ownership,
+    relay_preserved_official_auth_is_ready, repair_state, CodexInstallSnapshot,
+    TokenUsageDateRange, TokenUsageFilters,
 };
 use std::path::PathBuf;
 
@@ -71,23 +72,19 @@ impl CompanionDaemon {
         let selected = selected_providers(&config);
         let models = relay_model_slugs(&selected);
         let auth_repair_needed = config.app.preserve_official_codex_auth
-            && !relay_preserved_official_auth_is_ready(&codex_dir)?;
+            && (relay_auth_has_legacy_mirror_ownership(&codex_dir)?
+                || !relay_preserved_official_auth_is_ready(&codex_dir)?);
         let catalog_repair_needed =
             models.is_empty() && companion_managed_model_catalog_is_active(&codex_dir)?;
         if !auth_repair_needed && !catalog_repair_needed {
             return Ok(false);
         }
-        let source = config
-            .app
-            .preserve_official_codex_auth
-            .then(|| relay_official_auth_provider(&config, &selected))
-            .flatten();
         install_companion_provider_for_relay(
             Some(codex_dir),
             &config.relay,
             Some("Companion relay startup reconciliation"),
             &models,
-            source.as_ref(),
+            None,
             config.app.preserve_official_codex_auth,
         )?;
         restart_codex_if_running();
@@ -166,7 +163,7 @@ impl CompanionDaemon {
                 if let Some(provider) = config.providers.get(&provider_id) {
                     if !provider_can_direct_connect(provider) {
                         let message = if provider.kind == ProviderKind::OfficialCodex {
-                            "官方 OAuth / Agent Identity 账号必须使用 Companion 本地代理，不能保存为直连模式"
+                            "官方 Agent Identity 账号必须使用 Companion 本地代理，不能保存为直连模式"
                         } else {
                             "该 provider 当前不满足直连条件，不能保存为直连模式"
                         };
@@ -355,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_reconciliation_repairs_an_existing_preserved_relay() {
+    fn startup_reconciliation_migrates_relay_to_config_only_auth() {
         let temp = tempfile::tempdir().expect("tempdir");
         let codex_dir = temp.path().join("codex");
         std::fs::create_dir_all(&codex_dir).expect("codex dir");
@@ -407,14 +404,13 @@ mod tests {
         let auth: serde_json::Value =
             serde_json::from_slice(&std::fs::read(codex_dir.join("auth.json")).expect("live auth"))
                 .expect("auth json");
-        assert_eq!(auth["auth_mode"], "chatgpt");
-        assert_eq!(auth["OPENAI_API_KEY"], serde_json::Value::Null);
-        assert_eq!(auth["tokens"]["access_token"], "official-access");
+        assert_eq!(auth["auth_mode"], "apikey");
+        assert_eq!(auth["OPENAI_API_KEY"], "sk-third-party");
         let codex_config =
             std::fs::read_to_string(codex_dir.join("config.toml")).expect("live Codex config");
         assert!(codex_config.contains("requires_openai_auth = true"));
         assert!(codex_config.contains("experimental_bearer_token = \"CODEX_COMPANION_RELAY\""));
-        assert!(codex_config.contains("show-ultra-in-model-picker-slider = true"));
+        assert!(relay_preserved_official_auth_is_ready(&codex_dir).expect("config-only relay"));
         assert!(!daemon
             .reconcile_preserved_official_codex_auth_in_dir(codex_dir.clone())
             .expect("repeated reconciliation"));

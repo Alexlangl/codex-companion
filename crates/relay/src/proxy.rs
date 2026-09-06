@@ -18,6 +18,7 @@ use bytes::Bytes;
 use codex_companion_core::{
     provider_endpoint_is_chat_completions, redact_sensitive_text, ApiClient, CompanionConfig,
     GroupPolicy, HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderGroup, ProviderKind,
+    COMPANION_RELAY_BEARER_TOKEN,
 };
 use codex_companion_health::{
     classify_failure, cooldown_active, mark_failure, mark_model_failure,
@@ -735,6 +736,8 @@ async fn proxy_dispatch(
                     .unwrap_or_else(|| classify_failure(Some(status.as_u16()), &body_text));
                 let upstream_payload_too_large = status == StatusCode::PAYLOAD_TOO_LARGE;
                 let request_incompatible = status == StatusCode::BAD_REQUEST;
+                let client_version_incompatible =
+                    is_codex_client_version_incompatible(status, &body_text);
                 let compact_unsupported = compact_request
                     && matches!(
                         status,
@@ -742,7 +745,12 @@ async fn proxy_dispatch(
                             | StatusCode::METHOD_NOT_ALLOWED
                             | StatusCode::NOT_IMPLEMENTED
                     );
-                let message = if upstream_payload_too_large {
+                let message = if client_version_incompatible {
+                    format!(
+                        "{}\n\nCodex Companion 提示：官方 Codex 客户端版本不足以使用此模型，请升级 Codex Desktop/CLI 后重试。",
+                        body_text.trim_end()
+                    )
+                } else if upstream_payload_too_large {
                     format!(
                         "上游 Provider {} 返回 413 Payload Too Large：请求体超过其服务端限制，并非 Codex Companion 本地限制；请运行 /compact、移除大段日志或内联图片，或联系 Provider 调高限制",
                         provider.name
@@ -785,7 +793,9 @@ async fn proxy_dispatch(
                 // 上游在尚未提交任何响应前返回了明确的 HTTP 失败。无论本地能否
                 // 精确识别其语义，都应给组内下一个 provider 一个机会；否则诸如
                 // 404/405/422 的兼容层差异会直接终止 Codex 对话。
-                let can_retry = index + 1 < candidate_count && group.fallback_enabled;
+                let can_retry = !client_version_incompatible
+                    && index + 1 < candidate_count
+                    && group.fallback_enabled;
                 if can_retry {
                     append_event(
                         &state.store,
@@ -813,7 +823,9 @@ async fn proxy_dispatch(
                 );
                 return Ok(api_error_response(
                     status,
-                    if upstream_payload_too_large {
+                    if client_version_incompatible {
+                        "client_version_unsupported"
+                    } else if upstream_payload_too_large {
                         "upstream_request_too_large"
                     } else if request_incompatible {
                         "upstream_request_incompatible"
@@ -977,6 +989,13 @@ fn fallback_eligible(failure: &codex_companion_health::FailureClassification) ->
     failure.retryable || failure.kind == HealthFailureKind::AuthFailed
 }
 
+fn is_codex_client_version_incompatible(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && body
+            .to_ascii_lowercase()
+            .contains("requires a newer version of codex")
+}
+
 fn failure_error_code(kind: &HealthFailureKind) -> &'static str {
     match kind {
         HealthFailureKind::AuthFailed => "upstream_auth_failed",
@@ -1009,6 +1028,12 @@ fn authenticate_client(
         })?
         .flatten();
     let browser_origin = headers.contains_key(header::ORIGIN);
+    let trusted_local_codex = !state.enforce_api_key
+        && !browser_origin
+        && token.as_deref() == Some(COMPANION_RELAY_BEARER_TOKEN);
+    if trusted_local_codex {
+        return Ok(None);
+    }
     if client.is_none()
         && (state.enforce_api_key
             || (enforce_config_key && config.relay.require_api_key)
@@ -3460,6 +3485,47 @@ mod tests {
             .expect("authenticated browser request")
             .expect("client");
         assert_eq!(authenticated.id, secret.client.id);
+    }
+
+    #[test]
+    fn client_version_incompatibility_is_not_a_provider_fallback_failure() {
+        assert!(is_codex_client_version_incompatible(
+            StatusCode::BAD_REQUEST,
+            "The 'gpt-6-astra' model requires a newer version of Codex."
+        ));
+        assert!(!is_codex_client_version_incompatible(
+            StatusCode::BAD_REQUEST,
+            "invalid request body"
+        ));
+        assert!(!is_codex_client_version_incompatible(
+            StatusCode::OK,
+            "The model requires a newer version of Codex."
+        ));
+    }
+
+    #[test]
+    fn local_codex_takeover_token_bypasses_client_keys_only_on_loopback() {
+        let store = store_with_group(Vec::new());
+        store
+            .update(|config| {
+                config.relay.require_api_key = true;
+                Ok(())
+            })
+            .expect("strict mode");
+        let config = store.load().expect("config");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer CODEX_COMPANION_RELAY"),
+        );
+
+        let local = RelayState::new(store.clone(), reqwest::Client::new());
+        assert!(authenticate_client(&local, &config, &headers, true).is_ok());
+
+        let remote = RelayState::new_with_api_key_floor(store, reqwest::Client::new(), true);
+        let error = authenticate_client(&remote, &config, &headers, true)
+            .expect_err("public listener must reject the fixed local token");
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
