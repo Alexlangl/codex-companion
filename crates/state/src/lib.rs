@@ -405,6 +405,9 @@ pub fn install_direct_provider_with_options(
         provider_table["base_url"] = value(&provider.base_url);
         provider_table["wire_api"] = value("responses");
         provider_table["requires_openai_auth"] = value(true);
+        // Keep Codex App capabilities (remote control and official plugins)
+        // available while the request endpoint is routed through Companion.
+        provider_table["supports_websockets"] = value(true);
         provider_table["api_key_env_var"] = Item::None;
 
         match direct_auth {
@@ -4846,6 +4849,7 @@ wire_api = "responses"
             .as_table()
             .expect("relay provider");
         assert_eq!(relay_provider["requires_openai_auth"].as_bool(), Some(true));
+        assert_eq!(relay_provider["supports_websockets"].as_bool(), Some(true));
         assert_eq!(
             relay_provider["experimental_bearer_token"].as_str(),
             Some(COMPANION_RELAY_BEARER_TOKEN)
@@ -5330,6 +5334,7 @@ wire_api = "responses"
         let config = fs::read_to_string(temp.path().join("config.toml")).expect("relay config");
         assert!(config.contains("model_provider = \"codex-companion\""));
         assert!(config.contains("requires_openai_auth = true"));
+        assert!(config.contains("supports_websockets = true"));
         assert!(config.contains(COMPANION_RELAY_BEARER_TOKEN));
         let marker = read_companion_state(temp.path()).expect("managed state");
         assert!(marker.auth_write_hash.is_none());
