@@ -17,6 +17,7 @@ export interface RelayConfig {
 }
 
 export interface RelaySettingsUpdate {
+  host: string;
   requireApiKey: boolean;
   retryBudget: number;
   modelCooldownSeconds: number;

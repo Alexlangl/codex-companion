@@ -77,6 +77,7 @@ export function Relay({ active, status }: RelayProps) {
   const [editor, setEditor] = useState<ClientEditor | null>(null);
   const [selfTest, setSelfTest] = useState<ApiServiceSelfTest | null>(null);
   const [settings, setSettings] = useState<RelaySettingsUpdate>(() => relaySettingsFromStatus(status));
+  const [settingsSaved, setSettingsSaved] = useState(false);
   const [relayEvents, setRelayEvents] = useState<RelayEvent[]>(status.recentEvents);
   const [logsRefreshing, setLogsRefreshing] = useState(false);
   const logRefreshInFlightRef = useRef(false);
@@ -193,6 +194,7 @@ export function Relay({ active, status }: RelayProps) {
   function handleSaveSettings() {
     void runAction("save-settings", async () => {
       await updateRelaySettings(settings);
+      setSettingsSaved(true);
     });
   }
 
@@ -388,10 +390,27 @@ export function Relay({ active, status }: RelayProps) {
 
         <Panel eyebrow="运行策略" title="可靠性与保留策略">
           <div className="api-settings-form">
+            <Field label="监听地址">
+              <input
+                aria-describedby="relay-host-help"
+                onChange={(event) => {
+                  setSettingsSaved(false);
+                  setSettings((current) => ({ ...current, host: event.target.value }));
+                }}
+                placeholder="127.0.0.1 或 0.0.0.0"
+                value={settings.host}
+              />
+            </Field>
+            <p className="field-hint" id="relay-host-help">
+              本机使用 127.0.0.1；需要局域网或远程设备访问时使用 0.0.0.0，并必须开启 client 密钥。
+            </p>
             <label className="toggle-row api-key-policy-toggle">
               <input
                 checked={settings.requireApiKey}
-                onChange={(event) => setSettings((current) => ({ ...current, requireApiKey: event.target.checked }))}
+                onChange={(event) => {
+                  setSettingsSaved(false);
+                  setSettings((current) => ({ ...current, requireApiKey: event.target.checked }));
+                }}
                 type="checkbox"
               />
               <span>所有非浏览器 API 请求强制使用 client 密钥</span>
@@ -433,6 +452,7 @@ export function Relay({ active, status }: RelayProps) {
               <span>重试预算 0 = 尝试分组内全部账号</span>
               <span>模型 404 / 429 只冷却“账号 + 模型”，不会误伤该账号的其他模型</span>
             </div>
+            {settingsSaved ? <p className="field-hint">监听地址变更将在 Companion 下次启动 relay 时生效。</p> : null}
             <Button disabled={action !== null} onClick={handleSaveSettings}>
               保存运行策略
             </Button>
@@ -766,6 +786,7 @@ function StandaloneDiagnosticEvent(props: { event: RelayEvent; status: Companion
 function relaySettingsFromStatus(status: CompanionStatus): RelaySettingsUpdate {
   const relay = status.config.relay;
   return {
+    host: relay.host,
     requireApiKey: relay.requireApiKey,
     retryBudget: relay.retryBudget,
     modelCooldownSeconds: relay.modelCooldownSeconds,

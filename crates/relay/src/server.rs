@@ -55,9 +55,24 @@ impl BoundRelay {
         let client = http_client_builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()?;
+        let store = self.store.clone();
+        let configured_require_api_key = store.load()?.relay.require_api_key;
         let state = RelayState::new_with_api_key_floor(self.store, client, self.enforce_api_key);
         let app = relay_router(state);
-        axum::serve(self.listener, app).await?;
+        let bind_addr = self.outcome.bind_addr.clone();
+        axum::serve(self.listener, app)
+            .with_graceful_shutdown(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let Ok(config) = store.load() else { continue };
+                    if config.relay.bind_addr() != bind_addr
+                        || config.relay.require_api_key != configured_require_api_key
+                    {
+                        break;
+                    }
+                }
+            })
+            .await?;
         Ok(self.outcome)
     }
 }

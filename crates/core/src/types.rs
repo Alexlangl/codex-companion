@@ -347,6 +347,7 @@ pub fn default_request_log_retention_days() -> u16 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelaySettingsUpdate {
+    pub host: String,
     pub require_api_key: bool,
     pub retry_budget: u16,
     pub model_cooldown_seconds: u64,

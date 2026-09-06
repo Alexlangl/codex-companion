@@ -134,6 +134,7 @@ impl CompanionDaemon {
             ));
         }
         let relay = self.store.update(|config| {
+            config.relay.host = input.host.trim().to_string();
             validate_relay_auth_scope(&config.relay, input.require_api_key)?;
             config.relay.require_api_key = input.require_api_key;
             config.relay.retry_budget = input.retry_budget;
@@ -206,6 +207,16 @@ impl CompanionDaemon {
 }
 
 fn validate_relay_settings(input: &RelaySettingsUpdate) -> Result<()> {
+    let host = input.host.trim();
+    if host.is_empty()
+        || host.contains('/')
+        || host.contains(':')
+        || host.chars().any(char::is_whitespace)
+    {
+        return Err(CompanionError::InvalidConfig(
+            "代理监听地址必须是主机名或 IP 地址".into(),
+        ));
+    }
     if input.retry_budget > 20 {
         return Err(CompanionError::InvalidConfig("重试预算不能超过 20".into()));
     }
@@ -277,6 +288,7 @@ mod tests {
     #[test]
     fn rejects_dangerous_or_unbounded_settings() {
         let valid = RelaySettingsUpdate {
+            host: "127.0.0.1".to_string(),
             require_api_key: false,
             retry_budget: 3,
             model_cooldown_seconds: 300,

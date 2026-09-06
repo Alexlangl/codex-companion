@@ -341,6 +341,7 @@ async fn main() -> anyhow::Result<()> {
                 let current = daemon.status()?.config.relay;
                 print_json(
                     daemon.update_relay_settings(RelaySettingsUpdate {
+                        host: current.host.clone(),
                         require_api_key: args.require_api_key.unwrap_or(current.require_api_key),
                         retry_budget: args.retry_budget.unwrap_or(current.retry_budget),
                         model_cooldown_seconds: args
