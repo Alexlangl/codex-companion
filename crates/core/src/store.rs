@@ -95,9 +95,7 @@ impl ConfigStore {
             .as_file_mut()
             .sync_all()
             .map_err(|source| CompanionError::io(temporary.path(), source))?;
-        temporary
-            .persist(&self.path)
-            .map_err(|error| CompanionError::io(&self.path, error.error))?;
+        persist_config(temporary, &self.path)?;
         sync_parent_dir(&parent)
     }
 
@@ -129,6 +127,26 @@ impl ConfigStore {
             .unwrap_or_else(|| PathBuf::from("."));
         fs::create_dir_all(&parent).map_err(|source| CompanionError::io(&parent, source))?;
         Ok(parent)
+    }
+}
+
+fn persist_config(mut temporary: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    // Windows can briefly deny replacement while a reader or scanner holds
+    // the destination open. Retry the same complete file; never truncate it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match temporary.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && matches!(error.error.raw_os_error(), Some(5 | 32 | 33))
+                    && std::time::Instant::now() < deadline =>
+            {
+                temporary = error.file;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(CompanionError::io(path, error.error)),
+        }
     }
 }
 
