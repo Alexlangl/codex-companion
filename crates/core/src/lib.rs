@@ -19,6 +19,7 @@ pub use constants::*;
 pub use diagnostics::*;
 pub use error::{CompanionError, Result};
 pub use events::now_event;
+pub use http_client::desktop_proxy_environment;
 pub use http_client::http_client_builder;
 pub use paths::{default_codex_dir, default_config_path, default_data_dir};
 pub use private_file::atomic_write_private_file;

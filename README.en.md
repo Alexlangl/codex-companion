@@ -241,6 +241,14 @@ flowchart LR
 
 With `保留官方 Codex 登录` (Preserve Official Codex Login) enabled, third-party API keys are written to provider configuration while the official ChatGPT OAuth login remains in `auth.json`. Companion creates backups before changing Codex configuration and preserves newer user changes where possible.
 
+### Network proxies and official login
+
+HTTP and Responses WebSocket share proxy selection: explicit `http_proxy`, `https_proxy`, or `all_proxy` variables (uppercase also supported) take precedence over system settings. Without them, Companion reads macOS HTTP/HTTPS proxies, the Windows user's manual Internet proxy, or GNOME-family manual GSettings proxies on Linux. Other Linux desktops and headless sessions use environment variables. HTTP, HTTPS, and SOCKS5 proxies are supported.
+
+Loopback stays direct and `NO_PROXY` exceptions are retained. Clients launched by Companion provider/group activation receive the proxy environment, including macOS LaunchServices and Windows Store desktop executables. Completely quit and relaunch an existing client through Companion to apply changes. PAC/WPAD scripts are not supported. System `<local>` bypass rules apply inside Companion, but have no portable child-process environment equivalent; list concrete hosts or domains in `NO_PROXY` for child processes.
+
+Relay setup preserves an existing official OAuth login instead of replacing it with the selected provider's saved snapshot. It restores provider credentials only when no official login exists. Official accounts without `websocketUrl` use the Responses endpoint derived from their Base URL; third-party accounts still require an explicit supported WebSocket endpoint. These changes do not verify official remote-device pairing, which also depends on account state, permissions, and connectivity.
+
 ## Local API Service
 
 The active group is exposed at `http://127.0.0.1:17687/v1` by default:

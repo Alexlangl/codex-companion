@@ -16,9 +16,13 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+url.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinHttp", "Win32_Foundation"] }
 
 [dev-dependencies]
 tokio.workspace = true

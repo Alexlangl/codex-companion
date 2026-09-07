@@ -896,7 +896,14 @@ fn resolve_official_codex_auth(
             && normalized_current.is_some()
     });
 
-    let (material, source_provider_id) = if let Some(provider) = source_provider {
+    // Relay changes model routing, not the desktop login identity. Prefer the
+    // live session: a saved provider snapshot may contain an already rotated
+    // refresh token, and overwriting it breaks remote-control authentication.
+    let (material, source_provider_id) = if current_is_pure_chatgpt {
+        (current.clone().expect("current auth checked above"), None)
+    } else if let Some(material) = normalized_current {
+        (material, None)
+    } else if let Some(provider) = source_provider {
         if !matches!(provider.kind, ProviderKind::OfficialCodex) {
             return Err(CompanionError::InvalidConfig(format!(
                 "provider {} 不是官方 Codex OAuth 账号",
@@ -910,10 +917,6 @@ fn resolve_official_codex_auth(
             )));
         };
         (material, Some(provider.id.clone()))
-    } else if current_is_pure_chatgpt {
-        (current.clone().expect("current auth checked above"), None)
-    } else if let Some(material) = normalized_current {
-        (material, None)
     } else {
         return Ok(None);
     };
@@ -4703,6 +4706,40 @@ wire_api = "responses"
     }
 
     #[test]
+    fn relay_keeps_live_login_when_selected_provider_has_older_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let live = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"new-access","refresh_token":"new-refresh","account_id":"desktop-account","id_token":"new-id"}}"#;
+        fs::write(temp.path().join("auth.json"), live).expect("live login");
+        let source = temp.path().join("official-auth.json");
+        fs::write(&source, r#"{"tokens":{"access_token":"old-access","refresh_token":"old-refresh","account_id":"desktop-account","id_token":"old-id"}}"#).expect("saved login");
+        let provider = official_provider(&source);
+        let outcome = install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            Some(&provider),
+            false,
+        )
+        .expect("relay install");
+        assert!(outcome.official_auth.ready);
+        assert!(!outcome.official_auth.changed);
+        assert!(outcome.official_auth.source_provider_id.is_none());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).expect("preserved login"),
+            live
+        );
+        assert!(
+            !sync_managed_official_oauth_auth(Some(temp.path().to_path_buf()), &provider)
+                .expect("sync")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("auth.json")).expect("login after sync"),
+            live
+        );
+    }
+
+    #[test]
     fn relay_reinstall_keeps_official_oauth_unchanged() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
@@ -4903,7 +4940,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn relay_install_prefers_selected_managed_oauth_over_existing_native_auth() {
+    fn relay_install_does_not_bind_existing_native_auth_to_selected_provider() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("auth.json"),
@@ -4943,21 +4980,15 @@ wire_api = "responses"
         )
         .expect("install relay");
 
-        assert_eq!(
-            outcome.official_auth.source_provider_id.as_deref(),
-            Some("official-account")
-        );
+        assert_eq!(outcome.official_auth.source_provider_id.as_deref(), None);
         let installed_auth =
             read_json_value(&temp.path().join("auth.json")).expect("installed auth");
-        assert_eq!(
-            installed_auth["tokens"]["access_token"],
-            "source-access-one"
-        );
+        assert_eq!(installed_auth["tokens"]["access_token"], "native-access");
         assert_eq!(
             read_companion_state(temp.path())
                 .and_then(|marker| marker.official_auth_provider_id)
                 .as_deref(),
-            Some("official-account")
+            None
         );
 
         fs::write(
@@ -4974,15 +5005,12 @@ wire_api = "responses"
         .expect("refreshed source auth");
 
         assert!(
-            sync_managed_official_oauth_auth(Some(temp.path().to_path_buf()), &provider)
+            !sync_managed_official_oauth_auth(Some(temp.path().to_path_buf()), &provider)
                 .expect("sync native auth")
         );
         let mirrored_auth = read_json_value(&temp.path().join("auth.json")).expect("mirrored auth");
-        assert_eq!(mirrored_auth["tokens"]["access_token"], "source-access-two");
-        assert_eq!(
-            mirrored_auth["tokens"]["chatgpt_account_id"],
-            "workspace-two"
-        );
+        assert_eq!(mirrored_auth["tokens"]["access_token"], "native-access");
+        assert_eq!(mirrored_auth["tokens"]["refresh_token"], "native-refresh");
     }
 
     #[test]

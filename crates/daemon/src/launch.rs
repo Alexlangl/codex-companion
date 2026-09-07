@@ -1309,43 +1309,54 @@ fn powershell_single_quote(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+// Use one environment adapter for direct processes on every platform.
+fn client_command(program: &str, proxy_environment: &[(String, String)]) -> Command {
+    let mut command = Command::new(program);
+    command.envs(proxy_environment.iter().cloned());
+    command
+}
+
 #[cfg(target_os = "macos")]
 fn start_codex(target: &CodexLaunchTarget) -> bool {
+    let proxy_environment = codex_companion_core::desktop_proxy_environment();
     if let Some(command) = target.command.as_deref() {
-        return Command::new("/bin/sh")
+        return client_command("/bin/sh", &proxy_environment)
             .args(["-lc", command])
             .spawn()
             .is_ok();
     }
     target.app_names.iter().any(|app_name| {
-        Command::new("open")
-            .args(["-a", app_name])
-            .status()
-            .is_ok_and(|status| status.success())
-    }) || Command::new("codex").spawn().is_ok()
+        let mut command = Command::new("open");
+        command.args(["-a", app_name]);
+        for (key, value) in &proxy_environment {
+            command.arg("--env").arg(format!("{key}={value}"));
+        }
+        command.status().is_ok_and(|status| status.success())
+    }) || client_command("codex", &proxy_environment).spawn().is_ok()
 }
 
 #[cfg(target_os = "windows")]
 fn start_codex(target: &CodexLaunchTarget) -> bool {
+    let proxy_environment = codex_companion_core::desktop_proxy_environment();
     if let Some(command) = target.command.as_deref() {
-        return Command::new("cmd")
+        return client_command("cmd", &proxy_environment)
             .args(["/C", "start", "", "cmd", "/C", command])
             .status()
             .is_ok_and(|status| status.success());
     }
-    if start_windows_store_codex_app() {
+    if start_windows_store_codex_app(&proxy_environment) {
         return true;
     }
     target.app_names.iter().any(|app_name| {
-        Command::new("cmd")
+        client_command("cmd", &proxy_environment)
             .args(["/C", "start", "", app_name])
             .status()
             .is_ok_and(|status| status.success())
-    }) || Command::new("codex").spawn().is_ok()
+    }) || client_command("codex", &proxy_environment).spawn().is_ok()
 }
 
 #[cfg(target_os = "windows")]
-fn start_windows_store_codex_app() -> bool {
+fn start_windows_store_codex_app(proxy_environment: &[(String, String)]) -> bool {
     const SCRIPT: &str = r#"$entry = Get-StartApps |
   Where-Object {
     $_.AppID -like 'OpenAI.ChatGPT*' -or
@@ -1356,9 +1367,19 @@ fn start_windows_store_codex_app() -> bool {
   Sort-Object @{ Expression = { if ($_.AppID -like 'OpenAI.ChatGPT*' -or $_.Name -like 'ChatGPT*') { 0 } else { 1 } } }, Name |
   Select-Object -First 1
 if (-not $entry -or [string]::IsNullOrWhiteSpace($entry.AppID)) { exit 1 }
-Start-Process explorer.exe -ArgumentList ('shell:AppsFolder\' + $entry.AppID)
+# Explorer activation loses per-launch environment variables. Resolve the
+# packaged desktop executable and launch it as a child of this process.
+$family, $applicationId = $entry.AppID -split '!', 2
+$package = Get-AppxPackage | Where-Object { $_.PackageFamilyName -eq $family } | Select-Object -First 1
+if (-not $package) { exit 1 }
+$manifest = Get-AppxPackageManifest -Package $package.PackageFullName
+$application = $manifest.Package.Applications.Application | Where-Object { $_.Id -eq $applicationId } | Select-Object -First 1
+if (-not $application -or [string]::IsNullOrWhiteSpace($application.Executable)) { exit 1 }
+$executable = Join-Path $package.InstallLocation $application.Executable
+if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { exit 1 }
+Start-Process -FilePath $executable -WorkingDirectory $package.InstallLocation -ErrorAction Stop
 exit 0"#;
-    Command::new("powershell")
+    client_command("powershell", proxy_environment)
         .args(["-NoProfile", "-Command", SCRIPT])
         .status()
         .is_ok_and(|status| status.success())
@@ -1366,14 +1387,18 @@ exit 0"#;
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn start_codex(target: &CodexLaunchTarget) -> bool {
+    let proxy_environment = codex_companion_core::desktop_proxy_environment();
     if let Some(command) = target.command.as_deref() {
-        return Command::new("sh").args(["-lc", command]).spawn().is_ok();
+        return client_command("sh", &proxy_environment)
+            .args(["-lc", command])
+            .spawn()
+            .is_ok();
     }
     target
         .app_names
         .iter()
-        .any(|app_name| Command::new(app_name).spawn().is_ok())
-        || Command::new("codex").spawn().is_ok()
+        .any(|app_name| client_command(app_name, &proxy_environment).spawn().is_ok())
+        || client_command("codex", &proxy_environment).spawn().is_ok()
 }
 
 #[cfg(test)]
@@ -1385,6 +1410,76 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::fs;
+
+    #[test]
+    fn client_commands_keep_proxy_values_out_of_shell_arguments() {
+        let environment = vec![
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://user:p&ss@proxy.example:8080".to_string(),
+            ),
+            (
+                "NO_PROXY".to_string(),
+                "localhost,127.0.0.1,::1".to_string(),
+            ),
+        ];
+        let command = client_command("codex", &environment);
+        assert_eq!(command.get_args().count(), 0);
+        for (key, value) in environment {
+            assert!(command
+                .get_envs()
+                .any(|(name, actual)| name == std::ffi::OsStr::new(&key)
+                    && actual == Some(std::ffi::OsStr::new(&value))));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launched_child_receives_proxy_and_loopback_exceptions() {
+        let environment = vec![
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://proxy.example:8080".to_string(),
+            ),
+            (
+                "NO_PROXY".to_string(),
+                "localhost,127.0.0.1,::1".to_string(),
+            ),
+        ];
+        let output = client_command("sh", &environment)
+            .args(["-c", "printf '%s|%s' \"$HTTPS_PROXY\" \"$NO_PROXY\""])
+            .output()
+            .expect("child process");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "http://proxy.example:8080|localhost,127.0.0.1,::1"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launched_windows_child_receives_proxy_and_loopback_exceptions() {
+        let environment = vec![
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://proxy.example:8080".to_string(),
+            ),
+            (
+                "NO_PROXY".to_string(),
+                "localhost,127.0.0.1,::1".to_string(),
+            ),
+        ];
+        let output = client_command("cmd", &environment)
+            .args(["/C", "echo %HTTPS_PROXY% %NO_PROXY%"])
+            .output()
+            .expect("child process");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "http://proxy.example:8080 localhost,127.0.0.1,::1"
+        );
+    }
 
     fn provider(kind: ProviderKind, auth_ref: Option<&str>) -> ProviderConfig {
         ProviderConfig {

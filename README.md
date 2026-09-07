@@ -243,6 +243,14 @@ flowchart LR
 
 开启 `保留官方 Codex 登录` 后，第三方 API Key 直连会写入 provider 配置，官方 ChatGPT OAuth 继续保留在 `auth.json`。Companion 在修改 Codex 配置前会创建备份，并尽量保留修改后产生的用户内容。
 
+### 网络代理与官方登录
+
+HTTP 与 Responses WebSocket 使用相同的代理规则：优先读取 `http_proxy` / `https_proxy` / `all_proxy`（也支持大写），显式环境变量存在时不混入系统代理。没有显式配置时，macOS 读取系统 HTTP/HTTPS 代理，Windows 读取当前用户的手动 Internet 代理，Linux 的 GNOME 系桌面读取 GSettings 手动代理；其他 Linux 桌面或无桌面环境使用代理环境变量。支持 HTTP、HTTPS 和 SOCKS5 代理。
+
+Companion 始终让 loopback 地址直连，并保留 `NO_PROXY` 例外。通过 Companion 账号/分组启动流程启动的客户端会收到代理环境变量；macOS 使用 LaunchServices 的环境参数，Windows Store 桌面应用解析安装包中的可执行文件启动，其他进程直接继承。已经运行的客户端需要完全退出并重新通过 Companion 启动才能获得新环境。PAC/WPAD 自动代理脚本不在此支持范围内；系统 `<local>` 规则可用于 Companion 内部路由，但没有可移植的子进程环境变量等价写法，子进程应通过 `NO_PROXY` 列出具体主机或域名。
+
+本地代理接入优先保留客户端现有官方 OAuth 登录，不用所选 Provider 的旧快照覆盖它；只有缺少官方登录时才尝试恢复账号凭证。官方账号未保存 `websocketUrl` 时使用其 Base URL 对应的 Responses WebSocket 端点；第三方账号仍需显式配置支持的 WebSocket 地址。以上配置兼容不代表官方设备远程配对已经验证成功，配对还取决于官方账号状态、权限及网络连通性。
+
 ## 本地 API 服务
 
 当前分组默认暴露为 `http://127.0.0.1:17687/v1`：

@@ -41,7 +41,7 @@ ed25519-dalek = { version = "2.2", features = ["pkcs8", "rand_core"] }
 futures-util = "0.3"
 flate2 = "1.1"
 ratatui = "0.29"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "socks"] }
 rquickjs = { version = "0.8", features = ["array-buffer", "classes"] }
 rand = "0.9"
 regex = "1.12"

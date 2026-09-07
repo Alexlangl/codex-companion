@@ -32,9 +32,8 @@ use std::{
     time::Duration,
 };
 use tokio_tungstenite::{
-    connect_async,
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message as UpstreamMessage},
-    MaybeTlsStream, WebSocketStream,
+    WebSocketStream,
 };
 
 const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -44,7 +43,10 @@ const WEBSOCKET_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_WEBSOCKET_PREFLIGHT_MESSAGES: usize = 128;
 const MAX_WEBSOCKET_PREFLIGHT_BYTES: usize = 1024 * 1024;
 
-type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+type UpstreamWebSocket = WebSocketStream<reqwest::Upgraded>;
+
+#[cfg(test)]
+use tokio_tungstenite::connect_async;
 type UpstreamSink = SplitSink<UpstreamWebSocket, UpstreamMessage>;
 type UpstreamStream = SplitStream<UpstreamWebSocket>;
 type ClientWebSocket = axum::extract::ws::WebSocket;
@@ -204,7 +206,7 @@ fn websocket_candidates(
         .ok_or_else(|| "当前分组不存在".to_string())?;
     let mut selected = selected_providers_for_group(&config, group)
         .into_iter()
-        .filter(|provider| provider.enabled && provider.websocket_url.is_some())
+        .filter(|provider| provider.enabled && effective_websocket_url(provider).is_some())
         .collect::<Vec<_>>();
     if let Some(preferred) = preferred_provider
         .filter(|provider_id| {
@@ -216,7 +218,7 @@ fn websocket_candidates(
         .and_then(|provider_id| config.providers.get(provider_id))
         .filter(|provider| {
             provider.enabled
-                && provider.websocket_url.is_some()
+                && effective_websocket_url(provider).is_some()
                 && !selected.iter().any(|candidate| candidate.id == provider.id)
         })
     {
@@ -482,21 +484,92 @@ async fn connect_provider_websocket_with_options(
 async fn connect_websocket_with_timeout(
     request: tokio_tungstenite::tungstenite::http::Request<()>,
 ) -> Result<UpstreamWebSocket, WebSocketConnectError> {
-    match tokio::time::timeout(WEBSOCKET_CONNECT_TIMEOUT, connect_async(request)).await {
+    match tokio::time::timeout(WEBSOCKET_CONNECT_TIMEOUT, connect_websocket(request)).await {
         Err(_) => Err(WebSocketConnectError::message("WebSocket 连接超时")),
-        Ok(Ok((websocket, _))) => Ok(websocket),
-        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
-            let status = response.status();
-            Err(WebSocketConnectError {
-                message: format!("WebSocket 连接失败: HTTP {status}"),
-                status: Some(status.as_u16()),
-                failure: None,
-            })
-        }
-        Ok(Err(error)) => Err(WebSocketConnectError::message(format!(
-            "WebSocket 连接失败: {error}"
-        ))),
+        Ok(result) => result,
     }
+}
+
+async fn connect_websocket(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+) -> Result<UpstreamWebSocket, WebSocketConnectError> {
+    let client = codex_companion_core::http_client_builder()
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| WebSocketConnectError::message("无法创建 WebSocket HTTP 客户端"))?;
+    connect_websocket_with_client(request, &client).await
+}
+
+async fn connect_websocket_with_client(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+    client: &reqwest::Client,
+) -> Result<UpstreamWebSocket, WebSocketConnectError> {
+    // Use the same proxy discovery as HTTP requests, including macOS system
+    // proxies. connect_async opens a direct TCP socket and ignores them.
+    let (parts, _) = request.into_parts();
+    let mut url = url::Url::parse(&parts.uri.to_string())
+        .map_err(|_| WebSocketConnectError::message("WebSocket URL 无效"))?;
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        _ => return Err(WebSocketConnectError::message("WebSocket URL 协议无效")),
+    };
+    url.set_scheme(scheme)
+        .map_err(|_| WebSocketConnectError::message("WebSocket URL 无效"))?;
+    let expected_accept = parts
+        .headers
+        .get("sec-websocket-key")
+        .map(|key| tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes()))
+        .ok_or_else(|| WebSocketConnectError::message("WebSocket 握手缺少密钥"))?;
+    let response = client
+        .get(url)
+        .headers(parts.headers)
+        .send()
+        .await
+        .map_err(|error| {
+            WebSocketConnectError::message(format!("WebSocket 连接失败: {}", error.without_url()))
+        })?;
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return Err(WebSocketConnectError {
+            message: format!("WebSocket 连接失败: HTTP {}", response.status()),
+            status: Some(response.status().as_u16()),
+            failure: None,
+        });
+    }
+    let headers = response.headers();
+    let valid_upgrade = headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    let valid_connection = headers
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        });
+    if !valid_upgrade
+        || !valid_connection
+        || headers
+            .get("sec-websocket-accept")
+            .and_then(|v| v.to_str().ok())
+            != Some(expected_accept.as_str())
+        || headers.contains_key("sec-websocket-extensions")
+        || headers.contains_key("sec-websocket-protocol")
+    {
+        return Err(WebSocketConnectError::message("WebSocket 握手响应无效"));
+    }
+    let stream = response
+        .upgrade()
+        .await
+        .map_err(|_| WebSocketConnectError::message("WebSocket 协议升级失败"))?;
+    Ok(WebSocketStream::from_raw_socket(
+        stream,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await)
 }
 
 #[cfg(test)]
@@ -601,16 +674,44 @@ fn websocket_request(
     websocket_request_with_account_id(provider, authorization, None)
 }
 
+// Legacy official imports did not persist a WebSocket URL. Resolve the
+// standard Responses endpoint without requiring users to recreate accounts.
+// Third-party providers still opt in with an explicit endpoint.
+fn effective_websocket_url(provider: &ProviderConfig) -> Option<String> {
+    if let Some(url) = provider
+        .websocket_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        return Some(url.to_string());
+    }
+    if provider.kind != ProviderKind::OfficialCodex {
+        return None;
+    }
+    let mut url = url::Url::parse(&provider.base_url).ok()?;
+    let scheme = match url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        _ => return None,
+    };
+    url.set_scheme(scheme).ok()?;
+    let path = url.path().trim_end_matches('/');
+    if !path.ends_with("/responses") {
+        url.set_path(&format!("{path}/responses"));
+    }
+    Some(url.to_string())
+}
+
 fn websocket_request_with_account_id(
     provider: &ProviderConfig,
     authorization: Option<&str>,
     account_id_override: Option<&str>,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
-    let url = provider
-        .websocket_url
-        .as_deref()
+    let url = effective_websocket_url(provider)
         .ok_or_else(|| "provider 未配置 websocket_url".to_string())?;
     let mut request = url
+        .as_str()
         .into_client_request()
         .map_err(|error| format!("WebSocket URL 无效: {error}"))?;
     if let Some(authorization) = authorization {
@@ -641,7 +742,7 @@ fn websocket_request_with_account_id(
         request
             .headers_mut()
             .insert("originator", HeaderValue::from_static("codex_cli_rs"));
-        if let Some(version) = websocket_client_version(url) {
+        if let Some(version) = websocket_client_version(&url) {
             request.headers_mut().insert(
                 "version",
                 HeaderValue::from_str(version)
@@ -2121,6 +2222,113 @@ mod tests {
             })
             .expect("config");
         RelayState::new(store, reqwest::Client::new())
+    }
+
+    #[tokio::test]
+    async fn websocket_uses_http_proxy_and_validates_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for valid_accept in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    bytes.push(socket.read_u8().await.unwrap());
+                    assert!(bytes.len() < 16384);
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                assert!(request
+                    .starts_with("GET http://unreachable.example.test/v1/responses HTTP/1.1"));
+                let key = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("sec-websocket-key")
+                            .then(|| value.trim())
+                    })
+                    .unwrap();
+                let accept = if valid_accept {
+                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes())
+                } else {
+                    "invalid".to_string()
+                };
+                socket.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
+                if valid_accept {
+                    let mut ws = WebSocketStream::from_raw_socket(
+                        socket,
+                        tokio_tungstenite::tungstenite::protocol::Role::Server,
+                        None,
+                    )
+                    .await;
+                    assert_eq!(
+                        ws.next().await.unwrap().unwrap().into_text().unwrap(),
+                        "probe"
+                    );
+                    ws.send(UpstreamMessage::Text("ok".into())).await.unwrap();
+                }
+            });
+            let client = reqwest::Client::builder()
+                .http1_only()
+                .proxy(reqwest::Proxy::all(format!("http://{address}")).unwrap())
+                .build()
+                .unwrap();
+            let request = "ws://unreachable.example.test/v1/responses"
+                .into_client_request()
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connect_websocket_with_client(request, &client),
+            )
+            .await
+            .unwrap();
+            if valid_accept {
+                let mut websocket = result.unwrap();
+                websocket
+                    .send(UpstreamMessage::Text("probe".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    websocket
+                        .next()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .into_text()
+                        .unwrap(),
+                    "ok"
+                );
+            } else {
+                assert!(result.is_err());
+            }
+            proxy.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_official_account_can_connect_without_explicit_websocket_url() {
+        let mut official = provider("official", None);
+        official.kind = ProviderKind::OfficialCodex;
+        official.base_url = "https://chatgpt.com/backend-api/codex/".to_string();
+        let state = state_with_group(vec![official.clone(), provider("http-only", None)]);
+        let candidates = websocket_candidates(&state, None).expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        let request = websocket_request(&candidates[0], Some("Bearer test")).expect("request");
+        assert_eq!(
+            request.uri().to_string(),
+            "wss://chatgpt.com/backend-api/codex/responses"
+        );
+        official.websocket_url = Some("wss://custom.example/socket".to_string());
+        assert_eq!(
+            effective_websocket_url(&official).as_deref(),
+            Some("wss://custom.example/socket")
+        );
+        official.websocket_url = None;
+        official.base_url = "http://localhost:8080/responses".to_string();
+        assert_eq!(
+            effective_websocket_url(&official).as_deref(),
+            Some("ws://localhost:8080/responses")
+        );
     }
 
     #[test]
