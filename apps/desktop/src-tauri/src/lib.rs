@@ -1008,6 +1008,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            configure_updater_proxy_environment();
             codex_oauth::configure_event_emitter(app.handle());
             if let Ok(daemon) = daemon() {
                 let refresh_daemon = daemon.clone();
@@ -1217,4 +1218,14 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex Companion");
+}
+
+/// Tauri's updater builds its own reqwest client. Keep its environment-based
+/// proxy discovery aligned with the proxy used by Companion's API clients.
+fn configure_updater_proxy_environment() {
+    for (key, value) in codex_companion_core::desktop_proxy_environment() {
+        // The resolved values already honor explicitly configured proxy
+        // variables, then fall back to the platform's system settings.
+        std::env::set_var(key, value);
+    }
 }
