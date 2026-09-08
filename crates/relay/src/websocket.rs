@@ -676,7 +676,8 @@ fn websocket_request(
 
 // Legacy official imports did not persist a WebSocket URL. Resolve the
 // standard Responses endpoint without requiring users to recreate accounts.
-// Third-party providers still opt in with an explicit endpoint.
+// Third-party providers still opt in with an explicit endpoint because many
+// Responses-compatible HTTP APIs do not expose a WebSocket transport.
 fn effective_websocket_url(provider: &ProviderConfig) -> Option<String> {
     if let Some(url) = provider
         .websocket_url
@@ -2329,6 +2330,23 @@ mod tests {
             effective_websocket_url(&official).as_deref(),
             Some("ws://localhost:8080/responses")
         );
+    }
+
+    #[test]
+    fn third_party_responses_provider_requires_explicit_websocket_url() {
+        let relay_provider = provider("relay", None);
+        assert_eq!(effective_websocket_url(&relay_provider), None);
+
+        let mut explicit = provider(
+            "relay-explicit",
+            Some("wss://relay.example.com/socket".into()),
+        );
+        assert_eq!(
+            effective_websocket_url(&explicit).as_deref(),
+            Some("wss://relay.example.com/socket")
+        );
+        explicit.websocket_url = Some("  ".into());
+        assert_eq!(effective_websocket_url(&explicit), None);
     }
 
     #[test]
