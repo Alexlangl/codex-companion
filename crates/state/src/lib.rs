@@ -256,7 +256,10 @@ pub fn install_companion_provider_for_relay(
         });
         provider_table["base_url"] = value(relay.base_url());
         provider_table["wire_api"] = value("responses");
-        provider_table["supports_websockets"] = value(true);
+        // Responses WebSocket transport is independent from Codex remote
+        // control. Keep relay traffic on HTTP so mixed groups can fall back
+        // between official and HTTP-only providers without changing protocol.
+        provider_table["supports_websockets"] = value(false);
         if preserve_official_auth || official_auth.ready {
             provider_table["requires_openai_auth"] = value(true);
             provider_table["experimental_bearer_token"] = value(COMPANION_RELAY_BEARER_TOKEN);
@@ -4885,7 +4888,7 @@ wire_api = "responses"
             .as_table()
             .expect("relay provider");
         assert_eq!(relay_provider["requires_openai_auth"].as_bool(), Some(true));
-        assert_eq!(relay_provider["supports_websockets"].as_bool(), Some(true));
+        assert_eq!(relay_provider["supports_websockets"].as_bool(), Some(false));
         assert_eq!(
             relay_provider["experimental_bearer_token"].as_str(),
             Some(COMPANION_RELAY_BEARER_TOKEN)
@@ -5362,7 +5365,7 @@ wire_api = "responses"
         assert!(config.contains("model_provider = \"codex-companion\""));
         assert!(config.contains("name = \"OpenAI\""));
         assert!(config.contains("requires_openai_auth = true"));
-        assert!(config.contains("supports_websockets = true"));
+        assert!(config.contains("supports_websockets = false"));
         assert!(config.contains(COMPANION_RELAY_BEARER_TOKEN));
         let marker = read_companion_state(temp.path()).expect("managed state");
         assert!(marker.auth_write_hash.is_none());

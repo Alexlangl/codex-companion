@@ -6,6 +6,7 @@ mod server;
 mod state;
 mod upstream;
 mod websocket;
+mod websocket_audit;
 
 pub use api_service::{
     ApiServiceStore, RequestAttemptFinish, RequestAttemptStart, RequestLogFinish, RequestLogStart,

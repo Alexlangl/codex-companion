@@ -3,6 +3,7 @@ use crate::state::{apply_group_policy, RelayState};
 use crate::upstream::{
     normalize_official_input_item_ids, response_event_has_visible_output, semantic_failure_message,
 };
+use crate::websocket_audit::WebSocketRequestAudit;
 use axum::{
     extract::{ws::Message as ClientMessage, State, WebSocketUpgrade},
     http::{header, HeaderMap, StatusCode},
@@ -70,6 +71,7 @@ pub(crate) async fn responses_websocket(
         Ok(api_client) => api_client,
         Err(error) => return error.into_response(),
     };
+    let client_id = api_client.as_ref().map(|client| client.id.clone());
     let allowed_models = api_client
         .map(|api_client| api_client.allowed_models)
         .unwrap_or_default();
@@ -92,7 +94,7 @@ pub(crate) async fn responses_websocket(
         Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
     };
     let (candidate_index, provider, upstream) =
-        match connect_candidate_websocket_from(&state, &candidates, 0, None).await {
+        match connect_candidate_websocket_from(&state, &candidates, 0, None, &mut None).await {
             Ok(connected) => connected,
             Err(error) => return (StatusCode::BAD_GATEWAY, error).into_response(),
         };
@@ -108,6 +110,7 @@ pub(crate) async fn responses_websocket(
                 provider,
                 upstream,
                 allowed_models,
+                client_id,
             )
         })
         .into_response();
@@ -578,7 +581,7 @@ async fn connect_candidate_websocket(
     candidates: Vec<ProviderConfig>,
 ) -> Result<(ProviderConfig, UpstreamWebSocket), String> {
     let (_, provider, upstream) =
-        connect_candidate_websocket_from(state, &candidates, 0, None).await?;
+        connect_candidate_websocket_from(state, &candidates, 0, None, &mut None).await?;
     Ok((provider, upstream.websocket))
 }
 
@@ -587,9 +590,13 @@ async fn connect_candidate_websocket_from(
     candidates: &[ProviderConfig],
     start_index: usize,
     replay: Option<&ClientMessage>,
+    audit: &mut Option<WebSocketRequestAudit>,
 ) -> Result<(usize, ProviderConfig, ConnectedWebSocket), String> {
     let mut last_error = None;
     for (index, provider) in candidates.iter().enumerate().skip(start_index) {
+        if let Some(audit) = audit.as_mut() {
+            audit.attempt(&provider.id, "fallback");
+        }
         match connect_provider_websocket(state, provider).await {
             Ok(mut upstream) => {
                 if let Some(frame) = replay {
@@ -600,6 +607,9 @@ async fn connect_candidate_websocket_from(
                     {
                         let message = format!("WebSocket 重放请求失败: {error}");
                         record_websocket_failure(state, provider, None, None, &message);
+                        if let Some(audit) = audit.as_mut() {
+                            audit.fail(None, &message);
+                        }
                         last_error = Some(message);
                         continue;
                     }
@@ -614,6 +624,9 @@ async fn connect_candidate_websocket_from(
                     error.failure,
                     &error.message,
                 );
+                if let Some(audit) = audit.as_mut() {
+                    audit.fail(error.status, &error.message);
+                }
                 last_error = Some(error.message);
             }
         }
@@ -627,6 +640,7 @@ async fn connect_next_websocket(
     current_index: usize,
     attempted: &mut HashSet<usize>,
     replay: Option<&ClientMessage>,
+    audit: &mut Option<WebSocketRequestAudit>,
 ) -> Result<(usize, ProviderConfig, ConnectedWebSocket), String> {
     let mut last_error = None;
     for offset in 1..=candidates.len() {
@@ -635,6 +649,9 @@ async fn connect_next_websocket(
             continue;
         }
         let provider = &candidates[index];
+        if let Some(audit) = audit.as_mut() {
+            audit.attempt(&provider.id, "fallback");
+        }
         match connect_provider_websocket(state, provider).await {
             Ok(mut upstream) => {
                 if let Some(frame) = replay {
@@ -645,6 +662,9 @@ async fn connect_next_websocket(
                     {
                         let message = format!("WebSocket 重放请求失败: {error}");
                         record_websocket_failure(state, provider, None, None, &message);
+                        if let Some(audit) = audit.as_mut() {
+                            audit.fail(None, &message);
+                        }
                         last_error = Some(message);
                         continue;
                     }
@@ -659,6 +679,9 @@ async fn connect_next_websocket(
                     error.failure,
                     &error.message,
                 );
+                if let Some(audit) = audit.as_mut() {
+                    audit.fail(error.status, &error.message);
+                }
                 last_error = Some(error.message);
             }
         }
@@ -783,6 +806,7 @@ async fn bridge_websocket(
     mut provider: ProviderConfig,
     upstream: ConnectedWebSocket,
     allowed_models: Vec<String>,
+    client_id: Option<String>,
 ) {
     let (mut client_sink, mut client_stream) = client.split();
     let ConnectedWebSocket {
@@ -832,7 +856,29 @@ async fn bridge_websocket(
                 let Some(Ok(message)) = client_message else {
                     break;
                 };
+                let response_create = frame_has_type(&message, "response.create");
+                let starts_tracked_response = response_create && pending.request.is_none();
+                if starts_tracked_response {
+                    let payload = match &message {
+                        ClientMessage::Text(text) => text.as_bytes(),
+                        ClientMessage::Binary(bytes) => bytes.as_ref(),
+                        _ => &[],
+                    };
+                    let value = serde_json::from_slice(payload).unwrap_or(Value::Null);
+                    pending.audit = Some(WebSocketRequestAudit::new(
+                        &state,
+                        &value,
+                        client_id.as_deref(),
+                    ));
+                }
                 if let Some(model) = frame_disallowed_model(&message, &allowed_models) {
+                    if let Some(audit) = pending.audit.as_mut() {
+                        audit.finish(
+                            Some(403),
+                            "rejected",
+                            Some("API client 无权使用所请求的模型"),
+                        );
+                    }
                     let error = serde_json::json!({
                         "type": "error",
                         "error": {
@@ -844,12 +890,15 @@ async fn bridge_websocket(
                     let _ = client_sink.send(ClientMessage::Text(error.into())).await;
                     break;
                 }
-                let response_create = frame_has_type(&message, "response.create");
                 let response_cancel = frame_has_type(&message, "response.cancel");
-                let starts_tracked_response = response_create && pending.request.is_none();
                 let close = matches!(message, ClientMessage::Close(_));
                 if starts_tracked_response {
                     pending.begin(message.clone());
+                    if upstream_sink.is_some() {
+                        if let Some(audit) = pending.audit.as_mut() {
+                            audit.attempt(&provider.id, "policy");
+                        }
+                    }
                     attempted.clear();
                     attempted.insert(candidate_index);
                     last_upstream_activity = tokio::time::Instant::now();
@@ -875,6 +924,7 @@ async fn bridge_websocket(
                         &mut upstream_stream,
                         &mut oauth_access_token,
                         Some(&message),
+                        &mut pending.audit,
                     )
                     .await
                     {
@@ -919,6 +969,9 @@ async fn bridge_websocket(
                     .await;
                 if let Err(error) = send_result {
                     let detail = format!("向上游发送 WebSocket 帧失败: {error}");
+                    if let Some(audit) = pending.audit.as_mut() {
+                        audit.fail(None, &detail);
+                    }
                     discard_upstream_connection(&mut upstream_sink, &mut upstream_stream);
                     let may_replay =
                         pending.can_replay() && (!response_create || starts_tracked_response);
@@ -960,6 +1013,7 @@ async fn bridge_websocket(
                             &mut upstream_stream,
                             &mut oauth_access_token,
                             Some(&message),
+                            &mut pending.audit,
                         )
                         .await
                         {
@@ -1096,6 +1150,9 @@ async fn bridge_websocket(
                     matches!(&upstream_event, WebSocketUpstreamEvent::Failure { .. });
                 match upstream_event {
                     WebSocketUpstreamEvent::Failure { detail, status } => {
+                        if let Some(audit) = pending.audit.as_mut() {
+                            audit.fail(status, &detail);
+                        }
                         if pending.can_replay() {
                             let mut recovery_status = status;
                             let mut recovery_failure = None;
@@ -1109,6 +1166,9 @@ async fn bridge_websocket(
                             if should_refresh_oauth
                                 && pending.take_oauth_unauthorized_refresh_attempt()
                             {
+                                if let Some(audit) = pending.audit.as_mut() {
+                                    audit.attempt(&provider.id, "fallback");
+                                }
                                 match refresh_and_reconnect_current_oauth_websocket(
                                     &state,
                                     &mut candidate_index,
@@ -1134,6 +1194,9 @@ async fn bridge_websocket(
                                         continue;
                                     }
                                     Err(error) => {
+                                        if let Some(audit) = pending.audit.as_mut() {
+                                            audit.fail(error.status, &error.message);
+                                        }
                                         recovery_status = error.status.or(status);
                                         recovery_failure = error.failure;
                                         recovery_detail = format!("{detail}; {}", error.message);
@@ -1197,6 +1260,9 @@ async fn bridge_websocket(
                             break;
                         }
                         record_health_success(&state.store, &provider.id);
+                        if let Some(audit) = pending.audit.as_mut() {
+                            audit.finish(Some(200), "succeeded", None);
+                        }
                         pending.clear();
                         attempted.clear();
                         continue;
@@ -1291,8 +1357,9 @@ async fn bridge_websocket(
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PendingWebSocketResponse {
+    audit: Option<WebSocketRequestAudit>,
     request: Option<ClientMessage>,
     started_at: Option<tokio::time::Instant>,
     visible_output: bool,
@@ -1355,6 +1422,7 @@ impl PendingWebSocketResponse {
     }
 
     fn clear(&mut self) {
+        self.audit.take();
         self.request = None;
         self.started_at = None;
         self.visible_output = false;
@@ -1393,8 +1461,20 @@ async fn recover_websocket_before_output(
     if !pending.can_replay() {
         return false;
     }
+    if let Some(audit) = pending.audit.as_mut() {
+        audit.fail(status, detail);
+    }
     let replay = pending.request.as_ref();
-    match connect_next_websocket(state, candidates, *candidate_index, attempted, replay).await {
+    match connect_next_websocket(
+        state,
+        candidates,
+        *candidate_index,
+        attempted,
+        replay,
+        &mut pending.audit,
+    )
+    .await
+    {
         Ok((next_index, next_provider, next_upstream)) => {
             append_event(
                 &state.store,
@@ -1431,6 +1511,7 @@ async fn recover_websocket_before_output(
                     upstream_stream,
                     oauth_access_token,
                     replay,
+                    &mut pending.audit,
                 )
                 .await
             {
@@ -1467,7 +1548,11 @@ async fn reconnect_current_websocket(
     upstream_stream: &mut Option<UpstreamStream>,
     oauth_access_token: &mut Option<String>,
     replay: Option<&ClientMessage>,
+    audit: &mut Option<WebSocketRequestAudit>,
 ) -> bool {
+    if let Some(audit) = audit.as_mut() {
+        audit.attempt(&provider.id, "fallback");
+    }
     let current_provider = provider.clone();
     let mut upstream = match connect_provider_websocket(state, &current_provider).await {
         Ok(upstream) => upstream,
@@ -1479,6 +1564,9 @@ async fn reconnect_current_websocket(
                 error.failure,
                 &error.message,
             );
+            if let Some(audit) = audit.as_mut() {
+                audit.fail(error.status, &error.message);
+            }
             return false;
         }
     };
@@ -1493,6 +1581,9 @@ async fn reconnect_current_websocket(
         {
             let detail = format!("WebSocket 重放请求失败: {error}");
             record_websocket_failure(state, &current_provider, None, None, &detail);
+            if let Some(audit) = audit.as_mut() {
+                audit.fail(None, &detail);
+            }
             return false;
         }
     }
@@ -1583,9 +1674,10 @@ async fn reconnect_websocket_from_start(
     upstream_stream: &mut Option<UpstreamStream>,
     oauth_access_token: &mut Option<String>,
     replay: Option<&ClientMessage>,
+    audit: &mut Option<WebSocketRequestAudit>,
 ) -> Result<(), String> {
     let (next_index, next_provider, next_upstream) =
-        connect_candidate_websocket_from(state, candidates, 0, replay).await?;
+        connect_candidate_websocket_from(state, candidates, 0, replay, audit).await?;
     install_websocket_connection(
         state,
         candidate_index,
@@ -1653,6 +1745,9 @@ async fn handle_broken_upstream(
     client_sink: &mut ClientSink,
     detail: &str,
 ) -> bool {
+    if let Some(audit) = pending.audit.as_mut() {
+        audit.fail(None, detail);
+    }
     discard_upstream_connection(upstream_sink, upstream_stream);
     let attempted_replay = pending.can_replay();
     if attempted_replay

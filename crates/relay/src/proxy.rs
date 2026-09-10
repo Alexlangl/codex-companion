@@ -196,6 +196,12 @@ async fn proxy_dispatch(
             started_at,
             None,
         );
+        append_event(
+            &state.store,
+            "stream",
+            None,
+            format!("[{request_id}] {method} {uri} -> 200 OK（本地处理）"),
+        );
         return Ok(relay_root_response());
     }
     if let (Some(client), Some(model)) = (client.as_ref(), requested_model.as_deref()) {
@@ -1297,7 +1303,7 @@ fn allowed_models_response(models: &[String]) -> Response {
         .expect("models response")
 }
 
-fn next_request_id() -> String {
+pub(crate) fn next_request_id() -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
