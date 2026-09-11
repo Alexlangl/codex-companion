@@ -2828,6 +2828,23 @@ fn restore_model_catalog_contents(
     Ok(true)
 }
 
+/// Only the active Companion endpoint is eligible for transport migration.
+/// Direct providers and inactive Companion tables belong to other launches.
+pub fn relay_transport_needs_migration(codex_dir: &Path, relay: &RelayConfig) -> Result<bool> {
+    if !doctor(codex_dir.to_path_buf(), relay)?.installed {
+        return Ok(false);
+    }
+    let path = codex_dir.join("config.toml");
+    let current = fs::read_to_string(&path).map_err(|source| CompanionError::io(&path, source))?;
+    let doc = current.parse::<DocumentMut>().map_err(|source| {
+        CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
+    })?;
+    Ok(doc["model_providers"][COMPANION_PROVIDER_ID]
+        .get("supports_websockets")
+        .and_then(Item::as_bool)
+        != Some(false))
+}
+
 pub fn doctor(codex_dir: PathBuf, relay: &RelayConfig) -> Result<CodexInstallStatus> {
     let config_path = codex_dir.join("config.toml");
     let mut model_provider = None;

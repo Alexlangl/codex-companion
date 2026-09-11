@@ -72,15 +72,15 @@ fn resolve_proxy_config(
 fn read_system_proxy() -> ProxyConfig {
     #[cfg(target_os = "macos")]
     {
-        return macos::read_system_proxy().unwrap_or_default();
+        macos::read_system_proxy().unwrap_or_default()
     }
     #[cfg(target_os = "windows")]
     {
-        return windows::read_system_proxy().unwrap_or_default();
+        windows::read_system_proxy().unwrap_or_default()
     }
     #[cfg(target_os = "linux")]
     {
-        return linux::read_system_proxy().unwrap_or_default();
+        linux::read_system_proxy().unwrap_or_default()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     ProxyConfig::default()

@@ -76,18 +76,25 @@ impl CompanionDaemon {
                 || !relay_preserved_official_auth_is_ready(&codex_dir)?);
         let catalog_repair_needed =
             models.is_empty() && companion_managed_model_catalog_is_active(&codex_dir)?;
-        if !auth_repair_needed && !catalog_repair_needed {
+        let transport_repair_needed =
+            codex_companion_state::relay_transport_needs_migration(&codex_dir, &config.relay)?;
+        if !auth_repair_needed && !catalog_repair_needed && !transport_repair_needed {
             return Ok(false);
         }
+        let source = relay_official_auth_provider(&config, &selected);
         install_companion_provider_for_relay(
             Some(codex_dir),
             &config.relay,
             Some("Companion relay startup reconciliation"),
             &models,
-            None,
+            source.as_ref(),
             config.app.preserve_official_codex_auth,
         )?;
-        restart_codex_if_running();
+        // Old sessions negotiate HTTP through the relay's 426 response. A
+        // transport-only upgrade must not interrupt unrelated running tasks.
+        if auth_repair_needed || catalog_repair_needed {
+            restart_codex_if_running();
+        }
         Ok(true)
     }
 
@@ -349,6 +356,56 @@ mod tests {
                 .preserve_official_codex_auth
         );
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn startup_migrates_legacy_transport_once_without_changing_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex_dir = temp.path().join("codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let original_auth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"synthetic-access","refresh_token":"synthetic-refresh"}}"#;
+        std::fs::write(codex_dir.join("auth.json"), original_auth).unwrap();
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                config.app.last_codex_launch_mode = Some(CodexLaunchMode::GroupRelay);
+                config.app.preserve_official_codex_auth = true;
+                Ok(())
+            })
+            .unwrap();
+        let daemon = CompanionDaemon::new(store);
+        daemon.install(Some(codex_dir.clone())).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        let text = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("supports_websockets = false", "supports_websockets = true");
+        std::fs::write(&config_path, text).unwrap();
+        assert!(daemon
+            .reconcile_preserved_official_codex_auth_in_dir(codex_dir.clone())
+            .unwrap());
+        assert!(std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("supports_websockets = false"));
+        assert_eq!(
+            std::fs::read_to_string(codex_dir.join("auth.json")).unwrap(),
+            original_auth
+        );
+        assert!(!daemon
+            .reconcile_preserved_official_codex_auth_in_dir(codex_dir.clone())
+            .unwrap());
+        // A direct launch with an inactive legacy Companion table is untouched.
+        let text = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace(
+                "model_provider = \"codex-companion\"",
+                "model_provider = \"direct\"",
+            )
+            .replace("supports_websockets = false", "supports_websockets = true");
+        std::fs::write(&config_path, &text).unwrap();
+        assert!(!daemon
+            .reconcile_preserved_official_codex_auth_in_dir(codex_dir)
+            .unwrap());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), text);
     }
 
     #[test]

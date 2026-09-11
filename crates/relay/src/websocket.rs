@@ -71,6 +71,22 @@ pub(crate) async fn responses_websocket(
         Ok(api_client) => api_client,
         Err(error) => return error.into_response(),
     };
+    // Codex also caches provider capabilities in running sessions. Refusing
+    // the upgrade with 426 activates its immediate, session-scoped HTTP
+    // fallback; 503 instead consumes its entire WebSocket reconnect budget.
+    // Decide before filtering out HTTP-only providers, or a mixed group would
+    // silently become an official-only group for the lifetime of the socket.
+    match websocket_group_requires_http(&state) {
+        Ok(true) => {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                "This group requires HTTP Responses transport for provider fallback.",
+            )
+                .into_response();
+        }
+        Ok(false) => {}
+        Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
+    }
     let client_id = api_client.as_ref().map(|client| client.id.clone());
     let allowed_models = api_client
         .map(|api_client| api_client.allowed_models)
@@ -190,6 +206,18 @@ fn authenticate_websocket_client(
         ));
     }
     Ok(api_client)
+}
+
+fn websocket_group_requires_http(state: &RelayState) -> Result<bool, String> {
+    let config = state.store.load().map_err(|error| error.to_string())?;
+    let group = config
+        .groups
+        .get(&config.relay.active_group_id)
+        .ok_or_else(|| "当前分组不存在".to_string())?;
+    let selected = selected_providers_for_group(&config, group);
+    Ok(selected
+        .iter()
+        .any(|provider| effective_websocket_url(provider).is_none()))
 }
 
 fn websocket_candidates(
@@ -798,6 +826,8 @@ enum WebSocketBridgeEvent {
     IdleTimeout,
 }
 
+// The upgrade hands off both the selected connection and client audit context.
+#[allow(clippy::too_many_arguments)]
 async fn bridge_websocket(
     client: ClientWebSocket,
     state: RelayState,
@@ -2318,6 +2348,82 @@ mod tests {
             })
             .expect("config");
         RelayState::new(store, reqwest::Client::new())
+    }
+
+    #[tokio::test]
+    async fn mixed_group_declines_upgrade_before_connecting_official_provider() {
+        let mut official = provider("official", None);
+        official.kind = ProviderKind::OfficialCodex;
+        // An unreachable upstream proves negotiation happens before dialing it.
+        official.base_url = "http://127.0.0.1:1/v1".into();
+        let state = state_with_group(vec![official, provider("http-only", None)]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/responses", get(responses_websocket))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        for official_present in [true, false] {
+            if !official_present {
+                state
+                    .store
+                    .update(|config| {
+                        config.groups.get_mut("test").unwrap().provider_order =
+                            vec!["http-only".into()];
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let error = connect_async(format!("ws://{addr}/v1/responses"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, tokio_tungstenite::tungstenite::Error::Http(response)
+                if response.status() == StatusCode::UPGRADE_REQUIRED)
+            );
+        }
+        // Authentication still precedes capability negotiation.
+        state
+            .store
+            .update(|config| {
+                config.relay.require_api_key = true;
+                Ok(())
+            })
+            .unwrap();
+        let error = connect_async(format!("ws://{addr}/v1/responses"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, tokio_tungstenite::tungstenite::Error::Http(response)
+            if response.status() == StatusCode::UNAUTHORIZED)
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn websocket_transport_requires_every_selected_provider_to_support_it() {
+        let mut official = provider("official", None);
+        official.kind = ProviderKind::OfficialCodex;
+        let state = state_with_group(vec![official, provider("http", None)]);
+        assert!(websocket_group_requires_http(&state).unwrap());
+        state
+            .store
+            .update(|config| {
+                config.providers.get_mut("http").unwrap().enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!websocket_group_requires_http(&state).unwrap());
+        state
+            .store
+            .update(|config| {
+                config.providers.get_mut("http").unwrap().enabled = true;
+                config.groups.get_mut("test").unwrap().policy =
+                    codex_companion_core::GroupPolicy::Manual;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!websocket_group_requires_http(&state).unwrap());
     }
 
     #[tokio::test]
