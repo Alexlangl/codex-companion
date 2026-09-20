@@ -13,6 +13,7 @@ chrono.workspace = true
 codex-companion-core.workspace = true
 codex-companion-health.workspace = true
 crypto_box.workspace = true
+dirs.workspace = true
 ed25519-dalek.workspace = true
 reqwest.workspace = true
 rquickjs.workspace = true

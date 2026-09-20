@@ -6,6 +6,7 @@ import { compactPath, formatTime, formatTokens } from "../../lib/format";
 import { userFacingError } from "../../lib/errors";
 import { providerAccountTitle } from "../../lib/provider-display";
 import { getTokenUsageSyncStatus } from "../../lib/token-usage-api";
+import { PricingEditor } from "./PricingEditor";
 import type {
   CompanionStatus,
   TokenUsageBucket,
@@ -70,6 +71,7 @@ export function TokenStats({
   }), [dateRange, model, providerId]);
   const queryKey = `${codexDir.trim()}|${query.startDate ?? ""}|${query.endDate ?? ""}|${providerId}|${model}`;
   const latestQueryKeyRef = useRef(queryKey);
+  const pricingRevisionRef = useRef(0);
   latestQueryKeyRef.current = queryKey;
   const rangeLabel = usageRangeLabel(rangePreset, customStartTime, customEndTime);
   const refreshIntervalSeconds = status.config.app.tokenUsageRefreshIntervalSeconds;
@@ -87,6 +89,7 @@ export function TokenStats({
     inFlightRef.current = true;
     requestedQueryRef.current = queryKey;
     const requestQueryKey = queryKey;
+    const pricingRevision = pricingRevisionRef.current;
     const showFullLoading = !hasStats;
     if (showFullLoading) {
       setLoading(true);
@@ -96,7 +99,7 @@ export function TokenStats({
     setError(null);
     try {
       const nextStats = await onLoad(codexDir, { ...query, rebuild: mode === "rebuild" });
-      if (latestQueryKeyRef.current !== requestQueryKey) return;
+      if (latestQueryKeyRef.current !== requestQueryKey || pricingRevisionRef.current !== pricingRevision) return;
       setAvailableProviders((current) =>
         sameStringArray(current, nextStats.availableProviders) ? current : nextStats.availableProviders,
       );
@@ -309,7 +312,7 @@ export function TokenStats({
           <div className="warning-box">
             <strong>{stats.unpricedEvents} 条 Token 事件尚未定价</strong>
             <p>
-              当前成本只汇总已匹配价格的事件。未定价模型：{unpricedModelText}。可在 Companion 数据目录创建 model-pricing.json 补充价格。
+              当前成本只汇总已匹配价格的事件。未定价模型：{unpricedModelText}。可在本页「模型定价」直接添加价格。
             </p>
           </div>
         ) : null}
@@ -334,6 +337,12 @@ export function TokenStats({
           <Metric label="输出" value={formatTokens(stats?.outputTokens ?? 0)} />
         </div>
       </Panel>
+
+      <PricingEditor active={active} providers={status.config.providers} onSaved={async () => {
+        pricingRevisionRef.current += 1;
+        requestedQueryRef.current = "";
+        await load("silent");
+      }} />
 
       <Panel eyebrow="范围" title="扫描范围">
         <dl className="details-grid">

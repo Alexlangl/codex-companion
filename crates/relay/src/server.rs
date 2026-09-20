@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_official_max_for_ultra_to_native_responses_upstream() {
+    async fn preserves_ultra_to_native_responses_upstream() {
         let received = Arc::new(Mutex::new(None));
         let received_by_upstream = received.clone();
         let upstream = Router::new().route(
@@ -485,11 +485,11 @@ mod tests {
             .expect("received lock")
             .clone()
             .expect("captured upstream request");
-        assert_eq!(payload["reasoning"]["effort"], "max");
+        assert_eq!(payload["reasoning"]["effort"], "ultra");
     }
 
     #[tokio::test]
-    async fn sends_official_max_for_ultra_to_chat_completions_upstream() {
+    async fn preserves_ultra_to_chat_completions_upstream() {
         let received = Arc::new(Mutex::new(None));
         let received_by_upstream = received.clone();
         let upstream = Router::new().route(
@@ -543,7 +543,7 @@ mod tests {
             .expect("received lock")
             .clone()
             .expect("captured upstream request");
-        assert_eq!(payload["reasoning_effort"], "max");
+        assert_eq!(payload["reasoning_effort"], "ultra");
         assert!(payload.get("reasoning").is_none());
     }
 

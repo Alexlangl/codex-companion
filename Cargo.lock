@@ -720,6 +720,7 @@ dependencies = [
  "chrono",
  "codex-companion-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -733,6 +734,7 @@ dependencies = [
  "codex-companion-core",
  "codex-companion-health",
  "crypto_box",
+ "dirs",
  "ed25519-dalek",
  "futures-util",
  "reqwest 0.12.28",

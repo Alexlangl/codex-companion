@@ -18,6 +18,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Field, IconButton, Panel } from "../../components/ui";
 import type { BadgeTone } from "../../components/ui";
+import { AccountProtectionFields, DEFAULT_ACCOUNT_PROTECTION } from "./AccountProtectionFields";
 import {
   apiServiceSelfTest,
   clearApiRequestLogs,
@@ -78,6 +79,7 @@ export function Relay({ active, status }: RelayProps) {
   const [selfTest, setSelfTest] = useState<ApiServiceSelfTest | null>(null);
   const [settings, setSettings] = useState<RelaySettingsUpdate>(() => relaySettingsFromStatus(status));
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const settingsDirtyRef = useRef(false);
   const [relayEvents, setRelayEvents] = useState<RelayEvent[]>(status.recentEvents);
   const [logsRefreshing, setLogsRefreshing] = useState(false);
   const logRefreshInFlightRef = useRef(false);
@@ -133,7 +135,7 @@ export function Relay({ active, status }: RelayProps) {
   }, [active, loadLogs, loadSnapshot]);
 
   useEffect(() => {
-    setSettings(relaySettingsFromStatus(status));
+    if (!settingsDirtyRef.current) setSettings(relaySettingsFromStatus(status));
   }, [status]);
 
   async function runAction(label: string, task: () => Promise<void>) {
@@ -193,8 +195,10 @@ export function Relay({ active, status }: RelayProps) {
 
   function handleSaveSettings() {
     void runAction("save-settings", async () => {
-      await updateRelaySettings(settings);
+      const saved = await updateRelaySettings(settings);
+      setSettings(saved);
       setSettingsSaved(true);
+      settingsDirtyRef.current = false;
     });
   }
 
@@ -301,7 +305,7 @@ export function Relay({ active, status }: RelayProps) {
         </div>
       </section>
 
-      {error ? <div className="error-banner api-service-error">{error}</div> : null}
+      {error ? <div className="error-banner api-service-error" role="alert">{error}</div> : null}
 
       {revealedSecret ? (
         <section className="api-secret-reveal" aria-live="polite">
@@ -389,7 +393,10 @@ export function Relay({ active, status }: RelayProps) {
         </Panel>
 
         <Panel eyebrow="运行策略" title="可靠性与保留策略">
-          <div className="api-settings-form">
+          <form className="api-settings-form" onChange={() => {
+            settingsDirtyRef.current = true;
+            setSettingsSaved(false);
+          }} onSubmit={(event) => { event.preventDefault(); handleSaveSettings(); }}>
             <Field label="监听地址">
               <input
                 aria-describedby="relay-host-help"
@@ -452,11 +459,14 @@ export function Relay({ active, status }: RelayProps) {
               <span>重试预算 0 = 尝试分组内全部账号</span>
               <span>模型 404 / 429 只冷却“账号 + 模型”，不会误伤该账号的其他模型</span>
             </div>
-            {settingsSaved ? <p className="field-hint">监听地址变更将在 Companion 下次启动 relay 时生效。</p> : null}
-            <Button disabled={action !== null} onClick={handleSaveSettings}>
+            <AccountProtectionFields value={settings.accountProtection ?? DEFAULT_ACCOUNT_PROTECTION}
+              providers={status.config.providers}
+              onChange={(accountProtection) => setSettings((current) => ({ ...current, accountProtection }))} />
+            {settingsSaved ? <p className="field-hint" role="status">运行策略已保存。监听地址变更将在 Companion 下次启动 relay 时生效。</p> : null}
+            <Button disabled={action !== null} type="submit">
               保存运行策略
             </Button>
-          </div>
+          </form>
           {cooldowns.length > 0 ? (
             <div className="api-cooldown-list">
               <strong>当前模型冷却</strong>
@@ -792,6 +802,7 @@ function relaySettingsFromStatus(status: CompanionStatus): RelaySettingsUpdate {
     modelCooldownSeconds: relay.modelCooldownSeconds,
     sessionAffinityTtlSeconds: relay.sessionAffinityTtlSeconds,
     requestLogRetentionDays: relay.requestLogRetentionDays,
+    accountProtection: relay.accountProtection ?? DEFAULT_ACCOUNT_PROTECTION,
   };
 }
 

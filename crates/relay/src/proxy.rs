@@ -140,7 +140,11 @@ async fn proxy_dispatch(
         None,
         format!("[{request_id}] {method} {uri}"),
     );
-    let affinity_key = request_affinity_key(&headers, &body);
+    let image_request =
+        uri.path().ends_with("/images/generations") || uri.path().ends_with("/images/edits");
+    let affinity_key = (!image_request)
+        .then(|| request_affinity_key(&headers, &body))
+        .flatten();
     let session_id = request_session_id(&headers, &body);
     let request_metadata = request_metadata(&body);
     let requested_model = request_metadata.model.clone();
@@ -239,7 +243,28 @@ async fn proxy_dispatch(
                 started_at,
                 None,
             );
-            return Ok(allowed_models_response(&client.allowed_models));
+            let models = client
+                .allowed_models
+                .iter()
+                .filter(|model| {
+                    config
+                        .groups
+                        .get(&config.relay.active_group_id)
+                        .into_iter()
+                        .flat_map(|group| selected_providers_for_group(&config, group))
+                        .any(|p| {
+                            p.enabled
+                                && codex_companion_core::account_policy_block_reason(
+                                    &config.relay.account_protection,
+                                    &p,
+                                    Some(model),
+                                    chrono::Utc::now(),
+                                ) != Some("account_model_excluded")
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            return Ok(allowed_models_response(&models));
         }
     }
     if normalize_health(&mut config) {
@@ -254,6 +279,7 @@ async fn proxy_dispatch(
         .cloned()
         .ok_or_else(|| format!("active group not found: {}", config.relay.active_group_id))?;
     let explicit_preferred_provider = session_id
+        .filter(|_| !image_request)
         .as_deref()
         .and_then(|session_id| {
             state
@@ -293,12 +319,25 @@ async fn proxy_dispatch(
     if method == Method::GET && uri.path() == "/v1/models" && !official_model_catalog_request {
         let models = selected
             .iter()
-            .flat_map(|provider| provider.model_map.keys().cloned())
+            .flat_map(|provider| {
+                provider
+                    .model_map
+                    .keys()
+                    .filter(|model| {
+                        codex_companion_core::account_policy_block_reason(
+                            &config.relay.account_protection,
+                            provider,
+                            Some(model),
+                            chrono::Utc::now(),
+                        ) != Some("account_model_excluded")
+                    })
+                    .cloned()
+            })
             .filter(|model| model != "default")
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        if !models.is_empty() {
+        if !models.is_empty() || selected.iter().any(|p| !p.model_map.is_empty()) {
             record_request_finish(
                 &state,
                 request_id,
@@ -337,27 +376,17 @@ async fn proxy_dispatch(
                 target_provider,
             )
         });
-    // AuthFailed(key 被吊销/凭证失效)必须无条件排除：它不会随冷却到期恢复，
-    // 只有刷新成功(mark_success)才解除；单账号/关闭 fallback 时也不能拿它无
-    // 限重试。临时冷却(429/5xx/网络故障)排在健康账号之后，但仍保留完整
-    // 后备链，避免所有账号短暂冷却时只尝试一个账号就结束对话。
-    let has_alternatives = group.fallback_enabled && selected.len() > 1;
-    let mut cooldown_probes = Vec::new();
+    // Cooldown is an eligibility rule, including single-provider groups and
+    // manual failback. Never probe an account before its recovery time.
     let mut candidates = selected
         .into_iter()
         .filter_map(|provider| {
+            if !provider_available(&state, &provider, requested_model.as_deref()) {
+                return None;
+            }
             let health = config.health.get(&provider.id);
             if health.is_some_and(|health| matches!(health.status, HealthStatusKind::AuthFailed)) {
                 return None;
-            }
-            if manually_requested_provider
-                .as_deref()
-                .is_some_and(|provider_id| provider_id == provider.id)
-            {
-                return Some(provider);
-            }
-            if !has_alternatives {
-                return Some(provider);
             }
             let globally_available = health.is_none_or(|health| !cooldown_active(health));
             let model_available = requested_model.as_deref().is_none_or(|model| {
@@ -368,21 +397,6 @@ async fn proxy_dispatch(
             });
             if globally_available && model_available {
                 return Some(provider);
-            }
-            let transient_failure = health
-                .and_then(|health| health.last_failure_kind.as_ref())
-                .is_none_or(|kind| {
-                    matches!(
-                        kind,
-                        HealthFailureKind::RateLimited
-                            | HealthFailureKind::UpstreamFailed
-                            | HealthFailureKind::NetworkFailed
-                            | HealthFailureKind::RequestRejected
-                            | HealthFailureKind::Unknown
-                    )
-                });
-            if transient_failure {
-                cooldown_probes.push(provider);
             }
             None
         })
@@ -431,22 +445,10 @@ async fn proxy_dispatch(
             );
         }
     }
-    if group.fallback_enabled {
-        cooldown_probes.sort_by_key(|provider| {
-            (
-                state.provider_inflight_count(&provider.id),
-                config
-                    .health
-                    .get(&provider.id)
-                    .and_then(|health| health.last_checked),
-            )
-        });
-        candidates.extend(cooldown_probes);
-    }
     if official_model_catalog_request {
         // Catalog discovery is group-wide rather than session-affine. Keep an
         // available official account authoritative after every generic route
-        // ordering step, including temporary-cooldown fallback placement.
+        // ordering step, after unavailable accounts have been excluded.
         candidates.sort_by_key(|provider| !matches!(provider.kind, ProviderKind::OfficialCodex));
     }
     if !group.fallback_enabled {
@@ -483,7 +485,60 @@ async fn proxy_dispatch(
     let mut last_error = None;
     let candidate_count = candidates.len();
     let compact_request = method == Method::POST && uri.path().ends_with("/responses/compact");
-    for (index, provider) in candidates.into_iter().enumerate() {
+    for index in 0..candidate_count {
+        candidates.retain(|p| provider_available(&state, p, requested_model.as_deref()));
+        if candidates.is_empty() {
+            break;
+        }
+        let protection = &config.relay.account_protection;
+        let bound = explicit_preferred_provider.as_deref().or_else(|| {
+            affinity_preference
+                .as_ref()
+                .map(|(_, p)| p.provider_id.as_str())
+        });
+        let waiting = if bound == Some(candidates[0].id.as_str()) {
+            &candidates[..1]
+        } else {
+            &candidates[..]
+        };
+        let (selected, permit) = match state
+            .account_concurrency
+            .acquire_any(
+                waiting,
+                protection.max_account_concurrency,
+                protection.account_concurrency_wait_ms,
+                |p| provider_available(&state, p, requested_model.as_deref()),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(message) => {
+                let status = if message == "account_policy_unavailable" {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                };
+                record_request_finish(
+                    &state,
+                    request_id,
+                    None,
+                    Some(status),
+                    "rejected",
+                    index as u16,
+                    started_at,
+                    Some(message),
+                );
+                return Ok(api_error_response(
+                    status,
+                    message,
+                    "当前账号暂不可用，请稍后重试",
+                ));
+            }
+        };
+        let provider = candidates.remove(selected);
+        if !provider_available(&state, &provider, requested_model.as_deref()) {
+            continue;
+        }
         let attempt = (index + 1) as u16;
         let attempt_started_at = Instant::now();
         let route_reason = request_attempt_route_reason(
@@ -537,7 +592,11 @@ async fn proxy_dispatch(
                 &message,
             ));
         }
-        let request_guard = state.begin_provider_request(&provider.id);
+        if !provider_available(&state, &provider, requested_model.as_deref()) {
+            continue;
+        }
+        let mut request_guard = state.begin_provider_request(&provider.id);
+        request_guard.account_permit = Some(permit);
         let upstream = upstream_url(&provider, &uri);
         let upstream_result = tokio::time::timeout(
             UPSTREAM_RESPONSE_HEADER_TIMEOUT,
@@ -556,6 +615,11 @@ async fn proxy_dispatch(
         });
         match upstream_result {
             Ok(mut response) if response.status().is_success() => {
+                if method == Method::GET && uri.path() == "/v1/models" {
+                    response
+                        .filter_model_catalog(&config.relay.account_protection, &provider)
+                        .await?;
+                }
                 let upstream_status = response.status();
                 let preflight = response
                     .preflight_stream_failure(group.fallback_enabled && index + 1 < candidate_count)
@@ -563,6 +627,32 @@ async fn proxy_dispatch(
                 if let Err(error) = preflight {
                     let failure = classify_failure(None, &error.classification_text());
                     let message = error.to_string();
+                    if codex_companion_health::is_content_moderation_failure(&message) {
+                        record_request_attempt_finish(
+                            &state,
+                            request_id,
+                            attempt,
+                            Some(StatusCode::OK),
+                            "rejected",
+                            attempt_started_at,
+                            Some("content_moderation"),
+                        );
+                        record_request_finish(
+                            &state,
+                            request_id,
+                            Some(&provider.id),
+                            Some(StatusCode::OK),
+                            "rejected",
+                            attempt,
+                            started_at,
+                            Some("content_moderation"),
+                        );
+                        return Ok(crate::moderation::response(
+                            &uri,
+                            &body,
+                            requested_model.as_deref(),
+                        ));
+                    }
                     record_provider_failure(
                         &state,
                         &config,
@@ -571,6 +661,13 @@ async fn proxy_dispatch(
                         &failure,
                         &message,
                     );
+                    if failure.cooldown {
+                        if let Some(seconds) = error.retry_after_seconds() {
+                            update_health(&state.store, &provider.id, |health| {
+                                codex_companion_health::extend_cooldown(health, seconds)
+                            });
+                        }
+                    }
                     last_error = Some(message.clone());
                     record_request_attempt_finish(
                         &state,
@@ -640,9 +737,8 @@ async fn proxy_dispatch(
                             );
                         }
                     }
-                    if let Some(model) = requested_model.as_deref() {
-                        let _ = state.api_service.clear_model_cooldown(&provider.id, model);
-                    }
+                    // Eligibility already requires an expired model cooldown;
+                    // a concurrent success must not delete a newly set one.
                     record_health_success(&state.store, &provider.id);
                     append_event(
                         &state.store,
@@ -728,6 +824,7 @@ async fn proxy_dispatch(
                 let status = response.status();
                 let oauth_refresh_error = response.oauth_refresh_error().map(str::to_string);
                 let oauth_refresh_failure = response.oauth_refresh_failure().cloned();
+                let retry_after = response.retry_after_seconds();
                 let body_text = match tokio::time::timeout(
                     UPSTREAM_ERROR_BODY_TIMEOUT,
                     response.text(),
@@ -740,6 +837,40 @@ async fn proxy_dispatch(
                 };
                 let failure = oauth_refresh_failure
                     .unwrap_or_else(|| classify_failure(Some(status.as_u16()), &body_text));
+                if !matches!(status.as_u16(), 401 | 429)
+                    && codex_companion_health::is_content_moderation_failure(&body_text)
+                {
+                    record_request_attempt_finish(
+                        &state,
+                        request_id,
+                        attempt,
+                        Some(status),
+                        "rejected",
+                        attempt_started_at,
+                        Some("content_moderation"),
+                    );
+                    record_request_finish(
+                        &state,
+                        request_id,
+                        Some(&provider.id),
+                        Some(StatusCode::OK),
+                        "rejected",
+                        attempt,
+                        started_at,
+                        Some("content_moderation"),
+                    );
+                    return Ok(crate::moderation::response(
+                        &uri,
+                        &body,
+                        requested_model.as_deref(),
+                    ));
+                }
+                let retry_after = retry_after
+                    .into_iter()
+                    .chain(codex_companion_health::failure_retry_after_seconds(
+                        &body_text,
+                    ))
+                    .max();
                 let upstream_payload_too_large = status == StatusCode::PAYLOAD_TOO_LARGE;
                 let request_incompatible = status == StatusCode::BAD_REQUEST;
                 let client_version_incompatible =
@@ -776,7 +907,11 @@ async fn proxy_dispatch(
                 } else {
                     format!("上游返回 {}: {}", status, compact_error_body(&body_text))
                 };
-                if !upstream_payload_too_large && !request_incompatible && !compact_unsupported {
+                if failure.kind == HealthFailureKind::AuthFailed
+                    || (!upstream_payload_too_large
+                        && !request_incompatible
+                        && !compact_unsupported)
+                {
                     record_provider_failure(
                         &state,
                         &config,
@@ -785,6 +920,13 @@ async fn proxy_dispatch(
                         &failure,
                         &message,
                     );
+                    if failure.cooldown {
+                        if let Some(seconds) = retry_after {
+                            update_health(&state.store, &provider.id, |health| {
+                                codex_companion_health::extend_cooldown(health, seconds);
+                            });
+                        }
+                    }
                 }
                 last_error = Some(message.clone());
                 record_request_attempt_finish(
@@ -800,6 +942,7 @@ async fn proxy_dispatch(
                 // 精确识别其语义，都应给组内下一个 provider 一个机会；否则诸如
                 // 404/405/422 的兼容层差异会直接终止 Codex 对话。
                 let can_retry = !client_version_incompatible
+                    && !codex_companion_health::is_content_moderation_failure(&body_text)
                     && index + 1 < candidate_count
                     && group.fallback_enabled;
                 if can_retry {
@@ -844,6 +987,23 @@ async fn proxy_dispatch(
                 ));
             }
             Err(error) => {
+                if codex_companion_health::is_content_moderation_failure(error.message_text()) {
+                    record_request_finish(
+                        &state,
+                        request_id,
+                        Some(&provider.id),
+                        Some(StatusCode::OK),
+                        "rejected",
+                        attempt,
+                        started_at,
+                        Some("content_moderation"),
+                    );
+                    return Ok(crate::moderation::response(
+                        &uri,
+                        &body,
+                        requested_model.as_deref(),
+                    ));
+                }
                 let failure = error
                     .failure()
                     .cloned()
@@ -857,6 +1017,11 @@ async fn proxy_dispatch(
                     &failure,
                     &message,
                 );
+                if let Some(seconds) = error.retry_after_seconds() {
+                    update_health(&state.store, &provider.id, |health| {
+                        codex_companion_health::extend_cooldown(health, seconds)
+                    });
+                }
                 last_error = Some(message.clone());
                 record_request_attempt_finish(
                     &state,
@@ -1123,6 +1288,48 @@ fn is_model_scoped_failure(kind: &HealthFailureKind) -> bool {
     )
 }
 
+pub(crate) fn provider_available(
+    state: &RelayState,
+    provider: &ProviderConfig,
+    model: Option<&str>,
+) -> bool {
+    let Ok(config) = state.store.load() else {
+        return false;
+    };
+    let Some(current) = config.providers.get(&provider.id) else {
+        return false;
+    };
+    current.enabled
+        && codex_companion_core::account_policy_block_reason(
+            &config.relay.account_protection,
+            current,
+            model,
+            chrono::Utc::now(),
+        )
+        .is_none()
+        && current.auth_ref == provider.auth_ref
+        && current.direct_auth_ref == provider.direct_auth_ref
+        && current.websocket_url == provider.websocket_url
+        && current.base_url == provider.base_url
+        && current.model_map == provider.model_map
+        && config.health.get(&provider.id).is_none_or(|health| {
+            health.status != HealthStatusKind::AuthFailed && !cooldown_active(health)
+        })
+        && model.is_none_or(|model| {
+            !state
+                .api_service
+                .model_cooldown_active(
+                    &provider.id,
+                    provider
+                        .model_map
+                        .get(model)
+                        .map(String::as_str)
+                        .unwrap_or(model),
+                )
+                .unwrap_or(true)
+        })
+}
+
 fn record_provider_failure(
     state: &RelayState,
     config: &CompanionConfig,
@@ -1135,6 +1342,12 @@ fn record_provider_failure(
         return;
     }
     if let Some(model) = model.filter(|_| is_model_scoped_failure(&failure.kind)) {
+        let model = config
+            .providers
+            .get(provider_id)
+            .and_then(|p| p.model_map.get(model))
+            .map(String::as_str)
+            .unwrap_or(model);
         let _ = state.api_service.set_model_cooldown(
             provider_id,
             model,
@@ -1446,6 +1659,55 @@ fn relay_root_response() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn account_policies_and_concurrency_reject_before_upstream() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = spawn_mock_server(StatusCode::OK, "ok", Some(hits.clone())).await;
+        let p = provider("a", &url);
+        let store = store_with_group(vec![p.clone()]);
+        store
+            .update(|c| {
+                c.relay.account_protection.max_account_concurrency = 1;
+                Ok(())
+            })
+            .unwrap();
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        let held = state.account_concurrency.acquire(&p, 1, 0).await.unwrap();
+        let response = proxy_inner(
+            state.clone(),
+            Method::POST,
+            "/v1/responses".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(store.load().unwrap().health.get("a").is_none());
+        drop(held);
+        store
+            .update(|c| {
+                c.relay
+                    .account_protection
+                    .excluded_models
+                    .push("gpt-*".into());
+                Ok(())
+            })
+            .unwrap();
+        let response = proxy_inner(
+            state.clone(),
+            Method::POST,
+            "/v1/responses".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test"}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
     use crate::upstream::MAX_SSE_FRAME_BYTES;
     use axum::{body::to_bytes, routing::any, Router};
     use chrono::{Duration as ChronoDuration, Utc};
@@ -1561,6 +1823,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_and_local_catalogs_apply_exclusions() {
+        let url = spawn_mock_server(StatusCode::OK, r#"{"object":"list","data":[{"id":"blocked-model"},{"id":"allowed-model","context_window":12345}]}"#, None).await;
+        let store = store_with_group(vec![provider("a", &url)]);
+        store
+            .update(|config| {
+                config
+                    .relay
+                    .account_protection
+                    .excluded_models
+                    .push("blocked*".into());
+                Ok(())
+            })
+            .unwrap();
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        let response = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["data"].as_array().unwrap().len(), 1);
+        assert_eq!(value["data"][0]["context_window"], 12345);
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .get_mut("a")
+                    .unwrap()
+                    .model_map
+                    .insert("friendly".into(), "blocked-model".into());
+                Ok(())
+            })
+            .unwrap();
+        let response = proxy_inner(
+            state,
+            Method::GET,
+            "/v1/models".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["data"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn official_model_catalog_wins_over_third_party_model_maps() {
         let third_party_hits = Arc::new(AtomicUsize::new(0));
         let official_hits = Arc::new(AtomicUsize::new(0));
@@ -1600,14 +1915,6 @@ mod tests {
                     .expect("official provider");
                 official.kind = ProviderKind::OfficialCodex;
                 official.auth_ref = Some(format!("file:{}", auth_path.display()));
-                config.health.insert(
-                    "official".to_string(),
-                    ProviderHealth {
-                        status: HealthStatusKind::Cooldown,
-                        cooldown_until: Some(Utc::now() + ChronoDuration::minutes(5)),
-                        ..ProviderHealth::default()
-                    },
-                );
                 Ok(())
             })
             .expect("configure providers");
@@ -3346,7 +3653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_provider_route_ignores_its_own_cooldown() {
+    async fn single_provider_route_respects_its_own_cooldown() {
         let provider_hits = Arc::new(AtomicUsize::new(0));
         let provider_url = spawn_mock_server(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3379,13 +3686,10 @@ mod tests {
         .expect("proxy");
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(provider_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_hits.load(Ordering::SeqCst), 0);
         let body = to_bytes(response.into_body(), 1024).await.expect("body");
         let value: Value = serde_json::from_slice(&body).expect("error json");
-        assert_eq!(value["error"]["code"], "upstream_error");
-        assert!(value["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("temporary unavailable")));
+        assert_eq!(value["error"]["code"], "no_available_provider");
     }
 
     #[tokio::test]
@@ -3685,7 +3989,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_policy_403_falls_back_without_poisoning_provider_health() {
+    async fn content_policy_403_stops_without_poisoning_provider_health() {
         let hits_a = Arc::new(AtomicUsize::new(0));
         let hits_b = Arc::new(AtomicUsize::new(0));
         let url_a = spawn_mock_server(
@@ -3713,8 +4017,19 @@ mod tests {
         .expect("proxy");
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-codex-companion-moderation"],
+            "blocked"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let notice: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(notice["status"], "completed");
+        assert!(notice["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("审核拦截"));
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
         assert!(!store.load().expect("config").health.contains_key("a"));
     }
 
@@ -3815,7 +4130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cooled_providers_fallback_within_the_same_request() {
+    async fn cooled_providers_are_not_contacted_when_every_account_is_cooling() {
         let hits_a = Arc::new(AtomicUsize::new(0));
         let hits_b = Arc::new(AtomicUsize::new(0));
         let hits_c = Arc::new(AtomicUsize::new(0));
@@ -3874,12 +4189,9 @@ mod tests {
         )
         .await
         .expect("fallback request");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024).await.expect("body");
-        let value: Value = serde_json::from_slice(&body).expect("response json");
-        assert_eq!(value["status"], "completed");
-        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
         assert_eq!(hits_c.load(Ordering::SeqCst), 0);
     }
 
@@ -4021,7 +4333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_priority_failback_rebinds_to_the_selected_higher_provider() {
+    async fn manual_priority_failback_does_not_bypass_cooldown() {
         let hits_a = Arc::new(AtomicUsize::new(0));
         let hits_b = Arc::new(AtomicUsize::new(0));
         let hits_c = Arc::new(AtomicUsize::new(0));
@@ -4089,7 +4401,7 @@ mod tests {
             &to_bytes(failback.into_body(), 1024)
                 .await
                 .expect("failback body")[..],
-            b"from a"
+            b"from c"
         );
 
         let sticky = proxy_inner(
@@ -4105,11 +4417,11 @@ mod tests {
             &to_bytes(sticky.into_body(), 1024)
                 .await
                 .expect("sticky body")[..],
-            b"from a"
+            b"from c"
         );
-        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
         assert_eq!(hits_b.load(Ordering::SeqCst), 0);
-        assert_eq!(hits_c.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_c.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

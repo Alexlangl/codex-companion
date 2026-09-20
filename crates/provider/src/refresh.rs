@@ -1,5 +1,5 @@
 use crate::account_refresh::{
-    provider_supports_api_key_usage, refresh_api_key_usage, refresh_official_codex_account,
+    provider_supports_api_key_usage, refresh_api_key_usage, refresh_official_codex_account_detailed,
 };
 use crate::agent_identity::{ensure_agent_identity_authorization, provider_uses_agent_identity};
 use crate::auth::resolve_auth_token;
@@ -20,6 +20,7 @@ use codex_companion_health::{
 #[derive(Debug, Clone)]
 pub struct ProviderTestFailure {
     pub status: Option<u16>,
+    pub retry_after_seconds: Option<u64>,
     pub message: String,
     pub classification: Option<FailureClassification>,
 }
@@ -28,6 +29,7 @@ impl ProviderTestFailure {
     fn network(message: String) -> Self {
         Self {
             status: None,
+            retry_after_seconds: None,
             message,
             classification: None,
         }
@@ -36,6 +38,7 @@ impl ProviderTestFailure {
     fn auth(message: impl Into<String>) -> Self {
         Self {
             status: None,
+            retry_after_seconds: None,
             message: message.into(),
             classification: Some(classification_for_kind(HealthFailureKind::AuthFailed)),
         }
@@ -45,6 +48,7 @@ impl ProviderTestFailure {
         let classification = error.failure_classification();
         Self {
             status: error.status,
+            retry_after_seconds: error.retry_after_seconds,
             message: error.message,
             classification: Some(classification),
         }
@@ -66,8 +70,7 @@ impl ProviderRefreshSnapshot {
             .get(id)
             .cloned()
             .ok_or_else(|| CompanionError::InvalidConfig(format!("unknown provider: {id}")))?;
-        let api_key = (!matches!(provider.kind, ProviderKind::OfficialCodex))
-            .then(|| resolve_auth_token(&provider));
+        let api_key = Some(resolve_auth_token(&provider));
         let usage_credentials = provider
             .account
             .as_ref()
@@ -125,6 +128,7 @@ pub async fn test_provider_detailed(
                     let message = error.to_string();
                     ProviderTestFailure {
                         status: None,
+                        retry_after_seconds: None,
                         classification: Some(classify_failure(None, &message)),
                         message,
                     }
@@ -169,6 +173,7 @@ pub async fn test_provider_detailed(
             .unwrap_or_else(|error| format!("[{error}]"));
         Err(ProviderTestFailure {
             status: Some(status.as_u16()),
+            retry_after_seconds: None,
             message: format!("provider returned {status}: {body}"),
             classification: None,
         })
@@ -176,27 +181,75 @@ pub async fn test_provider_detailed(
 }
 
 pub async fn refresh_provider_status(store: &ConfigStore, id: &str) -> Result<ProviderHealth> {
-    let snapshot = ProviderRefreshSnapshot::capture(store, id)?;
+    crate::refresh_scheduler::refresh(store, id, false).await
+}
+
+pub async fn refresh_provider_status_background(
+    store: &ConfigStore,
+    id: &str,
+) -> Result<ProviderHealth> {
+    crate::refresh_scheduler::refresh(store, id, true).await
+}
+
+pub(crate) async fn refresh_provider_status_inner(
+    store: &ConfigStore,
+    id: &str,
+) -> Result<ProviderHealth> {
+    if let Some(health) = store.load()?.health.get(id) {
+        if health.status == codex_companion_core::HealthStatusKind::AuthFailed
+            || health
+                .next_refresh_after
+                .is_some_and(|until| until > Utc::now())
+        {
+            return Ok(health.clone());
+        }
+    }
+    let mut snapshot = ProviderRefreshSnapshot::capture(store, id)?;
+    let configured_version = store.load()?.relay.account_protection.codex_client_version;
+    let client_version = if snapshot.provider.kind == ProviderKind::OfficialCodex {
+        crate::codex_identity::refresh_remote_version(
+            configured_version.as_deref(),
+            &store.data_dir(),
+        )
+        .await
+    } else {
+        configured_version
+    };
     let provider = snapshot.provider.clone();
     let mut account_result = None;
     let mut api_usage_error = None;
     let result = if provider.kind == ProviderKind::OfficialCodex {
         let health_result = test_provider_detailed(&provider).await;
         if health_result.is_ok() && provider_uses_codex_oauth(&provider) {
+            // The check may have synchronized or refreshed this credential.
+            // Later results must not overwrite a concurrent reauthorization.
+            snapshot.api_key = Some(resolve_auth_token(&provider));
             match tokio::time::timeout(
                 std::time::Duration::from_secs(35),
-                refresh_official_codex_account(&provider),
+                refresh_official_codex_account_detailed(&provider, client_version.as_deref()),
             )
             .await
             {
-                Ok(result) => match result {
-                    Ok(account) => account_result = Some(account),
-                    Err(error) => api_usage_error = Some(error.to_string()),
-                },
-                Err(_) => api_usage_error = Some("Codex 额度刷新超时".to_string()),
+                Ok(Ok(account)) => {
+                    account_result = Some(account);
+                    Ok(())
+                }
+                Ok(Err(error)) => {
+                    api_usage_error = Some(error.message.clone());
+                    Err(ProviderTestFailure {
+                        status: error.status,
+                        retry_after_seconds: error.retry_after_seconds,
+                        message: error.message,
+                        classification: None,
+                    })
+                }
+                Err(_) => Err(ProviderTestFailure::network(
+                    "Codex 额度刷新超时".to_string(),
+                )),
             }
+        } else {
+            health_result
         }
-        health_result
     } else if provider_supports_api_key_usage(&provider) {
         match tokio::time::timeout(
             std::time::Duration::from_secs(35),
@@ -244,6 +297,12 @@ fn persist_refresh_outcome(
     account_result: Option<codex_companion_core::ProviderAccountInfo>,
     api_usage_error: Option<String>,
 ) -> Result<ProviderHealth> {
+    if result
+        .as_ref()
+        .is_err_and(|error| error.message.starts_with("token_authority_deferred:"))
+    {
+        return Ok(store.load()?.health.get(id).cloned().unwrap_or_default());
+    }
     store.update(|config| {
         let target_is_current = config
             .providers
@@ -257,7 +316,20 @@ fn persist_refresh_outcome(
         health.last_refresh_attempt = Some(now);
         match result {
             Ok(()) => {
-                mark_success(health);
+                health.refresh_failure_count = 0;
+                health.next_refresh_after = None;
+                health.refresh_error = None;
+                // A readable local token (and even a successful quota query) is
+                // not evidence that a previously rejected relay credential works.
+                // Only a real relay success or reauthorization clears that state.
+                if snapshot.provider.kind != ProviderKind::OfficialCodex {
+                    mark_success(health);
+                } else if health.status != codex_companion_core::HealthStatusKind::AuthFailed
+                    && health.last_failure_kind.is_none()
+                    && account_result.is_some()
+                {
+                    mark_success(health);
+                }
                 if let Some(provider) = config.providers.get_mut(id) {
                     if let Some(account) = account_result {
                         provider.account = Some(account);
@@ -273,10 +345,21 @@ fn persist_refresh_outcome(
                 }
             }
             Err(failure) => {
+                health.refresh_failure_count = health.refresh_failure_count.saturating_add(1);
+                let delay = (60_u64 << health.refresh_failure_count.saturating_sub(1).min(4))
+                    .max(failure.retry_after_seconds.unwrap_or(0));
+                health.next_refresh_after = Some(now + chrono::Duration::seconds(delay as i64));
+                health.refresh_error = Some(failure.message.clone());
                 let classification = failure
                     .classification
                     .unwrap_or_else(|| classify_failure(failure.status, &failure.message));
-                mark_failure(health, &classification, failure.message);
+                // Quota failures have their own backoff. They must not overwrite
+                // a real relay failure; authentication rejection is the exception.
+                if snapshot.provider.kind != ProviderKind::OfficialCodex
+                    || classification.kind == HealthFailureKind::AuthFailed
+                {
+                    mark_failure(health, &classification, failure.message);
+                }
                 if let Some(account) = account_result {
                     if let Some(provider) = config.providers.get_mut(id) {
                         provider.account = Some(account);
@@ -387,6 +470,62 @@ mod tests {
             refresh_interval_seconds: default_refresh_interval_seconds(),
             account: Some(ProviderAccountInfo::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn quota_backoff_survives_manual_refresh_and_does_not_reset_relay_auth() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let provider = official_provider(&temp.path().join("missing-auth.json"));
+        store
+            .update(|config| {
+                config.providers.insert(provider.id.clone(), provider);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = ProviderRefreshSnapshot::capture(&store, "official").unwrap();
+        let before = Utc::now();
+        let health = persist_refresh_outcome(
+            &store,
+            "official",
+            &snapshot,
+            Err(ProviderTestFailure {
+                status: Some(429),
+                retry_after_seconds: Some(7200),
+                message: "rate limit".into(),
+                classification: None,
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(health.next_refresh_after.unwrap() >= before + chrono::Duration::seconds(7200));
+        assert_eq!(health.refresh_failure_count, 1);
+        assert_ne!(health.status, HealthStatusKind::AuthFailed);
+        let skipped = refresh_provider_status(&store, "official").await.unwrap();
+        assert_eq!(skipped.refresh_failure_count, 1);
+        assert_eq!(skipped.last_refresh_attempt, health.last_refresh_attempt);
+        store
+            .update(|config| {
+                mark_failure(
+                    config.health.get_mut("official").unwrap(),
+                    &classification_for_kind(HealthFailureKind::AuthFailed),
+                    "revoked".into(),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let retained = persist_refresh_outcome(
+            &store,
+            "official",
+            &snapshot,
+            Ok(()),
+            Some(ProviderAccountInfo::default()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(retained.status, HealthStatusKind::AuthFailed);
+        assert_eq!(retained.last_error.as_deref(), Some("revoked"));
     }
 
     #[tokio::test]
@@ -592,6 +731,38 @@ mod tests {
     }
 
     #[test]
+    fn stale_oauth_failure_does_not_poison_reauthorized_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let path = temp.path().join("auth.json");
+        std::fs::write(&path, r#"{"tokens":{"access_token":"fixture-old"}}"#).unwrap();
+        let provider = official_provider(&path);
+        store
+            .update(|config| {
+                config.providers.insert(provider.id.clone(), provider);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = ProviderRefreshSnapshot::capture(&store, "official").unwrap();
+        std::fs::write(&path, r#"{"tokens":{"access_token":"fixture-new"}}"#).unwrap();
+        persist_refresh_outcome(
+            &store,
+            "official",
+            &snapshot,
+            Err(ProviderTestFailure {
+                status: Some(401),
+                retry_after_seconds: None,
+                message: "account_deactivated".into(),
+                classification: None,
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!store.load().unwrap().health.contains_key("official"));
+    }
+
+    #[test]
     fn stale_refresh_does_not_overwrite_edited_provider() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = ConfigStore::new(temp.path().join("config.json"));
@@ -662,6 +833,7 @@ mod tests {
                 status: Some(401),
                 message: "provider returned 401 Unauthorized".to_string(),
                 classification: None,
+                retry_after_seconds: None,
             }),
             Some(ProviderAccountInfo {
                 usage_available: Some(88.0),

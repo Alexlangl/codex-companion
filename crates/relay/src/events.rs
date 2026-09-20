@@ -88,10 +88,16 @@ pub(crate) fn record_health_success(store: &ConfigStore, provider_id: &str) -> b
 
     let persisted = store
         .update(|config| {
-            mark_success(config.health.entry(provider_id.to_string()).or_default());
-            Ok(())
+            let health = config.health.entry(provider_id.to_string()).or_default();
+            if health.status == HealthStatusKind::AuthFailed
+                || codex_companion_health::cooldown_active(health)
+            {
+                return Ok(false);
+            }
+            mark_success(health);
+            Ok(true)
         })
-        .is_ok();
+        .unwrap_or(false);
     let mut checkpoints = HEALTH_SUCCESS_CHECKPOINTS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -343,15 +349,15 @@ mod tests {
         update_health(&store, "provider-a", |health| {
             health.status = HealthStatusKind::AuthFailed;
         });
-        assert!(record_health_success(&store, "provider-a"));
+        assert!(!record_health_success(&store, "provider-a"));
         assert_eq!(
             store
                 .load()
-                .expect("recovered health")
+                .expect("protected health")
                 .health
                 .get("provider-a")
                 .map(|health| &health.status),
-            Some(&HealthStatusKind::Healthy)
+            Some(&HealthStatusKind::AuthFailed)
         );
     }
 
@@ -379,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn success_persists_after_an_external_failure_write() {
+    fn success_cannot_clear_an_external_auth_failure() {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = ConfigStore::new(temp.path().join("config.json"));
         assert!(record_health_success(&store, "provider-a"));
@@ -395,15 +401,15 @@ mod tests {
             })
             .expect("external failure");
 
-        assert!(record_health_success(&store, "provider-a"));
+        assert!(!record_health_success(&store, "provider-a"));
         assert_eq!(
             store
                 .load()
-                .expect("recovered health")
+                .expect("protected health")
                 .health
                 .get("provider-a")
                 .map(|health| &health.status),
-            Some(&HealthStatusKind::Healthy)
+            Some(&HealthStatusKind::AuthFailed)
         );
     }
 }

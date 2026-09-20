@@ -5,7 +5,41 @@ export type ProviderKind = "official_codex" | "openai_compatible" | "relay_provi
 export type GroupPolicy = "priority_fallback" | "round_robin" | "random" | "weighted" | "least_loaded" | "manual";
 export type TerminalKind = "auto" | "terminal" | "i_term2" | "power_shell" | "pwsh" | "windows_terminal" | "cmd" | "shell";
 
+export interface AccountPolicy {
+  excludedModels: string[];
+  quotaReserve?: { hourlyThresholdPercent: number; weeklyThresholdPercent: number } | null;
+}
+
+export interface AccountProtection {
+  codexClientVersion?: string | null;
+  maxAccountConcurrency: number;
+  accountConcurrencyWaitMs: number;
+  excludedModels: string[];
+  providers: Record<string, AccountPolicy>;
+}
+
+export interface ModelPriceSettings {
+  model: string;
+  inputPerMillion: string;
+  cachedInputPerMillion: string;
+  cacheWriteInputPerMillion: string;
+  outputPerMillion: string;
+  aliases: string[];
+}
+
+export interface PricingSettings {
+  models: ModelPriceSettings[];
+  providerMultipliers: Record<string, string>;
+}
+
+export interface PricingSettingsSnapshot {
+  builtinModels: ModelPriceSettings[];
+  overrides: PricingSettings;
+  pricingAsOf: string;
+}
+
 export interface RelayConfig {
+  accountProtection?: AccountProtection;
   host: string;
   port: number;
   activeGroupId: string;
@@ -17,6 +51,7 @@ export interface RelayConfig {
 }
 
 export interface RelaySettingsUpdate {
+  accountProtection?: AccountProtection;
   host: string;
   requireApiKey: boolean;
   retryBudget: number;

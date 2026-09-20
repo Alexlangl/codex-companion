@@ -688,6 +688,7 @@ impl ApiServiceStore {
         reason: &str,
         seconds: u64,
     ) -> Result<()> {
+        let model = codex_companion_core::base_model_key(model);
         let until = Utc::now()
             + Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX).clamp(1, 86_400));
         let connection = self.connection()?;
@@ -695,7 +696,7 @@ impl ApiServiceStore {
             .execute(
                 "INSERT INTO model_cooldowns (provider_id, model, reason, cooldown_until) \
                  VALUES (?1, ?2, ?3, ?4) ON CONFLICT(provider_id, model) DO UPDATE SET \
-                 reason = excluded.reason, cooldown_until = excluded.cooldown_until",
+                 reason = excluded.reason, cooldown_until = MAX(model_cooldowns.cooldown_until, excluded.cooldown_until)",
                 params![
                     provider_id,
                     model,
@@ -708,6 +709,7 @@ impl ApiServiceStore {
     }
 
     pub fn model_cooldown_active(&self, provider_id: &str, model: &str) -> Result<bool> {
+        let model = codex_companion_core::base_model_key(model);
         let connection = self.connection()?;
         let until = connection
             .query_row(
@@ -733,6 +735,7 @@ impl ApiServiceStore {
     }
 
     pub fn clear_model_cooldown(&self, provider_id: &str, model: &str) -> Result<()> {
+        let model = codex_companion_core::base_model_key(model);
         let connection = self.connection()?;
         connection
             .execute(

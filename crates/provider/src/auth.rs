@@ -45,6 +45,23 @@ pub fn resolve_auth_token(provider: &ProviderConfig) -> Option<String> {
     None
 }
 
+/// Prefer credential identity so aliases cannot evade account-wide admission.
+pub fn account_identity_key(provider: &ProviderConfig) -> String {
+    if provider.kind == ProviderKind::OfficialCodex {
+        if let Some(path) = provider_relay_auth_ref(provider).and_then(|s| s.strip_prefix("file:"))
+        {
+            if let Some(identity) = fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|value| crate::token_authority::identity(&value))
+            {
+                return identity;
+            }
+        }
+    }
+    codex_companion_core::account_concurrency_key(provider)
+}
+
 pub fn resolve_chatgpt_account_id(provider: &ProviderConfig) -> Option<String> {
     provider
         .account

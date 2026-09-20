@@ -10,8 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use codex_companion_core::{
-    ApiClient, HealthFailureKind, HealthStatusKind, ProviderConfig, ProviderKind,
-    COMPANION_RELAY_BEARER_TOKEN,
+    ApiClient, HealthStatusKind, ProviderConfig, ProviderKind, COMPANION_RELAY_BEARER_TOKEN,
 };
 use codex_companion_health::{
     classify_failure, cooldown_active, mark_failure, normalize_expired_cooldown,
@@ -60,6 +59,7 @@ type ClientSink = SplitSink<ClientWebSocket, ClientMessage>;
 struct ConnectedWebSocket {
     websocket: UpstreamWebSocket,
     oauth_access_token: Option<String>,
+    permit: std::sync::Arc<crate::account_concurrency::AccountPermit>,
 }
 
 pub(crate) async fn responses_websocket(
@@ -109,11 +109,29 @@ pub(crate) async fn responses_websocket(
         }
         Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
     };
-    let (candidate_index, provider, upstream) =
-        match connect_candidate_websocket_from(&state, &candidates, 0, None, &mut None).await {
-            Ok(connected) => connected,
-            Err(error) => return (StatusCode::BAD_GATEWAY, error).into_response(),
-        };
+    let (candidate_index, provider, upstream) = match connect_candidate_websocket_from(
+        &state,
+        &candidates,
+        0,
+        None,
+        &mut None,
+        preferred_provider.as_deref(),
+    )
+    .await
+    {
+        Ok(connected) => connected,
+        Err(error) => {
+            return (
+                if error.starts_with("account_concurrency_") {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                error,
+            )
+                .into_response()
+        }
+    };
     let provider_id = provider.id.clone();
     let bridge_state = state.clone();
     let mut response = websocket
@@ -283,34 +301,26 @@ fn websocket_candidates_from_selected(
     selected: Vec<ProviderConfig>,
     preferred_provider: Option<&str>,
 ) -> Vec<ProviderConfig> {
-    // 与 HTTP 路由保持同一健康策略：凭证已失效的账号不再尝试；短暂故障
-    // 的冷却账号在健康账号之后保留为兜底，避免整个组都在冷却时直接断开。
-    let has_alternatives = group.fallback_enabled && selected.len() > 1;
-    let mut cooldown_probes = Vec::new();
+    // Match HTTP eligibility: cooldowns cannot be bypassed by a small pool.
     let mut candidates = selected
         .into_iter()
         .filter_map(|provider| {
+            if codex_companion_core::account_policy_block_reason(
+                &config.relay.account_protection,
+                &provider,
+                None,
+                chrono::Utc::now(),
+            )
+            .is_some()
+            {
+                return None;
+            }
             let health = config.health.get(&provider.id);
             if health.is_some_and(|health| matches!(health.status, HealthStatusKind::AuthFailed)) {
                 return None;
             }
-            if !has_alternatives || health.is_none_or(|health| !cooldown_active(health)) {
+            if health.is_none_or(|health| !cooldown_active(health)) {
                 return Some(provider);
-            }
-            let transient_failure = health
-                .and_then(|health| health.last_failure_kind.as_ref())
-                .is_none_or(|kind| {
-                    matches!(
-                        kind,
-                        HealthFailureKind::RateLimited
-                            | HealthFailureKind::UpstreamFailed
-                            | HealthFailureKind::NetworkFailed
-                            | HealthFailureKind::RequestRejected
-                            | HealthFailureKind::Unknown
-                    )
-                });
-            if transient_failure {
-                cooldown_probes.push(provider);
             }
             None
         })
@@ -324,18 +334,6 @@ fn websocket_candidates_from_selected(
     }) {
         let preferred = candidates.remove(index);
         candidates.insert(0, preferred);
-    }
-    if group.fallback_enabled {
-        cooldown_probes.sort_by_key(|provider| {
-            (
-                state.provider_inflight_count(&provider.id),
-                config
-                    .health
-                    .get(&provider.id)
-                    .and_then(|health| health.last_checked),
-            )
-        });
-        candidates.extend(cooldown_probes);
     }
     if !group.fallback_enabled {
         candidates.truncate(1);
@@ -369,6 +367,7 @@ struct WebSocketConnectError {
     message: String,
     status: Option<u16>,
     failure: Option<FailureClassification>,
+    retry_after: Option<u64>,
 }
 
 impl WebSocketConnectError {
@@ -377,6 +376,7 @@ impl WebSocketConnectError {
             message: message.into(),
             status: None,
             failure: None,
+            retry_after: None,
         }
     }
 
@@ -387,6 +387,7 @@ impl WebSocketConnectError {
             message: error.message,
             status,
             failure: Some(failure),
+            retry_after: error.retry_after_seconds,
         }
     }
 
@@ -396,18 +397,40 @@ impl WebSocketConnectError {
     }
 }
 
+#[cfg(test)]
 async fn connect_provider_websocket(
     state: &RelayState,
     provider: &ProviderConfig,
 ) -> Result<ConnectedWebSocket, WebSocketConnectError> {
-    connect_provider_websocket_with_options(state, provider, true).await
+    connect_provider_websocket_with_options(state, provider, true, None).await
 }
 
 async fn connect_provider_websocket_with_options(
     state: &RelayState,
     provider: &ProviderConfig,
     retry_oauth_handshake_unauthorized: bool,
+    existing_permit: Option<std::sync::Arc<crate::account_concurrency::AccountPermit>>,
 ) -> Result<ConnectedWebSocket, WebSocketConnectError> {
+    let config = state
+        .store
+        .load()
+        .map_err(|e| WebSocketConnectError::message(e.to_string()))?;
+    let policy = &config.relay.account_protection;
+    let permit = match existing_permit {
+        Some(permit) => permit,
+        None => state
+            .account_concurrency
+            .acquire(
+                provider,
+                policy.max_account_concurrency,
+                policy.account_concurrency_wait_ms,
+            )
+            .await
+            .map_err(WebSocketConnectError::message)?,
+    };
+    if !websocket_provider_available(state, provider, None) {
+        return Err(WebSocketConnectError::message("account_policy_unavailable"));
+    }
     let mut agent_task_id = None;
     let mut official_oauth = false;
     let mut chatgpt_account_id = provider
@@ -509,6 +532,7 @@ async fn connect_provider_websocket_with_options(
     Ok(ConnectedWebSocket {
         websocket,
         oauth_access_token,
+        permit,
     })
 }
 
@@ -562,10 +586,19 @@ async fn connect_websocket_with_client(
             WebSocketConnectError::message(format!("WebSocket 连接失败: {}", error.without_url()))
         })?;
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                codex_companion_health::retry_after_seconds(value, chrono::Utc::now())
+            });
         return Err(WebSocketConnectError {
-            message: format!("WebSocket 连接失败: HTTP {}", response.status()),
-            status: Some(response.status().as_u16()),
+            message: format!("WebSocket 连接失败: HTTP {status}"),
+            status: Some(status.as_u16()),
             failure: None,
+            retry_after,
         });
     }
     let headers = response.headers();
@@ -609,7 +642,7 @@ async fn connect_candidate_websocket(
     candidates: Vec<ProviderConfig>,
 ) -> Result<(ProviderConfig, UpstreamWebSocket), String> {
     let (_, provider, upstream) =
-        connect_candidate_websocket_from(state, &candidates, 0, None, &mut None).await?;
+        connect_candidate_websocket_from(state, &candidates, 0, None, &mut None, None).await?;
     Ok((provider, upstream.websocket))
 }
 
@@ -619,14 +652,50 @@ async fn connect_candidate_websocket_from(
     start_index: usize,
     replay: Option<&ClientMessage>,
     audit: &mut Option<WebSocketRequestAudit>,
+    preferred_provider: Option<&str>,
 ) -> Result<(usize, ProviderConfig, ConnectedWebSocket), String> {
     let mut last_error = None;
-    for (index, provider) in candidates.iter().enumerate().skip(start_index) {
+    let mut remaining = candidates
+        .iter()
+        .skip(start_index)
+        .cloned()
+        .collect::<Vec<_>>();
+    while !remaining.is_empty() {
+        remaining.retain(|p| websocket_provider_available(state, p, replay));
+        if remaining.is_empty() {
+            break;
+        }
+        let config = state.store.load().map_err(|e| e.to_string())?;
+        let policy = &config.relay.account_protection;
+        let waiting = if preferred_provider == Some(remaining[0].id.as_str()) {
+            &remaining[..1]
+        } else {
+            &remaining[..]
+        };
+        let (selected, permit) = state
+            .account_concurrency
+            .acquire_any(
+                waiting,
+                policy.max_account_concurrency,
+                policy.account_concurrency_wait_ms,
+                |p| websocket_provider_available(state, p, replay),
+            )
+            .await
+            .map_err(str::to_string)?;
+        let selected_provider = remaining.remove(selected);
+        let provider = &selected_provider;
+        let index = candidates
+            .iter()
+            .position(|p| p.id == provider.id)
+            .expect("candidate exists");
         if let Some(audit) = audit.as_mut() {
             audit.attempt(&provider.id, "fallback");
         }
-        match connect_provider_websocket(state, provider).await {
+        match connect_provider_websocket_with_options(state, provider, true, Some(permit)).await {
             Ok(mut upstream) => {
+                if !websocket_provider_available(state, provider, replay) {
+                    continue;
+                }
                 if let Some(frame) = replay {
                     if let Err(error) = upstream
                         .websocket
@@ -645,6 +714,16 @@ async fn connect_candidate_websocket_from(
                 return Ok((index, provider.clone(), upstream));
             }
             Err(error) => {
+                if preferred_provider == Some(provider.id.as_str())
+                    && error.message.starts_with("account_concurrency_")
+                {
+                    return Err(error.message);
+                }
+                if let Some(seconds) = error.retry_after {
+                    update_health(&state.store, &provider.id, |health| {
+                        codex_companion_health::extend_cooldown(health, seconds)
+                    });
+                }
                 record_websocket_failure(
                     state,
                     provider,
@@ -671,17 +750,43 @@ async fn connect_next_websocket(
     audit: &mut Option<WebSocketRequestAudit>,
 ) -> Result<(usize, ProviderConfig, ConnectedWebSocket), String> {
     let mut last_error = None;
-    for offset in 1..=candidates.len() {
-        let index = (current_index + offset) % candidates.len();
-        if !attempted.insert(index) {
-            continue;
+    let mut remaining = (1..=candidates.len())
+        .map(|offset| (current_index + offset) % candidates.len())
+        .filter(|index| !attempted.contains(index))
+        .map(|index| candidates[index].clone())
+        .collect::<Vec<_>>();
+    while !remaining.is_empty() {
+        remaining.retain(|p| websocket_provider_available(state, p, replay));
+        if remaining.is_empty() {
+            break;
         }
-        let provider = &candidates[index];
+        let config = state.store.load().map_err(|e| e.to_string())?;
+        let policy = &config.relay.account_protection;
+        let (selected, permit) = state
+            .account_concurrency
+            .acquire_any(
+                &remaining,
+                policy.max_account_concurrency,
+                policy.account_concurrency_wait_ms,
+                |p| websocket_provider_available(state, p, replay),
+            )
+            .await
+            .map_err(str::to_string)?;
+        let selected_provider = remaining.remove(selected);
+        let provider = &selected_provider;
+        let index = candidates
+            .iter()
+            .position(|p| p.id == provider.id)
+            .expect("candidate exists");
+        attempted.insert(index);
         if let Some(audit) = audit.as_mut() {
             audit.attempt(&provider.id, "fallback");
         }
-        match connect_provider_websocket(state, provider).await {
+        match connect_provider_websocket_with_options(state, provider, true, Some(permit)).await {
             Ok(mut upstream) => {
+                if !websocket_provider_available(state, provider, replay) {
+                    continue;
+                }
                 if let Some(frame) = replay {
                     if let Err(error) = upstream
                         .websocket
@@ -700,6 +805,11 @@ async fn connect_next_websocket(
                 return Ok((index, provider.clone(), upstream));
             }
             Err(error) => {
+                if let Some(seconds) = error.retry_after {
+                    update_health(&state.store, &provider.id, |health| {
+                        codex_companion_health::extend_cooldown(health, seconds)
+                    });
+                }
                 record_websocket_failure(
                     state,
                     provider,
@@ -842,13 +952,16 @@ async fn bridge_websocket(
     let ConnectedWebSocket {
         websocket: upstream,
         mut oauth_access_token,
+        permit,
     } = upstream;
     let (upstream_sink, upstream_stream) = upstream.split();
     let mut upstream_sink = Some(upstream_sink);
     let mut upstream_stream = Some(upstream_stream);
     let mut pending = PendingWebSocketResponse::default();
+    let mut session_model: Option<String> = None;
     let mut attempted = HashSet::from([candidate_index]);
     let mut request_guard = state.begin_provider_request(&provider.id);
+    request_guard.account_permit = Some(permit);
     let mut last_upstream_activity = tokio::time::Instant::now();
 
     loop {
@@ -886,7 +999,25 @@ async fn bridge_websocket(
                 let Some(Ok(message)) = client_message else {
                     break;
                 };
+                let message = inherit_session_model(message, session_model.as_deref());
                 let response_create = frame_has_type(&message, "response.create");
+                if frame_has_type(&message, "session.update")
+                    && !websocket_provider_available(&state, &provider, Some(&message))
+                {
+                    if client_sink
+                        .send(websocket_transport_error_event("会话模型被账号策略禁用"))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                if response_create
+                    && !websocket_provider_available(&state, &provider, Some(&message))
+                {
+                    discard_upstream_connection(&mut upstream_sink, &mut upstream_stream);
+                }
                 let starts_tracked_response = response_create && pending.request.is_none();
                 if starts_tracked_response {
                     let payload = match &message {
@@ -919,6 +1050,9 @@ async fn bridge_websocket(
                     .to_string();
                     let _ = client_sink.send(ClientMessage::Text(error.into())).await;
                     break;
+                }
+                if let Some(model) = frame_model(&message) {
+                    session_model = Some(model);
                 }
                 let response_cancel = frame_has_type(&message, "response.cancel");
                 let close = matches!(message, ClientMessage::Close(_));
@@ -1180,6 +1314,46 @@ async fn bridge_websocket(
                     matches!(&upstream_event, WebSocketUpstreamEvent::Failure { .. });
                 match upstream_event {
                     WebSocketUpstreamEvent::Failure { detail, status } => {
+                        if pending.can_replay()
+                            && !matches!(status, Some(401 | 429))
+                            && codex_companion_health::is_content_moderation_failure(&detail)
+                        {
+                            let mut delivered = true;
+                            for frame in crate::moderation::frames(session_model.as_deref()) {
+                                if client_sink
+                                    .send(ClientMessage::Text(frame.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    delivered = false;
+                                    break;
+                                }
+                            }
+                            if let Some(audit) = pending.audit.as_mut() {
+                                audit.finish(Some(200), "rejected", Some("content_moderation"));
+                            }
+                            pending.clear();
+                            attempted.clear();
+                            if !delivered {
+                                break;
+                            }
+                            continue;
+                        }
+                        let payload = match &upstream_message {
+                            UpstreamMessage::Text(text) => text.as_bytes(),
+                            UpstreamMessage::Binary(bytes) => bytes.as_ref(),
+                            _ => &[],
+                        };
+                        if let Some(seconds) = std::str::from_utf8(payload)
+                            .ok()
+                            .and_then(codex_companion_health::failure_retry_after_seconds)
+                        {
+                            if classify_failure(status, &detail).cooldown {
+                                update_health(&state.store, &provider.id, |health| {
+                                    codex_companion_health::extend_cooldown(health, seconds)
+                                });
+                            }
+                        }
                         if let Some(audit) = pending.audit.as_mut() {
                             audit.fail(status, &detail);
                         }
@@ -1488,7 +1662,7 @@ async fn recover_websocket_before_output(
     allow_current_provider_reconnect: bool,
 ) -> bool {
     record_websocket_failure(state, provider, status, failure, detail);
-    if !pending.can_replay() {
+    if !pending.can_replay() || codex_companion_health::is_content_moderation_failure(detail) {
         return false;
     }
     if let Some(audit) = pending.audit.as_mut() {
@@ -1580,11 +1754,21 @@ async fn reconnect_current_websocket(
     replay: Option<&ClientMessage>,
     audit: &mut Option<WebSocketRequestAudit>,
 ) -> bool {
+    if !websocket_provider_available(state, provider, replay) {
+        return false;
+    }
     if let Some(audit) = audit.as_mut() {
         audit.attempt(&provider.id, "fallback");
     }
     let current_provider = provider.clone();
-    let mut upstream = match connect_provider_websocket(state, &current_provider).await {
+    let mut upstream = match connect_provider_websocket_with_options(
+        state,
+        &current_provider,
+        true,
+        request_guard.account_permit.clone(),
+    )
+    .await
+    {
         Ok(upstream) => upstream,
         Err(error) => {
             record_websocket_failure(
@@ -1660,8 +1844,13 @@ async fn refresh_and_reconnect_current_oauth_websocket(
     // a second forced refresh if its replacement handshake also returns 401;
     // this request has a one-shot recovery budget.
     let current_provider = provider.clone();
-    let mut upstream =
-        connect_provider_websocket_with_options(state, &current_provider, false).await?;
+    let mut upstream = connect_provider_websocket_with_options(
+        state,
+        &current_provider,
+        false,
+        request_guard.account_permit.clone(),
+    )
+    .await?;
     if let Some(frame) = replay {
         upstream
             .websocket
@@ -1706,8 +1895,9 @@ async fn reconnect_websocket_from_start(
     replay: Option<&ClientMessage>,
     audit: &mut Option<WebSocketRequestAudit>,
 ) -> Result<(), String> {
+    request_guard.account_permit.take();
     let (next_index, next_provider, next_upstream) =
-        connect_candidate_websocket_from(state, candidates, 0, replay, audit).await?;
+        connect_candidate_websocket_from(state, candidates, 0, replay, audit, None).await?;
     install_websocket_connection(
         state,
         candidate_index,
@@ -1745,7 +1935,9 @@ fn install_websocket_connection(
     let ConnectedWebSocket {
         websocket: next_upstream,
         oauth_access_token: next_oauth_access_token,
+        permit,
     } = next_upstream;
+    request_guard.account_permit = Some(permit);
     *oauth_access_token = next_oauth_access_token;
     let (next_sink, next_stream) = next_upstream.split();
     *upstream_sink = Some(next_sink);
@@ -1842,6 +2034,10 @@ fn record_websocket_failure(
     failure: Option<FailureClassification>,
     detail: &str,
 ) {
+    // Local admission failures are not upstream credential failures.
+    if detail.starts_with("account_concurrency_") || detail == "account_policy_unavailable" {
+        return;
+    }
     let failure = failure.unwrap_or_else(|| classify_failure(status, detail));
     if !matches!(
         failure.kind,
@@ -2053,21 +2249,6 @@ fn normalize_client_json_for_provider(value: &mut Value, provider: &ProviderConf
     for pointer in ["/model", "/response/model", "/session/model"] {
         changed |= rewrite_websocket_model(value, pointer, provider);
     }
-    for pointer in [
-        "/reasoning/effort",
-        "/reasoning_effort",
-        "/response/reasoning/effort",
-        "/response/reasoning_effort",
-        "/session/reasoning/effort",
-        "/session/reasoning_effort",
-    ] {
-        if let Some(effort) = value.pointer_mut(pointer) {
-            if effort.as_str() == Some("ultra") {
-                *effort = Value::String("max".to_string());
-                changed = true;
-            }
-        }
-    }
     changed
 }
 
@@ -2103,6 +2284,96 @@ fn frame_has_type(message: &ClientMessage, expected: &str) -> bool {
         .ok()
         .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
         .is_some_and(|event_type| event_type == expected)
+}
+
+fn websocket_provider_available(
+    state: &RelayState,
+    provider: &ProviderConfig,
+    frame: Option<&ClientMessage>,
+) -> bool {
+    let value = frame.and_then(|frame| {
+        let bytes: &[u8] = match frame {
+            ClientMessage::Text(text) => text.as_bytes(),
+            ClientMessage::Binary(bytes) => bytes,
+            _ => return None,
+        };
+        serde_json::from_slice::<Value>(bytes).ok()
+    });
+    let models = value
+        .as_ref()
+        .map(|value| {
+            [
+                value.get("model"),
+                value.pointer("/response/model"),
+                value.pointer("/session/model"),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|model| !model.trim().is_empty())
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if models.is_empty() && frame.is_some_and(|frame| frame_has_type(frame, "response.create")) {
+        let Ok(config) = state.store.load() else {
+            return false;
+        };
+        let policy = &config.relay.account_protection;
+        if !policy.excluded_models.is_empty()
+            || policy
+                .providers
+                .get(&provider.id)
+                .is_some_and(|p| !p.excluded_models.is_empty())
+        {
+            return false;
+        }
+    }
+    crate::proxy::provider_available(state, provider, None)
+        && models
+            .into_iter()
+            .all(|model| crate::proxy::provider_available(state, provider, Some(model)))
+}
+
+fn frame_model(message: &ClientMessage) -> Option<String> {
+    let bytes: &[u8] = match message {
+        ClientMessage::Text(s) => s.as_bytes(),
+        ClientMessage::Binary(b) => b,
+        _ => return None,
+    };
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    value
+        .pointer("/response/model")
+        .or_else(|| value.get("model"))
+        .or_else(|| value.pointer("/session/model"))
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn inherit_session_model(message: ClientMessage, model: Option<&str>) -> ClientMessage {
+    if !frame_has_type(&message, "response.create") || frame_model(&message).is_some() {
+        return message;
+    }
+    let Some(model) = model else {
+        return message;
+    };
+    let bytes: &[u8] = match &message {
+        ClientMessage::Text(s) => s.as_bytes(),
+        ClientMessage::Binary(b) => b,
+        _ => return message,
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
+        return message;
+    };
+    if value.get("response").is_some_and(Value::is_object) {
+        value["response"]["model"] = json!(model);
+    } else {
+        value["model"] = json!(model);
+    }
+    match message {
+        ClientMessage::Binary(_) => ClientMessage::Binary(value.to_string().into_bytes().into()),
+        _ => ClientMessage::Text(value.to_string().into()),
+    }
 }
 
 #[cfg(test)]
@@ -2149,8 +2420,8 @@ mod tests {
     use axum::{extract::State, response::IntoResponse, routing::get, Router};
     use chrono::Utc;
     use codex_companion_core::{
-        default_refresh_interval_seconds, ApiClientCreate, ConfigStore, ProviderAccountInfo,
-        ProviderGroup, RelayConfig,
+        default_refresh_interval_seconds, ApiClientCreate, ConfigStore, HealthFailureKind,
+        ProviderAccountInfo, ProviderGroup, RelayConfig,
     };
     use std::{
         collections::BTreeMap,
@@ -2825,7 +3096,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_frames_rewrite_nested_models_and_ultra_effort() {
+    fn websocket_frames_rewrite_nested_models_but_preserve_ultra_effort() {
         let mut provider = provider("relay", None);
         provider
             .model_map
@@ -2842,8 +3113,8 @@ mod tests {
         assert_eq!(value["model"], "upstream-model");
         assert_eq!(value["response"]["model"], "upstream-model");
         assert_eq!(value["session"]["model"], "upstream-model");
-        assert_eq!(value["reasoning_effort"], "max");
-        assert_eq!(value["response"]["reasoning"]["effort"], "max");
+        assert_eq!(value["reasoning_effort"], "ultra");
+        assert_eq!(value["response"]["reasoning"]["effort"], "ultra");
     }
 
     #[test]
@@ -2961,7 +3232,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_candidates_skip_invalid_credentials_and_deprioritize_cooldowns() {
+    fn websocket_candidates_exclude_invalid_credentials_and_cooldowns() {
         let state = state_with_group(vec![
             provider("invalid", Some("ws://127.0.0.1:1/invalid".to_string())),
             provider("cooling", Some("ws://127.0.0.1:1/cooling".to_string())),
@@ -2998,7 +3269,7 @@ mod tests {
                 .iter()
                 .map(|provider| provider.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["healthy", "cooling"]
+            vec!["healthy"]
         );
     }
 
@@ -3043,6 +3314,79 @@ mod tests {
                 .map(|health| health.status.clone()),
             Some(HealthStatusKind::Unknown)
         );
+    }
+
+    #[tokio::test]
+    async fn busy_preferred_websocket_account_is_not_rotated() {
+        let p = provider("preferred", Some("ws://127.0.0.1:1/v1/responses".into()));
+        let state = state_with_group(vec![
+            p.clone(),
+            provider("other", Some("ws://127.0.0.1:1/v1/responses".into())),
+        ]);
+        state
+            .store
+            .update(|config| {
+                config.relay.account_protection.max_account_concurrency = 1;
+                Ok(())
+            })
+            .unwrap();
+        let _held = state.account_concurrency.acquire(&p, 1, 0).await.unwrap();
+        let candidates = websocket_candidates(&state, Some("preferred")).unwrap();
+        let error = connect_candidate_websocket_from(
+            &state,
+            &candidates,
+            0,
+            None,
+            &mut None,
+            Some("preferred"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error, "account_concurrency_exceeded");
+        assert!(state.store.load().unwrap().health.is_empty());
+    }
+
+    #[test]
+    fn websocket_inherits_model_without_losing_response_context() {
+        let frame = ClientMessage::Text(json!({"type":"response.create","response":{"input":[{"role":"user","content":"keep"}],"previous_response_id":"resp_old","reasoning":{"effort":"ultra"}}}).to_string().into());
+        let updated = inherit_session_model(frame, Some("gpt-session"));
+        assert_eq!(frame_model(&updated).as_deref(), Some("gpt-session"));
+        let ClientMessage::Text(text) = updated else {
+            panic!()
+        };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["response"]["previous_response_id"], "resp_old");
+        assert_eq!(value["response"]["reasoning"]["effort"], "ultra");
+        assert_eq!(value["response"]["input"][0]["content"], "keep");
+    }
+
+    #[test]
+    fn websocket_exclusions_check_every_nested_model() {
+        let p = provider("a", Some("ws://127.0.0.1:1/v1/responses".into()));
+        let state = state_with_group(vec![p.clone()]);
+        state
+            .store
+            .update(|config| {
+                config
+                    .relay
+                    .account_protection
+                    .excluded_models
+                    .push("blocked*".into());
+                Ok(())
+            })
+            .unwrap();
+        for payload in [
+            json!({"type":"response.create","model":"allowed","response":{"model":"blocked"}}),
+            json!({"type":"session.update","model":"allowed","session":{"model":"blocked"}}),
+            json!({"type":"response.create"}),
+        ] {
+            assert!(!websocket_provider_available(
+                &state,
+                &p,
+                Some(&ClientMessage::Text(payload.to_string().into()))
+            ));
+        }
     }
 
     #[tokio::test]

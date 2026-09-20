@@ -19,7 +19,6 @@ use std::{
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 300;
-const OPAQUE_TOKEN_REFRESH_INTERVAL_SECONDS: i64 = 30 * 60;
 const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 const TOKEN_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const TOKEN_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -40,6 +39,7 @@ pub struct CodexOAuthError {
     pub kind: HealthFailureKind,
     pub status: Option<u16>,
     pub message: String,
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl CodexOAuthError {
@@ -48,6 +48,7 @@ impl CodexOAuthError {
             kind,
             status,
             message: message.to_string(),
+            retry_after_seconds: None,
         }
     }
 
@@ -64,6 +65,13 @@ impl CodexOAuthError {
     }
 
     pub fn failure_classification(&self) -> FailureClassification {
+        if self.message.starts_with("token_authority_deferred:") {
+            return FailureClassification {
+                kind: HealthFailureKind::RequestRejected,
+                retryable: false,
+                cooldown: false,
+            };
+        }
         classification_for_kind(self.kind.clone())
     }
 
@@ -96,7 +104,6 @@ struct RawCodexAuthSnapshot {
     plan_type: Option<String>,
     expires_at: Option<i64>,
     expired: Option<bool>,
-    last_refresh_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,18 +181,12 @@ async fn refresh_codex_auth_snapshot_detailed(
     failed_access_token: Option<&str>,
 ) -> std::result::Result<(CodexAuthSnapshot, bool), CodexOAuthError> {
     let auth_file = read_codex_auth_file(provider).map_err(CodexOAuthError::auth)?;
-    let raw = auth_file.snapshot();
-    let initial_access_token = raw.access_token.clone();
-    let needs_refresh = failed_access_token.is_some()
-        || raw.access_token.is_none()
-        || auth_snapshot_needs_refresh(&raw, Utc::now().timestamp());
-
-    if !needs_refresh {
-        return Ok((
-            snapshot_with_access(raw).map_err(CodexOAuthError::auth)?,
-            false,
-        ));
-    }
+    let initial_access_token = auth_file.snapshot().access_token;
+    let authority_path = crate::token_authority::authority_path(&auth_file.path, &auth_file.value);
+    fs::create_dir_all(authority_path.parent().unwrap()).map_err(CodexOAuthError::upstream)?;
+    let _authority_guard = lock_auth_file(&authority_path)
+        .await
+        .map_err(CodexOAuthError::upstream)?;
 
     // 刷新必须跨进程串行：desktop 与 daemon(或 live-follow 的别的进程)可能
     // 同时刷同一个 auth 文件，各自拿同一个 refresh_token 去刷会触发
@@ -196,6 +197,45 @@ async fn refresh_codex_auth_snapshot_detailed(
         .await
         .map_err(CodexOAuthError::upstream)?;
     let mut auth_file = read_codex_auth_file(provider).map_err(CodexOAuthError::auth)?;
+    if crate::token_authority::authority_path(&auth_file.path, &auth_file.value) != authority_path {
+        return Err(CodexOAuthError::upstream(
+            "等待刷新期间账号凭据已改变，请重试",
+        ));
+    }
+    let material = auth_file.value.clone();
+    let runtime = tokio::task::spawn_blocking(move || {
+        crate::token_authority::RuntimeSnapshot::capture(&material)
+    })
+    .await
+    .map_err(CodexOAuthError::upstream)?;
+    if let Some(value) = fs::read(&authority_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        if adopt_newer_local_auth(&mut auth_file, &value) {
+            write_auth_file(&auth_file).map_err(CodexOAuthError::upstream)?;
+        }
+    }
+    sync_local_auth_authority(&mut auth_file).map_err(CodexOAuthError::upstream)?;
+    for source in &runtime.sources {
+        if source == &auth_file.path {
+            continue;
+        }
+        if let Some(value) = source
+            .parent()
+            .and_then(crate::token_authority::read_runtime_auth)
+        {
+            if adopt_newer_local_auth(&mut auth_file, &value) {
+                write_auth_file(&auth_file).map_err(CodexOAuthError::upstream)?;
+            }
+        }
+    }
+    for value in &runtime.live {
+        if adopt_newer_local_auth(&mut auth_file, value) {
+            write_auth_file(&auth_file).map_err(CodexOAuthError::upstream)?;
+        }
+    }
+    publish_authority(&authority_path, &auth_file.value).map_err(CodexOAuthError::upstream)?;
     let raw = auth_file.snapshot();
     if let Some(failed_access_token) = failed_access_token {
         // A different process may have refreshed the same auth file after the
@@ -224,13 +264,40 @@ async fn refresh_codex_auth_snapshot_detailed(
     let refresh_token = raw.refresh_token.as_deref().ok_or_else(|| {
         CodexOAuthError::auth("Codex 官方账号 access_token 已过期或缺失，且缺少 refresh_token")
     })?;
+    if runtime.owns(&auth_file.value) {
+        return Err(CodexOAuthError::new(HealthFailureKind::RequestRejected, None,
+            "token_authority_deferred: 官方客户端正在使用此账号或无法确认其所有权，暂停轮换 refresh_token，等待客户端更新凭据"));
+    }
     let refreshed = refresh_tokens(refresh_token).await?;
+    let latest = read_codex_auth_file(provider).map_err(CodexOAuthError::auth)?;
+    let latest_raw = latest.snapshot();
+    if latest_raw.access_token != raw.access_token || latest_raw.refresh_token != raw.refresh_token
+    {
+        return Ok((
+            snapshot_with_access(latest_raw).map_err(CodexOAuthError::auth)?,
+            true,
+        ));
+    }
+    auth_file.value = latest.value;
     apply_refreshed_tokens(&mut auth_file.value, &refreshed);
     write_auth_file(&auth_file).map_err(CodexOAuthError::upstream)?;
+    publish_authority(&authority_path, &auth_file.value).map_err(CodexOAuthError::upstream)?;
     Ok((
         snapshot_with_access(auth_file.snapshot()).map_err(CodexOAuthError::auth)?,
         true,
     ))
+}
+
+fn publish_authority(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("companion_local_auth_source");
+    }
+    let text = value.to_string();
+    if fs::read_to_string(path).ok().as_deref() == Some(&text) {
+        return Ok(());
+    }
+    crate::write_private_auth_file(path, &text)
 }
 
 async fn refresh_tokens(
@@ -257,6 +324,16 @@ async fn refresh_tokens_at(
     ];
     let response = client
         .post(token_endpoint)
+        .header("originator", "Codex Desktop")
+        .header(
+            "User-Agent",
+            format!(
+                "Codex Desktop/{} ({}; {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+        )
         .form(&params)
         .send()
         .await
@@ -264,6 +341,11 @@ async fn refresh_tokens_at(
             CodexOAuthError::network(format!("刷新 Codex OAuth token 失败: {source}"))
         })?;
     let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| codex_companion_health::retry_after_seconds(v, Utc::now()));
     if response
         .content_length()
         .is_some_and(|length| length > MAX_TOKEN_RESPONSE_BYTES as u64)
@@ -281,7 +363,9 @@ async fn refresh_tokens_at(
         body.extend_from_slice(&chunk);
     }
     if !status.is_success() {
-        return Err(oauth_token_endpoint_error(status, &body));
+        let mut error = oauth_token_endpoint_error(status, &body);
+        error.retry_after_seconds = retry_after;
+        return Err(error);
     }
     let mut tokens = serde_json::from_slice::<TokenRefreshResponse>(&body).map_err(|source| {
         CodexOAuthError::upstream(format!("解析 Codex OAuth token 响应失败: {source}"))
@@ -341,7 +425,7 @@ async fn lock_auth_file(auth_path: &Path) -> Result<fs::File> {
     lock_auth_file_with_timeout(auth_path, AUTH_FILE_LOCK_TIMEOUT).await
 }
 
-async fn lock_auth_file_with_timeout(
+pub(crate) async fn lock_auth_file_with_timeout(
     auth_path: &Path,
     timeout: std::time::Duration,
 ) -> Result<fs::File> {
@@ -429,6 +513,103 @@ fn write_auth_file(auth_file: &CodexAuthFile) -> Result<()> {
     crate::write_private_auth_file(&auth_file.path, &format!("{text}\n"))
 }
 
+fn sync_local_auth_authority(auth_file: &mut CodexAuthFile) -> Result<()> {
+    let Some(source) = auth_file
+        .value
+        .get("companion_local_auth_source")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+    else {
+        return Ok(());
+    };
+    if source == auth_file.path {
+        return Ok(());
+    }
+    let Some(value) = fs::read_to_string(&source)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+    else {
+        return Ok(());
+    };
+    if adopt_newer_local_auth(auth_file, &value) {
+        write_auth_file(auth_file)?;
+    }
+    Ok(())
+}
+
+fn adopt_newer_local_auth(auth_file: &mut CodexAuthFile, source: &serde_json::Value) -> bool {
+    let Some(mut incoming) = crate::import::extract_codex_oauth_auth(source) else {
+        return false;
+    };
+    let Some(current) = crate::import::extract_codex_oauth_auth(&auth_file.value) else {
+        return false;
+    };
+    if official_auth_mode_from_auth_json(&incoming) != Some(OfficialAuthMode::OAuth) {
+        return false;
+    }
+    // Account IDs alone are insufficient for shared workspaces. Require the
+    // same user as well, and never infer identity from display names.
+    for key in ["account_id", "user_id"] {
+        let old = current
+            .get("tokens")
+            .and_then(|tokens| tokens.get(key))
+            .and_then(serde_json::Value::as_str);
+        let new = incoming
+            .get("tokens")
+            .and_then(|tokens| tokens.get(key))
+            .and_then(serde_json::Value::as_str);
+        if old.is_none_or(str::is_empty) || old != new {
+            return false;
+        }
+    }
+    let candidate = CodexAuthFile {
+        path: auth_file.path.clone(),
+        value: incoming.clone(),
+    };
+    let raw = candidate.snapshot();
+    if raw.access_token.is_none() || raw.refresh_token.is_none() {
+        return false;
+    }
+    let old = auth_file.snapshot();
+    let expiry = |raw: &RawCodexAuthSnapshot| {
+        raw.access_token
+            .as_deref()
+            .and_then(jwt_exp)
+            .or(raw.expires_at)
+    };
+    let refresh_time = |value: &serde_json::Value| {
+        pick_first_timestamp(
+            &[
+                value.get("tokens").unwrap_or(&serde_json::Value::Null),
+                value,
+            ],
+            &[&["last_refresh"]],
+        )
+    };
+    if expiry(&raw)
+        .zip(expiry(&old))
+        .is_some_and(|(new, old)| new < old)
+    {
+        return false;
+    }
+    let newer = expiry(&raw)
+        .zip(expiry(&old))
+        .is_some_and(|(new, old)| new > old)
+        || refresh_time(&incoming)
+            .zip(refresh_time(&current))
+            .is_some_and(|(new, old)| new >= old)
+        || (auth_snapshot_needs_refresh(&old, Utc::now().timestamp())
+            && !auth_snapshot_needs_refresh(&raw, Utc::now().timestamp()));
+    if !newer || (raw.access_token == old.access_token && raw.refresh_token == old.refresh_token) {
+        return false;
+    }
+    if let Some(source) = auth_file.value.get("companion_local_auth_source") {
+        incoming["companion_local_auth_source"] = source.clone();
+    }
+    auth_file.value = incoming;
+    true
+}
+
 impl CodexAuthFile {
     fn snapshot(&self) -> RawCodexAuthSnapshot {
         let tokens = self.value.get("tokens").unwrap_or(&serde_json::Value::Null);
@@ -489,17 +670,6 @@ impl CodexAuthFile {
                 ],
             ),
             expired: pick_first_bool(&sources, &[&["expired"], &["credentials", "expired"]]),
-            last_refresh_at: pick_first_timestamp(
-                &sources,
-                &[
-                    &["last_refresh"],
-                    &["lastRefresh"],
-                    &["last_refresh_at"],
-                    &["lastRefreshAt"],
-                    &["refreshed_at"],
-                    &["refreshedAt"],
-                ],
-            ),
         }
     }
 }
@@ -662,19 +832,18 @@ fn auth_snapshot_needs_refresh(raw: &RawCodexAuthSnapshot, now: i64) -> bool {
     let Some(access_token) = raw.access_token.as_deref() else {
         return true;
     };
-    if raw.expired == Some(true) {
-        return true;
+    if jwt_exp(access_token).is_some() {
+        return access_token_needs_refresh_at(access_token, now);
     }
-    if access_token_needs_refresh_at(access_token, now) {
+    if raw.expired == Some(true) {
         return true;
     }
     if let Some(expires_at) = raw.expires_at {
         return expires_at <= now.saturating_add(TOKEN_REFRESH_SKEW_SECONDS);
     }
-    raw.refresh_token.is_some()
-        && raw.last_refresh_at.is_none_or(|last_refresh| {
-            last_refresh.saturating_add(OPAQUE_TOKEN_REFRESH_INTERVAL_SECONDS) <= now
-        })
+    // An opaque token without an expiry remains usable until rejected. Elapsed
+    // time since login alone is not a reason to rotate a shared refresh token.
+    false
 }
 
 fn jwt_exp(token: &str) -> Option<i64> {
@@ -777,6 +946,109 @@ mod tests {
         format!("header.{encoded}.signature")
     }
 
+    #[tokio::test]
+    async fn valid_token_still_syncs_newer_authority_before_quota_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("native.json");
+        let managed = dir.path().join("managed.json");
+        let now = Utc::now().timestamp();
+        let token = |exp| {
+            let claims = serde_json::json!({"exp":exp,"https://api.openai.com/auth":{"chatgpt_account_id":"workspace","chatgpt_user_id":"user"}});
+            format!(
+                "header.{}.signature",
+                URL_SAFE_NO_PAD.encode(claims.to_string())
+            )
+        };
+        let old = token(now + 3600);
+        let new = token(now + 7200);
+        fs::write(
+            &source,
+            serde_json::json!({"tokens":{"access_token":new,"refresh_token":"new-refresh"}})
+                .to_string(),
+        )
+        .unwrap();
+        fs::write(&managed, serde_json::json!({"tokens":{"access_token":old,"refresh_token":"old-refresh"},"companion_local_auth_source":source}).to_string()).unwrap();
+        let provider = serde_json::from_value(serde_json::json!({"id":"test","name":"test","kind":"official_codex","baseUrl":"https://example.test","authRef":format!("file:{}",managed.display()),"modelMap":{},"priority":0,"enabled":true})).unwrap();
+        let (snapshot, changed) = ensure_codex_auth_snapshot_with_status_detailed(&provider)
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(snapshot.access_token, new);
+        assert!(fs::read_to_string(&managed)
+            .unwrap()
+            .contains("new-refresh"));
+    }
+
+    #[test]
+    fn authority_sync_requires_newer_credentials_for_same_user_and_workspace() {
+        let now = Utc::now().timestamp();
+        let auth = |exp, user: &str, account: &str| {
+            serde_json::json!({
+                "tokens": { "access_token": jwt_with_exp(exp), "refresh_token": "fixture-refresh",
+                    "user_id": user, "account_id": account }
+            })
+        };
+        let original = auth(now - 10, "user-a", "workspace-a");
+        let mut file = CodexAuthFile {
+            path: PathBuf::from("fixture.json"),
+            value: original.clone(),
+        };
+        assert!(!adopt_newer_local_auth(
+            &mut file,
+            &auth(now + 3600, "user-b", "workspace-a")
+        ));
+        assert!(!adopt_newer_local_auth(
+            &mut file,
+            &auth(now + 3600, "user-a", "workspace-b")
+        ));
+        assert_eq!(file.value, original);
+        assert!(adopt_newer_local_auth(
+            &mut file,
+            &auth(now + 3600, "user-a", "workspace-a")
+        ));
+        assert!(!auth_snapshot_needs_refresh(&file.snapshot(), now));
+        assert!(!adopt_newer_local_auth(&mut file, &original));
+    }
+
+    #[tokio::test]
+    async fn independent_credential_copies_reuse_shared_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = Utc::now().timestamp();
+        let old = serde_json::json!({"tokens":{"access_token":jwt_with_exp(now + 3600),"refresh_token":"old-rt","user_id":"u","account_id":"a"}});
+        let new = serde_json::json!({"tokens":{"access_token":jwt_with_exp(now + 7200),"refresh_token":"new-rt","user_id":"u","account_id":"a"}});
+        let first = temp.path().join("first.json");
+        let second = temp.path().join("second.json");
+        fs::write(&first, new.to_string()).unwrap();
+        fs::write(&second, old.to_string()).unwrap();
+        let provider = |path: &Path| {
+            serde_json::from_value(serde_json::json!({"id":"fixture","name":"fixture","kind":"official_codex","baseUrl":"https://example.test","authRef":format!("file:{}",path.display()),"modelMap":{},"priority":0,"enabled":true})).unwrap()
+        };
+        ensure_codex_auth_snapshot_detailed(&provider(&first))
+            .await
+            .unwrap();
+        let snapshot = ensure_codex_auth_snapshot_detailed(&provider(&second))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.access_token,
+            new["tokens"]["access_token"].as_str().unwrap()
+        );
+        assert!(fs::read_to_string(&second).unwrap().contains("new-rt"));
+        let mut stale = old.clone();
+        stale["last_refresh"] = serde_json::json!(now + 999999);
+        let mut current = CodexAuthFile {
+            path: first,
+            value: new.clone(),
+        };
+        assert!(!adopt_newer_local_auth(&mut current, &stale));
+        let runtime = crate::token_authority::RuntimeSnapshot {
+            live: vec![old],
+            ..Default::default()
+        };
+        assert!(runtime.owns(&new));
+        assert!(!runtime.owns(&serde_json::json!({"tokens":{"access_token":jwt_with_exp(now + 7200),"user_id":"other","account_id":"a"}})));
+    }
+
     #[test]
     fn detects_expiring_access_token() {
         let token = jwt_with_exp(1_000);
@@ -860,30 +1132,26 @@ mod tests {
     }
 
     #[test]
-    fn proactively_refreshes_opaque_tokens_from_last_refresh_time() {
+    fn valid_access_token_does_not_rotate_without_refresh_timestamp() {
         let raw = RawCodexAuthSnapshot {
-            access_token: Some("opaque-access".to_string()),
+            access_token: Some(jwt_with_exp(10_000)),
             refresh_token: Some("refresh".to_string()),
-            last_refresh_at: Some(1_000),
             ..Default::default()
         };
 
-        assert!(!auth_snapshot_needs_refresh(&raw, 1_000 + 1_799));
-        assert!(auth_snapshot_needs_refresh(
-            &raw,
-            1_000 + OPAQUE_TOKEN_REFRESH_INTERVAL_SECONDS
-        ));
+        assert!(!auth_snapshot_needs_refresh(&raw, 5_000));
+        assert!(auth_snapshot_needs_refresh(&raw, 9_700));
     }
 
     #[test]
-    fn refreshes_an_opaque_oauth_token_when_no_refresh_timestamp_exists() {
+    fn preserves_an_opaque_oauth_token_when_no_expiry_exists() {
         let raw = RawCodexAuthSnapshot {
             access_token: Some("opaque-access".to_string()),
             refresh_token: Some("refresh".to_string()),
             ..Default::default()
         };
 
-        assert!(auth_snapshot_needs_refresh(&raw, 1_000));
+        assert!(!auth_snapshot_needs_refresh(&raw, 1_000));
     }
 
     #[tokio::test]

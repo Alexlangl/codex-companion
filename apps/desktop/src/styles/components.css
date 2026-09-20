@@ -4070,3 +4070,23 @@ dd {
     max-width: 190px;
   }
 }
+.configuration-fields {
+  min-width: 0;
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.configuration-fields legend { padding: 0 6px; font-weight: 600; }
+.configuration-stack { display: grid; gap: 16px; min-width: 0; border: 0; padding: 12px 0; }
+.configuration-fields details + details { margin-top: 16px; }
+.configuration-fields summary, .pricing-multipliers summary { cursor: pointer; padding: 10px 0; }
+.configuration-fields .field { margin-bottom: 12px; }
+.pricing-model-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--border); }
+.pricing-model-row > div:first-child { min-width: 0; overflow-wrap: anywhere; }
+.pricing-model-row .actions { flex-shrink: 0; }
+.pricing-multipliers { margin-top: 16px; }
+@media (max-width: 640px) {
+  .pricing-model-row { align-items: flex-start; flex-direction: column; }
+}

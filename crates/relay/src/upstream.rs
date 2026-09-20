@@ -76,6 +76,12 @@ pub(crate) enum StreamPreflightError {
 }
 
 impl StreamPreflightError {
+    pub(crate) fn retry_after_seconds(&self) -> Option<u64> {
+        match self {
+            Self::Semantic(message) => codex_companion_health::failure_retry_after_seconds(message),
+            _ => None,
+        }
+    }
     pub(crate) fn classification_text(&self) -> String {
         match self {
             Self::Network(message) => format!("upstream network failure: {message}"),
@@ -97,8 +103,67 @@ impl fmt::Display for StreamPreflightError {
 }
 
 impl UpstreamResponse {
+    pub(crate) async fn filter_model_catalog(
+        &mut self,
+        policy: &codex_companion_core::AccountProtection,
+        provider: &ProviderConfig,
+    ) -> Result<(), String> {
+        if policy.excluded_models.is_empty()
+            && policy
+                .providers
+                .get(&provider.id)
+                .is_none_or(|p| p.excluded_models.is_empty())
+        {
+            return Ok(());
+        }
+        let body = collect_response_bytes(
+            self.response.take(),
+            self.buffered_body.take(),
+            std::mem::take(&mut self.prefetched_body),
+        )
+        .await?;
+        let body = crate::content_encoding::decode_request_body(
+            &mut self.headers,
+            body,
+            MAX_BUFFERED_SUCCESS_RESPONSE_BYTES,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut value: Value =
+            serde_json::from_slice(&body).map_err(|_| "上游模型目录格式无效".to_string())?;
+        for field in ["data", "models"] {
+            if let Some(models) = value.get_mut(field).and_then(Value::as_array_mut) {
+                models.retain(|model| {
+                    let name = model
+                        .get("id")
+                        .or_else(|| model.get("slug"))
+                        .and_then(Value::as_str);
+                    name.is_some_and(|name| {
+                        codex_companion_core::account_policy_block_reason(
+                            policy,
+                            provider,
+                            Some(name),
+                            chrono::Utc::now(),
+                        ) != Some("account_model_excluded")
+                    })
+                });
+            }
+        }
+        self.buffered_body = Some(Bytes::from(value.to_string()));
+        self.headers.remove(header::CONTENT_LENGTH);
+        self.headers.remove(header::CONTENT_ENCODING);
+        Ok(())
+    }
     pub(crate) fn status(&self) -> StatusCode {
         self.status
+    }
+
+    pub(crate) fn retry_after_seconds(&self) -> Option<u64> {
+        self.headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                codex_companion_health::retry_after_seconds(value, chrono::Utc::now())
+            })
     }
 
     pub(crate) fn oauth_refresh_error(&self) -> Option<&str> {
@@ -283,6 +348,7 @@ impl UpstreamResponse {
 pub(crate) struct UpstreamRequestError {
     message: String,
     failure: Option<FailureClassification>,
+    retry_after_seconds: Option<u64>,
 }
 
 impl UpstreamRequestError {
@@ -290,6 +356,7 @@ impl UpstreamRequestError {
         Self {
             message: message.into(),
             failure: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -298,6 +365,7 @@ impl UpstreamRequestError {
         Self {
             message: error.message,
             failure: Some(failure),
+            retry_after_seconds: error.retry_after_seconds,
         }
     }
 
@@ -309,6 +377,7 @@ impl UpstreamRequestError {
                 &message,
             )),
             message,
+            retry_after_seconds: None,
         }
     }
 
@@ -318,6 +387,10 @@ impl UpstreamRequestError {
 
     pub(crate) fn failure(&self) -> Option<&FailureClassification> {
         self.failure.as_ref()
+    }
+
+    pub(crate) fn retry_after_seconds(&self) -> Option<u64> {
+        self.retry_after_seconds
     }
 }
 
@@ -684,7 +757,6 @@ pub(crate) async fn send_upstream(
         session_identity.as_deref(),
     );
     let body = rewrite_model(provider, body);
-    let body = normalize_ultra_reasoning_effort(body);
     let (body, tool_context, chat_messages) =
         if transform == ResponseTransform::ChatCompletionsToResponses {
             responses_body_to_chat_completions_with_store(
@@ -761,7 +833,7 @@ pub(crate) async fn send_upstream(
     }
     if official_oauth && response.status() == reqwest::StatusCode::UNAUTHORIZED {
         let status = response.status();
-        let response_headers = response.headers().clone();
+        let mut response_headers = response.headers().clone();
         let failed_access_token = authorization
             .as_deref()
             .and_then(|value| value.strip_prefix("Bearer "))
@@ -797,6 +869,11 @@ pub(crate) async fn send_upstream(
                     .map_err(|error| format_upstream_request_error(&error, &upstream))?;
                 }
                 Err(refresh_error) => {
+                    if let Some(seconds) = refresh_error.retry_after_seconds {
+                        if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                            response_headers.insert(header::RETRY_AFTER, value);
+                        }
+                    }
                     let refresh_failure = refresh_error.failure_classification();
                     let error_body = read_auth_error_response_body(response, "官方 OAuth").await?;
                     return Ok(UpstreamResponse {
@@ -1170,6 +1247,8 @@ fn normalize_official_responses_input(
             "truncation",
             "user",
             "context_management",
+            "prompt_cache_options",
+            "prompt_cache_retention",
         ] {
             object.remove(key);
         }
@@ -1180,9 +1259,17 @@ fn normalize_official_responses_input(
         {
             object.remove("service_tier");
         }
-        object
-            .entry("parallel_tool_calls")
-            .or_insert(Value::Bool(true));
+        if object
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            object
+                .entry("parallel_tool_calls")
+                .or_insert(Value::Bool(true));
+        } else {
+            object.remove("parallel_tool_calls");
+        }
     }
     if value.get("prompt_cache_key").is_none() {
         if let Some(session_identity) = session_identity {
@@ -1218,6 +1305,13 @@ fn normalize_official_responses_input(
     }
     if let Some(items) = value.get_mut("input").and_then(Value::as_array_mut) {
         for item in items {
+            if let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) {
+                for part in parts {
+                    if let Some(object) = part.as_object_mut() {
+                        object.remove("prompt_cache_breakpoint");
+                    }
+                }
+            }
             if item.get("role").and_then(Value::as_str) == Some("system") {
                 item["role"] = Value::String("developer".to_string());
             }
@@ -1355,34 +1449,6 @@ fn rewrite_model(provider: &ProviderConfig, body: Bytes) -> Bytes {
     }
     value["model"] = serde_json::Value::String(mapped);
     serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
-}
-
-fn normalize_ultra_reasoning_effort(body: Bytes) -> Bytes {
-    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
-        return body;
-    };
-    let mut changed = false;
-    if let Some(effort) = value
-        .get_mut("reasoning")
-        .and_then(Value::as_object_mut)
-        .and_then(|reasoning| reasoning.get_mut("effort"))
-        .filter(|effort| effort.as_str() == Some("ultra"))
-    {
-        *effort = Value::String("max".to_string());
-        changed = true;
-    }
-    if let Some(effort) = value
-        .get_mut("reasoning_effort")
-        .filter(|effort| effort.as_str() == Some("ultra"))
-    {
-        *effort = Value::String("max".to_string());
-        changed = true;
-    }
-    if changed {
-        serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
-    } else {
-        body
-    }
 }
 
 fn validate_successful_responses_body(
@@ -1873,7 +1939,12 @@ impl ResponsesSseObserverState {
         let message = format!("[{}] upstream_stream_incomplete: {detail}", self.request_id);
         let failure = classify_failure(None, &message);
         crate::events::update_health(&self.store, &self.provider_id, |health| {
-            mark_failure(health, &failure, message.clone())
+            mark_failure(health, &failure, message.clone());
+            if failure.cooldown {
+                if let Some(seconds) = codex_companion_health::failure_retry_after_seconds(detail) {
+                    codex_companion_health::extend_cooldown(health, seconds);
+                }
+            }
         });
         crate::events::append_event(
             &self.store,
@@ -2063,6 +2134,16 @@ pub(crate) fn semantic_failure_message(value: &Value) -> Option<String> {
 }
 
 fn compact_json_error(value: &Value) -> String {
+    let error = value
+        .pointer("/response/error")
+        .or_else(|| value.get("error"))
+        .unwrap_or(value);
+    let codes = ["code", "type"]
+        .into_iter()
+        .filter_map(|key| error.get(key).and_then(Value::as_str))
+        .map(|s| s.chars().take(80).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ");
     let message = value
         .get("message")
         .and_then(Value::as_str)
@@ -2074,10 +2155,14 @@ fn compact_json_error(value: &Value) -> String {
         })
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| value.to_string());
-    redact_sensitive_text(&message)
+    let message: String = redact_sensitive_text(format!("{codes} {message}").trim())
         .chars()
         .take(MAX_UPSTREAM_ERROR_MESSAGE_CHARS)
-        .collect()
+        .collect();
+    if let Some(seconds) = codex_companion_health::failure_retry_after_seconds(&value.to_string()) {
+        return json!({"error":{"message":message,"retry_after_seconds":seconds}}).to_string();
+    }
+    message
 }
 
 fn response_transform(provider: &ProviderConfig, method: &Method, uri: &Uri) -> ResponseTransform {
@@ -2586,14 +2671,7 @@ fn responses_body_to_chat_completions_with_store(
     {
         output.insert(
             "reasoning_effort".to_string(),
-            Value::String(
-                if reasoning_effort == "ultra" {
-                    "max"
-                } else {
-                    reasoning_effort
-                }
-                .to_string(),
-            ),
+            Value::String(reasoning_effort.to_string()),
         );
     }
     if prompt_cache_enabled {
@@ -4511,6 +4589,23 @@ pub(crate) fn upstream_url(provider: &ProviderConfig, uri: &Uri) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_error_preserves_code_and_server_reset() {
+        let moderation = semantic_failure_message(&json!({"type":"response.failed","response":{"error":{"code":"content_policy_violation","message":"request rejected"}}})).unwrap();
+        assert!(codex_companion_health::is_content_moderation_failure(
+            &moderation
+        ));
+        let quota = semantic_failure_message(&json!({"type":"response.failed","response":{"error":{"code":"usage_limit_reached","message":"wait","resets_in_seconds":7200}}})).unwrap();
+        assert_eq!(
+            codex_companion_health::failure_retry_after_seconds(&quota),
+            Some(7200)
+        );
+        assert_eq!(
+            classify_failure(None, &quota).kind,
+            codex_companion_core::HealthFailureKind::QuotaExhausted
+        );
+    }
     use codex_companion_core::{
         default_refresh_interval_seconds, HealthFailureKind, ProviderAccountInfo, ProviderKind,
     };
@@ -5042,14 +5137,52 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_ultra_to_official_upstream_max_effort() {
-        let body = normalize_ultra_reasoning_effort(Bytes::from_static(
-            br#"{"reasoning":{"effort":"ultra"},"reasoning_effort":"ultra"}"#,
-        ));
+    fn official_requests_preserve_reasoning_history_and_tool_context() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let original = json!({
+            "model":"gpt-test", "reasoning":{"effort":"ultra","summary":"auto"},
+            "instructions":"Keep the complete context", "service_tier":"priority",
+            "parallel_tool_calls":false, "previous_response_id":"resp_fixture",
+            "prompt_cache_key":"session-fixture", "include":["message.output_text.logprobs"],
+            "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+            "tool_choice":"auto",
+            "input":[
+                {"role":"user","content":"Earlier question"},
+                {"type":"reasoning","id":"rs_fixture","summary":[],"encrypted_content":"fixture-encrypted"},
+                {"type":"function_call","id":"fc_fixture","call_id":"call_fixture","name":"lookup","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_fixture","output":"Full result"},
+                {"role":"user","content":"Continue"}
+            ]
+        });
+        let body = normalize_official_responses_input(
+            &provider,
+            &Method::POST,
+            &"/v1/responses".parse().unwrap(),
+            Bytes::from(serde_json::to_vec(&original).unwrap()),
+            Some("other-session"),
+        );
         let value: Value = serde_json::from_slice(&body).expect("json");
-
-        assert_eq!(value["reasoning"]["effort"], "max");
-        assert_eq!(value["reasoning_effort"], "max");
+        for key in [
+            "model",
+            "reasoning",
+            "input",
+            "instructions",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "previous_response_id",
+            "prompt_cache_key",
+            "service_tier",
+        ] {
+            assert_eq!(value[key], original[key], "request field changed: {key}");
+        }
+        assert_eq!(
+            value["include"],
+            json!([
+                "message.output_text.logprobs",
+                "reasoning.encrypted_content"
+            ])
+        );
     }
 
     #[test]
@@ -5162,7 +5295,7 @@ mod tests {
         assert_eq!(value["input"][0]["content"][0]["text"], "hello");
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], true);
-        assert_eq!(value["parallel_tool_calls"], true);
+        assert!(value.get("parallel_tool_calls").is_none());
         for key in [
             "max_output_tokens",
             "temperature",
@@ -5570,7 +5703,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_ultra_to_official_max_effort_for_chat_completions() {
+    fn preserves_ultra_effort_for_chat_completions() {
         let (body, _, _) = responses_body_to_chat_completions(
             Bytes::from_static(
                 br#"{"model":"gpt-5.6-sol","input":"hello","reasoning":{"effort":"ultra"}}"#,
@@ -5580,7 +5713,7 @@ mod tests {
         );
         let value: Value = serde_json::from_slice(&body).expect("json");
 
-        assert_eq!(value["reasoning_effort"], "max");
+        assert_eq!(value["reasoning_effort"], "ultra");
         assert!(value.get("reasoning").is_none());
     }
 

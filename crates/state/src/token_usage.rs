@@ -2633,6 +2633,14 @@ mod tests {
         assert_eq!(summary.cost.cache_write_input_usd, "0.000033");
         assert_eq!(summary.cost.output_usd, "0.00018");
         assert_eq!(summary.cost.total_usd, "0.000681");
+        let mut settings = crate::read_pricing_settings(temp.path()).unwrap().overrides;
+        settings.models[0].output_per_million = "36".into();
+        crate::save_pricing_settings(temp.path(), settings).unwrap();
+        let repriced =
+            collect_token_usage_cached(temp.path().to_path_buf(), temp.path().join("cache"))
+                .unwrap();
+        assert_eq!(repriced.events, summary.events);
+        assert_eq!(repriced.cost.total_usd, "0.000861");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::auth::resolve_auth_token;
-use crate::codex_oauth::ensure_codex_auth_snapshot;
+use crate::codex_oauth::ensure_codex_auth_snapshot_detailed;
 use crate::http::read_response_bytes_limited;
 use crate::types::ProviderUsageQueryTestInput;
 use chrono::{DateTime, Local, Utc};
@@ -19,6 +19,10 @@ const LEGACY_ACCOUNT_CHECK_URL: &str = "https://chatgpt.com/backend-api/wham/acc
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CHATGPT_WEB_REFERER: &str = "https://chatgpt.com/";
 const CHATGPT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+// Keep quota requests on the same client contract as the current Cockpit
+// implementation. Subscription profile requests intentionally keep their web
+// contract below.
+const CODEX_ORIGINATOR: &str = "Codex Desktop";
 const DEFAULT_USAGE_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const DEFAULT_USAGE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const USAGE_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
@@ -90,17 +94,59 @@ struct WindowInfo {
     reset_at: Option<i64>,
 }
 
+#[derive(Debug)]
+pub(crate) struct OfficialAccountRefreshError {
+    pub status: Option<u16>,
+    pub message: String,
+    pub retry_after_seconds: Option<u64>,
+}
+impl From<CompanionError> for OfficialAccountRefreshError {
+    fn from(error: CompanionError) -> Self {
+        Self {
+            status: None,
+            message: error.to_string(),
+            retry_after_seconds: None,
+        }
+    }
+}
+
+impl From<String> for OfficialAccountRefreshError {
+    fn from(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+            retry_after_seconds: None,
+        }
+    }
+}
+
 pub async fn refresh_official_codex_account(
     provider: &ProviderConfig,
 ) -> Result<ProviderAccountInfo> {
+    refresh_official_codex_account_detailed(provider, None)
+        .await
+        .map_err(|error| CompanionError::InvalidConfig(error.message))
+}
+
+pub(crate) async fn refresh_official_codex_account_detailed(
+    provider: &ProviderConfig,
+    client_version: Option<&str>,
+) -> std::result::Result<ProviderAccountInfo, OfficialAccountRefreshError> {
     if provider.kind != ProviderKind::OfficialCodex {
         return Err(CompanionError::InvalidConfig(format!(
             "provider {} 不是 Codex 官方账号",
             provider.id
-        )));
+        ))
+        .into());
     }
 
-    let auth = ensure_codex_auth_snapshot(provider).await?;
+    let auth = ensure_codex_auth_snapshot_detailed(provider)
+        .await
+        .map_err(|error| OfficialAccountRefreshError {
+            status: error.status,
+            message: error.message,
+            retry_after_seconds: error.retry_after_seconds,
+        })?;
     let client = http_client_builder()
         .timeout(DEFAULT_USAGE_HTTP_TIMEOUT)
         .connect_timeout(DEFAULT_USAGE_CONNECT_TIMEOUT)
@@ -129,9 +175,25 @@ pub async fn refresh_official_codex_account(
             .map(|value| value.to_ascii_uppercase());
     }
 
-    if let Ok(profile) =
-        fetch_account_profile(&client, &auth.access_token, account_id.as_deref()).await
-    {
+    let mut headers = codex_headers(&auth.access_token, account.account_id.as_deref())
+        .map_err(CompanionError::InvalidConfig)?;
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(&crate::codex_identity::quota_user_agent(client_version))
+            .map_err(|e| CompanionError::InvalidConfig(e.to_string()))?,
+    );
+    let usage = fetch_usage_once(&client, headers, USAGE_URL).await?;
+    let profile_result =
+        fetch_account_profile(&client, &auth.access_token, account_id.as_deref()).await;
+    if let Err(error) = &profile_result {
+        if matches!(error.status, Some(401 | 429))
+            || codex_companion_health::classify_failure(error.status, &error.message).kind
+                == codex_companion_core::HealthFailureKind::AuthFailed
+        {
+            return Err(profile_result.unwrap_err());
+        }
+    }
+    if let Ok(profile) = profile_result {
         if let Some(account_id) = profile.account_id {
             account.account_id = Some(account_id);
         }
@@ -152,7 +214,6 @@ pub async fn refresh_official_codex_account(
         }
     }
 
-    let usage = fetch_usage(&client, &auth.access_token, account.account_id.as_deref()).await?;
     apply_usage_to_account(&mut account, usage);
     account.last_refresh_at = Some(Utc::now().to_rfc3339());
     Ok(account)
@@ -764,7 +825,7 @@ async fn fetch_api_usage_once(
     if !status.is_success() {
         return Err(UsageFetchError {
             message: format!("{status} [body_len:{}]", body.len()),
-            retryable: status.as_u16() == 429 || status.is_server_error(),
+            retryable: status.is_server_error(),
         });
     }
     let value =
@@ -798,7 +859,7 @@ async fn fetch_account_profile(
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
-) -> std::result::Result<AccountProfile, String> {
+) -> std::result::Result<AccountProfile, OfficialAccountRefreshError> {
     let mut last_error = None;
     for (url, target_path, include_timezone) in [
         (
@@ -823,11 +884,16 @@ async fn fetch_account_profile(
         .await
         {
             Ok(profile) => return Ok(profile),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                if !matches!(error.status, Some(404 | 405)) {
+                    return Err(error);
+                }
+                last_error = Some(error);
+            }
         }
     }
 
-    Err(last_error.unwrap_or_else(|| "账号信息接口不可用".to_string()))
+    Err(last_error.unwrap_or_else(|| "账号信息接口不可用".to_string().into()))
 }
 
 async fn fetch_account_profile_once(
@@ -837,7 +903,7 @@ async fn fetch_account_profile_once(
     url: &str,
     target_path: &str,
     include_timezone: bool,
-) -> std::result::Result<AccountProfile, String> {
+) -> std::result::Result<AccountProfile, OfficialAccountRefreshError> {
     let mut request =
         client
             .get(url)
@@ -851,72 +917,72 @@ async fn fetch_account_profile_once(
         .await
         .map_err(|error| format!("请求账号信息失败: {error}"))?;
     let status = response.status();
+    let retry_after_seconds = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| codex_companion_health::retry_after_seconds(v, Utc::now()));
     let body = read_response_bytes_limited(response, USAGE_RESPONSE_LIMIT_BYTES)
         .await
         .map_err(|error| format!("读取账号信息响应失败: {error}"))?;
     if !status.is_success() {
-        return Err(format!(
-            "账号信息接口返回 {status}，body_len={}",
-            body.len()
-        ));
+        return Err(OfficialAccountRefreshError {
+            status: Some(status.as_u16()),
+            retry_after_seconds,
+            message: format!(
+                "账号信息接口返回 {status} [error_code:{}] [body_len:{}]",
+                extract_error_code(&body).unwrap_or_default(),
+                body.len()
+            ),
+        });
     }
     let value = serde_json::from_slice::<serde_json::Value>(&body)
         .map_err(|error| format!("账号信息 JSON 解析失败: {error}"))?;
     Ok(parse_account_profile(&value, account_id))
 }
 
-async fn fetch_usage(
-    client: &reqwest::Client,
-    access_token: &str,
-    account_id: Option<&str>,
-) -> Result<UsageResponse> {
-    let headers = codex_headers(access_token, account_id).map_err(CompanionError::InvalidConfig)?;
-    let mut last_error = None;
-    for attempt in 0..3 {
-        match fetch_usage_once(client, headers.clone()).await {
-            Ok(usage) => return Ok(usage),
-            Err((message, retryable)) => {
-                last_error = Some(message);
-                if !retryable || attempt == 2 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt + 1))).await;
-            }
-        }
-    }
-    Err(CompanionError::InvalidConfig(
-        last_error.unwrap_or_else(|| "Codex 额度接口不可用".to_string()),
-    ))
-}
-
 async fn fetch_usage_once(
     client: &reqwest::Client,
     headers: HeaderMap,
-) -> std::result::Result<UsageResponse, (String, bool)> {
+    url: &str,
+) -> std::result::Result<UsageResponse, OfficialAccountRefreshError> {
+    let error = |message| OfficialAccountRefreshError {
+        status: None,
+        message,
+        retry_after_seconds: None,
+    };
+    // One attempt per scheduled refresh. Backoff belongs to the scheduler, not
+    // a tight retry loop inside the endpoint client.
     let response = client
-        .get(USAGE_URL)
+        .get(url)
         .headers(headers)
         .send()
         .await
-        .map_err(|source| (format!("请求 Codex 额度失败: {source}"), true))?;
+        .map_err(|source| error(format!("请求 Codex 额度失败: {source}")))?;
     let status = response.status();
+    let retry_after_seconds = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| codex_companion_health::retry_after_seconds(value, Utc::now()));
     let body = read_response_bytes_limited(response, USAGE_RESPONSE_LIMIT_BYTES)
         .await
-        .map_err(|source| (format!("读取 Codex 额度响应失败: {source}"), true))?;
+        .map_err(|source| error(format!("读取 Codex 额度响应失败: {source}")))?;
     if !status.is_success() {
         let code = extract_error_code(&body)
             .map(|code| format!(" [error_code:{code}]"))
             .unwrap_or_default();
-        return Err((
-            format!(
+        return Err(OfficialAccountRefreshError {
+            status: Some(status.as_u16()),
+            message: format!(
                 "Codex 额度接口返回 {status}{code} [body_len:{}]",
                 body.len()
             ),
-            status.as_u16() == 429 || status.is_server_error(),
-        ));
+            retry_after_seconds,
+        });
     }
     serde_json::from_slice::<UsageResponse>(&body)
-        .map_err(|source| (format!("解析 Codex 额度 JSON 失败: {source}"), false))
+        .map_err(|source| error(format!("解析 Codex 额度 JSON 失败: {source}")))
 }
 
 fn codex_headers(
@@ -930,6 +996,12 @@ fn codex_headers(
             .map_err(|error| format!("构建 Authorization 头失败: {error}"))?,
     );
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(&codex_user_agent())
+            .map_err(|error| format!("构建 User-Agent 头失败: {error}"))?,
+    );
+    headers.insert("originator", HeaderValue::from_static(CODEX_ORIGINATOR));
     if let Some(account_id) = account_id.and_then(normalize_optional) {
         headers.insert(
             "ChatGPT-Account-Id",
@@ -946,6 +1018,9 @@ fn chatgpt_web_headers(
     target_path: &str,
 ) -> std::result::Result<HeaderMap, String> {
     let mut headers = codex_headers(access_token, account_id)?;
+    // This separate subscription endpoint retains its existing web contract,
+    // as does Cockpit. Do not project that identity onto the quota endpoint.
+    headers.remove("originator");
     headers.insert(REFERER, HeaderValue::from_static(CHATGPT_WEB_REFERER));
     headers.insert(USER_AGENT, HeaderValue::from_static(CHATGPT_WEB_USER_AGENT));
     headers.insert(
@@ -959,6 +1034,10 @@ fn chatgpt_web_headers(
             .map_err(|error| format!("构建 x-openai-target-route 头失败: {error}"))?,
     );
     Ok(headers)
+}
+
+fn codex_user_agent() -> String {
+    crate::codex_identity::quota_user_agent(None)
 }
 
 fn parse_account_profile(value: &serde_json::Value, expected_id: Option<&str>) -> AccountProfile {
@@ -1128,6 +1207,18 @@ fn apply_usage_to_account(account: &mut ProviderAccountInfo, usage: UsageRespons
     });
 
     let windows = usage_windows(&usage);
+    account.quota_hourly_present = usage
+        .rate_limit
+        .as_ref()
+        .map(|rate| rate.primary_window.is_some());
+    account.quota_weekly_present = usage
+        .rate_limit
+        .as_ref()
+        .map(|rate| rate.secondary_window.is_some());
+    account.quota_windows.clear();
+    account.quota_percent = None;
+    account.quota_reset_at = None;
+    account.quota_label = None;
     if !windows.is_empty() {
         let primary_windows = primary_usage_windows(&usage);
         let summary_windows = if primary_windows.is_empty() {
@@ -1596,7 +1687,9 @@ fn window_summary(
     window: Option<&WindowInfo>,
 ) -> Option<ProviderQuotaWindow> {
     let window = window?;
-    let used = window.used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
+    let used = window
+        .used_percent
+        .filter(|used| used.is_finite() && (0.0..=100.0).contains(used))?;
     let window_minutes = window.limit_window_seconds.and_then(|seconds| {
         if seconds > 0 {
             Some((seconds + 59) / 60)
@@ -1833,6 +1926,126 @@ fn get_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn quota_rate_limit_is_one_request_and_preserves_server_backoff() {
+        use axum::{http::StatusCode, routing::get, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = hits.clone();
+        let app = Router::new().route(
+            "/usage",
+            get(move || {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "7200")],
+                        r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/usage", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let error = fetch_usage_once(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            codex_headers("test-token", Some("test-account")).unwrap(),
+            &url,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, Some(429));
+        assert_eq!(error.retry_after_seconds, Some(7200));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn profile_failure_retains_status_and_retry_after() {
+        use axum::{http::StatusCode, routing::get, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/profile", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/profile",
+                    get(|| async {
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "600")],
+                            r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+                        )
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let error = fetch_account_profile_once(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            "fixture-token",
+            Some("fixture-account"),
+            &url,
+            "/profile",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, Some(429));
+        assert_eq!(error.retry_after_seconds, Some(600));
+        assert!(error.message.contains("rate_limit_exceeded"));
+        server.abort();
+    }
+
+    #[test]
+    fn missing_quota_data_is_unknown_not_unlimited() {
+        let mut account = ProviderAccountInfo::default();
+        apply_usage_to_account(
+            &mut account,
+            serde_json::from_value(serde_json::json!({})).unwrap(),
+        );
+        assert_eq!(account.quota_hourly_present, None);
+        assert_eq!(account.quota_weekly_present, None);
+        apply_usage_to_account(
+            &mut account,
+            serde_json::from_value(serde_json::json!({"rate_limit":{}})).unwrap(),
+        );
+        assert_eq!(account.quota_hourly_present, Some(false));
+        assert_eq!(account.quota_weekly_present, Some(false));
+        apply_usage_to_account(
+            &mut account,
+            serde_json::from_value(serde_json::json!({"rate_limit":{"primary_window":{}}}))
+                .unwrap(),
+        );
+        assert_eq!(account.quota_hourly_present, Some(true));
+        assert!(account.quota_windows.is_empty());
+    }
+
+    #[test]
+    fn quota_and_profile_headers_keep_separate_upstream_contracts() {
+        let quota = codex_headers("token", Some("account")).unwrap();
+        assert_eq!(quota.get("originator").unwrap(), CODEX_ORIGINATOR);
+        assert!(quota
+            .get(USER_AGENT)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("Codex Desktop/"));
+        let profile =
+            chatgpt_web_headers("token", Some("account"), "/backend-api/accounts/check").unwrap();
+        assert!(profile.get("originator").is_none());
+        assert_eq!(profile.get(REFERER).unwrap(), CHATGPT_WEB_REFERER);
+        assert_eq!(profile.get(USER_AGENT).unwrap(), CHATGPT_WEB_USER_AGENT);
+    }
 
     #[test]
     fn refreshed_auth_workspace_takes_precedence_over_stale_provider_metadata() {

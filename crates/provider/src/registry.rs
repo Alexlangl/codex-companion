@@ -8,6 +8,14 @@ use codex_companion_core::{
 use std::fs;
 
 pub fn add_provider(store: &ConfigStore, input: ProviderUpsert) -> Result<ProviderConfig> {
+    add_provider_with_health_reset(store, input, false)
+}
+
+pub(crate) fn add_provider_with_health_reset(
+    store: &ConfigStore,
+    input: ProviderUpsert,
+    reset_health: bool,
+) -> Result<ProviderConfig> {
     validate_id(&input.id)?;
     validate_base_url(&input.base_url)?;
     store.update(|config| {
@@ -30,10 +38,16 @@ pub fn add_provider(store: &ConfigStore, input: ProviderUpsert) -> Result<Provid
             refresh_interval_seconds: input.refresh_interval_seconds,
             account: input.account,
         };
-        config
-            .health
-            .entry(provider.id.clone())
-            .or_insert_with(ProviderHealth::default);
+        if reset_health {
+            config
+                .health
+                .insert(provider.id.clone(), ProviderHealth::default());
+        } else {
+            config
+                .health
+                .entry(provider.id.clone())
+                .or_insert_with(ProviderHealth::default);
+        }
         config
             .providers
             .insert(provider.id.clone(), provider.clone());

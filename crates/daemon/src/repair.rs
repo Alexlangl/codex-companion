@@ -253,6 +253,17 @@ impl CompanionDaemon {
         codex_companion_state::token_usage_sync_status()
     }
 
+    pub fn pricing_settings(&self) -> Result<codex_companion_core::PricingSettingsSnapshot> {
+        codex_companion_state::read_pricing_settings(&self.store.data_dir())
+    }
+
+    pub fn save_pricing_settings(
+        &self,
+        input: codex_companion_core::PricingSettings,
+    ) -> Result<codex_companion_core::PricingSettingsSnapshot> {
+        codex_companion_state::save_pricing_settings(&self.store.data_dir(), input)
+    }
+
     fn repair_target_provider_id_from_state(&self) -> Result<Option<String>> {
         let config = self.store.load()?;
         let target = match config.app.last_codex_launch_mode {

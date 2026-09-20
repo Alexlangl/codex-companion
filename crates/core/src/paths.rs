@@ -14,6 +14,13 @@ pub fn default_config_path() -> Result<PathBuf> {
     Ok(default_data_dir()?.join("config.json"))
 }
 
+/// Shared by independent Companion stores for the same OS user.
+pub fn account_coordination_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".codex-companion-coordination")
+}
+
 pub fn default_codex_dir() -> Result<PathBuf> {
     if let Some(path) = env_path("CODEX_COMPANION_CODEX_DIR") {
         return Ok(path);

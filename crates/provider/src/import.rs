@@ -174,6 +174,13 @@ fn import_oauth_provider(
     account: ProviderAccountInfo,
 ) -> Result<ProviderImportOutcome> {
     let auth_path = managed_account_credential_path(store, &draft.provider_id);
+    let credentials_changed = fs::read_to_string(&auth_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_none_or(|previous| {
+            official_access_token_from_auth_json(&previous, None)
+                != official_access_token_from_auth_json(&auth, None)
+        });
     if let Some(parent) = auth_path.parent() {
         fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
     }
@@ -211,7 +218,13 @@ fn import_oauth_provider(
                 || {
                     persist_private_credential_change(
                         PrivateCredentialChange::Write(auth_path.clone(), auth_contents),
-                        || add_provider(store, provider_input),
+                        || {
+                            crate::registry::add_provider_with_health_reset(
+                                store,
+                                provider_input,
+                                credentials_changed,
+                            )
+                        },
                     )
                 },
             )
@@ -934,7 +947,16 @@ pub fn import_local_codex_provider(
                         || provider.direct_auth_ref.as_deref() == Some(live_auth_ref.as_str()))
             })
             .map(|(id, _)| id.clone());
-        let mut outcome = import_provider_json(store, &text, existing_local_provider_id, None)?;
+        let mut plan =
+            prepare_provider_import(store, &value, existing_local_provider_id.as_deref(), None)?;
+        if !is_official_pat {
+            if let ProviderImportPlan::OAuth { auth, .. } = &mut plan {
+                // Only local import can establish a live credential authority;
+                // arbitrary imported JSON cannot nominate a filesystem source.
+                auth["companion_local_auth_source"] = serde_json::json!(auth_path);
+            }
+        }
+        let mut outcome = execute_provider_import(store, plan)?;
         let provider = store.update(|config| {
             let provider = config
                 .providers
@@ -1162,7 +1184,7 @@ fn validate_agent_identity_auth(auth: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Value> {
     let candidate =
         if let Some(accounts) = value.get("accounts").and_then(serde_json::Value::as_array) {
             accounts
@@ -1270,6 +1292,11 @@ fn extract_codex_oauth_auth(value: &serde_json::Value) -> Option<serde_json::Val
         .collect::<Vec<_>>();
     let mut identity_sources = vec![credentials, extra, candidate, value];
     identity_sources.extend(token_claims.iter());
+    identity_sources.extend(
+        token_claims
+            .iter()
+            .filter_map(|claims| claims.get("https://api.openai.com/auth")),
+    );
 
     let account_id = pick_first_string(
         &identity_sources,
@@ -1737,6 +1764,8 @@ fn extract_provider_account_info(
     );
 
     ProviderAccountInfo {
+        quota_hourly_present: None,
+        quota_weekly_present: None,
         auth_mode: official_auth_mode_from_auth_json(auth)
             .or_else(|| official_auth_mode_from_auth_json(value))
             .map(|mode| mode.as_str().to_string())
@@ -1780,6 +1809,7 @@ fn extract_oauth_account_id(
             &["account_id"],
             &["tokens", "chatgpt_account_id"],
             &["tokens", "account_id"],
+            &["https://api.openai.com/auth", "chatgpt_account_id"],
             &["credentials", "chatgpt_account_id"],
             &["credentials", "account_id"],
         ],
@@ -1798,6 +1828,8 @@ fn extract_oauth_user_id(source: &serde_json::Value, auth: &serde_json::Value) -
             &["user_id"],
             &["tokens", "chatgpt_user_id"],
             &["tokens", "user_id"],
+            &["https://api.openai.com/auth", "chatgpt_user_id"],
+            &["sub"],
             &["credentials", "chatgpt_user_id"],
             &["credentials", "user_id"],
         ],

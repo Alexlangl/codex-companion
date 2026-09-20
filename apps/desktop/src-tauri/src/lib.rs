@@ -953,6 +953,22 @@ fn get_token_usage_sync_status() -> Result<codex_companion_core::TokenUsageSyncS
 }
 
 #[tauri::command]
+fn get_pricing_settings() -> Result<codex_companion_core::PricingSettingsSnapshot, String> {
+    daemon()?
+        .pricing_settings()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_pricing_settings(
+    input: codex_companion_core::PricingSettings,
+) -> Result<codex_companion_core::PricingSettingsSnapshot, String> {
+    daemon()?
+        .save_pricing_settings(input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn get_session_page(
     codex_dir: Option<String>,
     query: Option<String>,
@@ -1211,6 +1227,8 @@ pub fn run() {
             reset_app_settings,
             get_token_usage,
             get_token_usage_sync_status,
+            get_pricing_settings,
+            save_pricing_settings,
             get_session_page,
             get_session_provider_preferences,
             set_session_provider_preference,

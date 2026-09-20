@@ -26,7 +26,18 @@ pub fn classification_for_kind(kind: HealthFailureKind) -> FailureClassification
 pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassification {
     let lower = body.to_ascii_lowercase();
 
-    if lower.contains("deactivated_workspace") {
+    if [
+        "deactivated_workspace",
+        "account_deactivated",
+        "account_suspended",
+        "account_banned",
+        "user_deactivated",
+        "account has been deactivated",
+        "account has been suspended",
+    ]
+    .iter()
+    .any(|code| lower.contains(code))
+    {
         return class(HealthFailureKind::AuthFailed, false, true);
     }
     if lower.contains("insufficient_quota")
@@ -61,12 +72,8 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
     if lower.contains("model_not_found") || lower.contains("model not found") {
         return class(HealthFailureKind::ModelMissing, true, true);
     }
-    if lower.contains("content_policy_violation")
-        || lower.contains("content policy violation")
-        || lower.contains("content filter")
-        || lower.contains("safety policy")
-    {
-        return class(HealthFailureKind::RequestRejected, true, false);
+    if is_content_moderation_failure(&lower) {
+        return class(HealthFailureKind::RequestRejected, false, false);
     }
     if matches!(status, Some(401)) || (matches!(status, Some(403)) && explicit_auth_failure(&lower))
     {
@@ -98,6 +105,43 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
     class(HealthFailureKind::Unknown, false, false)
 }
 
+/// A refusal is terminal for this request; do not replay it across accounts.
+pub fn is_content_moderation_failure(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    [
+        "content_policy",
+        "content policy",
+        "content_filter",
+        "content filter",
+        "safety policy",
+        "content exists risk",
+        "content moderation",
+        "prompt flagged",
+        "output flagged",
+        "blocked by our content",
+        "violates our content",
+        "responsible_ai",
+        "responsibleai",
+        "responsible ai policy",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Retry-After allows either delta seconds or an HTTP date.
+pub fn retry_after_seconds(value: &str, now: chrono::DateTime<Utc>) -> Option<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc2822(value.trim())
+                .ok()
+                .map(|time| time.signed_duration_since(now).num_seconds().max(0) as u64)
+        })
+        .map(|seconds| seconds.min(30 * 24 * 60 * 60))
+}
+
 pub fn mark_success(health: &mut ProviderHealth) {
     health.last_checked = Some(Utc::now());
     health.status = HealthStatusKind::Healthy;
@@ -109,6 +153,11 @@ pub fn mark_success(health: &mut ProviderHealth) {
 }
 
 pub fn mark_failure(health: &mut ProviderHealth, failure: &FailureClassification, message: String) {
+    if health.status == HealthStatusKind::AuthFailed
+        && failure.kind != HealthFailureKind::AuthFailed
+    {
+        return;
+    }
     if matches!(&failure.kind, HealthFailureKind::RequestRejected) {
         return;
     }
@@ -130,7 +179,7 @@ pub fn mark_failure(health: &mut ProviderHealth, failure: &FailureClassification
 
     if failure.cooldown {
         let seconds = cooldown_seconds(health.failure_count);
-        health.cooldown_until = Some(Utc::now() + Duration::seconds(seconds));
+        extend_cooldown(health, seconds as u64);
         if !matches!(
             health.status,
             HealthStatusKind::AuthFailed
@@ -147,11 +196,37 @@ pub fn mark_model_failure(
     failure: &FailureClassification,
     message: String,
 ) {
+    let previous_cooldown = health.cooldown_until;
     mark_failure(health, failure, message);
-    health.cooldown_until = None;
+    health.cooldown_until = previous_cooldown;
     if matches!(health.status, HealthStatusKind::Cooldown) {
         health.status = HealthStatusKind::Degraded;
     }
+}
+
+pub fn extend_cooldown(health: &mut ProviderHealth, seconds: u64) {
+    let until = Utc::now() + Duration::seconds(seconds.min(30 * 24 * 60 * 60) as i64);
+    health.cooldown_until = Some(health.cooldown_until.map_or(until, |old| old.max(until)));
+}
+
+/// Structured reset hints are also used by Responses errors and WebSocket events.
+pub fn failure_retry_after_seconds(body: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    [
+        &value,
+        value.get("error").unwrap_or(&serde_json::Value::Null),
+        value
+            .pointer("/response/error")
+            .unwrap_or(&serde_json::Value::Null),
+    ]
+    .into_iter()
+    .flat_map(|error| {
+        ["retry_after", "retry_after_seconds", "resets_in_seconds"]
+            .into_iter()
+            .filter_map(move |key| error.get(key).and_then(serde_json::Value::as_u64))
+    })
+    .max()
+    .map(|seconds| seconds.min(30 * 24 * 60 * 60))
 }
 
 pub fn cooldown_active(health: &ProviderHealth) -> bool {
@@ -246,6 +321,70 @@ fn cooldown_seconds(failure_count: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permanent_account_rejections_and_moderation_are_terminal() {
+        for code in [
+            "account_deactivated",
+            "deactivated_workspace",
+            "account_suspended",
+            "account_banned",
+        ] {
+            let failure = classify_failure(Some(400), code);
+            assert_eq!(failure.kind, HealthFailureKind::AuthFailed);
+            assert!(!failure.retryable);
+        }
+        let refusal = classify_failure(Some(403), "content_policy_violation");
+        assert_eq!(refusal.kind, HealthFailureKind::RequestRejected);
+        assert!(!refusal.retryable);
+        assert!(!refusal.cooldown);
+    }
+
+    #[test]
+    fn server_backoff_parses_dates_and_nested_reset_hints() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-18T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(retry_after_seconds("120", now), Some(120));
+        assert_eq!(
+            retry_after_seconds("Fri, 18 Sep 2026 00:02:00 GMT", now),
+            Some(120)
+        );
+        assert_eq!(retry_after_seconds("garbage", now), None);
+        assert_eq!(
+            failure_retry_after_seconds(r#"{"response":{"error":{"resets_in_seconds":7200}}}"#),
+            Some(7200)
+        );
+        assert_eq!(
+            failure_retry_after_seconds(r#"{"error":{"retry_after":3600}}"#),
+            Some(3600)
+        );
+    }
+
+    #[test]
+    fn later_failures_cannot_shorten_backoff_or_unlock_auth() {
+        let mut health = ProviderHealth::default();
+        extend_cooldown(&mut health, 3600);
+        let until = health.cooldown_until;
+        mark_model_failure(
+            &mut health,
+            &classification_for_kind(HealthFailureKind::RateLimited),
+            "rate limit".into(),
+        );
+        assert_eq!(health.cooldown_until, until);
+        mark_failure(
+            &mut health,
+            &classification_for_kind(HealthFailureKind::AuthFailed),
+            "revoked".into(),
+        );
+        mark_failure(
+            &mut health,
+            &classification_for_kind(HealthFailureKind::NetworkFailed),
+            "timeout".into(),
+        );
+        assert_eq!(health.status, HealthStatusKind::AuthFailed);
+        assert_eq!(health.cooldown_until, until);
+    }
 
     #[test]
     fn classifies_common_failures() {

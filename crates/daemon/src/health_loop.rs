@@ -5,7 +5,8 @@ use codex_companion_core::{
 };
 use codex_companion_health::{mark_failure, mark_success};
 use codex_companion_provider::{
-    ensure_codex_auth_snapshot_detailed, provider_uses_codex_oauth, refresh_provider_status,
+    ensure_codex_auth_snapshot_detailed, provider_uses_codex_oauth,
+    refresh_provider_status_background,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -217,9 +218,27 @@ async fn refresh_due_providers(store: &ConfigStore) {
         .providers
         .values()
         .filter(|provider| provider.enabled)
+        // An upstream 401/403 is a credential failure, not a transient health
+        // check result. A local auth.json snapshot must not clear it; recovery
+        // requires an explicit credential refresh or a successful relay call.
         .filter(|provider| {
+            !config.health.get(&provider.id).is_some_and(|health| {
+                health.status == codex_companion_core::HealthStatusKind::AuthFailed
+            })
+        })
+        .filter(|provider| {
+            let reserve_enabled = config
+                .relay
+                .account_protection
+                .providers
+                .get(&provider.id)
+                .is_some_and(|policy| policy.quota_reserve.is_some());
             provider_refresh_due(
-                provider.refresh_interval_seconds,
+                if reserve_enabled {
+                    provider.refresh_interval_seconds.min(120)
+                } else {
+                    provider.refresh_interval_seconds
+                },
                 config.health.get(&provider.id),
                 now,
             )
@@ -234,7 +253,7 @@ async fn refresh_due_providers(store: &ConfigStore) {
     let mut first_error = None;
     for (index, id) in ids.iter().enumerate() {
         progress.mark_provider(id, index);
-        if let Err(error) = refresh_provider_status(store, id).await {
+        if let Err(error) = refresh_provider_status_background(store, id).await {
             first_error.get_or_insert_with(|| error.to_string());
         }
         progress.mark_provider(id, index + 1);
@@ -250,6 +269,13 @@ fn official_oauth_keepalive_providers(config: &CompanionConfig) -> Vec<ProviderC
             provider.enabled
                 && provider.kind == ProviderKind::OfficialCodex
                 && provider_uses_codex_oauth(provider)
+                && !config.health.get(&provider.id).is_some_and(|health| {
+                    health.status == codex_companion_core::HealthStatusKind::AuthFailed
+                        || codex_companion_health::cooldown_active(health)
+                        || health
+                            .next_refresh_after
+                            .is_some_and(|until| until > Utc::now())
+                })
         })
         .cloned()
         .collect()
@@ -270,6 +296,9 @@ async fn keep_official_oauth_alive(store: &ConfigStore, config: &CompanionConfig
                 clear_oauth_keepalive_health_failure(store, &current.id);
             }
             Err(error) => {
+                if error.message.starts_with("token_authority_deferred:") {
+                    continue;
+                }
                 if current_provider_if_unchanged(store, &provider).is_none() {
                     continue;
                 }
@@ -281,6 +310,15 @@ async fn keep_official_oauth_alive(store: &ConfigStore, config: &CompanionConfig
                     &error.failure_classification(),
                     &message,
                 );
+                if let Some(seconds) = error.retry_after_seconds {
+                    let _ = store.update(|config| {
+                        codex_companion_health::extend_cooldown(
+                            config.health.entry(provider.id.clone()).or_default(),
+                            seconds,
+                        );
+                        Ok(())
+                    });
+                }
                 if should_log_oauth_keepalive_error(store, &provider.id, &message) {
                     let _ = append_diagnostic_log(
                         &store.data_dir(),
@@ -326,7 +364,10 @@ fn clear_oauth_keepalive_health_failure(store: &ConfigStore, provider_id: &str) 
             .last_error
             .as_deref()
             .is_some_and(|message| message.starts_with("OAuth 保活失败: "));
-        if is_keepalive_failure {
+        if is_keepalive_failure
+            && health.status != codex_companion_core::HealthStatusKind::AuthFailed
+            && !codex_companion_health::cooldown_active(health)
+        {
             mark_success(health);
         }
         Ok(())
@@ -403,6 +444,12 @@ fn provider_refresh_due(
     health: Option<&ProviderHealth>,
     now: chrono::DateTime<Utc>,
 ) -> bool {
+    if health.is_some_and(|health| {
+        health.status == codex_companion_core::HealthStatusKind::AuthFailed
+            || health.next_refresh_after.is_some_and(|until| until > now)
+    }) {
+        return false;
+    }
     health
         .and_then(|health| health.last_refresh_attempt)
         .is_none_or(|last_attempt| {
@@ -562,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_failure_is_persisted_and_only_its_own_recovery_clears_it() {
+    fn local_keepalive_success_cannot_clear_permanent_auth_failure() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = ConfigStore::new(temp.path().join("config.json"));
         let failure = codex_companion_health::classification_for_kind(
@@ -586,9 +633,9 @@ mod tests {
         let recovered = store.load().expect("recovered config");
         assert_eq!(
             recovered.health["official"].status,
-            codex_companion_core::HealthStatusKind::Healthy
+            codex_companion_core::HealthStatusKind::AuthFailed
         );
-        assert!(recovered.health["official"].last_error.is_none());
+        assert!(recovered.health["official"].last_error.is_some());
 
         store
             .update(|config| {

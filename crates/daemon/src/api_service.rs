@@ -141,6 +141,9 @@ impl CompanionDaemon {
             config.relay.model_cooldown_seconds = input.model_cooldown_seconds;
             config.relay.session_affinity_ttl_seconds = input.session_affinity_ttl_seconds;
             config.relay.request_log_retention_days = input.request_log_retention_days;
+            if let Some(protection) = input.account_protection {
+                config.relay.account_protection = protection;
+            }
             Ok(config.relay.clone())
         })?;
         let _ = self
@@ -207,6 +210,42 @@ impl CompanionDaemon {
 }
 
 fn validate_relay_settings(input: &RelaySettingsUpdate) -> Result<()> {
+    if let Some(policy) = &input.account_protection {
+        if policy
+            .codex_client_version
+            .as_deref()
+            .is_some_and(|version| {
+                version.is_empty()
+                    || version.len() > 64
+                    || !version.contains('.')
+                    || !version
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'+'))
+            })
+        {
+            return Err(CompanionError::InvalidConfig(
+                "Codex 客户端版本格式无效".into(),
+            ));
+        }
+        if policy.max_account_concurrency > 256 || policy.account_concurrency_wait_ms > 120_000 {
+            return Err(CompanionError::InvalidConfig(
+                "账号并发上限须为 0–256，等待时间须为 0–120000 毫秒".into(),
+            ));
+        }
+        for reserve in policy
+            .providers
+            .values()
+            .filter_map(|policy| policy.quota_reserve.as_ref())
+        {
+            if !(1..=100).contains(&reserve.hourly_threshold_percent)
+                || !(1..=100).contains(&reserve.weekly_threshold_percent)
+            {
+                return Err(CompanionError::InvalidConfig(
+                    "额度保留阈值须为 1–100%".into(),
+                ));
+            }
+        }
+    }
     let host = input.host.trim();
     if host.is_empty()
         || host.contains('/')
@@ -294,6 +333,7 @@ mod tests {
             model_cooldown_seconds: 300,
             session_affinity_ttl_seconds: 3600,
             request_log_retention_days: 30,
+            account_protection: None,
         };
         assert!(validate_relay_settings(&valid).is_ok());
         assert!(validate_relay_settings(&RelaySettingsUpdate {

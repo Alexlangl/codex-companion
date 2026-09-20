@@ -1,4 +1,4 @@
-use crate::health_loop::{refresh_coordinator, RefreshProgressGuard};
+use crate::health_loop::RefreshProgressGuard;
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{ProviderConfig, ProviderHealth, ProviderImportProgress, Result};
 use codex_companion_provider::{
@@ -133,7 +133,6 @@ impl CompanionDaemon {
     }
 
     pub async fn refresh_provider(&self, id: &str) -> Result<ProviderHealth> {
-        let _guard = refresh_coordinator().lock().await;
         let progress = RefreshProgressGuard::begin(&self.store, &[id.to_string()]);
         progress.mark_provider(id, 0);
         let result = refresh_provider_status(&self.store, id).await;
@@ -142,7 +141,6 @@ impl CompanionDaemon {
     }
 
     pub async fn refresh_all_providers(&self) -> Result<Vec<ProviderHealth>> {
-        let _guard = refresh_coordinator().lock().await;
         let ids = self
             .store
             .load()?

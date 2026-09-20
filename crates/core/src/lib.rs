@@ -1,4 +1,6 @@
+mod account_policy;
 mod auth;
+pub use account_policy::*;
 mod constants;
 mod diagnostics;
 mod error;
@@ -21,7 +23,9 @@ pub use error::{CompanionError, Result};
 pub use events::now_event;
 pub use http_client::desktop_proxy_environment;
 pub use http_client::http_client_builder;
-pub use paths::{default_codex_dir, default_config_path, default_data_dir};
+pub use paths::{
+    account_coordination_dir, default_codex_dir, default_config_path, default_data_dir,
+};
 pub use private_file::atomic_write_private_file;
 pub use provider_url::{
     provider_api_base_url, provider_base_url_is_endpoint, provider_endpoint_is_chat_completions,

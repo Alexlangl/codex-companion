@@ -1,4 +1,7 @@
-use codex_companion_core::{CompanionError, Result, TokenCostBreakdown};
+use codex_companion_core::{
+    atomic_write_private_file, CompanionError, ModelPriceSettings, PricingSettings,
+    PricingSettingsSnapshot, Result, TokenCostBreakdown,
+};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,6 +10,88 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub const PRICING_AS_OF: &str = "2026-08-09";
+
+pub fn read_pricing_settings(data_dir: &Path) -> Result<PricingSettingsSnapshot> {
+    let path = data_dir.join("model-pricing.json");
+    let mut overrides = PricingSettings::default();
+    if path.exists() {
+        let text = fs::read_to_string(&path).map_err(|source| CompanionError::io(&path, source))?;
+        let raw: PricingOverride =
+            serde_json::from_str(&text).map_err(|source| CompanionError::json(&path, source))?;
+        overrides.models = raw
+            .models
+            .into_iter()
+            .map(|model| ModelPriceSettings {
+                model: model.model,
+                cache_write_input_per_million: model
+                    .cache_write_input_per_million
+                    .as_ref()
+                    .unwrap_or(&model.input_per_million)
+                    .to_string(),
+                input_per_million: model.input_per_million.to_string(),
+                cached_input_per_million: model.cached_input_per_million.to_string(),
+                output_per_million: model.output_per_million.to_string(),
+                aliases: model.aliases,
+            })
+            .collect();
+        overrides.provider_multipliers = raw
+            .provider_multipliers
+            .into_iter()
+            .map(|(key, value)| (key, value.to_string()))
+            .collect();
+    }
+    let builtin_models = PricingCatalog::builtin()
+        .models
+        .into_values()
+        .map(|price| ModelPriceSettings {
+            model: price.model,
+            input_per_million: price.input_per_million.to_string(),
+            cached_input_per_million: price.cached_input_per_million.to_string(),
+            cache_write_input_per_million: price.cache_write_input_per_million.to_string(),
+            output_per_million: price.output_per_million.to_string(),
+            aliases: Vec::new(),
+        })
+        .collect();
+    Ok(PricingSettingsSnapshot {
+        builtin_models,
+        overrides,
+        pricing_as_of: PRICING_AS_OF.into(),
+    })
+}
+
+pub fn save_pricing_settings(
+    data_dir: &Path,
+    settings: PricingSettings,
+) -> Result<PricingSettingsSnapshot> {
+    let path = data_dir.join("model-pricing.json");
+    let mut names = BTreeSet::new();
+    for model in &settings.models {
+        for name in std::iter::once(&model.model).chain(model.aliases.iter()) {
+            let key = normalize_model_key(name);
+            if key.is_empty() || !names.insert(key) {
+                return Err(CompanionError::InvalidConfig(format!(
+                    "模型名称或别名为空或重复：{name}"
+                )));
+            }
+        }
+    }
+    let mut providers = BTreeSet::new();
+    for key in settings.provider_multipliers.keys() {
+        if key.trim().is_empty() || !providers.insert(key.trim().to_ascii_lowercase()) {
+            return Err(CompanionError::InvalidConfig(
+                "账号倍率的账号为空或重复".into(),
+            ));
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&settings)
+        .map_err(|source| CompanionError::json(&path, source))?;
+    let raw =
+        serde_json::from_slice(&bytes).map_err(|source| CompanionError::json(&path, source))?;
+    // Validate the entire catalog before replacing the previous file.
+    PricingCatalog::builtin().apply_override(&path, raw)?;
+    atomic_write_private_file(&path, &bytes)?;
+    read_pricing_settings(data_dir)
+}
 const TOKENS_PER_MILLION: u64 = 1_000_000;
 
 #[derive(Debug, Clone)]
@@ -126,13 +211,17 @@ impl PricingCatalog {
         catalog
     }
 
-    pub fn load_override(mut self, path: &Path) -> Result<Self> {
+    pub fn load_override(self, path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(self);
         }
         let text = fs::read_to_string(path).map_err(|source| CompanionError::io(path, source))?;
         let value = serde_json::from_str::<PricingOverride>(&text)
             .map_err(|source| CompanionError::json(path, source))?;
+        self.apply_override(path, value)
+    }
+
+    fn apply_override(mut self, path: &Path, value: PricingOverride) -> Result<Self> {
         for model in value.models {
             let input = parse_nonnegative_decimal(
                 path,
@@ -357,6 +446,66 @@ fn format_usd(value: Decimal) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editable_pricing_preserves_legacy_aliases_precision_and_multiplier() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("model-pricing.json");
+        std::fs::write(&path, r#"{"models":[{"model":"test-model","inputPerMillion":"0.1234567890123456789","cachedInputPerMillion":0,"outputPerMillion":2,"aliases":["test-alias"]}],"providerMultipliers":{"account":0.8}}"#).unwrap();
+        let snapshot = super::read_pricing_settings(temp.path()).unwrap();
+        assert_eq!(
+            snapshot.overrides.models[0].input_per_million,
+            "0.1234567890123456789"
+        );
+        assert_eq!(
+            snapshot.overrides.models[0].cache_write_input_per_million,
+            "0.1234567890123456789"
+        );
+        super::save_pricing_settings(temp.path(), snapshot.overrides).unwrap();
+        let catalog = super::PricingCatalog::builtin()
+            .load_override(&path)
+            .unwrap();
+        let (_, cost) = catalog
+            .estimate("test-alias", Some("account"), 0, 0, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(cost.total_usd(), super::decimal("1.6"));
+    }
+
+    #[test]
+    fn invalid_edits_leave_previous_pricing_untouched_and_reset_restores_builtin() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = super::read_pricing_settings(temp.path()).unwrap();
+        let mut price = settings.builtin_models.remove(0);
+        let name = price.model.clone();
+        let builtin_price = price.input_per_million.clone();
+        price.input_per_million = "123".into();
+        settings.overrides.models.push(price);
+        super::save_pricing_settings(temp.path(), settings.overrides.clone()).unwrap();
+        let path = temp.path().join("model-pricing.json");
+        let previous = std::fs::read(&path).unwrap();
+        let mut negative = settings.overrides.clone();
+        negative.models[0].output_per_million = "-1".into();
+        assert!(super::save_pricing_settings(temp.path(), negative).is_err());
+        let mut duplicate = settings.overrides.clone();
+        duplicate.models[0].aliases.push(name.to_uppercase());
+        assert!(super::save_pricing_settings(temp.path(), duplicate).is_err());
+        let mut empty = settings.overrides.clone();
+        empty.models[0].model = " ".into();
+        assert!(super::save_pricing_settings(temp.path(), empty).is_err());
+        settings
+            .overrides
+            .provider_multipliers
+            .insert("account".into(), "0".into());
+        assert!(super::save_pricing_settings(temp.path(), settings.overrides).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+        super::save_pricing_settings(temp.path(), Default::default()).unwrap();
+        let catalog = super::PricingCatalog::builtin()
+            .load_override(&path)
+            .unwrap();
+        assert_eq!(
+            catalog.find(&name).unwrap().input_per_million,
+            super::decimal(&builtin_price)
+        );
+    }
     use super::*;
 
     #[test]

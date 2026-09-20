@@ -100,6 +100,9 @@ struct RelayClientUpdateArgs {
 
 #[derive(Debug, Args)]
 struct RelaySettingsArgs {
+    /// JSON file containing account concurrency, quota reserve and model policies.
+    #[arg(long)]
+    account_protection_file: Option<PathBuf>,
     #[arg(long)]
     require_api_key: Option<bool>,
     #[arg(long)]
@@ -353,6 +356,12 @@ async fn main() -> anyhow::Result<()> {
                         request_log_retention_days: args
                             .request_log_retention_days
                             .unwrap_or(current.request_log_retention_days),
+                        account_protection: args
+                            .account_protection_file
+                            .map(|path| -> anyhow::Result<_> {
+                                Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+                            })
+                            .transpose()?,
                     })?,
                 )?;
             }

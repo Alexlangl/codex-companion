@@ -31,9 +31,11 @@ pub(crate) struct RelayState {
     priority_failback_baselines: Arc<HashMap<String, u64>>,
     provider_inflight: Arc<Mutex<HashMap<String, usize>>>,
     round_robin_sequence: Arc<AtomicU64>,
+    pub(crate) account_concurrency: Arc<crate::account_concurrency::AccountConcurrency>,
 }
 
 pub(crate) struct ProviderRequestGuard {
+    pub(crate) account_permit: Option<Arc<crate::account_concurrency::AccountPermit>>,
     provider_id: String,
     provider_inflight: Arc<Mutex<HashMap<String, usize>>>,
 }
@@ -95,6 +97,15 @@ impl RelayState {
             })
             .unwrap_or_default();
         Self {
+            account_concurrency: Arc::new(crate::account_concurrency::AccountConcurrency::shared(
+                {
+                    #[cfg(test)]
+                    let root = store.data_dir();
+                    #[cfg(not(test))]
+                    let root = codex_companion_core::account_coordination_dir();
+                    root.join("account-slots")
+                },
+            )),
             store,
             client,
             api_service,
@@ -274,6 +285,7 @@ impl RelayState {
             *inflight.entry(provider_id.to_string()).or_default() += 1;
         }
         ProviderRequestGuard {
+            account_permit: None,
             provider_id: provider_id.to_string(),
             provider_inflight: self.provider_inflight.clone(),
         }

@@ -11,4 +11,4 @@ description.workspace = true
 chrono.workspace = true
 codex-companion-core.workspace = true
 serde.workspace = true
-
+serde_json.workspace = true

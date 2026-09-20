@@ -38,6 +38,7 @@ const COMPANION_MARKER_VERSION: i64 = 4;
 const COMPANION_STATE_RELATIVE_PATH: &str = "backups/codex-companion/managed-state.json";
 const REPAIR_BACKUP_RETENTION: usize = 10;
 
+pub use pricing::{read_pricing_settings, save_pricing_settings};
 pub use session_index::list_sessions_cached;
 pub use token_usage::{
     collect_token_usage, collect_token_usage_cached, collect_token_usage_cached_in_range,

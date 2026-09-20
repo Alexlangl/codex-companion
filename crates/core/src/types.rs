@@ -158,6 +158,34 @@ pub struct RelayConfig {
     pub session_affinity_ttl_seconds: u64,
     #[serde(default = "default_request_log_retention_days")]
     pub request_log_retention_days: u16,
+    #[serde(default)]
+    pub account_protection: AccountProtection,
+}
+
+/// Optional policies mirror Cockpit's account selector controls. Zero disables
+/// the concurrency limit; quota reserve is opt-in for each provider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AccountProtection {
+    pub codex_client_version: Option<String>,
+    pub max_account_concurrency: u16,
+    pub account_concurrency_wait_ms: u64,
+    pub excluded_models: Vec<String>,
+    pub providers: BTreeMap<String, AccountPolicy>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AccountPolicy {
+    pub excluded_models: Vec<String>,
+    pub quota_reserve: Option<QuotaReserve>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaReserve {
+    pub hourly_threshold_percent: u8,
+    pub weekly_threshold_percent: u8,
 }
 
 impl Default for RelayConfig {
@@ -171,6 +199,7 @@ impl Default for RelayConfig {
             model_cooldown_seconds: default_model_cooldown_seconds(),
             session_affinity_ttl_seconds: default_session_affinity_ttl_seconds(),
             request_log_retention_days: default_request_log_retention_days(),
+            account_protection: AccountProtection::default(),
         }
     }
 }
@@ -233,6 +262,10 @@ pub enum ProviderUsageQueryTemplate {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAccountInfo {
+    #[serde(default)]
+    pub quota_hourly_present: Option<bool>,
+    #[serde(default)]
+    pub quota_weekly_present: Option<bool>,
     #[serde(default)]
     pub auth_mode: Option<String>,
     pub display_name: Option<String>,
@@ -306,6 +339,12 @@ pub struct ProviderHealth {
     pub last_checked: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_refresh_attempt: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub refresh_failure_count: u32,
+    #[serde(default)]
+    pub next_refresh_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub refresh_error: Option<String>,
     pub last_success: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub last_failure_kind: Option<HealthFailureKind>,
@@ -319,6 +358,9 @@ impl Default for ProviderHealth {
             status: HealthStatusKind::Unknown,
             last_checked: None,
             last_refresh_attempt: None,
+            refresh_failure_count: 0,
+            next_refresh_after: None,
+            refresh_error: None,
             last_success: None,
             last_error: None,
             last_failure_kind: None,
@@ -353,6 +395,8 @@ pub struct RelaySettingsUpdate {
     pub model_cooldown_seconds: u64,
     pub session_affinity_ttl_seconds: u64,
     pub request_log_retention_days: u16,
+    #[serde(default)]
+    pub account_protection: Option<AccountProtection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -894,4 +938,30 @@ mod tests {
         assert_eq!(group.priority_failback_revision, 0);
         assert_eq!(group.priority_failback_target_provider_id, None);
     }
+}
+/// Editable local cost estimates. Decimal strings avoid rounding during editing.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingSettings {
+    pub models: Vec<ModelPriceSettings>,
+    pub provider_multipliers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPriceSettings {
+    pub model: String,
+    pub input_per_million: String,
+    pub cached_input_per_million: String,
+    pub cache_write_input_per_million: String,
+    pub output_per_million: String,
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingSettingsSnapshot {
+    pub builtin_models: Vec<ModelPriceSettings>,
+    pub overrides: PricingSettings,
+    pub pricing_as_of: String,
 }

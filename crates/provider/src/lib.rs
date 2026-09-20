@@ -1,13 +1,16 @@
 mod account_refresh;
 mod agent_identity;
 mod auth;
+mod codex_identity;
 mod codex_oauth;
 mod export;
 mod groups;
 mod http;
 mod import;
 mod refresh;
+mod refresh_scheduler;
 mod registry;
+mod token_authority;
 mod types;
 mod validate;
 
@@ -15,7 +18,9 @@ use codex_companion_core::{atomic_write_private_file, CompanionError, Result};
 use std::{fs, path::Path};
 
 pub use account_refresh::{refresh_official_codex_account, test_configured_usage_query};
-pub use auth::{resolve_auth_token, resolve_chatgpt_account_id, sync_official_auth_mode};
+pub use auth::{
+    account_identity_key, resolve_auth_token, resolve_chatgpt_account_id, sync_official_auth_mode,
+};
 pub use codex_oauth::{
     ensure_codex_auth_snapshot, ensure_codex_auth_snapshot_detailed,
     ensure_codex_auth_snapshot_with_status, ensure_codex_auth_snapshot_with_status_detailed,
@@ -33,7 +38,7 @@ pub use import::{
     import_provider_json, import_provider_json_many, parse_provider_import_draft,
     provider_import_progress, review_provider_json_many, ApiKeyProviderImportRequest,
 };
-pub use refresh::{refresh_provider_status, test_provider};
+pub use refresh::{refresh_provider_status, refresh_provider_status_background, test_provider};
 pub use registry::{add_provider, list_providers, remove_provider, update_api_key_provider};
 pub use types::{
     ApiKeyProviderUpdate, GroupUpsert, ProviderExportFormat, ProviderExportOutput,
