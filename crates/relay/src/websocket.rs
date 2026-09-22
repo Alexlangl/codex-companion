@@ -13,7 +13,7 @@ use codex_companion_core::{
     ApiClient, HealthStatusKind, ProviderConfig, ProviderKind, COMPANION_RELAY_BEARER_TOKEN,
 };
 use codex_companion_health::{
-    classify_failure, cooldown_active, mark_failure, normalize_expired_cooldown,
+    classify_failure, mark_failure, normalize_expired_cooldown,
     repair_legacy_auth_misclassification, FailureClassification,
 };
 use codex_companion_provider::{
@@ -284,11 +284,15 @@ fn websocket_candidates(
 
 fn normalize_websocket_health(config: &mut codex_companion_core::CompanionConfig) -> bool {
     let mut changed = false;
-    for health in config.health.values_mut() {
+    for (id, health) in &mut config.health {
         changed |= repair_legacy_auth_misclassification(health);
         let previous_status = health.status.clone();
         let previous_cooldown = health.cooldown_until;
-        normalize_expired_cooldown(health);
+        if let Some(provider) = config.providers.get(id) {
+            codex_companion_health::normalize_provider_cooldown(&provider.kind, health);
+        } else {
+            normalize_expired_cooldown(health);
+        }
         changed |= health.status != previous_status || health.cooldown_until != previous_cooldown;
     }
     changed
@@ -319,7 +323,9 @@ fn websocket_candidates_from_selected(
             if health.is_some_and(|health| matches!(health.status, HealthStatusKind::AuthFailed)) {
                 return None;
             }
-            if health.is_none_or(|health| !cooldown_active(health)) {
+            if health.is_none_or(|health| {
+                !codex_companion_health::provider_cooldown_active(&provider.kind, health)
+            }) {
                 return Some(provider);
             }
             None
@@ -3236,6 +3242,7 @@ mod tests {
         let state = state_with_group(vec![
             provider("invalid", Some("ws://127.0.0.1:1/invalid".to_string())),
             provider("cooling", Some("ws://127.0.0.1:1/cooling".to_string())),
+            provider("quota", Some("ws://127.0.0.1:1/quota".into())),
             provider("healthy", Some("ws://127.0.0.1:1/healthy".to_string())),
         ]);
         state
@@ -3258,6 +3265,15 @@ mod tests {
                         ..Default::default()
                     },
                 );
+                config.health.insert(
+                    "quota".into(),
+                    codex_companion_core::ProviderHealth {
+                        status: HealthStatusKind::QuotaExhausted,
+                        last_failure_kind: Some(HealthFailureKind::QuotaExhausted),
+                        cooldown_until: Some(chrono::Utc::now() + chrono::Duration::minutes(1)),
+                        ..Default::default()
+                    },
+                );
                 Ok(())
             })
             .expect("health");
@@ -3269,7 +3285,7 @@ mod tests {
                 .iter()
                 .map(|provider| provider.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["healthy"]
+            vec!["cooling", "healthy"]
         );
     }
 

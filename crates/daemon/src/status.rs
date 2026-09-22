@@ -4,7 +4,7 @@ use codex_companion_core::{
     default_codex_dir, CompanionConfig, CompanionStatus, DataRootStatus, ProviderConfig,
     ProviderGroup, RelayEvent, Result,
 };
-use codex_companion_health::repair_legacy_auth_misclassification;
+use codex_companion_health::{normalize_expired_cooldown, repair_legacy_auth_misclassification};
 use codex_companion_provider::{active_group, selected_providers, sync_official_auth_mode};
 use codex_companion_relay::read_recent_events;
 use codex_companion_state::{
@@ -99,8 +99,16 @@ fn non_empty_env(name: &str) -> bool {
 
 fn repair_legacy_health(config: &mut CompanionConfig) -> bool {
     let mut repaired = false;
-    for health in config.health.values_mut() {
+    for (id, health) in &mut config.health {
         repaired |= repair_legacy_auth_misclassification(health);
+        let previous_status = health.status.clone();
+        let previous_cooldown = health.cooldown_until;
+        if let Some(provider) = config.providers.get(id) {
+            codex_companion_health::normalize_provider_cooldown(&provider.kind, health);
+        } else {
+            normalize_expired_cooldown(health);
+        }
+        repaired |= health.status != previous_status || health.cooldown_until != previous_cooldown;
     }
     repaired
 }
@@ -125,6 +133,43 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::fs;
+
+    #[test]
+    fn status_clears_expired_cooldown_without_a_relay_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                for (id, status) in [
+                    ("expired", HealthStatusKind::Cooldown),
+                    ("revoked", HealthStatusKind::AuthFailed),
+                ] {
+                    config.health.insert(
+                        id.into(),
+                        ProviderHealth {
+                            status,
+                            cooldown_until: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+                            last_failure_kind: Some(HealthFailureKind::NetworkFailed),
+                            ..ProviderHealth::default()
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        let config = CompanionDaemon::new(store.clone())
+            .load_config_with_repaired_legacy_health()
+            .unwrap();
+        assert_eq!(config.health["expired"].status, HealthStatusKind::Degraded);
+        assert!(config.health["expired"].cooldown_until.is_none());
+        assert_eq!(
+            config.health["revoked"].status,
+            HealthStatusKind::AuthFailed
+        );
+        assert!(store.load().unwrap().health["expired"]
+            .cooldown_until
+            .is_none());
+    }
 
     #[test]
     fn install_uses_models_declared_by_the_active_group() {

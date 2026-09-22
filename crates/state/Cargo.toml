@@ -18,6 +18,4 @@ sha2.workspace = true
 thiserror.workspace = true
 toml_edit.workspace = true
 walkdir.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true

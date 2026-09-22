@@ -89,6 +89,9 @@ pub(crate) fn record_health_success(store: &ConfigStore, provider_id: &str) -> b
     let persisted = store
         .update(|config| {
             let health = config.health.entry(provider_id.to_string()).or_default();
+            if let Some(provider) = config.providers.get(provider_id) {
+                codex_companion_health::normalize_provider_cooldown(&provider.kind, health);
+            }
             if health.status == HealthStatusKind::AuthFailed
                 || codex_companion_health::cooldown_active(health)
             {
@@ -136,6 +139,9 @@ where
     let _ = store.update(|config| {
         let health = config.health.entry(provider_id.to_string()).or_default();
         update(health);
+        if let Some(provider) = config.providers.get(provider_id) {
+            codex_companion_health::normalize_provider_cooldown(&provider.kind, health);
+        }
         Ok(())
     });
 }

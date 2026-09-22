@@ -14,6 +14,14 @@ impl CompanionDaemon {
         let service = self.api_service_store()?;
         let mut snapshot = service.snapshot(100)?;
         let config = self.store.load()?;
+        snapshot.model_cooldowns.retain(|cooldown| {
+            config
+                .providers
+                .get(&cooldown.provider_id)
+                .is_some_and(|provider| {
+                    provider.kind == codex_companion_core::ProviderKind::OfficialCodex
+                })
+        });
         snapshot.affinity_bindings =
             service.affinity_binding_count(config.relay.session_affinity_ttl_seconds)?;
         snapshot.pool_health.total = config.providers.len();
@@ -23,11 +31,15 @@ impl CompanionDaemon {
             .filter(|provider| provider.enabled)
         {
             snapshot.pool_health.enabled += 1;
+            if config.health.get(&provider.id).is_some_and(|health| {
+                codex_companion_health::provider_cooldown_active(&provider.kind, health)
+                    && health.status != HealthStatusKind::AuthFailed
+            }) {
+                snapshot.pool_health.cooldown += 1;
+                continue;
+            }
             match config.health.get(&provider.id).map(|health| &health.status) {
                 Some(HealthStatusKind::Healthy) => snapshot.pool_health.healthy += 1,
-                Some(HealthStatusKind::Cooldown | HealthStatusKind::RateLimited) => {
-                    snapshot.pool_health.cooldown += 1;
-                }
                 Some(HealthStatusKind::Unknown) | None => {}
                 Some(_) => snapshot.pool_health.degraded += 1,
             }

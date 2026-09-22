@@ -167,13 +167,18 @@ pub async fn test_provider_detailed(
         Ok(())
     } else {
         let status = response.status();
+        let retry_after_seconds = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| codex_companion_health::retry_after_seconds(value, Utc::now()));
         let body = read_response_bytes_limited(response, PROVIDER_TEST_RESPONSE_LIMIT_BYTES)
             .await
             .map(|body| redact_sensitive_text(&String::from_utf8_lossy(&body)))
             .unwrap_or_else(|error| format!("[{error}]"));
         Err(ProviderTestFailure {
             status: Some(status.as_u16()),
-            retry_after_seconds: None,
+            retry_after_seconds,
             message: format!("provider returned {status}: {body}"),
             classification: None,
         })
@@ -319,14 +324,12 @@ fn persist_refresh_outcome(
                 health.refresh_failure_count = 0;
                 health.next_refresh_after = None;
                 health.refresh_error = None;
-                // A readable local token (and even a successful quota query) is
-                // not evidence that a previously rejected relay credential works.
-                // Only a real relay success or reauthorization clears that state.
-                if snapshot.provider.kind != ProviderKind::OfficialCodex {
-                    mark_success(health);
-                } else if health.status != codex_companion_core::HealthStatusKind::AuthFailed
+                // A successful /models or quota query does not prove inference
+                // has recovered. Preserve relay failures and their retry deadline.
+                if health.status != codex_companion_core::HealthStatusKind::AuthFailed
                     && health.last_failure_kind.is_none()
-                    && account_result.is_some()
+                    && (snapshot.provider.kind != ProviderKind::OfficialCodex
+                        || account_result.is_some())
                 {
                     mark_success(health);
                 }
@@ -353,10 +356,13 @@ fn persist_refresh_outcome(
                 let classification = failure
                     .classification
                     .unwrap_or_else(|| classify_failure(failure.status, &failure.message));
-                // Quota failures have their own backoff. They must not overwrite
-                // a real relay failure; authentication rejection is the exception.
-                if snapshot.provider.kind != ProviderKind::OfficialCodex
-                    || classification.kind == HealthFailureKind::AuthFailed
+                // /models and quota probes have their own backoff. Endpoint
+                // failures must not repeatedly renew the inference cooldown.
+                // Explicit credential rejection or third-party quota exhaustion
+                // remain authoritative account-level failures.
+                if classification.kind == HealthFailureKind::AuthFailed
+                    || (snapshot.provider.kind != ProviderKind::OfficialCodex
+                        && classification.kind == HealthFailureKind::QuotaExhausted)
                 {
                     mark_failure(health, &classification, failure.message);
                 }
@@ -526,6 +532,101 @@ mod tests {
         .unwrap();
         assert_eq!(retained.status, HealthStatusKind::AuthFailed);
         assert_eq!(retained.last_error.as_deref(), Some("revoked"));
+    }
+
+    #[test]
+    fn repeated_model_probes_do_not_create_or_extend_relay_cooldown() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                config.providers.insert("api".into(), api_provider());
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = ProviderRefreshSnapshot::capture(&store, "api").unwrap();
+        for status in [429, 503, 404] {
+            let health = persist_refresh_outcome(
+                &store,
+                "api",
+                &snapshot,
+                Err(ProviderTestFailure {
+                    status: Some(status),
+                    retry_after_seconds: Some(3600),
+                    message: format!("provider returned {status}"),
+                    classification: None,
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(health.failure_count, 0);
+            assert!(health.cooldown_until.is_none());
+            assert!(health.refresh_error.is_some());
+            assert!(health.next_refresh_after.unwrap() > Utc::now());
+        }
+        store
+            .update(|config| {
+                mark_failure(
+                    config.health.get_mut("api").unwrap(),
+                    &classify_failure(Some(503), "inference unavailable"),
+                    "inference unavailable".into(),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let before = store.load().unwrap().health["api"].clone();
+        for result in [
+            Err(ProviderTestFailure::network(
+                "models connection failed".into(),
+            )),
+            Ok(()),
+        ] {
+            let health =
+                persist_refresh_outcome(&store, "api", &snapshot, result, None, None).unwrap();
+            assert_eq!(health.cooldown_until, before.cooldown_until);
+            assert_eq!(health.failure_count, before.failure_count);
+            assert_eq!(health.last_error, before.last_error);
+            assert_eq!(health.last_failure_kind, before.last_failure_kind);
+            assert_eq!(health.last_checked, before.last_checked);
+        }
+    }
+
+    #[tokio::test]
+    async fn models_probe_respects_retry_after_without_blocking_inference() {
+        use axum::{http::StatusCode, routing::get, Router};
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "7200")],
+                    "too many requests",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut provider = api_provider();
+        provider.base_url = format!("http://{address}/v1");
+        let failure = test_provider_detailed(&provider).await.unwrap_err();
+        assert_eq!(failure.retry_after_seconds, Some(7200));
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                config.providers.insert("api".into(), provider);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = ProviderRefreshSnapshot::capture(&store, "api").unwrap();
+        let before = Utc::now();
+        let health =
+            persist_refresh_outcome(&store, "api", &snapshot, Err(failure), None, None).unwrap();
+        assert!(health.next_refresh_after.unwrap() >= before + chrono::Duration::seconds(7200));
+        assert!(health.cooldown_until.is_none());
+        task.abort();
     }
 
     #[tokio::test]

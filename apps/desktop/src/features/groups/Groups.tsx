@@ -7,7 +7,7 @@ import { currentApplication, userVisibleGroups } from "../../lib/current-applica
 import { getApiRequestLogs } from "../../lib/api";
 import { formatTime } from "../../lib/format";
 import { apiRequestLogsEqual } from "../../lib/log-snapshot";
-import { hasQuotaInfo, providerAccountTitle, providerHealthLabel, providerHealthTone, quotaInfo } from "../../lib/provider-display";
+import { hasQuotaInfo, providerAccountTitle, providerHealthDetail, providerHealthLabel, providerHealthTone, quotaInfo } from "../../lib/provider-display";
 import type { ApiRequestLog, BusyState, CompanionStatus, GroupPolicy, GroupUpsert, ProviderConfig } from "../../types/domain";
 
 const GROUP_ROUTE_REFRESH_INTERVAL_MS = 2_000;
@@ -206,6 +206,7 @@ export function Groups(props: GroupsProps) {
                     {providerIds.map((id, index) => {
                           const provider = status.config.providers[id];
                           const health = status.config.health[id];
+                          const healthDetail = providerHealthDetail(health);
                           const quota = provider ? quotaInfo(provider.account) : null;
                           const showQuota = quota ? hasQuotaInfo(quota) : false;
                           const canRequestPriorityFailback = isActiveGroup
@@ -221,6 +222,7 @@ export function Groups(props: GroupsProps) {
                               <div className="group-provider-main">
                                 <strong>{provider ? providerAccountTitle(provider) : id}</strong>
                                 <small>{provider ? groupProviderMeta(provider, showQuota ? quota?.percentLabel : undefined) : "账号不存在"}</small>
+                                {healthDetail && <small className="provider-health-detail">{healthDetail}</small>}
                               </div>
                               <div className="group-provider-badges">
                                 {canRequestPriorityFailback && (
@@ -487,7 +489,7 @@ function groupProviderMeta(provider: ProviderConfig, quotaLabel?: string) {
   }
   const status = groupProviderConnectionStatus(provider.account?.subscriptionStatus);
   const quota = quotaLabel && quotaLabel !== "待刷新" ? ` · 余量 ${quotaLabel}` : "";
-  return `${providerName}${status}${quota}`;
+  return `${providerName}上次检查：${status}${quota}`;
 }
 
 function groupProviderConnectionStatus(status?: string | null): string {

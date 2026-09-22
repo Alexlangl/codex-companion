@@ -1,3 +1,4 @@
+import { SettingsDialog } from "../../components/SettingsDialog";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
   ArrowRight,
@@ -18,7 +19,10 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Field, IconButton, Panel } from "../../components/ui";
 import type { BadgeTone } from "../../components/ui";
-import { AccountProtectionFields, DEFAULT_ACCOUNT_PROTECTION } from "./AccountProtectionFields";
+import {
+  AccountProtectionFields,
+  DEFAULT_ACCOUNT_PROTECTION,
+} from "./AccountProtectionFields";
 import {
   apiServiceSelfTest,
   clearApiRequestLogs,
@@ -74,13 +78,19 @@ export function Relay({ active, status }: RelayProps) {
   const [error, setError] = useState<string | null>(null);
   const [clientName, setClientName] = useState("");
   const [clientModels, setClientModels] = useState("");
-  const [revealedSecret, setRevealedSecret] = useState<ApiClientSecret | null>(null);
+  const [revealedSecret, setRevealedSecret] = useState<ApiClientSecret | null>(
+    null,
+  );
   const [editor, setEditor] = useState<ClientEditor | null>(null);
   const [selfTest, setSelfTest] = useState<ApiServiceSelfTest | null>(null);
-  const [settings, setSettings] = useState<RelaySettingsUpdate>(() => relaySettingsFromStatus(status));
+  const [settings, setSettings] = useState<RelaySettingsUpdate>(() =>
+    relaySettingsFromStatus(status),
+  );
   const [settingsSaved, setSettingsSaved] = useState(false);
   const settingsDirtyRef = useRef(false);
-  const [relayEvents, setRelayEvents] = useState<RelayEvent[]>(status.recentEvents);
+  const [relayEvents, setRelayEvents] = useState<RelayEvent[]>(
+    status.recentEvents,
+  );
   const [logsRefreshing, setLogsRefreshing] = useState(false);
   const logRefreshInFlightRef = useRef(false);
   const logRefreshRevisionRef = useRef(0);
@@ -108,13 +118,19 @@ export function Relay({ active, status }: RelayProps) {
     const revision = logRefreshRevisionRef.current;
     if (showLoading) setLogsRefreshing(true);
     try {
-      const [requests, events] = await Promise.all([getApiRequestLogs(), getRelayEvents()]);
+      const [requests, events] = await Promise.all([
+        getApiRequestLogs(),
+        getRelayEvents(),
+      ]);
       if (revision !== logRefreshRevisionRef.current) return;
       setSnapshot((current) => {
-        if (!current || apiRequestLogsEqual(current.recentRequests, requests)) return current;
+        if (!current || apiRequestLogsEqual(current.recentRequests, requests))
+          return current;
         return { ...current, recentRequests: requests };
       });
-      setRelayEvents((current) => relayEventsEqual(current, events) ? current : events);
+      setRelayEvents((current) =>
+        relayEventsEqual(current, events) ? current : events,
+      );
       if (showLoading) setError(null);
     } catch (unknownError) {
       if (showLoading) setError(userFacingError(unknownError));
@@ -158,7 +174,10 @@ export function Relay({ active, status }: RelayProps) {
       return;
     }
     void runAction("create-client", async () => {
-      const secret = await createApiClient({ name, allowedModels: parseModels(clientModels) });
+      const secret = await createApiClient({
+        name,
+        allowedModels: parseModels(clientModels),
+      });
       setRevealedSecret(secret);
       setClientName("");
       setClientModels("");
@@ -166,14 +185,16 @@ export function Relay({ active, status }: RelayProps) {
   }
 
   function handleRotateClient(client: ApiClient) {
-    if (!window.confirm(`轮换“${client.name}”的密钥？旧密钥会立即失效。`)) return;
+    if (!window.confirm(`轮换“${client.name}”的密钥？旧密钥会立即失效。`))
+      return;
     void runAction(`rotate-${client.id}`, async () => {
       setRevealedSecret(await rotateApiClientKey(client.id));
     });
   }
 
   function handleDeleteClient(client: ApiClient) {
-    if (!window.confirm(`删除 API client“${client.name}”？此操作不可撤销。`)) return;
+    if (!window.confirm(`删除 API client“${client.name}”？此操作不可撤销。`))
+      return;
     void runAction(`delete-${client.id}`, async () => {
       await deleteApiClient(client.id);
       if (revealedSecret?.client.id === client.id) setRevealedSecret(null);
@@ -207,11 +228,14 @@ export function Relay({ active, status }: RelayProps) {
   }
 
   function handleClearLogs() {
-    if (!window.confirm("清空本地 API 请求日志？client 和配置不会被删除。")) return;
+    if (!window.confirm("清空本地 API 请求日志？client 和配置不会被删除。"))
+      return;
     void runAction("clear-logs", async () => {
       await clearApiRequestLogs();
       logRefreshRevisionRef.current += 1;
-      setSnapshot((current) => current ? { ...current, recentRequests: [] } : current);
+      setSnapshot((current) =>
+        current ? { ...current, recentRequests: [] } : current,
+      );
       setRelayEvents([]);
     });
   }
@@ -223,13 +247,20 @@ export function Relay({ active, status }: RelayProps) {
   const clients = snapshot?.clients ?? [];
   const requests = snapshot?.recentRequests ?? [];
   const cooldowns = snapshot?.modelCooldowns ?? [];
-  const diagnosticGroups = useMemo(() => groupRelayDiagnosticEvents(relayEvents), [relayEvents]);
-  const requestEvents = useMemo(() => requestEventMap(diagnosticGroups), [diagnosticGroups]);
+  const diagnosticGroups = useMemo(
+    () => groupRelayDiagnosticEvents(relayEvents),
+    [relayEvents],
+  );
+  const requestEvents = useMemo(
+    () => requestEventMap(diagnosticGroups),
+    [diagnosticGroups],
+  );
   const requestsById = useMemo(
     () => new Map(requests.map((request) => [request.requestId, request])),
     [requests],
   );
-  const secretForExample = revealedSecret?.apiKey ?? "YOUR_CODEX_COMPANION_API_KEY";
+  const secretForExample =
+    revealedSecret?.apiKey ?? "YOUR_CODEX_COMPANION_API_KEY";
   const curlExample = [
     `curl ${status.relayBaseUrl}/responses \\`,
     `  -H "Authorization: Bearer ${secretForExample}" \\`,
@@ -239,7 +270,10 @@ export function Relay({ active, status }: RelayProps) {
 
   return (
     <div className="api-service-stack">
-      <section className="api-service-overview" aria-labelledby="api-service-title">
+      <section
+        className="api-service-overview"
+        aria-labelledby="api-service-title"
+      >
         <div className="api-service-overview-main">
           <div className="api-service-icon" aria-hidden="true">
             <RadioTower size={18} />
@@ -247,26 +281,42 @@ export function Relay({ active, status }: RelayProps) {
           <div>
             <span className="panel-eyebrow">LOCAL OPENAI-COMPATIBLE API</span>
             <h2 id="api-service-title">把当前账号分组作为本地 API</h2>
-            <p>应用只连接一个地址，Companion 负责 OAuth、协议转换、会话亲和、故障切换与审计。</p>
+            <p>
+              应用只连接一个地址，Companion 负责
+              OAuth、协议转换、会话亲和、故障切换与审计。
+            </p>
           </div>
         </div>
         <div className="api-service-endpoint">
           <span>Base URL</span>
           <code>{status.relayBaseUrl}</code>
-          <IconButton label="复制 API Base URL" onClick={() => void navigator.clipboard.writeText(status.relayBaseUrl)}>
+          <IconButton
+            label="复制 API Base URL"
+            onClick={() =>
+              void navigator.clipboard.writeText(status.relayBaseUrl)
+            }
+          >
             <Copy size={15} />
           </IconButton>
         </div>
         <div className="api-service-health-row">
           <StatusItem
             label="HTTP 监听"
-            state={selfTest === null ? "pending" : selfTest.listenerOk ? "ok" : "error"}
+            state={
+              selfTest === null
+                ? "pending"
+                : selfTest.listenerOk
+                  ? "ok"
+                  : "error"
+            }
             value={`${status.config.relay.host}:${status.config.relay.port}`}
           />
           <StatusItem
             label="当前分组"
             state={status.activeGroup ? "ok" : "error"}
-            value={status.activeGroup?.name ?? status.config.relay.activeGroupId}
+            value={
+              status.activeGroup?.name ?? status.config.relay.activeGroupId
+            }
           />
           <StatusItem
             label="可用账号"
@@ -281,7 +331,11 @@ export function Relay({ active, status }: RelayProps) {
           <StatusItem
             label="账号池"
             state={poolHealthState(snapshot)}
-            value={snapshot ? `${snapshot.poolHealth.healthy}/${snapshot.poolHealth.enabled} 健康` : "读取中"}
+            value={
+              snapshot
+                ? `${snapshot.poolHealth.healthy}/${snapshot.poolHealth.enabled} 健康`
+                : "读取中"
+            }
           />
           <StatusItem
             label="会话亲和"
@@ -290,14 +344,327 @@ export function Relay({ active, status }: RelayProps) {
           />
         </div>
         <div className="api-service-toolbar">
-          <Button disabled={action !== null} onClick={handleSelfTest} variant="secondary">
-            <ShieldCheck size={15} /> {action === "self-test" ? "正在自检" : "运行本地自检"}
+          <SettingsDialog
+            title="运行策略"
+            description="管理连接、重试、日志保留与账号保护。保存后应用到后续请求。"
+          >
+            <div className="relay-runtime-settings">
+              {error ? (
+                <p className="error-banner" role="alert">
+                  {error}
+                </p>
+              ) : null}
+              <form
+                className="api-settings-form"
+                onChange={() => {
+                  settingsDirtyRef.current = true;
+                  setSettingsSaved(false);
+                }}
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  handleSaveSettings();
+                }}
+              >
+                <Field label="监听地址">
+                  <input
+                    aria-describedby="relay-host-help"
+                    onChange={(event) => {
+                      setSettingsSaved(false);
+                      setSettings((current) => ({
+                        ...current,
+                        host: event.target.value,
+                      }));
+                    }}
+                    placeholder="127.0.0.1 或 0.0.0.0"
+                    value={settings.host}
+                  />
+                </Field>
+                <p className="field-hint" id="relay-host-help">
+                  本机使用 127.0.0.1；需要局域网或远程设备访问时使用
+                  0.0.0.0，并必须开启 client 密钥。
+                </p>
+                <label className="toggle-row api-key-policy-toggle">
+                  <input
+                    checked={settings.requireApiKey}
+                    onChange={(event) => {
+                      setSettingsSaved(false);
+                      setSettings((current) => ({
+                        ...current,
+                        requireApiKey: event.target.checked,
+                      }));
+                    }}
+                    type="checkbox"
+                  />
+                  <span>所有非浏览器 API 请求强制使用 client 密钥</span>
+                </label>
+                <p className="field-hint">
+                  默认“本机兼容”保留当前 Codex
+                  无感连接；浏览器跨域请求始终需要有效密钥。开启严格模式前请先创建
+                  client。
+                </p>
+                <div className="form-grid">
+                  <NumberSetting
+                    label="重试预算"
+                    max={20}
+                    min={0}
+                    onChange={(retryBudget) =>
+                      setSettings((current) => ({ ...current, retryBudget }))
+                    }
+                    value={settings.retryBudget}
+                  />
+                  <NumberSetting
+                    label="模型冷却（秒）"
+                    max={86400}
+                    min={5}
+                    onChange={(modelCooldownSeconds) =>
+                      setSettings((current) => ({
+                        ...current,
+                        modelCooldownSeconds,
+                      }))
+                    }
+                    value={settings.modelCooldownSeconds}
+                  />
+                  <NumberSetting
+                    label="会话亲和（秒）"
+                    max={86400}
+                    min={60}
+                    onChange={(sessionAffinityTtlSeconds) =>
+                      setSettings((current) => ({
+                        ...current,
+                        sessionAffinityTtlSeconds,
+                      }))
+                    }
+                    value={settings.sessionAffinityTtlSeconds}
+                  />
+                  <NumberSetting
+                    label="日志保留（天）"
+                    max={3650}
+                    min={1}
+                    onChange={(requestLogRetentionDays) =>
+                      setSettings((current) => ({
+                        ...current,
+                        requestLogRetentionDays,
+                      }))
+                    }
+                    value={settings.requestLogRetentionDays}
+                  />
+                </div>
+                <div className="api-setting-notes">
+                  <span>重试预算 0 = 尝试分组内全部账号</span>
+                  <span>
+                    官方账号的模型 404 / 429
+                    仅冷却对应模型；中转账号仅在明确额度耗尽时冷却
+                  </span>
+                </div>
+                <AccountProtectionFields
+                  value={
+                    settings.accountProtection ?? DEFAULT_ACCOUNT_PROTECTION
+                  }
+                  providers={status.config.providers}
+                  onChange={(accountProtection) =>
+                    setSettings((current) => ({
+                      ...current,
+                      accountProtection,
+                    }))
+                  }
+                />
+                {settingsSaved ? (
+                  <p className="field-hint" role="status">
+                    运行策略已保存。监听地址变更将在 Companion 下次启动 relay
+                    时生效。
+                  </p>
+                ) : null}
+                <Button disabled={action !== null} type="submit">
+                  保存运行策略
+                </Button>
+              </form>
+              {cooldowns.length > 0 ? (
+                <div className="api-cooldown-list">
+                  <strong>当前模型冷却</strong>
+                  {cooldowns.map((cooldown) => (
+                    <div key={`${cooldown.providerId}-${cooldown.model}`}>
+                      <span>{cooldown.model}</span>
+                      <small>
+                        {providerTitle(status, cooldown.providerId)} · 至{" "}
+                        {formatTime(cooldown.cooldownUntil)}
+                      </small>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </SettingsDialog>
+          <SettingsDialog
+            title="访问控制"
+            description="管理 API client 及其密钥和模型权限。"
+          >
+            <div className="relay-clients-settings">
+              {error ? (
+                <p className="error-banner" role="alert">
+                  {error}
+                </p>
+              ) : null}
+              <p className="relay-help">
+                为每个调用方创建独立密钥和模型权限。停用、轮换或删除不会影响其他
+                client。
+              </p>
+              {revealedSecret ? (
+                <div className="api-secret-reveal" role="status">
+                  <div>
+                    <strong>{revealedSecret.client.name} 的新密钥</strong>
+                    <code>{revealedSecret.apiKey}</code>
+                  </div>
+                  <IconButton
+                    label="复制新密钥"
+                    onClick={() =>
+                      void navigator.clipboard.writeText(revealedSecret.apiKey)
+                    }
+                  >
+                    <Copy aria-hidden="true" size={15} />
+                  </IconButton>
+                </div>
+              ) : null}
+              <div className="api-client-create">
+                <Field label="Client 名称">
+                  <input
+                    aria-label="API client 名称"
+                    onChange={(event) => setClientName(event.target.value)}
+                    placeholder="例如：本地 CLI / 自动化脚本"
+                    value={clientName}
+                  />
+                </Field>
+                <Field label="允许模型（可选）">
+                  <input
+                    aria-describedby="api-model-help"
+                    onChange={(event) => setClientModels(event.target.value)}
+                    placeholder="gpt-5.6, gpt-5.6-codex"
+                    value={clientModels}
+                  />
+                </Field>
+                <p className="field-hint" id="api-model-help">
+                  逗号或换行分隔；留空表示允许全部模型。
+                </p>
+                <Button disabled={action !== null} onClick={handleCreateClient}>
+                  <Plus size={15} /> 创建并显示密钥
+                </Button>
+              </div>
+              <div className="api-client-list">
+                {clients.length === 0 ? (
+                  <div className="api-compact-empty">
+                    尚未创建 client。先创建一个，再开启强制密钥。
+                  </div>
+                ) : (
+                  clients.map((client) => (
+                    <div className="api-client-row" key={client.id}>
+                      <div className="api-client-main">
+                        <div className="api-client-title">
+                          <strong>{client.name}</strong>
+                          <Badge tone={client.enabled ? "ok" : "neutral"}>
+                            {client.enabled ? "启用" : "停用"}
+                          </Badge>
+                        </div>
+                        <code>{client.keyPrefix}••••••••</code>
+                        <span>
+                          {client.allowedModels.length === 0
+                            ? "全部模型"
+                            : client.allowedModels.join(" · ")}
+                          {` · ${client.requestCount} 次请求`}
+                          {client.lastUsedAt
+                            ? ` · 最近 ${formatTime(client.lastUsedAt)}`
+                            : " · 尚未使用"}
+                        </span>
+                        <span className="api-client-usage-line">
+                          <Badge
+                            tone={
+                              client.health.status === "degraded"
+                                ? "danger"
+                                : client.health.status === "healthy"
+                                  ? "ok"
+                                  : "neutral"
+                            }
+                          >
+                            {client.health.status === "degraded"
+                              ? "连接降级"
+                              : client.health.status === "healthy"
+                                ? "连接正常"
+                                : client.health.status === "idle"
+                                  ? "待使用"
+                                  : "已停用"}
+                          </Badge>
+                          {`今日 ${client.usage.today.requests} · 本周 ${client.usage.week.requests} · 本月 ${client.usage.month.requests} · 成功率 ${client.usage.month.successRate}%`}
+                        </span>
+                      </div>
+                      <div className="api-client-actions">
+                        <IconButton
+                          label={`编辑 ${client.name}`}
+                          onClick={() => setEditor(editorFromClient(client))}
+                        >
+                          <Settings2 size={14} />
+                        </IconButton>
+                        <IconButton
+                          label={`轮换 ${client.name} 密钥`}
+                          onClick={() => handleRotateClient(client)}
+                        >
+                          <RotateCw size={14} />
+                        </IconButton>
+                        <IconButton
+                          label={`删除 ${client.name}`}
+                          onClick={() => handleDeleteClient(client)}
+                        >
+                          <Trash2 size={14} />
+                        </IconButton>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </SettingsDialog>
+          <SettingsDialog
+            title="接入说明"
+            description="使用本地 API 地址连接支持 OpenAI 协议的应用。"
+          >
+            <Panel eyebrow="接入" title="OpenAI-compatible 调用方式">
+              <div className="api-usage-grid">
+                <div>
+                  <span>支持路径</span>
+                  <strong>
+                    <code>/v1/responses</code> 与 <code>/v1/models</code>
+                  </strong>
+                  <p>
+                    上游只有 Chat Completions 时，Companion
+                    会独立完成请求、SSE、工具调用和错误语义转换。
+                  </p>
+                </div>
+                <pre className="api-code-sample">
+                  <code>{curlExample}</code>
+                </pre>
+              </div>
+            </Panel>
+          </SettingsDialog>
+          <Button
+            disabled={action !== null}
+            onClick={handleSelfTest}
+            variant="secondary"
+          >
+            <ShieldCheck size={15} />{" "}
+            {action === "self-test" ? "正在自检" : "运行本地自检"}
           </Button>
-          <Button disabled={loading} onClick={() => void loadSnapshot()} variant="ghost">
-            <RefreshCw className={loading ? "spin-icon" : undefined} size={15} /> 刷新数据
+          <Button
+            disabled={loading}
+            onClick={() => void loadSnapshot()}
+            variant="ghost"
+          >
+            <RefreshCw
+              className={loading ? "spin-icon" : undefined}
+              size={15}
+            />{" "}
+            刷新数据
           </Button>
           {selfTest ? (
-            <span className={`api-self-test-result ${selfTest.ok ? "api-self-test-ok" : "api-self-test-failed"}`}>
+            <span
+              className={`api-self-test-result ${selfTest.ok ? "api-self-test-ok" : "api-self-test-failed"}`}
+            >
               {selfTest.ok ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
               {selfTest.message} · {selfTest.latencyMs} ms
             </span>
@@ -305,7 +672,11 @@ export function Relay({ active, status }: RelayProps) {
         </div>
       </section>
 
-      {error ? <div className="error-banner api-service-error" role="alert">{error}</div> : null}
+      {error ? (
+        <div className="error-banner api-service-error" role="alert">
+          {error}
+        </div>
+      ) : null}
 
       {revealedSecret ? (
         <section className="api-secret-reveal" aria-live="polite">
@@ -313,203 +684,73 @@ export function Relay({ active, status }: RelayProps) {
             <KeyRound size={17} />
             <div>
               <strong>{revealedSecret.client.name} 的新密钥</strong>
-              <span>只显示这一次。数据库仅保存 SHA-256 哈希，请现在复制到调用方。</span>
+              <span>
+                只显示这一次。数据库仅保存 SHA-256 哈希，请现在复制到调用方。
+              </span>
             </div>
           </div>
           <code>{revealedSecret.apiKey}</code>
           <div className="actions">
-            <Button onClick={() => void navigator.clipboard.writeText(revealedSecret.apiKey)}>
+            <Button
+              onClick={() =>
+                void navigator.clipboard.writeText(revealedSecret.apiKey)
+              }
+            >
               <Copy size={14} /> 复制密钥
             </Button>
-            <Button onClick={() => setRevealedSecret(null)} variant="ghost">我已保存</Button>
+            <Button onClick={() => setRevealedSecret(null)} variant="ghost">
+              我已保存
+            </Button>
           </div>
         </section>
       ) : null}
 
-      <div className="api-service-grid">
-        <Panel eyebrow="访问控制" title="API clients">
-          <p className="relay-help">为每个调用方创建独立密钥和模型权限。停用、轮换或删除不会影响其他 client。</p>
-          <div className="api-client-create">
-            <Field label="Client 名称">
-              <input
-                aria-label="API client 名称"
-                onChange={(event) => setClientName(event.target.value)}
-                placeholder="例如：本地 CLI / 自动化脚本"
-                value={clientName}
-              />
-            </Field>
-            <Field label="允许模型（可选）">
-              <input
-                aria-describedby="api-model-help"
-                onChange={(event) => setClientModels(event.target.value)}
-                placeholder="gpt-5.6, gpt-5.6-codex"
-                value={clientModels}
-              />
-            </Field>
-            <p className="field-hint" id="api-model-help">逗号或换行分隔；留空表示允许全部模型。</p>
-            <Button disabled={action !== null} onClick={handleCreateClient}>
-              <Plus size={15} /> 创建并显示密钥
-            </Button>
-          </div>
-          <div className="api-client-list">
-            {clients.length === 0 ? (
-              <div className="api-compact-empty">尚未创建 client。先创建一个，再开启强制密钥。</div>
-            ) : (
-              clients.map((client) => (
-                <div className="api-client-row" key={client.id}>
-                  <div className="api-client-main">
-                    <div className="api-client-title">
-                      <strong>{client.name}</strong>
-                      <Badge tone={client.enabled ? "ok" : "neutral"}>{client.enabled ? "启用" : "停用"}</Badge>
-                    </div>
-                    <code>{client.keyPrefix}••••••••</code>
-                    <span>
-                      {client.allowedModels.length === 0 ? "全部模型" : client.allowedModels.join(" · ")}
-                      {` · ${client.requestCount} 次请求`}
-                      {client.lastUsedAt ? ` · 最近 ${formatTime(client.lastUsedAt)}` : " · 尚未使用"}
-                    </span>
-                    <span className="api-client-usage-line">
-                      <Badge tone={client.health.status === "degraded" ? "danger" : client.health.status === "healthy" ? "ok" : "neutral"}>
-                        {client.health.status === "degraded" ? "连接降级" : client.health.status === "healthy" ? "连接正常" : client.health.status === "idle" ? "待使用" : "已停用"}
-                      </Badge>
-                      {`今日 ${client.usage.today.requests} · 本周 ${client.usage.week.requests} · 本月 ${client.usage.month.requests} · 成功率 ${client.usage.month.successRate}%`}
-                    </span>
-                  </div>
-                  <div className="api-client-actions">
-                    <IconButton label={`编辑 ${client.name}`} onClick={() => setEditor(editorFromClient(client))}>
-                      <Settings2 size={14} />
-                    </IconButton>
-                    <IconButton label={`轮换 ${client.name} 密钥`} onClick={() => handleRotateClient(client)}>
-                      <RotateCw size={14} />
-                    </IconButton>
-                    <IconButton label={`删除 ${client.name}`} onClick={() => handleDeleteClient(client)}>
-                      <Trash2 size={14} />
-                    </IconButton>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        </Panel>
-
-        <Panel eyebrow="运行策略" title="可靠性与保留策略">
-          <form className="api-settings-form" onChange={() => {
-            settingsDirtyRef.current = true;
-            setSettingsSaved(false);
-          }} onSubmit={(event) => { event.preventDefault(); handleSaveSettings(); }}>
-            <Field label="监听地址">
-              <input
-                aria-describedby="relay-host-help"
-                onChange={(event) => {
-                  setSettingsSaved(false);
-                  setSettings((current) => ({ ...current, host: event.target.value }));
-                }}
-                placeholder="127.0.0.1 或 0.0.0.0"
-                value={settings.host}
-              />
-            </Field>
-            <p className="field-hint" id="relay-host-help">
-              本机使用 127.0.0.1；需要局域网或远程设备访问时使用 0.0.0.0，并必须开启 client 密钥。
-            </p>
-            <label className="toggle-row api-key-policy-toggle">
-              <input
-                checked={settings.requireApiKey}
-                onChange={(event) => {
-                  setSettingsSaved(false);
-                  setSettings((current) => ({ ...current, requireApiKey: event.target.checked }));
-                }}
-                type="checkbox"
-              />
-              <span>所有非浏览器 API 请求强制使用 client 密钥</span>
-            </label>
-            <p className="field-hint">
-              默认“本机兼容”保留当前 Codex 无感连接；浏览器跨域请求始终需要有效密钥。开启严格模式前请先创建 client。
-            </p>
-            <div className="form-grid">
-              <NumberSetting
-                label="重试预算"
-                max={20}
-                min={0}
-                onChange={(retryBudget) => setSettings((current) => ({ ...current, retryBudget }))}
-                value={settings.retryBudget}
-              />
-              <NumberSetting
-                label="模型冷却（秒）"
-                max={86400}
-                min={5}
-                onChange={(modelCooldownSeconds) => setSettings((current) => ({ ...current, modelCooldownSeconds }))}
-                value={settings.modelCooldownSeconds}
-              />
-              <NumberSetting
-                label="会话亲和（秒）"
-                max={86400}
-                min={60}
-                onChange={(sessionAffinityTtlSeconds) => setSettings((current) => ({ ...current, sessionAffinityTtlSeconds }))}
-                value={settings.sessionAffinityTtlSeconds}
-              />
-              <NumberSetting
-                label="日志保留（天）"
-                max={3650}
-                min={1}
-                onChange={(requestLogRetentionDays) => setSettings((current) => ({ ...current, requestLogRetentionDays }))}
-                value={settings.requestLogRetentionDays}
-              />
-            </div>
-            <div className="api-setting-notes">
-              <span>重试预算 0 = 尝试分组内全部账号</span>
-              <span>模型 404 / 429 只冷却“账号 + 模型”，不会误伤该账号的其他模型</span>
-            </div>
-            <AccountProtectionFields value={settings.accountProtection ?? DEFAULT_ACCOUNT_PROTECTION}
-              providers={status.config.providers}
-              onChange={(accountProtection) => setSettings((current) => ({ ...current, accountProtection }))} />
-            {settingsSaved ? <p className="field-hint" role="status">运行策略已保存。监听地址变更将在 Companion 下次启动 relay 时生效。</p> : null}
-            <Button disabled={action !== null} type="submit">
-              保存运行策略
-            </Button>
-          </form>
-          {cooldowns.length > 0 ? (
-            <div className="api-cooldown-list">
-              <strong>当前模型冷却</strong>
-              {cooldowns.map((cooldown) => (
-                <div key={`${cooldown.providerId}-${cooldown.model}`}>
-                  <span>{cooldown.model}</span>
-                  <small>{providerTitle(status, cooldown.providerId)} · 至 {formatTime(cooldown.cooldownUntil)}</small>
-                </div>
-              ))}
-            </div>
-          ) : null}
-        </Panel>
-      </div>
-
-      <Panel eyebrow="接入" title="OpenAI-compatible 调用方式">
-        <div className="api-usage-grid">
-          <div>
-            <span>支持路径</span>
-            <strong><code>/v1/responses</code> 与 <code>/v1/models</code></strong>
-            <p>上游只有 Chat Completions 时，Companion 会独立完成请求、SSE、工具调用和错误语义转换。</p>
-          </div>
-          <pre className="api-code-sample"><code>{curlExample}</code></pre>
-        </div>
-      </Panel>
-
       <Panel eyebrow="结构化审计" title="API 请求日志">
         <div className="api-log-toolbar">
-          <p className="relay-help">只记录路由元数据，不保存提示词、响应正文或完整密钥。日志持久化在本机 SQLite，每 2 秒自动刷新。</p>
+          <p className="relay-help">
+            只记录路由元数据，不保存提示词、响应正文或完整密钥。日志持久化在本机
+            SQLite，每 2 秒自动刷新。
+          </p>
           <div className="actions">
-            <Button disabled={logsRefreshing} onClick={handleRefreshLogs} variant="ghost">
-              <RefreshCw aria-hidden="true" className={logsRefreshing ? "spin-icon" : undefined} size={14} /> 刷新日志
+            <Button
+              disabled={logsRefreshing}
+              onClick={handleRefreshLogs}
+              variant="ghost"
+            >
+              <RefreshCw
+                aria-hidden="true"
+                className={logsRefreshing ? "spin-icon" : undefined}
+                size={14}
+              />{" "}
+              刷新日志
             </Button>
-            <Button disabled={(requests.length === 0 && relayEvents.length === 0) || action !== null} onClick={handleClearLogs} variant="ghost">
+            <Button
+              disabled={
+                (requests.length === 0 && relayEvents.length === 0) ||
+                action !== null
+              }
+              onClick={handleClearLogs}
+              variant="ghost"
+            >
               <Trash2 aria-hidden="true" size={14} /> 清空日志
             </Button>
           </div>
         </div>
         {requests.length === 0 ? (
-          <div className="api-compact-empty"><Database size={18} /> 暂无 API 请求</div>
+          <div className="api-compact-empty">
+            <Database size={18} /> 暂无 API 请求
+          </div>
         ) : (
-          <div className="api-request-table" role="table" aria-label="API 请求日志">
+          <div
+            className="api-request-table"
+            role="table"
+            aria-label="API 请求日志"
+          >
             <div className="api-request-head" role="row">
-              <span>时间 / Client</span><span>请求</span><span>路由</span><span>结果</span>
+              <span role="columnheader">时间 / Client</span>
+              <span role="columnheader">请求</span>
+              <span role="columnheader">路由</span>
+              <span role="columnheader">结果</span>
             </div>
             {requests.map((request) => (
               <RequestRow
@@ -524,7 +765,10 @@ export function Relay({ active, status }: RelayProps) {
       </Panel>
 
       <details className="advanced-details api-diagnostics">
-        <summary>查看底层转发诊断（{diagnosticGroups.length} 组 / {relayEvents.length} 条事件）</summary>
+        <summary>
+          查看底层转发诊断（{diagnosticGroups.length} 组 / {relayEvents.length}{" "}
+          条事件）
+        </summary>
         <div className="relay-diagnostic-list">
           {diagnosticGroups.length === 0 ? (
             <div className="api-compact-empty">暂无诊断事件</div>
@@ -533,7 +777,11 @@ export function Relay({ active, status }: RelayProps) {
               <RelayDiagnosticGroupRow
                 group={group}
                 key={diagnosticGroupKey(group)}
-                request={group.type === "request" ? requestsById.get(group.requestId) : undefined}
+                request={
+                  group.type === "request"
+                    ? requestsById.get(group.requestId)
+                    : undefined
+                }
                 status={status}
               />
             ))
@@ -541,32 +789,61 @@ export function Relay({ active, status }: RelayProps) {
         </div>
       </details>
 
-      <Dialog.Root open={Boolean(editor)} onOpenChange={(open) => !open && setEditor(null)}>
+      <Dialog.Root
+        open={Boolean(editor)}
+        onOpenChange={(open) => !open && setEditor(null)}
+      >
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
           <Dialog.Content className="dialog-content api-client-dialog">
             <div className="dialog-header">
               <div>
-                <Dialog.Title className="dialog-title">编辑 API client</Dialog.Title>
-                <Dialog.Description className="dialog-description">修改名称、启用状态和允许模型；不会改变当前密钥。</Dialog.Description>
+                <Dialog.Title className="dialog-title">
+                  编辑 API client
+                </Dialog.Title>
+                <Dialog.Description className="dialog-description">
+                  修改名称、启用状态和允许模型；不会改变当前密钥。
+                </Dialog.Description>
               </div>
-              <Dialog.Close className="icon-button" aria-label="关闭"><X size={16} /></Dialog.Close>
+              <Dialog.Close className="icon-button" aria-label="关闭">
+                <X size={16} />
+              </Dialog.Close>
             </div>
             {editor ? (
               <div className="api-editor-form">
                 <Field label="Client 名称">
-                  <input onChange={(event) => setEditor({ ...editor, name: event.target.value })} value={editor.name} />
+                  <input
+                    onChange={(event) =>
+                      setEditor({ ...editor, name: event.target.value })
+                    }
+                    value={editor.name}
+                  />
                 </Field>
                 <Field label="允许模型">
-                  <textarea onChange={(event) => setEditor({ ...editor, models: event.target.value })} value={editor.models} />
+                  <textarea
+                    onChange={(event) =>
+                      setEditor({ ...editor, models: event.target.value })
+                    }
+                    value={editor.models}
+                  />
                 </Field>
                 <label className="toggle-row">
-                  <input checked={editor.enabled} onChange={(event) => setEditor({ ...editor, enabled: event.target.checked })} type="checkbox" />
+                  <input
+                    checked={editor.enabled}
+                    onChange={(event) =>
+                      setEditor({ ...editor, enabled: event.target.checked })
+                    }
+                    type="checkbox"
+                  />
                   <span>启用此 client</span>
                 </label>
                 <div className="actions">
-                  <Button disabled={action !== null} onClick={handleSaveClient}>保存 client</Button>
-                  <Dialog.Close asChild><Button variant="secondary">取消</Button></Dialog.Close>
+                  <Button disabled={action !== null} onClick={handleSaveClient}>
+                    保存 client
+                  </Button>
+                  <Dialog.Close asChild>
+                    <Button variant="secondary">取消</Button>
+                  </Dialog.Close>
                 </div>
               </div>
             ) : null}
@@ -603,10 +880,13 @@ function StatusItem({
   );
 }
 
-function poolHealthState(snapshot: ApiServiceSnapshot | null): "error" | "ok" | "pending" {
+function poolHealthState(
+  snapshot: ApiServiceSnapshot | null,
+): "error" | "ok" | "pending" {
   if (!snapshot) return "pending";
   if (snapshot.poolHealth.degraded > 0) return "error";
-  if (snapshot.poolHealth.healthy < snapshot.poolHealth.enabled) return "pending";
+  if (snapshot.poolHealth.healthy < snapshot.poolHealth.enabled)
+    return "pending";
   return "ok";
 }
 
@@ -637,21 +917,49 @@ function RequestRow(props: {
 }) {
   const { events, request, status } = props;
   const tone = requestOutcomeTone(request.outcome);
-  const provider = request.providerId ? providerTitle(status, request.providerId) : "本地处理";
+  const provider = request.providerId
+    ? providerTitle(status, request.providerId)
+    : "本地处理";
   const attemptViews = requestAttemptViews(request, events);
-  const hasSwitch = request.attempts > 1 || attemptViews.some((attempt) => attempt.routeReason === "fallback");
+  const hasSwitch =
+    request.attempts > 1 ||
+    attemptViews.some((attempt) => attempt.routeReason === "fallback");
   const attemptSummary = requestAttemptSummary(request.attempts, hasSwitch);
   const parameterSummary = requestParameterSummary(request);
   const showTrace = shouldShowRequestTrace(request, attemptViews);
 
   return (
-    <div className="api-request-row" role="row" title={request.error ?? undefined}>
-      <div role="cell"><strong>{formatTime(request.startedAt)}</strong><span>{request.clientName ?? "本机兼容调用"}</span></div>
-      <div role="cell"><strong>{request.method} {request.path}</strong><span>{parameterSummary}</span></div>
-      <div role="cell"><strong>{provider}</strong><span>{attemptSummary}</span></div>
-      <div role="cell"><Badge tone={tone}>{request.statusCode ?? "—"} · {outcomeLabel(request.outcome)}</Badge><span>{request.latencyMs ?? 0} ms</span></div>
+    <div
+      className="api-request-row"
+      role="row"
+      title={request.error ?? undefined}
+    >
+      <div role="cell">
+        <strong>{formatTime(request.startedAt)}</strong>
+        <span>{request.clientName ?? "本机兼容调用"}</span>
+      </div>
+      <div role="cell">
+        <strong>
+          {request.method} {request.path}
+        </strong>
+        <span>{parameterSummary}</span>
+      </div>
+      <div role="cell">
+        <strong>{provider}</strong>
+        <span>{attemptSummary}</span>
+      </div>
+      <div role="cell">
+        <Badge tone={tone}>
+          {request.statusCode ?? "—"} · {outcomeLabel(request.outcome)}
+        </Badge>
+        <span>{request.latencyMs ?? 0} ms</span>
+      </div>
       {showTrace ? (
-        <RequestAuditTrace attempts={attemptViews} request={request} status={status} />
+        <RequestAuditTrace
+          attempts={attemptViews}
+          request={request}
+          status={status}
+        />
       ) : null}
     </div>
   );
@@ -673,7 +981,9 @@ function RequestAuditTrace(props: {
 }) {
   const { attempts, request, status } = props;
   const traceStatus = requestTraceStatus(request, attempts);
-  const failedAttempts = attempts.filter((attempt) => attempt.outcome === "failed");
+  const failedAttempts = attempts.filter(
+    (attempt) => attempt.outcome === "failed",
+  );
   const detailUnavailable = request.attempts > 1 && attempts.length === 0;
 
   return (
@@ -696,7 +1006,9 @@ function RequestAuditTrace(props: {
           </ul>
         ) : null}
         {detailUnavailable ? (
-          <span className="api-request-trace-note">这是升级前的历史记录，逐次失败明细未持久化。</span>
+          <span className="api-request-trace-note">
+            这是升级前的历史记录，逐次失败明细未持久化。
+          </span>
         ) : null}
       </div>
     </div>
@@ -710,12 +1022,20 @@ function AttemptChain(props: {
   return (
     <ol className="api-attempt-chain" aria-label="上游尝试链路">
       {props.attempts.map((attempt, index) => (
-        <li className={`api-attempt api-attempt-${attempt.outcome}`} key={attempt.attempt}>
+        <li
+          className={`api-attempt api-attempt-${attempt.outcome}`}
+          key={attempt.attempt}
+        >
           <div>
             <strong>{providerTitle(props.status, attempt.providerId)}</strong>
-            <span>{attemptOutcomeLabel(attempt.outcome)} · {attemptRouteReasonLabel(attempt.routeReason)}</span>
+            <span>
+              {attemptOutcomeLabel(attempt.outcome)} ·{" "}
+              {attemptRouteReasonLabel(attempt.routeReason)}
+            </span>
           </div>
-          {index < props.attempts.length - 1 ? <ArrowRight aria-hidden="true" size={14} /> : null}
+          {index < props.attempts.length - 1 ? (
+            <ArrowRight aria-hidden="true" size={14} />
+          ) : null}
         </li>
       ))}
     </ol>
@@ -737,7 +1057,9 @@ function RelayDiagnosticGroupRow(props: {
   const requestLabel = diagnosticRequestLabel(request, requestEvent);
 
   return (
-    <article className={`relay-diagnostic-group relay-diagnostic-${groupStatus.tone}`}>
+    <article
+      className={`relay-diagnostic-group relay-diagnostic-${groupStatus.tone}`}
+    >
       <header className="relay-diagnostic-header">
         <div>
           <strong>{requestLabel}</strong>
@@ -745,48 +1067,75 @@ function RelayDiagnosticGroupRow(props: {
         </div>
         <div className="relay-diagnostic-meta">
           <Badge tone={groupStatus.tone}>{groupStatus.label}</Badge>
-          <time dateTime={group.latestAt}>{formatDiagnosticTime(group.latestAt)}</time>
+          <time dateTime={group.latestAt}>
+            {formatDiagnosticTime(group.latestAt)}
+          </time>
         </div>
       </header>
-      <ol className="relay-diagnostic-timeline" aria-label={`${requestLabel} 转发时间线`}>
+      <ol
+        className="relay-diagnostic-timeline"
+        aria-label={`${requestLabel} 转发时间线`}
+      >
         {group.events.map((event) => (
-          <DiagnosticTimelineEvent event={event} key={`${event.timestamp}-${event.kind}-${event.message}`} status={status} />
+          <DiagnosticTimelineEvent
+            event={event}
+            key={`${event.timestamp}-${event.kind}-${event.message}`}
+            status={status}
+          />
         ))}
       </ol>
     </article>
   );
 }
 
-function DiagnosticTimelineEvent(props: { event: RelayEvent; status: CompanionStatus }) {
+function DiagnosticTimelineEvent(props: {
+  event: RelayEvent;
+  status: CompanionStatus;
+}) {
   const { event, status } = props;
-  const provider = event.providerId ? providerTitle(status, event.providerId) : "Companion";
+  const provider = event.providerId
+    ? providerTitle(status, event.providerId)
+    : "Companion";
   const tone = diagnosticEventTone(event.kind);
   return (
     <li className={`relay-diagnostic-step relay-diagnostic-step-${tone}`}>
       <span aria-hidden="true" className="relay-diagnostic-dot" />
       <div>
-        <strong>{eventKindLabel(event)} · {provider}</strong>
+        <strong>
+          {eventKindLabel(event)} · {provider}
+        </strong>
         <span>{relayEventMessageText(event)}</span>
       </div>
-      <time dateTime={event.timestamp}>{formatDiagnosticTime(event.timestamp)}</time>
+      <time dateTime={event.timestamp}>
+        {formatDiagnosticTime(event.timestamp)}
+      </time>
     </li>
   );
 }
 
-function StandaloneDiagnosticEvent(props: { event: RelayEvent; status: CompanionStatus }) {
+function StandaloneDiagnosticEvent(props: {
+  event: RelayEvent;
+  status: CompanionStatus;
+}) {
   const { event, status } = props;
   const tone = diagnosticEventTone(event.kind);
-  const provider = event.providerId ? providerTitle(status, event.providerId) : "Companion";
+  const provider = event.providerId
+    ? providerTitle(status, event.providerId)
+    : "Companion";
   return (
     <article className={`relay-diagnostic-group relay-diagnostic-${tone}`}>
       <header className="relay-diagnostic-header">
         <div>
-          <strong>{eventKindLabel(event)} · {provider}</strong>
+          <strong>
+            {eventKindLabel(event)} · {provider}
+          </strong>
           <span>{relayEventMessageText(event)}</span>
         </div>
         <div className="relay-diagnostic-meta">
           <Badge tone={tone}>{eventKindLabel(event)}</Badge>
-          <time dateTime={event.timestamp}>{formatDiagnosticTime(event.timestamp)}</time>
+          <time dateTime={event.timestamp}>
+            {formatDiagnosticTime(event.timestamp)}
+          </time>
         </div>
       </header>
     </article>
@@ -807,7 +1156,14 @@ function relaySettingsFromStatus(status: CompanionStatus): RelaySettingsUpdate {
 }
 
 function parseModels(value: string) {
-  return [...new Set(value.split(/[\n,]/).map((model) => model.trim()).filter(Boolean))];
+  return [
+    ...new Set(
+      value
+        .split(/[\n,]/)
+        .map((model) => model.trim())
+        .filter(Boolean),
+    ),
+  ];
 }
 
 function editorFromClient(client: ApiClient): ClientEditor {
@@ -826,12 +1182,18 @@ function providerTitle(status: CompanionStatus, providerId: string) {
 
 function outcomeLabel(outcome: string) {
   switch (outcome) {
-    case "succeeded": return "成功";
-    case "local": return "本地";
-    case "failed": return "失败";
-    case "rejected": return "拒绝";
-    case "processing": return "处理中";
-    default: return outcome;
+    case "succeeded":
+      return "成功";
+    case "local":
+      return "本地";
+    case "failed":
+      return "失败";
+    case "rejected":
+      return "拒绝";
+    case "processing":
+      return "处理中";
+    default:
+      return outcome;
   }
 }
 
@@ -853,34 +1215,49 @@ function requestAttemptViews(
 ): ApiRequestAttemptLog[] {
   if (request.attemptLog.length > 0) return request.attemptLog;
 
-  const fallbackEvents = events.filter((event) => event.kind === "fallback" && event.providerId);
-  const probeEvent = events.find((event) => event.kind === "failback" && event.providerId);
+  const fallbackEvents = events.filter(
+    (event) => event.kind === "fallback" && event.providerId,
+  );
+  const probeEvent = events.find(
+    (event) => event.kind === "failback" && event.providerId,
+  );
   if (fallbackEvents.length === 0 && !probeEvent) return [];
 
-  const attempts: ApiRequestAttemptLog[] = fallbackEvents.map((event, index) => ({
-    attempt: index + 1,
-    providerId: event.providerId ?? "unknown",
-    routeReason: legacyRouteReason(index, event.providerId, probeEvent),
-    startedAt: event.timestamp,
-    finishedAt: event.timestamp,
-    statusCode: null,
-    outcome: "failed",
-    latencyMs: null,
-    error: relayEventMessageText(event),
-  }));
+  const attempts: ApiRequestAttemptLog[] = fallbackEvents.map(
+    (event, index) => ({
+      attempt: index + 1,
+      providerId: event.providerId ?? "unknown",
+      routeReason: legacyRouteReason(index, event.providerId, probeEvent),
+      startedAt: event.timestamp,
+      finishedAt: event.timestamp,
+      statusCode: null,
+      outcome: "failed",
+      latencyMs: null,
+      error: relayEventMessageText(event),
+    }),
+  );
 
   const terminalEvent = [...events]
     .reverse()
-    .find((event) => event.kind === "stream" || (event.kind === "error" && event.providerId));
-  const terminalProviderId = request.providerId ?? terminalEvent?.providerId ?? probeEvent?.providerId;
+    .find(
+      (event) =>
+        event.kind === "stream" || (event.kind === "error" && event.providerId),
+    );
+  const terminalProviderId =
+    request.providerId ?? terminalEvent?.providerId ?? probeEvent?.providerId;
   if (!terminalProviderId) return attempts;
 
   const terminalOutcome = requestTerminalOutcome(request.outcome);
-  const terminalError = requestTerminalError(request, terminalEvent, probeEvent);
+  const terminalError = requestTerminalError(
+    request,
+    terminalEvent,
+    probeEvent,
+  );
   attempts.push({
     attempt: attempts.length + 1,
     providerId: terminalProviderId,
-    routeReason: attempts.length > 0 ? "fallback" : legacyProbeReason(probeEvent),
+    routeReason:
+      attempts.length > 0 ? "fallback" : legacyProbeReason(probeEvent),
     startedAt: terminalEvent?.timestamp ?? request.startedAt,
     finishedAt: terminalEvent?.timestamp ?? null,
     statusCode: request.statusCode,
@@ -902,7 +1279,8 @@ function requestTerminalError(
   terminalEvent: RelayEvent | undefined,
   probeEvent: RelayEvent | undefined,
 ): string | null {
-  if (request.outcome === "succeeded" || request.outcome === "processing") return null;
+  if (request.outcome === "succeeded" || request.outcome === "processing")
+    return null;
   if (request.error) return request.error;
   if (terminalEvent) return relayEventMessageText(terminalEvent);
   if (probeEvent) return relayEventMessageText(probeEvent);
@@ -915,13 +1293,16 @@ function legacyRouteReason(
   probeEvent: RelayEvent | undefined,
 ): string {
   if (index > 0) return "fallback";
-  if (probeEvent?.providerId === providerId) return legacyProbeReason(probeEvent);
+  if (probeEvent?.providerId === providerId)
+    return legacyProbeReason(probeEvent);
   return "policy";
 }
 
 function legacyProbeReason(probeEvent: RelayEvent | undefined): string {
   if (!probeEvent) return "policy";
-  return probeEvent.message.includes("自动") ? "automatic_failback" : "manual_failback";
+  return probeEvent.message.includes("自动")
+    ? "automatic_failback"
+    : "manual_failback";
 }
 
 function shouldShowRequestTrace(
@@ -929,12 +1310,14 @@ function shouldShowRequestTrace(
   attempts: ApiRequestAttemptLog[],
 ): boolean {
   if (request.attempts > 1) return true;
-  if (request.outcome === "failed" || request.outcome === "rejected") return true;
-  return attempts.some((attempt) => (
-    attempt.outcome !== "succeeded"
-      || attempt.routeReason === "manual_failback"
-      || attempt.routeReason === "automatic_failback"
-  ));
+  if (request.outcome === "failed" || request.outcome === "rejected")
+    return true;
+  return attempts.some(
+    (attempt) =>
+      attempt.outcome !== "succeeded" ||
+      attempt.routeReason === "manual_failback" ||
+      attempt.routeReason === "automatic_failback",
+  );
 }
 
 function requestTraceStatus(
@@ -944,18 +1327,25 @@ function requestTraceStatus(
   if (request.outcome === "failed" || request.outcome === "rejected") {
     return { label: "请求失败", tone: "danger" };
   }
-  if (request.outcome === "processing" && (
-    attempts.some((attempt) => attempt.outcome === "failed") || request.attempts > 1
-  )) {
+  if (
+    request.outcome === "processing" &&
+    (attempts.some((attempt) => attempt.outcome === "failed") ||
+      request.attempts > 1)
+  ) {
     return { label: "失败后已切换，处理中", tone: "warn" };
   }
-  if (attempts.some((attempt) => attempt.outcome === "failed") || request.attempts > 1) {
+  if (
+    attempts.some((attempt) => attempt.outcome === "failed") ||
+    request.attempts > 1
+  ) {
     return { label: "失败切换后成功", tone: "warn" };
   }
   if (attempts.some((attempt) => attempt.routeReason === "manual_failback")) {
     return { label: "手动向上探测", tone: "info" };
   }
-  if (attempts.some((attempt) => attempt.routeReason === "automatic_failback")) {
+  if (
+    attempts.some((attempt) => attempt.routeReason === "automatic_failback")
+  ) {
     return { label: "自动向上探测", tone: "info" };
   }
   return { label: "尝试明细", tone: "info" };
@@ -978,14 +1368,21 @@ function attemptRouteReasonLabel(reason: string): string {
 }
 
 function attemptStatusSummary(attempt: ApiRequestAttemptLog): string {
-  const status = attempt.statusCode ? `HTTP ${attempt.statusCode}` : "未收到 HTTP 状态";
-  if (attempt.latencyMs === null || attempt.latencyMs === undefined) return status;
+  const status = attempt.statusCode
+    ? `HTTP ${attempt.statusCode}`
+    : "未收到 HTTP 状态";
+  if (attempt.latencyMs === null || attempt.latencyMs === undefined)
+    return status;
   return `${status} · ${attempt.latencyMs} ms`;
 }
 
-function requestEventMap(groups: RelayDiagnosticGroup[]): Map<string, RelayEvent[]> {
+function requestEventMap(
+  groups: RelayDiagnosticGroup[],
+): Map<string, RelayEvent[]> {
   const entries = groups
-    .filter((group): group is RelayRequestEventGroup => group.type === "request")
+    .filter(
+      (group): group is RelayRequestEventGroup => group.type === "request",
+    )
     .map((group) => [group.requestId, group.events] as const);
   return new Map(entries);
 }
@@ -1004,20 +1401,25 @@ function diagnosticRequestLabel(
   return "上游请求";
 }
 
-function diagnosticGroupStatus(events: RelayEvent[]): { label: string; tone: BadgeTone } {
+function diagnosticGroupStatus(events: RelayEvent[]): {
+  label: string;
+  tone: BadgeTone;
+} {
   const hasFallback = events.some((event) => event.kind === "fallback");
   const hasFailback = events.some((event) => event.kind === "failback");
   const lastTerminalEvent = [...events]
     .reverse()
     .find((event) => event.kind === "stream" || event.kind === "error");
 
-  if (lastTerminalEvent?.kind === "error") return { label: "请求失败", tone: "danger" };
+  if (lastTerminalEvent?.kind === "error")
+    return { label: "请求失败", tone: "danger" };
   if (hasFallback && lastTerminalEvent?.kind === "stream") {
     return { label: "失败切换后成功", tone: "warn" };
   }
   if (hasFallback) return { label: "失败后已切换，处理中", tone: "warn" };
   if (hasFailback) return { label: "向上探测", tone: "info" };
-  if (lastTerminalEvent?.kind === "stream") return { label: "请求成功", tone: "ok" };
+  if (lastTerminalEvent?.kind === "stream")
+    return { label: "请求成功", tone: "ok" };
   return { label: "处理中", tone: "info" };
 }
 

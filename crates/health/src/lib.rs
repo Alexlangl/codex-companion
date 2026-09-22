@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use codex_companion_core::{HealthFailureKind, HealthStatusKind, ProviderHealth};
+use codex_companion_core::{HealthFailureKind, HealthStatusKind, ProviderHealth, ProviderKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureClassification {
@@ -47,7 +47,7 @@ pub fn classify_failure(status: Option<u16>, body: &str) -> FailureClassificatio
         || lower.contains("usage limit has been reached")
         || lower.contains("usage limit reached")
         || lower.contains("quota exceeded")
-        || lower.contains("billing")
+        || lower.contains("billing_hard_limit_reached")
         || lower.contains("额度耗尽")
         || lower.contains("额度不足")
         || lower.contains("余额不足")
@@ -235,6 +235,28 @@ pub fn cooldown_active(health: &ProviderHealth) -> bool {
         .is_some_and(|until| until > Utc::now())
 }
 
+pub fn provider_cooldown_active(kind: &ProviderKind, health: &ProviderHealth) -> bool {
+    (kind == &ProviderKind::OfficialCodex
+        || health.last_failure_kind == Some(HealthFailureKind::QuotaExhausted))
+        && cooldown_active(health)
+}
+
+/// Third-party inference is paused only for explicit quota exhaustion. Also
+/// remove old transient cooldowns when reading configurations from older builds.
+pub fn normalize_provider_cooldown(kind: &ProviderKind, health: &mut ProviderHealth) -> bool {
+    let previous = (health.status.clone(), health.cooldown_until);
+    if kind != &ProviderKind::OfficialCodex
+        && health.last_failure_kind != Some(HealthFailureKind::QuotaExhausted)
+    {
+        health.cooldown_until = None;
+        if health.status == HealthStatusKind::Cooldown {
+            health.status = HealthStatusKind::Degraded;
+        }
+    }
+    normalize_expired_cooldown(health);
+    previous != (health.status.clone(), health.cooldown_until)
+}
+
 pub fn normalize_expired_cooldown(health: &mut ProviderHealth) {
     if health
         .cooldown_until
@@ -321,6 +343,46 @@ fn cooldown_seconds(failure_count: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn third_party_cools_only_for_explicit_quota_exhaustion() {
+        for kind in [
+            ProviderKind::RelayProvider,
+            ProviderKind::OpenAiCompatible,
+            ProviderKind::OfficialCodex,
+        ] {
+            for (status, message, quota) in [
+                (Some(429), "rate_limit_exceeded", false),
+                (Some(503), "service unavailable", false),
+                (None, "network timeout", false),
+                (Some(404), "model_not_found", false),
+                (Some(403), "contact billing support", false),
+                (Some(429), "insufficient_quota", true),
+                (Some(403), "insufficient_balance", true),
+            ] {
+                let mut health = ProviderHealth::default();
+                mark_failure(
+                    &mut health,
+                    &classify_failure(status, message),
+                    message.into(),
+                );
+                let expected = health.cooldown_until.is_some()
+                    && (kind == ProviderKind::OfficialCodex || quota);
+                assert_eq!(provider_cooldown_active(&kind, &health), expected);
+                normalize_provider_cooldown(&kind, &mut health);
+                assert_eq!(cooldown_active(&health), expected);
+            }
+        }
+        let mut revoked = ProviderHealth::default();
+        mark_failure(
+            &mut revoked,
+            &classify_failure(Some(401), "invalid key"),
+            "invalid key".into(),
+        );
+        normalize_provider_cooldown(&ProviderKind::RelayProvider, &mut revoked);
+        assert_eq!(revoked.status, HealthStatusKind::AuthFailed);
+        assert!(revoked.cooldown_until.is_none());
+    }
 
     #[test]
     fn permanent_account_rejections_and_moderation_are_terminal() {

@@ -7,6 +7,7 @@ import {
   providerAccountSubtitle,
   providerAccountTitle,
   providerHealthLabel,
+  providerHealthDetail,
   providerHealthTone,
   providerTypeLabel,
   providerUsesAgentIdentity,
@@ -50,6 +51,7 @@ export function ProviderCompactItem({
   onRefresh: (id: string) => Promise<void>;
 }) {
   const health = status.config.health[provider.id];
+  const healthDetail = providerHealthDetail(health);
   const active = currentProviderId(currentApplication(status)) === provider.id;
   const quota = quotaInfo(provider.account);
   const effectiveLaunchMode = resolveProviderLaunchMode(provider, launchMode, status.directConnectProviderIds);
@@ -65,12 +67,15 @@ export function ProviderCompactItem({
       <span className="compact-check" aria-hidden="true">
         {active ? <Check size={12} /> : providerMark}
       </span>
-      <span className="sr-only">{active ? "当前账号" : "可用账号"}</span>
+      <span className="sr-only">{active ? "当前账号" : "已配置账号"}</span>
       <strong>{providerAccountTitle(provider)}</strong>
       {showQuota ? <span className={`compact-dot compact-dot-${quota.tone}`} /> : null}
       {showQuota ? <span className="compact-quota">{quota.percentLabel}</span> : null}
       <span className={`compact-dot compact-dot-${providerHealthTone(health?.status)}`} title={providerHealthLabel(health?.status)} />
-      <span className="compact-status">{providerHealthLabel(health?.status)}</span>
+      <span className="compact-status">
+        {providerHealthLabel(health?.status)}
+        {healthDetail && <small className="provider-health-detail">{healthDetail}</small>}
+      </span>
       {provider.account?.validUntil ? <Badge tone={validityTone(provider.account.validUntil)}>{validityLabel(provider.account.validUntil)?.split(" · ")[0]}</Badge> : null}
       {showPlanBadge ? <Badge tone="neutral">{provider.account?.subscriptionType}</Badge> : null}
       {usesAgentIdentity ? <Badge tone="accent">Agent Identity</Badge> : null}
@@ -131,6 +136,7 @@ export function ProviderCard({
   onRemove: (id: string) => Promise<void>;
 }) {
   const health = status.config.health[provider.id];
+  const healthDetail = providerHealthDetail(health);
   const active = currentProviderId(currentApplication(status)) === provider.id;
   const account = provider.account;
   const quota = quotaInfo(account);
@@ -213,6 +219,7 @@ export function ProviderCard({
         </div>
       </div>
 
+      {healthDetail && <p className="provider-health-detail">{healthDetail}</p>}
       {health?.lastError ? <p className="provider-error-line">{health.lastError}</p> : null}
     </div>
   );

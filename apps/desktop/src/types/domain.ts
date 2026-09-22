@@ -306,6 +306,8 @@ export interface ProviderHealth {
   lastSuccess?: string | null;
   lastError?: string | null;
   lastFailureKind?: string | null;
+  refreshError?: string | null;
+  nextRefreshAfter?: string | null;
   cooldownUntil?: string | null;
   failureCount: number;
 }

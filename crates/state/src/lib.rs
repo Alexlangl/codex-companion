@@ -1,5 +1,6 @@
 mod model_catalog;
 mod pricing;
+mod repair_history;
 mod session_index;
 mod token_usage;
 
@@ -36,7 +37,9 @@ const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const COMPANION_MARKER_TABLE: &str = "codex_companion";
 const COMPANION_MARKER_VERSION: i64 = 4;
 const COMPANION_STATE_RELATIVE_PATH: &str = "backups/codex-companion/managed-state.json";
-const REPAIR_BACKUP_RETENTION: usize = 10;
+const REPAIR_BACKUP_RETENTION: usize = 2;
+const REPAIR_BACKUP_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const REPAIR_ROLLBACK_FAILED_MARKER: &str = "rollback-failed.txt";
 
 pub use pricing::{read_pricing_settings, save_pricing_settings};
 pub use session_index::list_sessions_cached;
@@ -3327,37 +3330,15 @@ fn rewrite_history_files(
     backup_root: &Path,
     codex_dir: &Path,
 ) -> Result<HistoryMigration> {
-    if source_ids.is_empty() {
-        return Ok(HistoryMigration::default());
-    }
     let mut total = HistoryMigration::default();
+    if source_ids.is_empty() {
+        return Ok(total);
+    }
     for path in files {
-        let text = fs::read_to_string(path).map_err(|source| CompanionError::io(path, source))?;
-        let trailing_newline = text.ends_with('\n');
-        let mut changed_lines = 0;
-        let mut next_lines = Vec::new();
-        for line in text.lines() {
-            if let Some(next_line) =
-                rewrite_session_meta_provider_line(line, source_ids, target_provider_id)?
-            {
-                changed_lines += 1;
-                next_lines.push(next_line);
-            } else {
-                next_lines.push(line.to_string());
-            }
-        }
-        if changed_lines == 0 {
-            continue;
-        }
-
-        backup_file(path, backup_root, codex_dir)?;
-        let mut next = next_lines.join("\n");
-        if trailing_newline {
-            next.push('\n');
-        }
-        fs::write(path, next).map_err(|source| CompanionError::io(path, source))?;
-        total.files += 1;
-        total.lines += changed_lines;
+        let changed =
+            repair_history::rewrite(path, source_ids, target_provider_id, backup_root, codex_dir)?;
+        total.files += usize::from(changed > 0);
+        total.lines += changed;
     }
     Ok(total)
 }
@@ -3374,6 +3355,9 @@ fn rewrite_session_meta_provider_line(
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Ok(None);
+    }
     let Some(provider) = value
         .get("payload")
         .and_then(|payload| payload.get("model_provider"))
@@ -3384,7 +3368,12 @@ fn rewrite_session_meta_provider_line(
     if !source_ids.contains(provider) {
         return Ok(None);
     }
+    let usage_provider = provider.to_string();
     if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+        // Resumability uses the active namespace; historical usage must retain its source.
+        payload
+            .entry("companion_usage_provider")
+            .or_insert(Value::String(usage_provider));
         payload.insert(
             "model_provider".to_string(),
             Value::String(target_provider_id.to_string()),
@@ -3627,7 +3616,9 @@ fn run_repair_transaction<T>(
     match mutate(&mut backup_root) {
         Ok(value) => {
             if backup_root.is_some() {
-                let _ = cleanup_old_repair_backups(codex_dir, REPAIR_BACKUP_RETENTION);
+                if let Err(error) = cleanup_old_repair_backups(codex_dir, REPAIR_BACKUP_RETENTION) {
+                    eprintln!("修复备份清理失败: {error}");
+                }
             }
             Ok((backup_root, value))
         }
@@ -3640,10 +3631,17 @@ fn run_repair_transaction<T>(
                     "{error}；修复未完成，已从 {} 回滚已修改文件",
                     root.display()
                 ))),
-                Err(rollback_error) => Err(CompanionError::InvalidConfig(format!(
-                    "{error}；自动回滚也失败: {rollback_error}；备份位于 {}",
-                    root.display()
-                ))),
+                Err(rollback_error) => {
+                    // A later successful repair must not prune evidence needed for recovery.
+                    let _ = atomic_write_private_file(
+                        &root.join(REPAIR_ROLLBACK_FAILED_MARKER),
+                        rollback_error.to_string().as_bytes(),
+                    );
+                    Err(CompanionError::InvalidConfig(format!(
+                        "{error}；自动回滚也失败: {rollback_error}；备份位于 {}",
+                        root.display()
+                    )))
+                }
             }
         }
     }
@@ -3689,8 +3687,13 @@ fn ensure_repair_backup_root<'a>(
 }
 
 fn restore_repair_backup(backup_root: &Path, codex_dir: &Path) -> Result<()> {
+    repair_history::restore(backup_root, codex_dir)?;
     let mut files = WalkDir::new(backup_root)
         .into_iter()
+        .filter_entry(|entry| {
+            entry.path() != backup_root.join(repair_history::PATCH_DIR)
+                && entry.path() != backup_root.join(REPAIR_ROLLBACK_FAILED_MARKER)
+        })
         .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
@@ -3717,9 +3720,69 @@ fn restore_repair_backup(backup_root: &Path, codex_dir: &Path) -> Result<()> {
 }
 
 fn cleanup_old_repair_backups(codex_dir: &Path, retain: usize) -> Result<()> {
+    cleanup_repair_backups_with_limit(codex_dir, retain, REPAIR_BACKUP_MAX_BYTES)
+}
+
+fn legacy_repair_backup_directories(codex_dir: &Path) -> Result<Vec<PathBuf>> {
+    let parent = codex_dir.join("backups/codex-companion");
+    let entries = match fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(CompanionError::io(&parent, error)),
+    };
+    let mut directories = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| CompanionError::io(&parent, source))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !entry
+            .file_type()
+            .map_err(|source| CompanionError::io(&path, source))?
+            .is_dir()
+            || name.len() != 15
+            || chrono::NaiveDateTime::parse_from_str(&name, "%Y%m%d-%H%M%S").is_err()
+            || !(path.join("sessions").is_dir() || path.join("archived_sessions").is_dir())
+        {
+            continue;
+        }
+        // Early repair snapshots shared the config-backup parent. Only recognize
+        // their known history layout; any config/auth or unknown item protects it.
+        let mut history_only = true;
+        for child in fs::read_dir(&path).map_err(|source| CompanionError::io(&path, source))? {
+            let child = child.map_err(|source| CompanionError::io(&path, source))?;
+            let name = child.file_name();
+            let name = name.to_string_lossy();
+            if !matches!(
+                name.as_ref(),
+                "sessions"
+                    | "archived_sessions"
+                    | "state_5.sqlite"
+                    | "session_index.jsonl"
+                    | "history_repair_backups"
+            ) && !name.starts_with("backup-")
+            {
+                history_only = false;
+                break;
+            }
+        }
+        if history_only {
+            directories.push(path);
+        }
+    }
+    Ok(directories)
+}
+
+fn cleanup_repair_backups_with_limit(
+    codex_dir: &Path,
+    retain: usize,
+    max_bytes: u64,
+) -> Result<()> {
     let parent = repair_backup_parent(codex_dir);
-    let Ok(entries) = fs::read_dir(&parent) else {
-        return Ok(());
+    let entries = match fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(CompanionError::io(&parent, error)),
     };
     let mut directories = entries
         .filter_map(std::result::Result::ok)
@@ -3730,11 +3793,61 @@ fn cleanup_old_repair_backups(codex_dir: &Path, retain: usize) -> Result<()> {
                 .filter(|file_type| file_type.is_dir())
                 .map(|_| entry.path())
         })
+        .filter(|path| !path.join(REPAIR_ROLLBACK_FAILED_MARKER).exists())
         .collect::<Vec<_>>();
-    directories.sort();
-    let remove_count = directories.len().saturating_sub(retain);
-    for path in directories.into_iter().take(remove_count) {
+    directories.extend(legacy_repair_backup_directories(codex_dir)?);
+    let marker = read_companion_state(codex_dir).or_else(|| {
+        fs::read_to_string(codex_dir.join("config.toml"))
+            .ok()
+            .and_then(|text| text.parse::<DocumentMut>().ok())
+            .and_then(|doc| CompanionConfigMarker::from_legacy_doc(&doc))
+    });
+    if let Some(marker) = marker {
+        let protected = [
+            marker.backup_root,
+            marker.config_backup,
+            marker.auth_backup,
+            marker.model_catalog_backup,
+            marker.auth_write_snapshot,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|path| resolve_codex_relative(codex_dir, &path))
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .collect::<Vec<_>>();
+        directories.retain(|path| {
+            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            !protected
+                .iter()
+                .any(|protected| protected.starts_with(&path))
+        });
+    }
+    directories.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    let mut sizes = Vec::new();
+    for path in &directories {
+        let mut bytes = 0u64;
+        for entry in WalkDir::new(path) {
+            let entry = entry.map_err(|error| CompanionError::InvalidConfig(error.to_string()))?;
+            if entry.file_type().is_file() {
+                bytes = bytes.saturating_add(
+                    fs::metadata(entry.path())
+                        .map_err(|source| CompanionError::io(entry.path(), source))?
+                        .len(),
+                );
+            }
+        }
+        sizes.push(bytes);
+    }
+    let mut total: u64 = sizes.iter().sum();
+    let count = directories.len();
+    for (index, (path, size)) in directories.into_iter().zip(sizes).enumerate() {
+        let remaining = count - index;
+        // Always retain the latest recovery point, even when it alone exceeds the budget.
+        if remaining <= 1 || (remaining <= retain && total <= max_bytes) {
+            break;
+        }
         fs::remove_dir_all(&path).map_err(|source| CompanionError::io(&path, source))?;
+        total = total.saturating_sub(size);
     }
     Ok(())
 }
@@ -5972,6 +6085,66 @@ wire_api = "responses"
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, vec!["003", "004", "005"]);
+    }
+
+    #[test]
+    fn repair_backup_cleanup_enforces_size_budget_but_keeps_latest_recovery_point() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = repair_backup_parent(temp.path());
+        for name in ["001", "002", "003"] {
+            let dir = parent.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("state_5.sqlite"), [0; 8]).unwrap();
+        }
+        // Size, not count, forces two snapshots out.
+        cleanup_repair_backups_with_limit(temp.path(), 3, 10).unwrap();
+        assert!(!parent.join("001").exists());
+        assert!(!parent.join("002").exists());
+        assert!(parent.join("003").exists());
+        cleanup_repair_backups_with_limit(temp.path(), 2, 1).unwrap();
+        assert!(parent.join("003").exists());
+    }
+
+    #[test]
+    fn cleanup_includes_legacy_history_but_preserves_config_and_unknown_backups() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("backups/codex-companion");
+        let legacy = parent.join("20260608-150454");
+        fs::create_dir_all(legacy.join("sessions")).unwrap();
+        fs::create_dir_all(legacy.join("backup-older-history")).unwrap();
+        let config = parent.join("20260608-154918");
+        fs::create_dir_all(config.join("sessions")).unwrap();
+        fs::write(config.join("auth.json"), "do not remove").unwrap();
+        let unknown = parent.join("20260608-171753");
+        fs::create_dir_all(unknown.join("sessions")).unwrap();
+        fs::write(unknown.join("unknown.txt"), "do not remove").unwrap();
+        let latest = repair_backup_parent(temp.path()).join("20260922-103922-475");
+        fs::create_dir_all(&latest).unwrap();
+        cleanup_repair_backups_with_limit(temp.path(), 1, 1).unwrap();
+        assert!(!legacy.exists());
+        assert!(config.join("auth.json").exists());
+        assert!(unknown.join("unknown.txt").exists());
+        assert!(latest.exists());
+    }
+
+    #[test]
+    fn cleanup_preserves_a_backup_referenced_by_active_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let protected = temp.path().join("backups/codex-companion/20260608-150454");
+        fs::create_dir_all(protected.join("sessions")).unwrap();
+        let latest = repair_backup_parent(temp.path()).join("20260922-103922-475");
+        fs::create_dir_all(&latest).unwrap();
+        write_companion_state(
+            temp.path(),
+            &CompanionConfigMarker {
+                backup_root: Some("backups/codex-companion/20260608-150454".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        cleanup_repair_backups_with_limit(temp.path(), 1, 1).unwrap();
+        assert!(protected.exists());
+        assert!(latest.exists());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-const TOKEN_USAGE_CACHE_VERSION: u32 = 9;
+const TOKEN_USAGE_CACHE_VERSION: u32 = 10;
 const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 const TOKEN_USAGE_PREFIX_BYTES: u64 = 64 * 1024;
 
@@ -1512,6 +1512,7 @@ fn update_model_and_provider(state: &mut FileParseState, value: &Value) {
     if let Some(provider_id) = pick_string(
         value,
         &[
+            &["companion_usage_provider"],
             &["model_provider"],
             &["modelProvider"],
             &["provider_id"],
@@ -2003,6 +2004,24 @@ mod tests {
         assert_eq!(delta.cached_input, 40);
         assert_eq!(delta.cache_write_input, 5);
         assert_eq!(delta.output, 20);
+    }
+
+    #[test]
+    fn usage_provider_survives_namespace_repair_and_explicit_event_provider_takes_precedence() {
+        let mut state = FileParseState::default();
+        update_model_and_provider(
+            &mut state,
+            &serde_json::json!({
+                "model_provider": "codex-companion",
+                "companion_usage_provider": "provider-a"
+            }),
+        );
+        assert_eq!(state.current_provider_id.as_deref(), Some("provider-a"));
+        update_model_and_provider(
+            &mut state,
+            &serde_json::json!({"provider_id": "provider-b"}),
+        );
+        assert_eq!(state.current_provider_id.as_deref(), Some("provider-b"));
     }
 
     #[test]

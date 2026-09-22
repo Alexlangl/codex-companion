@@ -21,8 +21,8 @@ use codex_companion_core::{
     COMPANION_RELAY_BEARER_TOKEN,
 };
 use codex_companion_health::{
-    classify_failure, cooldown_active, mark_failure, mark_model_failure,
-    normalize_expired_cooldown, repair_legacy_auth_misclassification,
+    classify_failure, mark_failure, mark_model_failure, normalize_expired_cooldown,
+    repair_legacy_auth_misclassification,
 };
 use codex_companion_provider::selected_providers_for_group;
 use futures_util::StreamExt;
@@ -379,27 +379,9 @@ async fn proxy_dispatch(
     // Cooldown is an eligibility rule, including single-provider groups and
     // manual failback. Never probe an account before its recovery time.
     let mut candidates = selected
-        .into_iter()
-        .filter_map(|provider| {
-            if !provider_available(&state, &provider, requested_model.as_deref()) {
-                return None;
-            }
-            let health = config.health.get(&provider.id);
-            if health.is_some_and(|health| matches!(health.status, HealthStatusKind::AuthFailed)) {
-                return None;
-            }
-            let globally_available = health.is_none_or(|health| !cooldown_active(health));
-            let model_available = requested_model.as_deref().is_none_or(|model| {
-                !state
-                    .api_service
-                    .model_cooldown_active(&provider.id, model)
-                    .unwrap_or(false)
-            });
-            if globally_available && model_available {
-                return Some(provider);
-            }
-            None
-        })
+        .iter()
+        .cloned()
+        .filter(|provider| provider_available(&state, provider, requested_model.as_deref()))
         .collect::<Vec<_>>();
 
     apply_group_policy(&state, &group, &mut candidates);
@@ -458,7 +440,7 @@ async fn proxy_dispatch(
         candidates.truncate(usize::from(config.relay.retry_budget).saturating_add(1));
     }
     if candidates.is_empty() {
-        let message = "当前本地代理分组没有可用账号".to_string();
+        let message = unavailable_providers_message(&state, &selected, requested_model.as_deref());
         append_event(
             &state.store,
             "error",
@@ -1288,6 +1270,79 @@ fn is_model_scoped_failure(kind: &HealthFailureKind) -> bool {
     )
 }
 
+fn unavailable_providers_message(
+    state: &RelayState,
+    providers: &[ProviderConfig],
+    model: Option<&str>,
+) -> String {
+    let prefix = "当前本地代理分组没有可用账号";
+    if providers.is_empty() {
+        return format!("{prefix}：分组没有已启用的账号");
+    }
+    let Ok(config) = state.store.load() else {
+        return format!("{prefix}：无法读取账号状态");
+    };
+    let now = chrono::Utc::now();
+    let reasons = providers
+        .iter()
+        .enumerate()
+        .map(|(index, provider)| {
+            let reason = if let Some(health) = config.health.get(&provider.id).filter(|health| {
+                health.status == HealthStatusKind::AuthFailed
+                    || codex_companion_health::provider_cooldown_active(&provider.kind, health)
+            }) {
+                if health.status == HealthStatusKind::AuthFailed {
+                    "认证失败，需要重新授权或更新凭证".to_string()
+                } else {
+                    let seconds = health
+                        .cooldown_until
+                        .map(|until| (until - now).num_seconds().max(0) + 1)
+                        .unwrap_or(0);
+                    let cause = match health.last_failure_kind {
+                        Some(HealthFailureKind::RateLimited) => "上游限流",
+                        Some(HealthFailureKind::QuotaExhausted) => "额度耗尽",
+                        Some(HealthFailureKind::NetworkFailed) => "连接失败",
+                        Some(HealthFailureKind::ModelMissing) => "模型不可用",
+                        _ => "上游失败",
+                    };
+                    format!("{cause}，冷却剩余 {seconds} 秒")
+                }
+            } else if let Some(reason) = config.providers.get(&provider.id).and_then(|current| {
+                codex_companion_core::account_policy_block_reason(
+                    &config.relay.account_protection,
+                    current,
+                    model,
+                    now,
+                )
+            }) {
+                match reason {
+                    "account_model_excluded" => "此模型已被排除".to_string(),
+                    "quota_reserve_reached" => "已达到额度保留阈值".to_string(),
+                    _ => "额度信息缺失、过期或无效，需要刷新额度".to_string(),
+                }
+            } else if provider.kind == ProviderKind::OfficialCodex
+                && model.is_some_and(|model| {
+                    let mapped = provider
+                        .model_map
+                        .get(model)
+                        .map(String::as_str)
+                        .unwrap_or(model);
+                    state
+                        .api_service
+                        .model_cooldown_active(&provider.id, mapped)
+                        .unwrap_or(false)
+                })
+            {
+                "请求模型正在冷却，可在本地代理页面查看到期时间".to_string()
+            } else {
+                "账号已停用、配置已变更或状态暂不可读取".to_string()
+            };
+            format!("账号 {}：{reason}", index + 1)
+        })
+        .collect::<Vec<_>>();
+    format!("{prefix}；{}", reasons.join("；"))
+}
+
 pub(crate) fn provider_available(
     state: &RelayState,
     provider: &ProviderConfig,
@@ -1313,21 +1368,23 @@ pub(crate) fn provider_available(
         && current.base_url == provider.base_url
         && current.model_map == provider.model_map
         && config.health.get(&provider.id).is_none_or(|health| {
-            health.status != HealthStatusKind::AuthFailed && !cooldown_active(health)
+            health.status != HealthStatusKind::AuthFailed
+                && !codex_companion_health::provider_cooldown_active(&current.kind, health)
         })
-        && model.is_none_or(|model| {
-            !state
-                .api_service
-                .model_cooldown_active(
-                    &provider.id,
-                    provider
-                        .model_map
-                        .get(model)
-                        .map(String::as_str)
-                        .unwrap_or(model),
-                )
-                .unwrap_or(true)
-        })
+        && (current.kind != ProviderKind::OfficialCodex
+            || model.is_none_or(|model| {
+                !state
+                    .api_service
+                    .model_cooldown_active(
+                        &provider.id,
+                        provider
+                            .model_map
+                            .get(model)
+                            .map(String::as_str)
+                            .unwrap_or(model),
+                    )
+                    .unwrap_or(true)
+            }))
 }
 
 fn record_provider_failure(
@@ -1341,7 +1398,13 @@ fn record_provider_failure(
     if matches!(&failure.kind, HealthFailureKind::RequestRejected) {
         return;
     }
-    if let Some(model) = model.filter(|_| is_model_scoped_failure(&failure.kind)) {
+    if let Some(model) = model.filter(|_| {
+        is_model_scoped_failure(&failure.kind)
+            && config
+                .providers
+                .get(provider_id)
+                .is_some_and(|p| p.kind == ProviderKind::OfficialCodex)
+    }) {
         let model = config
             .providers
             .get(provider_id)
@@ -1620,9 +1683,15 @@ fn scoped_affinity_key(key: &str, client_id: Option<&str>) -> String {
 
 fn normalize_health(config: &mut CompanionConfig) -> bool {
     let mut repaired = false;
-    for health in config.health.values_mut() {
+    for (id, health) in &mut config.health {
         repaired |= repair_legacy_auth_misclassification(health);
-        normalize_expired_cooldown(health);
+        let previous = (health.status.clone(), health.cooldown_until);
+        if let Some(provider) = config.providers.get(id) {
+            codex_companion_health::normalize_provider_cooldown(&provider.kind, health);
+        } else {
+            normalize_expired_cooldown(health);
+        }
+        repaired |= previous != (health.status.clone(), health.cooldown_until);
     }
     repaired
 }
@@ -3214,7 +3283,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("ok from b"));
         assert_eq!(provider_a_hits.load(Ordering::SeqCst), 1);
         assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
-        assert!(state
+        assert!(!state
             .api_service
             .model_cooldown_active("a", "gpt-test")
             .expect("rate limit cooldown"));
@@ -3581,7 +3650,7 @@ mod tests {
         .expect("second proxy");
 
         assert_eq!(second_response.status(), StatusCode::OK);
-        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b_hits.load(Ordering::SeqCst), 2);
         assert_eq!(provider_a_hits.load(Ordering::SeqCst), 2);
         assert_eq!(
             state
@@ -3636,7 +3705,7 @@ mod tests {
             health.last_failure_kind,
             Some(HealthFailureKind::UpstreamFailed)
         );
-        assert!(health.cooldown_until.is_some());
+        assert!(health.cooldown_until.is_none());
         let events =
             std::fs::read_to_string(store.data_dir().join("relay/events.jsonl")).expect("events");
         assert!(events.contains(&request_id));
@@ -3653,43 +3722,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_provider_route_respects_its_own_cooldown() {
+    async fn single_provider_quota_cooldown_expires_without_local_errors_extending_it() {
         let provider_hits = Arc::new(AtomicUsize::new(0));
-        let provider_url = spawn_mock_server(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "temporary unavailable",
-            Some(provider_hits.clone()),
-        )
-        .await;
+        let provider_url =
+            spawn_mock_server(StatusCode::OK, "recovered", Some(provider_hits.clone())).await;
         let store = store_with_group(vec![provider("a", &provider_url)]);
         store
             .update(|config| {
-                let failure = classify_failure(Some(503), "temporary unavailable");
+                let failure = classify_failure(Some(429), "insufficient_quota");
                 let health = config
                     .health
                     .entry("a".to_string())
                     .or_insert_with(ProviderHealth::default);
-                mark_failure(health, &failure, "temporary unavailable".to_string());
+                mark_failure(health, &failure, "insufficient_quota".to_string());
                 Ok(())
             })
             .expect("seed cooldown");
-        let state = RelayState::new(store, reqwest::Client::new());
+        let before = store.load().unwrap().health["a"].clone();
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        for _ in 0..2 {
+            let response = proxy_inner(
+                state.clone(),
+                Method::GET,
+                "/v1/models".parse().expect("uri"),
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await
+            .expect("proxy");
 
-        let response = proxy_inner(
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(provider_hits.load(Ordering::SeqCst), 0);
+            let body = to_bytes(response.into_body(), 1024).await.expect("body");
+            let value: Value = serde_json::from_slice(&body).expect("error json");
+            assert_eq!(value["error"]["code"], "no_available_provider");
+            assert!(value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("额度耗尽"));
+            let after = store.load().unwrap().health["a"].clone();
+            assert_eq!(after.cooldown_until, before.cooldown_until);
+            assert_eq!(after.failure_count, before.failure_count);
+        }
+        store
+            .update(|config| {
+                config.health.get_mut("a").unwrap().cooldown_until =
+                    Some(Utc::now() - ChronoDuration::seconds(1));
+                Ok(())
+            })
+            .unwrap();
+        let recovered = proxy_inner(
             state,
             Method::GET,
-            "/v1/models".parse().expect("uri"),
+            "/v1/models".parse().unwrap(),
             HeaderMap::new(),
             Bytes::new(),
         )
         .await
-        .expect("proxy");
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(provider_hits.load(Ordering::SeqCst), 0);
-        let body = to_bytes(response.into_body(), 1024).await.expect("body");
-        let value: Value = serde_json::from_slice(&body).expect("error json");
-        assert_eq!(value["error"]["code"], "no_available_provider");
+        .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(provider_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3901,7 +3993,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limit_cools_only_the_failed_provider_model_pair() {
+    async fn transient_third_party_failures_keep_accepting_new_requests() {
+        for (status, body) in [
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
+            (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
+            (StatusCode::NOT_FOUND, "model_not_found"),
+        ] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let url = spawn_mock_server(status, body, Some(hits.clone())).await;
+            let store = store_with_group(vec![provider("a", &url)]);
+            store
+                .update(|config| {
+                    config.health.insert(
+                        "a".into(),
+                        ProviderHealth {
+                            status: HealthStatusKind::Cooldown,
+                            last_failure_kind: Some(HealthFailureKind::NetworkFailed),
+                            cooldown_until: Some(Utc::now() + ChronoDuration::minutes(30)),
+                            ..ProviderHealth::default()
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            let state = RelayState::new(store.clone(), reqwest::Client::new());
+            for count in 1..=2 {
+                let response = proxy_inner(
+                    state.clone(),
+                    Method::POST,
+                    "/v1/responses".parse().unwrap(),
+                    HeaderMap::new(),
+                    Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+                )
+                .await
+                .unwrap();
+                assert!(response.status().is_client_error() || response.status().is_server_error());
+                assert_eq!(hits.load(Ordering::SeqCst), count);
+                let health = store.load().unwrap().health["a"].clone();
+                assert!(health.cooldown_until.is_none());
+                assert_ne!(health.status, HealthStatusKind::Cooldown);
+            }
+        }
+    }
+
+    #[test]
+    fn model_cooldowns_apply_only_to_official_accounts() {
+        let mut official = provider("official", "https://api.example.test/v1");
+        official.kind = ProviderKind::OfficialCodex;
+        let third_party = provider("relay", "https://relay.example.test/v1");
+        let store = store_with_group(vec![official, third_party]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        for id in ["official", "relay"] {
+            record_provider_failure(
+                &state,
+                &store.load().unwrap(),
+                id,
+                Some("gpt-test"),
+                &classify_failure(Some(429), "rate_limit_exceeded"),
+                "rate_limit_exceeded",
+            );
+        }
+        assert!(state
+            .api_service
+            .model_cooldown_active("official", "gpt-test")
+            .unwrap());
+        assert!(!state
+            .api_service
+            .model_cooldown_active("relay", "gpt-test")
+            .unwrap());
+        assert!(!provider_available(
+            &state,
+            &store.load().unwrap().providers["official"],
+            Some("gpt-test")
+        ));
+        assert!(provider_available(
+            &state,
+            &store.load().unwrap().providers["relay"],
+            Some("gpt-test")
+        ));
+    }
+
+    #[tokio::test]
+    async fn third_party_rate_limit_does_not_cool_any_model() {
         let hits_a = Arc::new(AtomicUsize::new(0));
         let hits_b = Arc::new(AtomicUsize::new(0));
         let url_a = spawn_mock_server(
@@ -3932,13 +4105,13 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 3);
         assert_eq!(hits_b.load(Ordering::SeqCst), 3);
-        assert!(state
+        assert!(!state
             .api_service
             .model_cooldown_active("a", "gpt-one")
             .expect("gpt-one cooldown"));
-        assert!(state
+        assert!(!state
             .api_service
             .model_cooldown_active("a", "gpt-two")
             .expect("gpt-two cooldown"));
@@ -4130,7 +4303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cooled_providers_are_not_contacted_when_every_account_is_cooling() {
+    async fn legacy_third_party_model_cooldowns_do_not_block_requests() {
         let hits_a = Arc::new(AtomicUsize::new(0));
         let hits_b = Arc::new(AtomicUsize::new(0));
         let hits_c = Arc::new(AtomicUsize::new(0));
@@ -4189,9 +4362,9 @@ mod tests {
         )
         .await
         .expect("fallback request");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
-        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
         assert_eq!(hits_c.load(Ordering::SeqCst), 0);
     }
 
@@ -4379,7 +4552,8 @@ mod tests {
                 config.health.insert(
                     "a".to_string(),
                     ProviderHealth {
-                        status: HealthStatusKind::Cooldown,
+                        status: HealthStatusKind::QuotaExhausted,
+                        last_failure_kind: Some(HealthFailureKind::QuotaExhausted),
                         cooldown_until: Some(Utc::now() + ChronoDuration::minutes(5)),
                         ..ProviderHealth::default()
                     },

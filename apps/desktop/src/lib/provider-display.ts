@@ -2,6 +2,7 @@ import type { BadgeTone } from "../components/ui";
 import type {
   ProviderAccountInfo,
   ProviderConfig,
+  ProviderHealth,
   ProviderQuotaWindow,
 } from "../types/domain";
 import { daysUntil, formatPercent, formatTime } from "./format";
@@ -149,6 +150,37 @@ export function providerHealthTone(status?: string): BadgeTone {
     default:
       return "neutral";
   }
+}
+
+export function providerHealthDetail(health?: ProviderHealth): string | null {
+  if (!health) return null;
+  if (health.status === "auth_failed") return "凭证失效，需重新授权或更新凭证";
+  const parts: string[] = [];
+  const causes: Record<string, string> = {
+    rate_limited: "上游限流",
+    quota_exhausted: "上游报告额度耗尽",
+    network_failed: "上游连接失败",
+    upstream_failed: "上游服务失败",
+    model_missing: "上游模型不可用",
+  };
+  const cause = causes[health.lastFailureKind ?? ""];
+  if (health.cooldownUntil) {
+    const remaining = Math.ceil((Date.parse(health.cooldownUntil) - Date.now()) / 1000);
+    if (remaining > 0) {
+      const retryAt = new Date(health.cooldownUntil).toLocaleString("zh-CN", { hour12: false });
+      parts.push(`${cause ?? "上游请求失败"}；冷却至 ${retryAt}，到期后可重试`);
+    } else if (Number.isFinite(remaining)) {
+      parts.push("冷却已结束，可再次尝试请求");
+    }
+  } else if (cause) {
+    parts.push(`上次请求：${cause}`);
+  }
+  if (health.refreshError) {
+    let refreshDetail = "状态探测失败（单独退避，不暂停推理请求）";
+    if (health.nextRefreshAfter) refreshDetail += `，下次探测 ${formatTime(health.nextRefreshAfter)}`;
+    parts.push(refreshDetail);
+  }
+  return parts.length > 0 ? parts.join("；") : null;
 }
 
 export function quotaInfo(account?: ProviderAccountInfo | null): {
