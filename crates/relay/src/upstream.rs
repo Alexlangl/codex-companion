@@ -107,8 +107,9 @@ impl UpstreamResponse {
         &mut self,
         policy: &codex_companion_core::AccountProtection,
         provider: &ProviderConfig,
+        codex_catalog: bool,
     ) -> Result<(), String> {
-        if policy.excluded_models.is_empty()
+        if !codex_catalog && policy.excluded_models.is_empty()
             && policy
                 .providers
                 .get(&provider.id)
@@ -148,6 +149,7 @@ impl UpstreamResponse {
                 });
             }
         }
+        if codex_catalog { crate::model_catalog::adapt_codex_model_catalog(&mut value); }
         self.buffered_body = Some(Bytes::from(value.to_string()));
         self.headers.remove(header::CONTENT_LENGTH);
         self.headers.remove(header::CONTENT_ENCODING);

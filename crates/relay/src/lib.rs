@@ -17,3 +17,5 @@ pub use events::{clear_event_logs, read_recent_events};
 pub use server::{serve, BoundRelay, RelayStartOutcome};
 
 mod usage_capture;
+
+mod model_catalog;

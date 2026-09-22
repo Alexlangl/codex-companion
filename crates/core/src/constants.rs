@@ -4,3 +4,6 @@ pub const COMPANION_RELAY_BEARER_TOKEN: &str = "CODEX_COMPANION_RELAY";
 pub const DEFAULT_RELAY_HOST: &str = "127.0.0.1";
 pub const DEFAULT_RELAY_PORT: u16 = 17687;
 pub const DEFAULT_GROUP_ID: &str = "default";
+
+/// Shared schema for generated native Codex model catalogs.
+pub const CODEX_MODEL_CATALOG_TEMPLATE: &str = include_str!("model_catalog_template.json");

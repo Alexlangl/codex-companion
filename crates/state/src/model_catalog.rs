@@ -94,7 +94,7 @@ fn load_cached_models(codex_dir: &Path) -> Vec<Value> {
 }
 
 fn fallback_template() -> Result<Value> {
-    serde_json::from_str(include_str!("model_catalog_template.json")).map_err(|source| {
+    serde_json::from_str(codex_companion_core::CODEX_MODEL_CATALOG_TEMPLATE).map_err(|source| {
         CompanionError::InvalidConfig(format!("内置 Codex 模型目录模板无效: {source}"))
     })
 }

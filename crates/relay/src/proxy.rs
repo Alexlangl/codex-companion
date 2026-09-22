@@ -264,7 +264,7 @@ async fn proxy_dispatch(
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            return Ok(allowed_models_response(&models));
+            return Ok(allowed_models_response(&models, is_codex_catalog_request(&uri)));
         }
     }
     if normalize_health(&mut config) {
@@ -348,7 +348,7 @@ async fn proxy_dispatch(
                 started_at,
                 None,
             );
-            return Ok(allowed_models_response(&models));
+            return Ok(allowed_models_response(&models, is_codex_catalog_request(&uri)));
         }
     }
     let affinity_preference = affinity_key.as_deref().and_then(|key| {
@@ -599,7 +599,7 @@ async fn proxy_dispatch(
             Ok(mut response) if response.status().is_success() => {
                 if method == Method::GET && uri.path() == "/v1/models" {
                     response
-                        .filter_model_catalog(&config.relay.account_protection, &provider)
+                        .filter_model_catalog(&config.relay.account_protection, &provider, is_codex_catalog_request(&uri))
                         .await?;
                 }
                 let upstream_status = response.status();
@@ -1565,20 +1565,25 @@ fn api_error_response(status: StatusCode, code: &str, message: &str) -> Response
         .unwrap_or_else(|_| text_response(status, message.to_string()))
 }
 
-fn allowed_models_response(models: &[String]) -> Response {
+fn is_codex_catalog_request(uri: &Uri) -> bool {
+    url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+        .any(|(key, value)| key == "client_version" && !value.is_empty())
+}
+
+fn allowed_models_response(models: &[String], codex_catalog: bool) -> Response {
     let data = models
         .iter()
         .map(|model| serde_json::json!({"id": model, "object": "model", "owned_by": "codex-companion"}))
         .collect::<Vec<_>>();
+    let mut catalog = serde_json::json!({"object": "list", "data": data});
+    if codex_catalog { crate::model_catalog::adapt_codex_model_catalog(&mut catalog); }
     Response::builder()
         .status(StatusCode::OK)
         .header(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json; charset=utf-8"),
         )
-        .body(Body::from(
-            serde_json::json!({"object": "list", "data": data}).to_string(),
-        ))
+        .body(Body::from(catalog.to_string()))
         .expect("models response")
 }
 
@@ -1859,6 +1864,32 @@ mod tests {
         .await
         .expect("browser root probe");
         assert_eq!(browser_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn codex_versioned_models_accepts_third_party_catalogs_and_filters_exclusions() {
+        let upstream = spawn_mock_server(StatusCode::OK, r#"{"object":"list","data":[{"id":"allowed"},{"id":"blocked"}]}"#, None).await;
+        let store = store_with_group(vec![provider("a", &upstream)]);
+        store.update(|config| {
+            config.relay.account_protection.excluded_models.push("blocked".into());
+            Ok(())
+        }).unwrap();
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        let response = proxy_inner(state.clone(), Method::GET, "/v1/models?client_version=0.155.0".parse().unwrap(), HeaderMap::new(), Bytes::new()).await.unwrap();
+        let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+        let catalog: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(catalog["models"].as_array().unwrap().len(), 1);
+        assert_eq!(catalog["models"][0]["slug"], "allowed");
+        assert_eq!(catalog["data"][0]["id"], "allowed");
+        // The same native shape is required when model maps are served locally.
+        store.update(|config| {
+            config.providers.get_mut("a").unwrap().model_map.insert("local-model".into(), "actual-model".into());
+            Ok(())
+        }).unwrap();
+        let response = proxy_inner(state, Method::GET, "/v1/models?client_version=0.155.0".parse().unwrap(), HeaderMap::new(), Bytes::new()).await.unwrap();
+        let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+        let catalog: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(catalog["models"][0]["slug"], "local-model");
     }
 
     #[tokio::test]
