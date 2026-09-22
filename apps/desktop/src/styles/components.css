@@ -1007,10 +1007,6 @@ textarea:focus,
   white-space: normal;
 }
 
-.compact-status:has(.provider-health-detail) {
-  flex: 0 1 24rem;
-  min-width: 0;
-}
 
 .account-meta small,
 .account-meta strong {
@@ -1707,15 +1703,15 @@ dd {
 }
 
 .provider-compact-item {
-  display: flex;
+  display: grid;
+  grid-template-columns: 28px minmax(140px, 1fr) minmax(140px, 240px) minmax(90px, 120px) 268px;
   min-width: 0;
   min-height: 42px;
-  flex-wrap: wrap;
-  gap: 6px;
+  gap: 12px;
   align-items: center;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 6px 7px;
+  padding: 10px;
   background: var(--surface-raised);
   transition: border-color 160ms ease;
 }
@@ -1750,16 +1746,7 @@ dd {
   background: var(--primary);
 }
 
-.provider-compact-item > strong {
-  min-width: 76px;
-  flex: 1 1 112px;
-  overflow: hidden;
-  color: var(--foreground);
-  font-size: 13px;
-  font-weight: 680;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+
 
 .compact-dot {
   width: 6px;
@@ -4173,3 +4160,33 @@ dd {
   .usage-scan-settings { flex-wrap: wrap; }
   .usage-scan-settings .field { flex-basis: 100%; }
 }
+
+/* Stable compact columns; diagnostic copy expands below the status on demand. */
+.compact-identity { min-width: 0; align-self: center; }
+.compact-identity > strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.compact-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.compact-badges:empty { display: none; }
+.provider-compact-item .compact-check { align-self: center; }
+.compact-quota { display: flex; align-items: center; gap: 6px; min-width: 0; align-self: center; overflow-wrap: anywhere; }
+.compact-status, .compact-health-toggle { display: flex; align-items: center; gap: 6px; font-size: 11px; line-height: 28px; }
+.compact-health-toggle { cursor: pointer; border: 0; padding: 0; background: transparent; color: var(--muted); font: inherit; font-size: 11px; }
+.compact-health-toggle:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: 3px; }
+.compact-health { min-width: 0; }
+.compact-health-expanded { grid-column: 2 / -1; margin: 0; padding-top: 8px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); line-height: 1.6; overflow-wrap: anywhere; }
+.compact-badges .badge { max-width: 140px; }
+.compact-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.dialog-content.confirm-dialog { width: min(440px, calc(100vw - 32px)); }
+.confirm-dialog .actions { justify-content: flex-end; margin-top: 24px; }
+@media (max-width: 1150px) {
+  .provider-compact-item { grid-template-columns: 28px minmax(140px, 1fr) minmax(100px, 180px) 110px; }
+  .compact-actions { grid-column: 2 / -1; }
+}
+@media (max-width: 600px) {
+  .provider-compact-item { grid-template-columns: 28px minmax(0, 1fr); }
+  .compact-quota, .compact-health { grid-column: 2; }
+  .compact-actions { flex-wrap: wrap; justify-content: flex-start; }
+}
+
+.compact-action-spacer { width: 28px; flex: 0 0 28px; }
+
+.confirm-dialog .error-banner { margin: 16px 0; }

@@ -532,8 +532,7 @@ export function TokenStats({
               labelForKey={(key) => usageProviderLabel(status, key)}
             />
             <p className="field-hint">
-              按会话记录中的来源统计。中转记录未保存具体上游时，标为“中转 ·
-              上游未记录”，不会将历史用量归到当前账号。
+              按请求实际使用的 Provider 统计。旧记录或无法匹配来源的用量单列，不归入当前账号。
             </p>
           </>
         ) : null}
@@ -959,9 +958,9 @@ function usageProviderLabel(
   providerId: string,
 ): string {
   const provider = status.config.providers[providerId];
-  if (providerId === "codex-companion") return "中转 · 上游未记录";
+  if (provider) return provider.name.trim() || providerAccountTitle(provider);
+  if (providerId === "codex-companion") return "未归属用量";
   if (providerId === "openai") return "OpenAI · 账号未记录";
   if (providerId === "unknown") return "来源未记录";
-  if (!provider) return providerId;
-  return providerAccountTitle(provider);
+  return providerId;
 }

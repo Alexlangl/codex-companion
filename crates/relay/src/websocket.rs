@@ -91,7 +91,8 @@ pub(crate) async fn responses_websocket(
     let allowed_models = api_client
         .map(|api_client| api_client.allowed_models)
         .unwrap_or_default();
-    let preferred_provider = websocket_session_id(&headers).and_then(|session_id| {
+    let session_id = websocket_session_id(&headers);
+    let preferred_provider = session_id.as_deref().and_then(|session_id| {
         state
             .api_service
             .session_provider_preference(&session_id)
@@ -145,6 +146,7 @@ pub(crate) async fn responses_websocket(
                 upstream,
                 allowed_models,
                 client_id,
+                session_id,
             )
         })
         .into_response();
@@ -953,6 +955,7 @@ async fn bridge_websocket(
     upstream: ConnectedWebSocket,
     allowed_models: Vec<String>,
     client_id: Option<String>,
+    session_id: Option<String>,
 ) {
     let (mut client_sink, mut client_stream) = client.split();
     let ConnectedWebSocket {
@@ -1036,6 +1039,7 @@ async fn bridge_websocket(
                         &state,
                         &value,
                         client_id.as_deref(),
+                        session_id.as_deref(),
                     ));
                 }
                 if let Some(model) = frame_disallowed_model(&message, &allowed_models) {
@@ -1456,6 +1460,14 @@ async fn bridge_websocket(
                         pending.mark_output_started();
                     }
                     WebSocketUpstreamEvent::Terminal => {
+                        if let Some(audit) = pending.audit.as_mut() {
+                            let bytes = match &upstream_message {
+                                UpstreamMessage::Text(text) => text.as_bytes(),
+                                UpstreamMessage::Binary(bytes) => bytes.as_ref(),
+                                _ => &[],
+                            };
+                            if let Ok(value) = serde_json::from_slice(bytes) { audit.record_usage(&value); }
+                        }
                         if flush_pending_messages(&mut client_sink, &mut pending)
                             .await
                             .is_err()
@@ -3475,7 +3487,7 @@ mod tests {
                 .expect("send output");
             websocket
                 .send(UpstreamMessage::Text(
-                    r#"{"type":"response.completed","response":{"status":"completed"}}"#.into(),
+                    r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":80}}}}"#.into(),
                 ))
                 .await
                 .expect("send completed");
@@ -3496,7 +3508,9 @@ mod tests {
             let _ = axum::serve(relay_listener, app).await;
         });
 
-        let (mut client, _) = connect_async(format!("ws://{relay_addr}/v1/responses"))
+        let mut request = format!("ws://{relay_addr}/v1/responses").into_client_request().expect("request");
+        request.headers_mut().insert("session_id", HeaderValue::from_static("usage-websocket"));
+        let (mut client, _) = connect_async(request)
             .await
             .expect("relay handshake");
         client
@@ -3521,6 +3535,12 @@ mod tests {
                 }
             }
         }
+        let mut events = vec![codex_companion_core::TokenUsageEvent {
+            session_id: Some("usage-websocket".into()), timestamp: Some(Utc::now().to_rfc3339()),
+            input_tokens: 20, cached_input_tokens: 80, output_tokens: 20, ..Default::default()
+        }];
+        codex_companion_core::apply_usage_attribution(&state.store.data_dir(), &mut events).expect("attribute");
+        assert_eq!(events[0].provider_id.as_deref(), Some("second"));
         assert!(output.contains("from second"));
         assert!(!output.contains("upstream capacity temporarily unavailable"));
         assert_eq!(

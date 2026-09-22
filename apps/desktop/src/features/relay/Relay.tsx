@@ -1,3 +1,4 @@
+import { ConfirmAction } from "../../components/ConfirmAction";
 import { SettingsDialog } from "../../components/SettingsDialog";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
@@ -93,15 +94,19 @@ export function Relay({ active, status }: RelayProps) {
   );
   const [logsRefreshing, setLogsRefreshing] = useState(false);
   const logRefreshInFlightRef = useRef(false);
+  const clearingLogsRef = useRef(false);
+  const [logsMessage, setLogsMessage] = useState("");
   const logRefreshRevisionRef = useRef(0);
 
   const loadSnapshot = useCallback(async () => {
     setLoading(true);
+    const revision = logRefreshRevisionRef.current;
     try {
       const [nextSnapshot, nextSelfTest] = await Promise.all([
         getApiServiceSnapshot(),
         apiServiceSelfTest(),
       ]);
+      if (revision !== logRefreshRevisionRef.current || clearingLogsRef.current) return;
       setSnapshot(nextSnapshot);
       setSelfTest(nextSelfTest);
       setError(null);
@@ -113,7 +118,7 @@ export function Relay({ active, status }: RelayProps) {
   }, []);
 
   const loadLogs = useCallback(async (showLoading: boolean): Promise<void> => {
-    if (logRefreshInFlightRef.current) return;
+    if (logRefreshInFlightRef.current || clearingLogsRef.current) return;
     logRefreshInFlightRef.current = true;
     const revision = logRefreshRevisionRef.current;
     if (showLoading) setLogsRefreshing(true);
@@ -227,17 +232,21 @@ export function Relay({ active, status }: RelayProps) {
     void runAction("self-test", () => Promise.resolve());
   }
 
-  function handleClearLogs() {
-    if (!window.confirm("清空本地 API 请求日志？client 和配置不会被删除。"))
-      return;
-    void runAction("clear-logs", async () => {
-      await clearApiRequestLogs();
-      logRefreshRevisionRef.current += 1;
-      setSnapshot((current) =>
-        current ? { ...current, recentRequests: [] } : current,
-      );
+  async function handleClearLogs(): Promise<void> {
+    clearingLogsRef.current = true;
+    logRefreshRevisionRef.current += 1;
+    setAction("clear-logs");
+    setLogsMessage("");
+    try {
+      const removed = await clearApiRequestLogs();
+      setSnapshot((current) => current ? { ...current, recentRequests: [] } : current);
       setRelayEvents([]);
-    });
+      setLogsMessage(`已清空 ${removed} 条请求日志及转发诊断；新请求会继续记录。`);
+    } finally {
+      logRefreshRevisionRef.current += 1;
+      clearingLogsRef.current = false;
+      setAction(null);
+    }
   }
 
   function handleRefreshLogs(): void {
@@ -724,18 +733,17 @@ export function Relay({ active, status }: RelayProps) {
               />{" "}
               刷新日志
             </Button>
-            <Button
-              disabled={
-                (requests.length === 0 && relayEvents.length === 0) ||
-                action !== null
-              }
-              onClick={handleClearLogs}
-              variant="ghost"
+            <ConfirmAction
+              title="清空转发日志？"
+              description="删除本地 API 请求日志和转发诊断。Client、配置和用量统计会保留；此操作不可撤销。"
+              disabled={action !== null}
+              onConfirm={handleClearLogs}
             >
               <Trash2 aria-hidden="true" size={14} /> 清空日志
-            </Button>
+            </ConfirmAction>
           </div>
         </div>
+        {logsMessage ? <p className="field-hint" role="status">{logsMessage}</p> : null}
         {requests.length === 0 ? (
           <div className="api-compact-empty">
             <Database size={18} /> 暂无 API 请求

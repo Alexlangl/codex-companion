@@ -312,6 +312,7 @@ codex-companion-tui
 | `~/.codex-companion/relay/api-service.sqlite3` | API client 哈希、请求审计、会话亲和与转换历史 |
 | `~/.codex-companion/logs/` | 已脱敏的 Companion JSONL 诊断日志 |
 | `~/.codex-companion/cache/` | 会话索引与 token 用量缓存 |
+| `~/.codex-companion/usage-attribution.sqlite3` | 请求实际 Provider 与 Token 计数的来源记录 |
 | `~/.codex/backups/codex-companion/` | Codex 配置安装与修复备份 |
 
 可以使用 `CODEX_COMPANION_HOME` 修改 Companion 数据目录，使用 `CODEX_COMPANION_CODEX_DIR` 指向另一个 Codex 目录。
@@ -387,6 +388,8 @@ Codex 使用 Responses API。地址明确指向 `/chat/completions` 的 provider
 <summary><strong>用量页为什么和上游账单不完全一致？</strong></summary>
 
 用量页读取本地 Codex 会话中的 token 事件，并使用内置或自定义价格快照估算。上游可能采用不同的计费分类、折扣、倍率或舍入方式。
+
+经 Companion 转发的 HTTP / WebSocket 请求会记录最终响应的 Provider、会话标识、完成时间和 Token 计数，以匹配会话中的用量事件。Provider 分类使用你配置的名称；回退后的请求归入实际处理响应的 Provider。来源记录不保存提示词或响应正文，清空请求日志或诊断日志不会删除它。升级前未记录来源、缺少会话标识或无法唯一匹配的用量显示为“未归属用量”，不会按当前路由猜测归属。
 
 </details>
 

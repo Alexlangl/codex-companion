@@ -279,8 +279,8 @@ async fn proxy_dispatch(
         .cloned()
         .ok_or_else(|| format!("active group not found: {}", config.relay.active_group_id))?;
     let explicit_preferred_provider = session_id
-        .filter(|_| !image_request)
         .as_deref()
+        .filter(|_| !image_request)
         .and_then(|session_id| {
             state
                 .api_service
@@ -748,6 +748,9 @@ async fn proxy_dispatch(
                         None,
                     );
                     // 守卫随响应体流存活，LeastLoaded 才统计得到流式生成期间的真实负载。
+                    let downstream = crate::usage_capture::capture_usage(
+                        downstream, state.store.clone(), request_id, session_id.as_deref(), &provider.id,
+                    );
                     return Ok(attach_request_guard(downstream, request_guard));
                 }
 
@@ -4269,7 +4272,7 @@ mod tests {
         .await;
         let url_b = spawn_mock_server(
             StatusCode::OK,
-            r#"{"id":"resp_b","object":"response","status":"completed","output":[]}"#,
+            r#"{"id":"resp_b","object":"response","status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":80}}}"#,
             Some(hits_b.clone()),
         )
         .await;
@@ -4280,7 +4283,7 @@ mod tests {
             Method::POST,
             "/v1/responses".parse().expect("uri"),
             HeaderMap::new(),
-            Bytes::from_static(br#"{"model":"gpt-test","input":"hello"}"#),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","metadata":{"session_id":"usage-http"}}"#),
         )
         .await
         .expect("proxy");
@@ -4289,6 +4292,13 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024).await.expect("body");
         let value: Value = serde_json::from_slice(&body).expect("response json");
         assert_eq!(value["status"], "completed");
+        crate::ApiServiceStore::from_config_store(&store).clear_request_logs().expect("clear disposable logs");
+        let mut events = vec![codex_companion_core::TokenUsageEvent {
+            session_id: Some("usage-http".into()), timestamp: Some(chrono::Utc::now().to_rfc3339()),
+            input_tokens: 20, cached_input_tokens: 80, output_tokens: 20, ..Default::default()
+        }];
+        codex_companion_core::apply_usage_attribution(&store.data_dir(), &mut events).expect("attribute");
+        assert_eq!(events[0].provider_id.as_deref(), Some("b"));
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
         assert_eq!(hits_b.load(Ordering::SeqCst), 1);
         assert_eq!(

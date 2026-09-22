@@ -495,6 +495,9 @@ fn collect_token_usage_cached_inner(
     }
 
     apply_inherited_pricing_models(&mut all_events, &replay_catalog);
+    if let Some(data_dir) = cache_dir.parent() {
+        codex_companion_core::apply_usage_attribution(data_dir, &mut all_events)?;
+    }
     let pricing_path = default_pricing_override_path(&cache_dir);
     let catalog = PricingCatalog::builtin().load_override(&pricing_path)?;
     Ok(summarize_token_events(
@@ -2709,6 +2712,28 @@ mod tests {
         assert_eq!(summary.cost.cache_write_input_usd, "0.000033");
         assert_eq!(summary.cost.output_usd, "0.00018");
         assert_eq!(summary.cost.total_usd, "0.000681");
+    }
+
+    #[test]
+    fn cached_events_pick_up_new_provenance_before_provider_filtering() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let lines = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"s1","model_provider":"codex-companion"}}),
+            serde_json::json!({"timestamp":timestamp,"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":20}}}}),
+        ];
+        fs::write(sessions.join("session.jsonl"), lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        let cache = temp.path().join("cache");
+        let before = collect_token_usage_cached(temp.path().into(), cache.clone()).unwrap();
+        assert_eq!(before.by_provider[0].key,"codex-companion");
+        codex_companion_core::record_usage_attribution(temp.path(), "req", "s1", "my-provider", &serde_json::json!({"status":"completed","usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":80}}})).unwrap();
+        let after = collect_token_usage_cached_with_filters(temp.path().into(),cache,&TokenUsageDateRange::default(),&TokenUsageFilters::parse(Some("my-provider"),None)).unwrap();
+        assert_eq!(after.total_tokens,before.total_tokens);
+        assert_eq!(after.by_provider[0].key,"my-provider");
+        assert_eq!(after.available_providers,vec!["my-provider"]);
+        assert_eq!(after.events,1);
     }
 
     #[test]

@@ -311,13 +311,14 @@ mod tests {
     async fn accepts_responses_requests_larger_than_axum_default_limit() {
         let upstream = Router::new().route(
             "/{*path}",
-            any(|| async {
+            // Drain the body before replying so HTTP/1 does not reset an in-flight upload.
+            any(|_body: axum::body::Bytes| async {
                 (
                     StatusCode::OK,
                     r#"{"id":"resp_large","object":"response","status":"completed","output":[]}"#,
                 )
             }),
-        );
+        ).layer(axum::extract::DefaultBodyLimit::disable());
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("upstream bind");

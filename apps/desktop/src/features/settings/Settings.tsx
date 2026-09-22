@@ -1,3 +1,4 @@
+import { ConfirmAction } from "../../components/ConfirmAction";
 import * as Select from "@radix-ui/react-select";
 import {
   Cable,
@@ -206,15 +207,18 @@ export function Settings(props: SettingsProps) {
   }
 
   async function handleClearDiagnosticLogs(): Promise<void> {
-    const confirmed = window.confirm("确定清空 Companion 诊断日志吗？账号、配置和会话不会被删除。");
-    if (!confirmed) return;
     setDiagnosticBusy(true);
     try {
       const removed = await clearDiagnosticLogs();
-      setDiagnosticMessage(`已清理 ${removed} 个日志文件`);
-      setDiagnosticInfo(await getDiagnosticInfo());
+      setDiagnosticMessage(`已清理 ${removed} 个日志文件；后续运行会产生新日志。`);
+      try {
+        setDiagnosticInfo(await getDiagnosticInfo());
+      } catch (error) {
+        setDiagnosticMessage(`清理成功，但刷新信息失败：${userFacingError(error)}`);
+      }
     } catch (unknownError) {
       setDiagnosticMessage(userFacingError(unknownError));
+      throw unknownError;
     } finally {
       setDiagnosticBusy(false);
     }
@@ -405,9 +409,9 @@ export function Settings(props: SettingsProps) {
           <Button disabled={diagnosticBusy} onClick={() => void loadDiagnostics()} variant="ghost">
             <RefreshCw aria-hidden="true" size={15} /> 刷新信息
           </Button>
-          <Button disabled={diagnosticBusy} onClick={() => void handleClearDiagnosticLogs()} variant="danger">
+          <ConfirmAction title="清空诊断日志？" description="删除 Companion 本地诊断日志。账号、配置和会话会保留；此操作不可撤销。" disabled={diagnosticBusy} onConfirm={handleClearDiagnosticLogs} variant="danger">
             <Trash2 aria-hidden="true" size={15} /> 清空日志
-          </Button>
+          </ConfirmAction>
         </div>
       </Panel>
     </div>

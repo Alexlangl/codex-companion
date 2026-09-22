@@ -71,12 +71,14 @@ pub fn clear_diagnostic_logs(data_dir: &Path) -> Result<usize> {
         .lock()
         .map_err(|_| CompanionError::InvalidConfig("diagnostic log lock poisoned".to_string()))?;
     let log_directory = diagnostic_log_directory(data_dir);
-    let Ok(entries) = fs::read_dir(&log_directory) else {
-        return Ok(0);
+    let entries = match fs::read_dir(&log_directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => return Err(CompanionError::io(&log_directory, source)),
     };
     let mut removed = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for entry in entries {
+        let path = entry.map_err(|source| CompanionError::io(&log_directory, source))?.path();
         if path.is_file()
             && path
                 .file_name()
@@ -276,6 +278,14 @@ mod tests {
         assert!(current.exists());
         assert!(log_dir.join("companion.log.4.jsonl").exists());
         assert!(!log_dir.join("companion.log.5.jsonl").exists());
+    }
+
+    #[test]
+    fn clear_reports_unreadable_log_directory_instead_of_success() {
+        let temp = tempfile::tempdir().expect("temp");
+        assert_eq!(clear_diagnostic_logs(temp.path()).expect("missing directory"), 0);
+        fs::write(diagnostic_log_directory(temp.path()), "not a directory").expect("file");
+        assert!(clear_diagnostic_logs(temp.path()).is_err());
     }
 
     #[test]

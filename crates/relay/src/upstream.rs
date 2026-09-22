@@ -1965,12 +1965,12 @@ impl ResponsesSseObserverState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SseBlockBoundary {
-    block_end: usize,
-    drain_len: usize,
+pub(crate) struct SseBlockBoundary {
+    pub(crate) block_end: usize,
+    pub(crate) drain_len: usize,
 }
 
-fn next_sse_block_boundary(buffer: &[u8], end_of_stream: bool) -> Option<SseBlockBoundary> {
+pub(crate) fn next_sse_block_boundary(buffer: &[u8], end_of_stream: bool) -> Option<SseBlockBoundary> {
     let mut index = 0;
     while index < buffer.len() {
         let Some(first_len) = sse_line_ending_len(buffer, index, end_of_stream) else {

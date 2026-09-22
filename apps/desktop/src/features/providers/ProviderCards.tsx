@@ -1,6 +1,10 @@
+import { useId, useState } from "react";
 import { Check, Download, Pencil, Play, RefreshCw, Trash2 } from "lucide-react";
 import { Badge, IconButton } from "../../components/ui";
-import { currentApplication, currentProviderId } from "../../lib/current-application";
+import {
+  currentApplication,
+  currentProviderId,
+} from "../../lib/current-application";
 import { formatTime } from "../../lib/format";
 import {
   hasQuotaInfo,
@@ -17,7 +21,11 @@ import {
   validityTone,
 } from "../../lib/provider-display";
 import { providerEndpointIsChatCompletions } from "../../lib/provider-url";
-import type { CompanionStatus, ProviderConfig, ProviderLaunchMode } from "../../types/domain";
+import type {
+  CompanionStatus,
+  ProviderConfig,
+  ProviderLaunchMode,
+} from "../../types/domain";
 import {
   canDirectLaunch,
   launchModeLabel,
@@ -44,68 +52,167 @@ export function ProviderCompactItem({
   refreshing: boolean;
   status: CompanionStatus;
   onLaunch: (id: string, mode?: ProviderLaunchMode) => Promise<void>;
-  onLaunchModeChange: (providerId: string, mode: ProviderLaunchMode) => Promise<void>;
+  onLaunchModeChange: (
+    providerId: string,
+    mode: ProviderLaunchMode,
+  ) => Promise<void>;
   onEdit: (provider: ProviderConfig) => void;
   onExport: (provider: ProviderConfig) => void;
   onRemove: (id: string) => Promise<void>;
   onRefresh: (id: string) => Promise<void>;
 }) {
+  const [healthExpanded, setHealthExpanded] = useState(false);
+  const healthDetailId = useId();
   const health = status.config.health[provider.id];
   const healthDetail = providerHealthDetail(health);
   const active = currentProviderId(currentApplication(status)) === provider.id;
   const quota = quotaInfo(provider.account);
-  const effectiveLaunchMode = resolveProviderLaunchMode(provider, launchMode, status.directConnectProviderIds);
+  const effectiveLaunchMode = resolveProviderLaunchMode(
+    provider,
+    launchMode,
+    status.directConnectProviderIds,
+  );
   const canEdit = provider.kind !== "official_codex";
-  const showPlanBadge = provider.kind === "official_codex" && Boolean(provider.account?.subscriptionType);
+  const showPlanBadge =
+    provider.kind === "official_codex" &&
+    Boolean(provider.account?.subscriptionType);
   const showQuota = hasQuotaInfo(quota);
   const usesAgentIdentity = providerUsesAgentIdentity(provider);
   const usesWebSocket = providerUsesWebSocket(provider);
   const providerMark = provider.kind === "official_codex" ? "C" : "API";
   const refreshDisabled = disabled || refreshing;
   return (
-    <div aria-busy={refreshing} className={`provider-compact-item ${active ? "provider-compact-active" : ""}`}>
+    <div
+      aria-busy={refreshing}
+      className={`provider-compact-item ${active ? "provider-compact-active" : ""}`}
+    >
       <span className="compact-check" aria-hidden="true">
         {active ? <Check size={12} /> : providerMark}
       </span>
       <span className="sr-only">{active ? "当前账号" : "已配置账号"}</span>
-      <strong>{providerAccountTitle(provider)}</strong>
-      {showQuota ? <span className={`compact-dot compact-dot-${quota.tone}`} /> : null}
-      {showQuota ? <span className="compact-quota">{quota.percentLabel}</span> : null}
-      <span className={`compact-dot compact-dot-${providerHealthTone(health?.status)}`} title={providerHealthLabel(health?.status)} />
-      <span className="compact-status">
-        {providerHealthLabel(health?.status)}
-        {healthDetail && <small className="provider-health-detail">{healthDetail}</small>}
+      <div className="compact-identity">
+        <strong title={providerAccountTitle(provider)}>
+          {providerAccountTitle(provider)}
+        </strong>
+        <div className="compact-badges">
+          {provider.account?.validUntil ? (
+            <Badge tone={validityTone(provider.account.validUntil)}>
+              {validityLabel(provider.account.validUntil)?.split(" · ")[0]}
+            </Badge>
+          ) : null}
+          {showPlanBadge ? (
+            <Badge tone="neutral">{provider.account?.subscriptionType}</Badge>
+          ) : null}
+          {usesAgentIdentity ? (
+            <Badge tone="accent">Agent Identity</Badge>
+          ) : null}
+          {usesWebSocket ? <Badge tone="info">WebSocket</Badge> : null}
+        </div>
+      </div>
+      <span className="compact-quota" title={quota.percentLabel}>
+        {showQuota ? (
+          <>
+            <span
+              className={`compact-dot compact-dot-${quota.tone}`}
+              aria-hidden="true"
+            />
+            {quota.percentLabel}
+          </>
+        ) : (
+          "—"
+        )}
       </span>
-      {provider.account?.validUntil ? <Badge tone={validityTone(provider.account.validUntil)}>{validityLabel(provider.account.validUntil)?.split(" · ")[0]}</Badge> : null}
-      {showPlanBadge ? <Badge tone="neutral">{provider.account?.subscriptionType}</Badge> : null}
-      {usesAgentIdentity ? <Badge tone="accent">Agent Identity</Badge> : null}
-      {usesWebSocket ? <Badge tone="info">WebSocket</Badge> : null}
-      <LaunchModeControl
-        compact
-        directConnectProviderIds={status.directConnectProviderIds}
-        disabled={disabled}
-        mode={effectiveLaunchMode}
-        preserveOfficialCodexAuth={Boolean(status.config.app.preserveOfficialCodexAuth)}
-        provider={provider}
-        onChange={(mode) => void onLaunchModeChange(provider.id, mode)}
-      />
-      <IconButton disabled={refreshDisabled} label="刷新账号状态" onClick={() => void onRefresh(provider.id)}>
-        <RefreshCw aria-hidden="true" className={refreshing ? "spin-icon" : undefined} size={14} />
-      </IconButton>
-      <IconButton disabled={disabled} label={`启动账号：${launchModeLabel(effectiveLaunchMode)}`} onClick={() => void onLaunch(provider.id, effectiveLaunchMode)}>
-        <Play size={14} />
-      </IconButton>
-      {canEdit ? (
-        <IconButton disabled={disabled} label="编辑 Provider" onClick={() => onEdit(provider)}>
-          <Pencil size={14} />
+      <div className="compact-health">
+        {healthDetail ? (
+          <button
+            type="button"
+            className="compact-health-toggle"
+            aria-expanded={healthExpanded}
+            aria-controls={healthDetailId}
+            onClick={() => setHealthExpanded(!healthExpanded)}
+          >
+            <span
+              className={`compact-dot compact-dot-${providerHealthTone(health?.status)}`}
+              aria-hidden="true"
+            />
+            {providerHealthLabel(health?.status)}
+            <span aria-hidden="true">{healthExpanded ? "⌃" : "⌄"}</span>
+          </button>
+        ) : (
+          <span className="compact-status">
+            <span
+              className={`compact-dot compact-dot-${providerHealthTone(health?.status)}`}
+              aria-hidden="true"
+            />
+            {providerHealthLabel(health?.status)}
+          </span>
+        )}
+      </div>
+      <div className="compact-actions">
+        <LaunchModeControl
+          compact
+          directConnectProviderIds={status.directConnectProviderIds}
+          disabled={disabled}
+          mode={effectiveLaunchMode}
+          preserveOfficialCodexAuth={Boolean(
+            status.config.app.preserveOfficialCodexAuth,
+          )}
+          provider={provider}
+          onChange={(mode) => void onLaunchModeChange(provider.id, mode)}
+        />
+        <IconButton
+          disabled={refreshDisabled}
+          label="刷新账号状态"
+          onClick={() => void onRefresh(provider.id)}
+        >
+          <RefreshCw
+            aria-hidden="true"
+            className={refreshing ? "spin-icon" : undefined}
+            size={14}
+          />
         </IconButton>
+        <IconButton
+          disabled={disabled}
+          label={`启动账号：${launchModeLabel(effectiveLaunchMode)}`}
+          onClick={() => void onLaunch(provider.id, effectiveLaunchMode)}
+        >
+          <Play size={14} />
+        </IconButton>
+        {canEdit ? (
+          <IconButton
+            disabled={disabled}
+            label="编辑 Provider"
+            onClick={() => onEdit(provider)}
+          >
+            <Pencil size={14} />
+          </IconButton>
+        ) : (
+          <span className="compact-action-spacer" aria-hidden="true" />
+        )}
+        <IconButton
+          disabled={disabled}
+          label="导出 JSON"
+          onClick={() => onExport(provider)}
+        >
+          <Download size={14} />
+        </IconButton>
+        <IconButton
+          disabled={disabled}
+          label="删除账号"
+          onClick={() => void onRemove(provider.id)}
+        >
+          <Trash2 size={14} />
+        </IconButton>
+      </div>
+      {healthDetail ? (
+        <p
+          id={healthDetailId}
+          hidden={!healthExpanded}
+          className="compact-health-expanded"
+        >
+          {healthDetail}
+        </p>
       ) : null}
-      <IconButton disabled={disabled} label="导出 JSON" onClick={() => onExport(provider)}>
-        <Download size={14} />
-      </IconButton>
-      <IconButton disabled={disabled} label="删除账号" onClick={() => void onRemove(provider.id)}>
-        <Trash2 size={14} />
-      </IconButton>
     </div>
   );
 }

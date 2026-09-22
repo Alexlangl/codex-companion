@@ -8,6 +8,7 @@ homepage.workspace = true
 description.workspace = true
 
 [dependencies]
+rusqlite.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 regex.workspace = true

@@ -32,3 +32,6 @@ pub use provider_url::{
 };
 pub use store::{ensure_default_group, ConfigStore};
 pub use types::*;
+
+mod usage_attribution;
+pub use usage_attribution::{apply_usage_attribution, record_usage_attribution};
