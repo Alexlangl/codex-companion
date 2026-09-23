@@ -25,7 +25,7 @@ use walkdir::WalkDir;
 
 use model_catalog::{
     build_model_catalog, managed_model_catalog_path, normalized_model_slugs,
-    visible_cached_model_slugs, MANAGED_MODEL_CATALOG_FILENAME,
+    MANAGED_MODEL_CATALOG_FILENAME,
 };
 
 const CODEX_STATE_DB_FILENAME: &str = "state_5.sqlite";
@@ -2066,14 +2066,16 @@ fn reclaim_model_settings_if_needed(
         // Reclaim only the config pointer. The referenced user file is preserved.
         doc.as_table_mut().remove("model_catalog_json");
     }
-    let mut target_models = requested_models
+    let target_models = requested_models
         .iter()
         .map(|model| model.trim())
         .filter(|model| !model.is_empty() && *model != "default")
         .map(str::to_string)
         .collect::<Vec<_>>();
     if target_models.is_empty() {
-        target_models = visible_cached_model_slugs(codex_dir);
+        // A native catalog is a partial, refreshable snapshot. Its absence of
+        // a selected model is not evidence that the user's choice is invalid.
+        return unmanaged_catalog_is_live;
     }
     let Some(default_model) = target_models.first() else {
         doc.as_table_mut().remove("model");
@@ -4223,6 +4225,7 @@ mod tests {
         .expect("user catalog");
         let user_config = r#"model_provider = "custom"
 model = "gpt-custom"
+model_reasoning_effort = "max"
 model_catalog_json = "user-model-catalog.json"
 
 [model_providers.custom]
@@ -4237,7 +4240,8 @@ wire_api = "responses"
 
         let installed = fs::read_to_string(temp.path().join("config.toml")).expect("config");
         assert!(installed.contains("model_provider = \"codex-companion\""));
-        assert!(installed.contains("model = \"gpt-official\""));
+        assert!(installed.contains("model = \"gpt-custom\""));
+        assert!(installed.contains("model_reasoning_effort = \"max\""));
         assert!(!installed.contains("model_catalog_json"));
         assert!(temp.path().join("user-model-catalog.json").is_file());
         assert!(!managed_model_catalog_path(temp.path()).exists());

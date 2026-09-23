@@ -14,7 +14,8 @@ use codex_companion_core::{
 
 const PROVIDER_TEST_RESPONSE_LIMIT_BYTES: usize = 128 * 1024;
 use codex_companion_health::{
-    classification_for_kind, classify_failure, mark_failure, mark_success, FailureClassification,
+    classification_for_kind, classify_failure, mark_failure, mark_success,
+    normalize_provider_cooldown, FailureClassification,
 };
 
 #[derive(Debug, Clone)]
@@ -358,13 +359,14 @@ fn persist_refresh_outcome(
                     .unwrap_or_else(|| classify_failure(failure.status, &failure.message));
                 // /models and quota probes have their own backoff. Endpoint
                 // failures must not repeatedly renew the inference cooldown.
-                // Explicit credential rejection or third-party quota exhaustion
-                // remain authoritative account-level failures.
+                // Credential rejection and quota exhaustion are account-level
+                // failures, but API Key inference must remain retryable.
                 if classification.kind == HealthFailureKind::AuthFailed
                     || (snapshot.provider.kind != ProviderKind::OfficialCodex
                         && classification.kind == HealthFailureKind::QuotaExhausted)
                 {
                     mark_failure(health, &classification, failure.message);
+                    normalize_provider_cooldown(&snapshot.provider.kind, health);
                 }
                 if let Some(account) = account_result {
                     if let Some(provider) = config.providers.get_mut(id) {
@@ -590,6 +592,39 @@ mod tests {
             assert_eq!(health.last_failure_kind, before.last_failure_kind);
             assert_eq!(health.last_checked, before.last_checked);
         }
+    }
+
+    #[test]
+    fn api_key_balance_probe_does_not_start_inference_cooldown() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store
+            .update(|config| {
+                config.providers.insert("api".into(), api_provider());
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = ProviderRefreshSnapshot::capture(&store, "api").unwrap();
+        let health = persist_refresh_outcome(
+            &store,
+            "api",
+            &snapshot,
+            Err(ProviderTestFailure {
+                status: Some(403),
+                retry_after_seconds: Some(1800),
+                message: "insufficient_balance".into(),
+                classification: None,
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(health.status, HealthStatusKind::QuotaExhausted);
+        assert!(health.cooldown_until.is_none());
+        assert!(!codex_companion_health::provider_cooldown_active(
+            &ProviderKind::RelayProvider,
+            &health,
+        ));
     }
 
     #[tokio::test]

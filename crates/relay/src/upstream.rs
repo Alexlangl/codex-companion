@@ -159,6 +159,20 @@ impl UpstreamResponse {
         self.status
     }
 
+    pub(crate) fn merge_model_catalogs(&mut self, catalogs: Vec<Value>) {
+        let Some(body) = &self.buffered_body else { return };
+        let Ok(mut primary) = serde_json::from_slice::<Value>(body) else { return };
+        crate::model_catalog::merge_codex_catalogs(&mut primary, catalogs);
+        self.buffered_body = Some(Bytes::from(primary.to_string()));
+        self.headers.remove(header::ETAG);
+        self.headers.remove(header::LAST_MODIFIED);
+        self.headers.remove(header::CONTENT_LENGTH);
+    }
+
+    pub(crate) fn buffered_catalog(&self) -> Option<Value> {
+        serde_json::from_slice(self.buffered_body.as_deref()?).ok()
+    }
+
     pub(crate) fn retry_after_seconds(&self) -> Option<u64> {
         self.headers
             .get("retry-after")
@@ -706,6 +720,17 @@ pub(crate) async fn send_upstream(
         body,
         upstream,
     } = request;
+    let mut catalog_headers;
+    let headers = if method == Method::GET && uri.path() == "/v1/models" {
+        // Local catalog repairs change the payload independently of the
+        // upstream ETag, so revalidate by fetching the full source catalog.
+        catalog_headers = headers.clone();
+        catalog_headers.remove(header::IF_NONE_MATCH);
+        catalog_headers.remove(header::IF_MODIFIED_SINCE);
+        &catalog_headers
+    } else {
+        headers
+    };
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|error| format!("invalid method: {error}"))?;
     let transform = match response_transform(provider, method, uri) {

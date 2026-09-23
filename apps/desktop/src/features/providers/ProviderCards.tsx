@@ -186,9 +186,7 @@ export function ProviderCompactItem({
           >
             <Pencil size={14} />
           </IconButton>
-        ) : (
-          <span className="compact-action-spacer" aria-hidden="true" />
-        )}
+        ) : null}
         <IconButton
           disabled={disabled}
           label="导出 JSON"

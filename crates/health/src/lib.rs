@@ -236,18 +236,14 @@ pub fn cooldown_active(health: &ProviderHealth) -> bool {
 }
 
 pub fn provider_cooldown_active(kind: &ProviderKind, health: &ProviderHealth) -> bool {
-    (kind == &ProviderKind::OfficialCodex
-        || health.last_failure_kind == Some(HealthFailureKind::QuotaExhausted))
-        && cooldown_active(health)
+    kind == &ProviderKind::OfficialCodex && cooldown_active(health)
 }
 
-/// Third-party inference is paused only for explicit quota exhaustion. Also
-/// remove old transient cooldowns when reading configurations from older builds.
+/// API Key providers never enter an inference cooldown, including after a
+/// balance error. Clear persisted cooldowns from older builds on load.
 pub fn normalize_provider_cooldown(kind: &ProviderKind, health: &mut ProviderHealth) -> bool {
     let previous = (health.status.clone(), health.cooldown_until);
-    if kind != &ProviderKind::OfficialCodex
-        && health.last_failure_kind != Some(HealthFailureKind::QuotaExhausted)
-    {
+    if kind != &ProviderKind::OfficialCodex {
         health.cooldown_until = None;
         if health.status == HealthStatusKind::Cooldown {
             health.status = HealthStatusKind::Degraded;
@@ -345,20 +341,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn third_party_cools_only_for_explicit_quota_exhaustion() {
+    fn only_official_accounts_cool_down_even_for_quota_exhaustion() {
         for kind in [
             ProviderKind::RelayProvider,
             ProviderKind::OpenAiCompatible,
             ProviderKind::OfficialCodex,
         ] {
-            for (status, message, quota) in [
-                (Some(429), "rate_limit_exceeded", false),
-                (Some(503), "service unavailable", false),
-                (None, "network timeout", false),
-                (Some(404), "model_not_found", false),
-                (Some(403), "contact billing support", false),
-                (Some(429), "insufficient_quota", true),
-                (Some(403), "insufficient_balance", true),
+            for (status, message) in [
+                (Some(429), "rate_limit_exceeded"),
+                (Some(503), "service unavailable"),
+                (None, "network timeout"),
+                (Some(404), "model_not_found"),
+                (Some(403), "contact billing support"),
+                (Some(429), "insufficient_quota"),
+                (Some(403), "insufficient_balance"),
             ] {
                 let mut health = ProviderHealth::default();
                 mark_failure(
@@ -366,8 +362,7 @@ mod tests {
                     &classify_failure(status, message),
                     message.into(),
                 );
-                let expected = health.cooldown_until.is_some()
-                    && (kind == ProviderKind::OfficialCodex || quota);
+                let expected = health.cooldown_until.is_some() && kind == ProviderKind::OfficialCodex;
                 assert_eq!(provider_cooldown_active(&kind, &health), expected);
                 normalize_provider_cooldown(&kind, &mut health);
                 assert_eq!(cooldown_active(&health), expected);

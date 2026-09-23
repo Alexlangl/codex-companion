@@ -481,6 +481,11 @@ fn parse_model_entry(
     fallback_id: Option<&str>,
     trusted_capabilities: bool,
 ) -> Option<DiscoveredModel> {
+    let mut normalized = entry.clone();
+    if trusted_capabilities {
+        codex_companion_core::repair_codex_model_metadata(&mut normalized);
+    }
+    let entry = &normalized;
     if let Some(id) = entry.as_str().and_then(non_empty) {
         return Some(DiscoveredModel {
             id: id.clone(),

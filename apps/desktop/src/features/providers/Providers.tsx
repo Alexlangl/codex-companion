@@ -476,7 +476,7 @@ export function Providers({
         {providers.length === 0 ? (
           <p className="empty">添加账号后，可以直接启动单个账号，也可以把多个账号编排成分组。</p>
         ) : viewMode === "compact" ? (
-          <div className="provider-compact-list">
+          <div className="provider-compact-list" role="region" aria-label="紧凑账号列表" tabIndex={0}>
             {providers.map((provider) => (
               <ProviderCompactItem
                 disabled={disabled}

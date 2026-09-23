@@ -1659,8 +1659,15 @@ dd {
 }
 
 .provider-compact-list {
-  grid-template-columns: 1fr;
-  gap: 8px;
+  grid-template-columns: minmax(800px, 1fr);
+  min-width: 0;
+  overflow-x: auto;
+  gap: 4px;
+}
+
+.provider-compact-list:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 .provider-card-grid,
@@ -1704,14 +1711,14 @@ dd {
 
 .provider-compact-item {
   display: grid;
-  grid-template-columns: 28px minmax(140px, 1fr) minmax(140px, 240px) minmax(90px, 120px) 268px;
+  grid-template-columns: 28px minmax(140px, 1fr) minmax(92px, 150px) minmax(85px, 112px) max-content;
   min-width: 0;
-  min-height: 42px;
-  gap: 12px;
+  min-height: 40px;
+  gap: 8px;
   align-items: center;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 10px;
+  padding: 4px 8px;
   background: var(--surface-raised);
   transition: border-color 160ms ease;
 }
@@ -2508,6 +2515,22 @@ dd {
   margin-top: 0;
 }
 
+.relay-clients-settings .api-secret-reveal {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.relay-clients-settings .api-secret-reveal > div:first-child {
+  display: flex;
+  min-width: min(100%, 13rem);
+  flex: 1 1 13rem;
+}
+
+.relay-clients-settings .api-secret-reveal code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .api-service-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr);
@@ -2528,8 +2551,50 @@ dd {
 }
 
 .api-client-list {
-  display: grid;
+  overflow-x: auto;
   margin-top: 6px;
+}
+
+.api-client-table {
+  width: 100%;
+  min-width: 730px;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 12px;
+}
+
+.api-client-table th,
+.api-client-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 11px 9px;
+  vertical-align: middle;
+}
+
+.api-client-table thead th {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.api-client-table tbody th {
+  max-width: 150px;
+  overflow-wrap: anywhere;
+}
+
+.api-client-table td:nth-child(3) {
+  max-width: 145px;
+  overflow-wrap: anywhere;
+}
+
+.api-client-table small {
+  display: block;
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.api-client-table .api-client-actions {
+  display: flex;
+  gap: 5px;
 }
 
 .api-client-row {
@@ -4162,31 +4227,19 @@ dd {
 }
 
 /* Stable compact columns; diagnostic copy expands below the status on demand. */
-.compact-identity { min-width: 0; align-self: center; }
-.compact-identity > strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
-.compact-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.compact-identity { display: flex; align-items: center; gap: 6px; min-width: 0; align-self: center; }
+.compact-identity > strong { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.compact-badges { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; }
 .compact-badges:empty { display: none; }
 .provider-compact-item .compact-check { align-self: center; }
-.compact-quota { display: flex; align-items: center; gap: 6px; min-width: 0; align-self: center; overflow-wrap: anywhere; }
-.compact-status, .compact-health-toggle { display: flex; align-items: center; gap: 6px; font-size: 11px; line-height: 28px; }
+.compact-quota { display: flex; align-items: center; gap: 6px; min-width: 0; align-self: center; white-space: nowrap; }
+.compact-status, .compact-health-toggle { display: flex; align-items: center; gap: 6px; font-size: 11px; line-height: 28px; white-space: nowrap; }
 .compact-health-toggle { cursor: pointer; border: 0; padding: 0; background: transparent; color: var(--muted); font: inherit; font-size: 11px; }
 .compact-health-toggle:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: 3px; }
 .compact-health { min-width: 0; }
 .compact-health-expanded { grid-column: 2 / -1; margin: 0; padding-top: 8px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); line-height: 1.6; overflow-wrap: anywhere; }
 .compact-badges .badge { max-width: 140px; }
-.compact-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.compact-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; white-space: nowrap; }
 .dialog-content.confirm-dialog { width: min(440px, calc(100vw - 32px)); }
 .confirm-dialog .actions { justify-content: flex-end; margin-top: 24px; }
-@media (max-width: 1150px) {
-  .provider-compact-item { grid-template-columns: 28px minmax(140px, 1fr) minmax(100px, 180px) 110px; }
-  .compact-actions { grid-column: 2 / -1; }
-}
-@media (max-width: 600px) {
-  .provider-compact-item { grid-template-columns: 28px minmax(0, 1fr); }
-  .compact-quota, .compact-health { grid-column: 2; }
-  .compact-actions { flex-wrap: wrap; justify-content: flex-start; }
-}
-
-.compact-action-spacer { width: 28px; flex: 0 0 28px; }
-
 .confirm-dialog .error-banner { margin: 16px 0; }

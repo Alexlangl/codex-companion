@@ -120,6 +120,8 @@ export interface ApiRequestAttemptLog {
   outcome: string;
   latencyMs?: number | null;
   error?: string | null;
+  upstreamModel?: string | null;
+  turnStateLength?: number | null;
 }
 
 export interface ApiRequestLog {
@@ -138,6 +140,8 @@ export interface ApiRequestLog {
   attempts: number;
   latencyMs?: number | null;
   error?: string | null;
+  upstreamModel?: string | null;
+  turnStateLength?: number | null;
   attemptLog: ApiRequestAttemptLog[];
 }
 
@@ -310,6 +314,8 @@ export interface ProviderHealth {
   nextRefreshAfter?: string | null;
   cooldownUntil?: string | null;
   failureCount: number;
+  turnStateLength?: number | null;
+  turnStateCheckedAt?: string | null;
 }
 
 export interface ProviderGroup {

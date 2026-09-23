@@ -20,6 +20,8 @@ export function apiRequestLogsEqual(left: ApiRequestLog[], right: ApiRequestLog[
       && request.attempts === candidate.attempts
       && request.latencyMs === candidate.latencyMs
       && request.error === candidate.error
+      && request.upstreamModel === candidate.upstreamModel
+      && request.turnStateLength === candidate.turnStateLength
       && requestAttemptsEqual(request.attemptLog, candidate.attemptLog);
   });
 }
@@ -40,7 +42,9 @@ function requestAttemptsEqual(
       && attempt.statusCode === candidate.statusCode
       && attempt.outcome === candidate.outcome
       && attempt.latencyMs === candidate.latencyMs
-      && attempt.error === candidate.error;
+      && attempt.error === candidate.error
+      && attempt.upstreamModel === candidate.upstreamModel
+      && attempt.turnStateLength === candidate.turnStateLength;
   });
 }
 

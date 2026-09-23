@@ -483,7 +483,7 @@ async fn proxy_dispatch(
         } else {
             &candidates[..]
         };
-        let (selected, permit) = match state
+        let (selected_index, permit) = match state
             .account_concurrency
             .acquire_any(
                 waiting,
@@ -517,7 +517,7 @@ async fn proxy_dispatch(
                 ));
             }
         };
-        let provider = candidates.remove(selected);
+        let provider = candidates.remove(selected_index);
         if !provider_available(&state, &provider, requested_model.as_deref()) {
             continue;
         }
@@ -595,12 +595,55 @@ async fn proxy_dispatch(
                 provider.name
             )))
         });
+        if upstream_result.is_ok() {
+            let upstream_model = requested_model.as_deref().map(|model| {
+                provider
+                    .model_map
+                    .get(model)
+                    .map(String::as_str)
+                    .unwrap_or(model)
+            });
+            let _ = state.api_service.record_upstream_metadata(
+                request_id,
+                attempt,
+                upstream_model,
+            );
+        }
         match upstream_result {
             Ok(mut response) if response.status().is_success() => {
                 if method == Method::GET && uri.path() == "/v1/models" {
                     response
                         .filter_model_catalog(&config.relay.account_protection, &provider, is_codex_catalog_request(&uri))
                         .await?;
+                    if is_codex_catalog_request(&uri) {
+                        let requests = selected.iter()
+                            .filter(|other| other.id != provider.id)
+                            .map(|other| async {
+                                if !other.model_map.is_empty() && other.model_map.keys().any(|key| key != "default") {
+                                    let data = other.model_map.keys().filter(|key| key.as_str() != "default")
+                                        .filter(|key| codex_companion_core::account_policy_block_reason(
+                                            &config.relay.account_protection, other, Some(key), chrono::Utc::now(),
+                                        ) != Some("account_model_excluded"))
+                                        .map(|key| serde_json::json!({"id":key})).collect::<Vec<_>>();
+                                    return Some(serde_json::json!({"data":data}));
+                                }
+                                let fetch = async {
+                                    let url = upstream_url(other, &uri);
+                                    let mut catalog = send_upstream(&state.client, &state.api_service,
+                                        UpstreamRequest::new(other, &method, &uri, &headers, Bytes::new(), &url))
+                                        .await.ok()?;
+                                    if !catalog.status().is_success() { return None }
+                                    catalog.filter_model_catalog(&config.relay.account_protection, other, true).await.ok()?;
+                                    catalog.buffered_catalog()
+                                };
+                                tokio::time::timeout(Duration::from_secs(5), fetch).await.ok().flatten()
+                            }).collect::<Vec<_>>();
+                        let catalogs = futures_util::stream::iter(requests)
+                            .buffered(4)
+                            .filter_map(|catalog| async { catalog })
+                            .collect::<Vec<_>>().await;
+                        response.merge_model_catalogs(catalogs);
+                    }
                 }
                 let upstream_status = response.status();
                 let preflight = response
@@ -643,7 +686,7 @@ async fn proxy_dispatch(
                         &failure,
                         &message,
                     );
-                    if failure.cooldown {
+                    if provider.kind == ProviderKind::OfficialCodex && failure.cooldown {
                         if let Some(seconds) = error.retry_after_seconds() {
                             update_health(&state.store, &provider.id, |health| {
                                 codex_companion_health::extend_cooldown(health, seconds)
@@ -905,7 +948,7 @@ async fn proxy_dispatch(
                         &failure,
                         &message,
                     );
-                    if failure.cooldown {
+                    if provider.kind == ProviderKind::OfficialCodex && failure.cooldown {
                         if let Some(seconds) = retry_after {
                             update_health(&state.store, &provider.id, |health| {
                                 codex_companion_health::extend_cooldown(health, seconds);
@@ -1002,7 +1045,10 @@ async fn proxy_dispatch(
                     &failure,
                     &message,
                 );
-                if let Some(seconds) = error.retry_after_seconds() {
+                if let Some(seconds) = error
+                    .retry_after_seconds()
+                    .filter(|_| provider.kind == ProviderKind::OfficialCodex)
+                {
                     update_health(&state.store, &provider.id, |health| {
                         codex_companion_health::extend_cooldown(health, seconds)
                     });
@@ -1976,6 +2022,34 @@ mod tests {
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert!(value["data"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_merges_group_models_and_repairs_none_reasoning() {
+        let sol = spawn_mock_server(StatusCode::OK,
+            r#"{"models":[{"slug":"gpt-6-sol","default_reasoning_level":"none","supported_reasoning_levels":[{"effort":"none"}]}]}"#, None).await;
+        let luna = spawn_mock_server(StatusCode::OK,
+            r#"{"data":[{"id":"gpt-6-luna"}]}"#, None).await;
+        let store = store_with_group(vec![provider("sol", &sol), provider("luna", &luna)]);
+        let state = RelayState::new(store.clone(), reqwest::Client::new());
+        for order in [vec!["sol", "luna"], vec!["luna", "sol"]] {
+            store.update(|config| {
+                config.groups.get_mut("test").unwrap().provider_order = order.iter().map(|s| s.to_string()).collect();
+                Ok(())
+            }).unwrap();
+            let response = proxy_inner(state.clone(), Method::GET,
+                "/v1/models?client_version=0.155.0".parse().unwrap(), HeaderMap::new(), Bytes::new()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let catalog: Value = serde_json::from_slice(&bytes).unwrap();
+            let models = catalog["models"].as_array().unwrap();
+            assert_eq!(models.len(), 2);
+            assert_eq!(models[0]["slug"], "gpt-6-sol");
+            assert_eq!(models[1]["slug"], "gpt-6-luna");
+            for model in models {
+                assert!(model["supported_reasoning_levels"].as_array().unwrap().iter().any(|level| level["effort"] == "high"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -3756,7 +3830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_provider_quota_cooldown_expires_without_local_errors_extending_it() {
+    async fn api_key_quota_failure_does_not_block_retries_and_clears_legacy_cooldown() {
         let provider_hits = Arc::new(AtomicUsize::new(0));
         let provider_url =
             spawn_mock_server(StatusCode::OK, "recovered", Some(provider_hits.clone())).await;
@@ -3772,7 +3846,7 @@ mod tests {
                 Ok(())
             })
             .expect("seed cooldown");
-        let before = store.load().unwrap().health["a"].clone();
+        assert!(store.load().unwrap().health["a"].cooldown_until.is_some());
         let state = RelayState::new(store.clone(), reqwest::Client::new());
         for _ in 0..2 {
             let response = proxy_inner(
@@ -3785,37 +3859,11 @@ mod tests {
             .await
             .expect("proxy");
 
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(provider_hits.load(Ordering::SeqCst), 0);
-            let body = to_bytes(response.into_body(), 1024).await.expect("body");
-            let value: Value = serde_json::from_slice(&body).expect("error json");
-            assert_eq!(value["error"]["code"], "no_available_provider");
-            assert!(value["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("额度耗尽"));
+            assert_eq!(response.status(), StatusCode::OK);
             let after = store.load().unwrap().health["a"].clone();
-            assert_eq!(after.cooldown_until, before.cooldown_until);
-            assert_eq!(after.failure_count, before.failure_count);
+            assert!(after.cooldown_until.is_none());
         }
-        store
-            .update(|config| {
-                config.health.get_mut("a").unwrap().cooldown_until =
-                    Some(Utc::now() - ChronoDuration::seconds(1));
-                Ok(())
-            })
-            .unwrap();
-        let recovered = proxy_inner(
-            state,
-            Method::GET,
-            "/v1/models".parse().unwrap(),
-            HeaderMap::new(),
-            Bytes::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(recovered.status(), StatusCode::OK);
-        assert_eq!(provider_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -4193,6 +4241,19 @@ mod tests {
                 .and_then(|health| health.last_failure_kind.clone()),
             Some(HealthFailureKind::QuotaExhausted)
         );
+        assert!(health["a"].cooldown_until.is_none());
+        let retry = proxy_inner(
+            RelayState::new(store.clone(), reqwest::Client::new()),
+            Method::POST,
+            "/v1/responses".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test","input":"again"}"#),
+        )
+        .await
+        .expect("retry after insufficient balance");
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -4547,7 +4608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_priority_failback_does_not_bypass_cooldown() {
+    async fn manual_priority_failback_ignores_legacy_api_key_cooldown() {
         let hits_a = Arc::new(AtomicUsize::new(0));
         let hits_b = Arc::new(AtomicUsize::new(0));
         let hits_c = Arc::new(AtomicUsize::new(0));
@@ -4616,7 +4677,7 @@ mod tests {
             &to_bytes(failback.into_body(), 1024)
                 .await
                 .expect("failback body")[..],
-            b"from c"
+            b"from a"
         );
 
         let sticky = proxy_inner(
@@ -4632,11 +4693,11 @@ mod tests {
             &to_bytes(sticky.into_body(), 1024)
                 .await
                 .expect("sticky body")[..],
-            b"from c"
+            b"from a"
         );
-        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
         assert_eq!(hits_b.load(Ordering::SeqCst), 0);
-        assert_eq!(hits_c.load(Ordering::SeqCst), 3);
+        assert_eq!(hits_c.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

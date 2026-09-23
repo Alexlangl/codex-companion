@@ -6,6 +6,8 @@ mod diagnostics;
 mod error;
 mod events;
 mod http_client;
+mod model_capabilities;
+pub use model_capabilities::{known_codex_ultra_model, repair_codex_model_metadata};
 mod paths;
 mod private_file;
 mod provider_url;

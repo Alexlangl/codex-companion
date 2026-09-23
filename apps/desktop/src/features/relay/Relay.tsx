@@ -557,74 +557,43 @@ export function Relay({ active, status }: RelayProps) {
                   <Plus size={15} /> 创建并显示密钥
                 </Button>
               </div>
-              <div className="api-client-list">
+              <div className="api-client-list" role="region" aria-label="API client 列表" tabIndex={0}>
                 {clients.length === 0 ? (
                   <div className="api-compact-empty">
                     尚未创建 client。先创建一个，再开启强制密钥。
                   </div>
                 ) : (
-                  clients.map((client) => (
-                    <div className="api-client-row" key={client.id}>
-                      <div className="api-client-main">
-                        <div className="api-client-title">
-                          <strong>{client.name}</strong>
-                          <Badge tone={client.enabled ? "ok" : "neutral"}>
-                            {client.enabled ? "启用" : "停用"}
-                          </Badge>
-                        </div>
-                        <code>{client.keyPrefix}••••••••</code>
-                        <span>
-                          {client.allowedModels.length === 0
-                            ? "全部模型"
-                            : client.allowedModels.join(" · ")}
-                          {` · ${client.requestCount} 次请求`}
-                          {client.lastUsedAt
-                            ? ` · 最近 ${formatTime(client.lastUsedAt)}`
-                            : " · 尚未使用"}
-                        </span>
-                        <span className="api-client-usage-line">
-                          <Badge
-                            tone={
-                              client.health.status === "degraded"
-                                ? "danger"
-                                : client.health.status === "healthy"
-                                  ? "ok"
-                                  : "neutral"
-                            }
-                          >
-                            {client.health.status === "degraded"
-                              ? "连接降级"
-                              : client.health.status === "healthy"
-                                ? "连接正常"
-                                : client.health.status === "idle"
-                                  ? "待使用"
-                                  : "已停用"}
-                          </Badge>
-                          {`今日 ${client.usage.today.requests} · 本周 ${client.usage.week.requests} · 本月 ${client.usage.month.requests} · 成功率 ${client.usage.month.successRate}%`}
-                        </span>
-                      </div>
-                      <div className="api-client-actions">
-                        <IconButton
-                          label={`编辑 ${client.name}`}
-                          onClick={() => setEditor(editorFromClient(client))}
-                        >
-                          <Settings2 size={14} />
-                        </IconButton>
-                        <IconButton
-                          label={`轮换 ${client.name} 密钥`}
-                          onClick={() => handleRotateClient(client)}
-                        >
-                          <RotateCw size={14} />
-                        </IconButton>
-                        <IconButton
-                          label={`删除 ${client.name}`}
-                          onClick={() => handleDeleteClient(client)}
-                        >
-                          <Trash2 size={14} />
-                        </IconButton>
-                      </div>
-                    </div>
-                  ))
+                  <table className="api-client-table">
+                    <caption className="sr-only">本地 API client 与密钥使用情况</caption>
+                    <thead><tr>
+                      <th scope="col">名称</th>
+                      <th scope="col">API 密钥</th>
+                      <th scope="col">模型</th>
+                      <th scope="col">用量</th>
+                      <th scope="col">状态</th>
+                      <th scope="col">添加时间</th>
+                      <th scope="col">操作</th>
+                    </tr></thead>
+                    <tbody>
+                      {clients.map((client) => (
+                        <tr key={client.id}>
+                          <th scope="row">{client.name}</th>
+                          <td><code>{client.keyPrefix}••••••••</code></td>
+                          <td>{client.allowedModels.length === 0 ? "全部模型" : client.allowedModels.join(" · ")}</td>
+                          <td>{client.requestCount} 次 <small>今日 {client.usage.today.requests} · 本月成功率 {client.usage.month.successRate}%</small></td>
+                          <td><Badge tone={client.enabled ? client.health.status === "degraded" ? "warn" : "ok" : "neutral"}>
+                            {client.enabled ? client.health.status === "degraded" ? "连接降级" : "启用" : "停用"}
+                          </Badge></td>
+                          <td>{formatTime(client.createdAt)}</td>
+                          <td><div className="api-client-actions">
+                            <IconButton label={`编辑 ${client.name}`} onClick={() => setEditor(editorFromClient(client))}><Settings2 aria-hidden="true" size={14} /></IconButton>
+                            <IconButton label={`轮换 ${client.name} 密钥`} onClick={() => handleRotateClient(client)}><RotateCw aria-hidden="true" size={14} /></IconButton>
+                            <IconButton label={`删除 ${client.name}`} onClick={() => handleDeleteClient(client)}><Trash2 aria-hidden="true" size={14} /></IconButton>
+                          </div></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 )}
               </div>
             </div>
@@ -951,6 +920,7 @@ function RequestRow(props: {
           {request.method} {request.path}
         </strong>
         <span>{parameterSummary}</span>
+        {request.upstreamModel ? <span>上游模型 {request.upstreamModel}</span> : null}
       </div>
       <div role="cell">
         <strong>{provider}</strong>
@@ -1242,6 +1212,8 @@ function requestAttemptViews(
       outcome: "failed",
       latencyMs: null,
       error: relayEventMessageText(event),
+      upstreamModel: null,
+      turnStateLength: null,
     }),
   );
 
@@ -1272,6 +1244,8 @@ function requestAttemptViews(
     outcome: terminalOutcome,
     latencyMs: request.latencyMs,
     error: terminalError,
+    upstreamModel: request.upstreamModel,
+    turnStateLength: request.turnStateLength,
   });
   return attempts;
 }

@@ -350,6 +350,10 @@ pub struct ProviderHealth {
     pub last_failure_kind: Option<HealthFailureKind>,
     pub cooldown_until: Option<DateTime<Utc>>,
     pub failure_count: u32,
+    #[serde(default)]
+    pub turn_state_length: Option<u16>,
+    #[serde(default)]
+    pub turn_state_checked_at: Option<DateTime<Utc>>,
 }
 
 impl Default for ProviderHealth {
@@ -366,6 +370,8 @@ impl Default for ProviderHealth {
             last_failure_kind: None,
             cooldown_until: None,
             failure_count: 0,
+            turn_state_length: None,
+            turn_state_checked_at: None,
         }
     }
 }
@@ -481,6 +487,10 @@ pub struct ApiRequestAttemptLog {
     pub outcome: String,
     pub latency_ms: Option<u64>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub upstream_model: Option<String>,
+    #[serde(default)]
+    pub turn_state_length: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -501,6 +511,10 @@ pub struct ApiRequestLog {
     pub attempts: u16,
     pub latency_ms: Option<u64>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub upstream_model: Option<String>,
+    #[serde(default)]
+    pub turn_state_length: Option<u16>,
     #[serde(default)]
     pub attempt_log: Vec<ApiRequestAttemptLog>,
 }

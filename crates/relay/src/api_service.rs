@@ -97,6 +97,8 @@ impl ApiServiceStore {
                     model TEXT,
                     reasoning_effort TEXT,
                     service_tier TEXT,
+                    upstream_model TEXT,
+                    turn_state_length INTEGER,
                     client_id TEXT,
                     provider_id TEXT,
                     status_code INTEGER,
@@ -121,6 +123,8 @@ impl ApiServiceStore {
                     outcome TEXT NOT NULL DEFAULT 'processing',
                     latency_ms INTEGER,
                     error TEXT,
+                    upstream_model TEXT,
+                    turn_state_length INTEGER,
                     PRIMARY KEY(request_id, attempt),
                     FOREIGN KEY(request_id) REFERENCES api_requests(request_id) ON DELETE CASCADE
                 );
@@ -163,6 +167,7 @@ impl ApiServiceStore {
             )
             .map_err(database_error)?;
         ensure_request_metadata_columns(&connection)?;
+        ensure_attempt_metadata_columns(&connection)?;
         Ok(())
     }
 
@@ -591,6 +596,26 @@ impl ApiServiceStore {
         Ok(())
     }
 
+    /// Historical turn-state columns remain readable, but are no longer collected.
+    pub fn record_upstream_metadata(
+        &self,
+        request_id: &str,
+        attempt: u16,
+        upstream_model: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE api_requests SET upstream_model = ?2 WHERE request_id = ?1",
+            params![request_id, upstream_model],
+        ).map_err(database_error)?;
+        connection.execute(
+            "UPDATE api_request_attempts SET upstream_model = ?3 \
+             WHERE request_id = ?1 AND attempt = ?2",
+            params![request_id, attempt, upstream_model],
+        ).map_err(database_error)?;
+        Ok(())
+    }
+
     pub fn record_request_attempt_finish(&self, input: RequestAttemptFinish<'_>) -> Result<()> {
         let error = input.error.map(compact_log_error);
         let connection = self.connection()?;
@@ -646,7 +671,8 @@ impl ApiServiceStore {
             .prepare(
                 "SELECT r.request_id, r.started_at, r.method, r.path, r.model, \
                  r.reasoning_effort, r.service_tier, r.client_id, c.name, r.provider_id, \
-                 r.status_code, r.outcome, r.attempts, r.latency_ms, r.error \
+                 r.status_code, r.outcome, r.attempts, r.latency_ms, r.error, \
+                 r.upstream_model, r.turn_state_length \
                  FROM api_requests r LEFT JOIN api_clients c ON c.id = r.client_id \
                  ORDER BY r.started_at DESC LIMIT ?1",
             )
@@ -975,21 +1001,38 @@ fn api_request_from_row(row: &Row<'_>) -> rusqlite::Result<ApiRequestLog> {
         attempts: row.get(12)?,
         latency_ms: row.get(13)?,
         error: row.get(14)?,
+        upstream_model: row.get(15)?,
+        turn_state_length: row.get(16)?,
         attempt_log: Vec::new(),
     })
 }
 
 fn ensure_request_metadata_columns(connection: &Connection) -> Result<()> {
-    for column in ["reasoning_effort", "service_tier"] {
+    for column in ["reasoning_effort", "service_tier", "upstream_model", "turn_state_length"] {
         if api_requests_has_column(connection, column)? {
             continue;
         }
+        let kind = if column == "turn_state_length" { "INTEGER" } else { "TEXT" };
         connection
             .execute(
-                &format!("ALTER TABLE api_requests ADD COLUMN {column} TEXT"),
+                &format!("ALTER TABLE api_requests ADD COLUMN {column} {kind}"),
                 [],
             )
             .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn ensure_attempt_metadata_columns(connection: &Connection) -> Result<()> {
+    for (column, kind) in [("upstream_model", "TEXT"), ("turn_state_length", "INTEGER")] {
+        let mut statement = connection.prepare("PRAGMA table_info(api_request_attempts)").map_err(database_error)?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1)).map_err(database_error)?;
+        let found = columns.collect::<std::result::Result<Vec<_>, _>>().map_err(database_error)?
+            .iter().any(|existing| existing == column);
+        if !found {
+            connection.execute(&format!("ALTER TABLE api_request_attempts ADD COLUMN {column} {kind}"), [])
+                .map_err(database_error)?;
+        }
     }
     Ok(())
 }
@@ -1016,7 +1059,7 @@ fn request_attempts(
     let mut statement = connection
         .prepare(
             "SELECT attempt, provider_id, route_reason, started_at, finished_at, status_code, \
-             outcome, latency_ms, error FROM api_request_attempts \
+             outcome, latency_ms, error, upstream_model, turn_state_length FROM api_request_attempts \
              WHERE request_id = ?1 ORDER BY attempt ASC",
         )
         .map_err(database_error)?;
@@ -1043,6 +1086,8 @@ fn api_request_attempt_from_row(row: &Row<'_>) -> rusqlite::Result<ApiRequestAtt
         outcome: row.get(6)?,
         latency_ms: row.get(7)?,
         error: row.get(8)?,
+        upstream_model: row.get(9)?,
+        turn_state_length: row.get(10)?,
     })
 }
 
@@ -1179,6 +1224,19 @@ mod tests {
                     latency_ms INTEGER,
                     error TEXT
                 );
+                CREATE TABLE api_request_attempts (
+                    request_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    route_reason TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    status_code INTEGER,
+                    outcome TEXT NOT NULL DEFAULT 'processing',
+                    latency_ms INTEGER,
+                    error TEXT,
+                    PRIMARY KEY(request_id, attempt)
+                );
                 INSERT INTO api_requests (
                     request_id, started_at, method, path, model, outcome
                 ) VALUES (
@@ -1201,6 +1259,8 @@ mod tests {
         );
         assert_eq!(snapshot.recent_requests[0].reasoning_effort, None);
         assert_eq!(snapshot.recent_requests[0].service_tier, None);
+        assert_eq!(snapshot.recent_requests[0].upstream_model, None);
+        assert_eq!(snapshot.recent_requests[0].turn_state_length, None);
     }
 
     #[test]
@@ -1294,6 +1354,8 @@ mod tests {
                 error: None,
             })
             .expect("second attempt finish");
+        store.record_upstream_metadata("request-1", 2, Some("gpt-upstream"))
+            .expect("derived metadata");
         store
             .record_request_finish(RequestLogFinish {
                 request_id: "request-1",
@@ -1320,6 +1382,10 @@ mod tests {
             Some("priority")
         );
         assert_eq!(snapshot.recent_requests[0].attempts, 2);
+        assert_eq!(snapshot.recent_requests[0].upstream_model.as_deref(), Some("gpt-upstream"));
+        assert_eq!(snapshot.recent_requests[0].turn_state_length, None);
+        assert_eq!(snapshot.recent_requests[0].attempt_log[0].turn_state_length, None);
+        assert_eq!(snapshot.recent_requests[0].attempt_log[1].turn_state_length, None);
         assert_eq!(snapshot.recent_requests[0].attempt_log.len(), 2);
         assert_eq!(
             snapshot.recent_requests[0].attempt_log[0].provider_id,

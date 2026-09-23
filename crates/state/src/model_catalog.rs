@@ -13,6 +13,7 @@ pub(crate) fn managed_model_catalog_path(codex_dir: &Path) -> PathBuf {
     codex_dir.join(MANAGED_MODEL_CATALOG_FILENAME)
 }
 
+#[cfg(test)]
 pub(crate) fn visible_cached_model_slugs(codex_dir: &Path) -> Vec<String> {
     let mut seen = BTreeSet::new();
     load_cached_models(codex_dir)
@@ -67,6 +68,7 @@ pub(crate) fn build_model_catalog(codex_dir: &Path, model_slugs: &[String]) -> R
                 .unwrap_or_else(|| fallback.clone());
             merge_missing_fields(&mut entry, &fallback);
             customize_entry(&mut entry, slug, priority, exact_match);
+            codex_companion_core::repair_codex_model_metadata(&mut entry);
             entry
         })
         .collect::<Vec<_>>();
@@ -113,6 +115,8 @@ fn merge_missing_fields(entry: &mut Value, fallback: &Value) {
 }
 
 fn customize_entry(entry: &mut Value, slug: &str, priority: usize, exact_match: bool) {
+    entry["slug"] = json!(slug);
+    codex_companion_core::repair_codex_model_metadata(entry);
     let Some(entry) = entry.as_object_mut() else {
         return;
     };
@@ -140,7 +144,7 @@ fn customize_entry(entry: &mut Value, slug: &str, priority: usize, exact_match: 
 }
 
 fn known_ultra_model(slug: &str) -> bool {
-    matches!(slug, "gpt-5.6-sol" | "gpt-5.6-terra")
+    codex_companion_core::known_codex_ultra_model(slug)
 }
 
 fn ensure_ultra_reasoning(entry: &mut Map<String, Value>) {
@@ -180,6 +184,22 @@ fn remove_ultra_reasoning(entry: &mut Map<String, Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stale_gpt6_none_reasoning_is_repaired_when_generating_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join(MODELS_CACHE_FILENAME), json!({"models":[
+            {"slug":"gpt-6-sol","supported_reasoning_levels":[{"effort":"none"}],"default_reasoning_level":"none"},
+            {"slug":"gpt-6-luna","supported_reasoning_levels":[{"effort":"none"}],"default_reasoning_level":"none"}
+        ]}).to_string()).unwrap();
+        let bytes = build_model_catalog(temp.path(), &["gpt-6-sol".into(), "gpt-6-luna".into()]).unwrap();
+        let catalog: Value = serde_json::from_slice(&bytes).unwrap();
+        for (index, ultra) in [(0, true), (1, false)] {
+            let model = &catalog["models"][index];
+            assert_eq!(model["default_reasoning_level"], "medium");
+            assert_eq!(model["supported_reasoning_levels"].as_array().unwrap().iter().any(|v| v["effort"] == "ultra"), ultra);
+            assert!(model["supported_reasoning_levels"].as_array().unwrap().iter().any(|v| v["effort"] == "max"));
+        }
+    }
 
     #[test]
     fn configured_model_is_first_and_duplicates_are_removed() {

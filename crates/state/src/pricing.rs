@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-pub const PRICING_AS_OF: &str = "2026-08-09";
+pub const PRICING_AS_OF: &str = "2026-09-23";
 
 pub fn read_pricing_settings(data_dir: &Path) -> Result<PricingSettingsSnapshot> {
     let path = data_dir.join("model-pricing.json");
@@ -187,6 +187,9 @@ impl PricingCatalog {
             override_path: None,
         };
         for (model, input, cached_input, cache_write_input, output) in [
+            ("gpt-6-astra", "10.00", "1.00", "10.00", "50.00"),
+            ("gpt-6-sol", "2.00", "0.20", "2.00", "10.00"),
+            ("gpt-6-luna", "0.10", "0.01", "0.10", "0.50"),
             ("gpt-5.6-sol", "5.00", "0.50", "6.25", "30.00"),
             ("gpt-5.6", "5.00", "0.50", "6.25", "30.00"),
             ("gpt-5.6-terra", "2.00", "0.20", "2.50", "12.00"),
@@ -556,6 +559,9 @@ mod tests {
     fn current_openai_snapshot_prices_terra_and_luna() {
         let catalog = PricingCatalog::builtin();
         for (model, input, cached_input, cache_write_input, output) in [
+            ("gpt-6-astra", "10.00", "1.00", "10.00", "50.00"),
+            ("gpt-6-sol", "2.00", "0.20", "2.00", "10.00"),
+            ("gpt-6-luna", "0.10", "0.01", "0.10", "0.50"),
             ("gpt-5.6-terra", "2.00", "0.20", "2.50", "12.00"),
             ("gpt-5.6-luna", "0.20", "0.02", "0.25", "1.20"),
         ] {

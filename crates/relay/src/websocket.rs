@@ -3250,7 +3250,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_candidates_exclude_invalid_credentials_and_cooldowns() {
+    fn websocket_candidates_keep_api_key_quota_failures_retryable() {
         let state = state_with_group(vec![
             provider("invalid", Some("ws://127.0.0.1:1/invalid".to_string())),
             provider("cooling", Some("ws://127.0.0.1:1/cooling".to_string())),
@@ -3297,7 +3297,7 @@ mod tests {
                 .iter()
                 .map(|provider| provider.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["cooling", "healthy"]
+            vec!["cooling", "quota", "healthy"]
         );
     }
 
