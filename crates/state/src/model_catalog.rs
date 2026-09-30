@@ -67,6 +67,19 @@ pub(crate) fn build_model_catalog(codex_dir: &Path, model_slugs: &[String]) -> R
                 .or_else(|| cached_template.clone())
                 .unwrap_or_else(|| fallback.clone());
             merge_missing_fields(&mut entry, &fallback);
+            if !exact_match && slug == "gpt-6.1-sol" {
+                if let Some(fields) = entry.as_object_mut() {
+                    for field in [
+                        "context_window",
+                        "max_context_window",
+                        "auto_compact_token_limit",
+                        "default_reasoning_level",
+                        "supported_reasoning_levels",
+                    ] {
+                        fields.remove(field);
+                    }
+                }
+            }
             customize_entry(&mut entry, slug, priority, exact_match);
             codex_companion_core::repair_codex_model_metadata(&mut entry);
             entry
@@ -191,14 +204,43 @@ mod tests {
             {"slug":"gpt-6-sol","supported_reasoning_levels":[{"effort":"none"}],"default_reasoning_level":"none"},
             {"slug":"gpt-6-luna","supported_reasoning_levels":[{"effort":"none"}],"default_reasoning_level":"none"}
         ]}).to_string()).unwrap();
-        let bytes = build_model_catalog(temp.path(), &["gpt-6-sol".into(), "gpt-6-luna".into()]).unwrap();
+        let bytes =
+            build_model_catalog(temp.path(), &["gpt-6-sol".into(), "gpt-6-luna".into()]).unwrap();
         let catalog: Value = serde_json::from_slice(&bytes).unwrap();
         for (index, ultra) in [(0, true), (1, false)] {
             let model = &catalog["models"][index];
             assert_eq!(model["default_reasoning_level"], "medium");
-            assert_eq!(model["supported_reasoning_levels"].as_array().unwrap().iter().any(|v| v["effort"] == "ultra"), ultra);
-            assert!(model["supported_reasoning_levels"].as_array().unwrap().iter().any(|v| v["effort"] == "max"));
+            assert_eq!(
+                model["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["effort"] == "ultra"),
+                ultra
+            );
+            assert!(model["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["effort"] == "max"));
         }
+    }
+
+    #[test]
+    fn new_sol_does_not_inherit_old_sol_limits_or_reasoning() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = build_model_catalog(temp.path(), &["gpt-6.1-sol".into()]).unwrap();
+        let catalog: Value = serde_json::from_slice(&bytes).unwrap();
+        let model = &catalog["models"][0];
+        assert_eq!(model["context_window"], 1_050_000);
+        assert_eq!(model["default_reasoning_level"], "medium");
+        assert_eq!(model["auto_compact_token_limit"], 945_000);
+        assert!(model.get("multi_agent_version").is_none());
+        assert!(model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|level| level["effort"] != "ultra"));
     }
 
     #[test]
@@ -248,12 +290,16 @@ mod tests {
         let model = &catalog["models"][0];
 
         assert_eq!(model["slug"], "gpt-5.6-sol");
+        assert_eq!(model["display_name"], "GPT-5.6 Sol");
         assert!(model["supported_reasoning_levels"]
             .as_array()
             .expect("levels")
             .iter()
             .any(|level| level["effort"] == "ultra"));
         assert_eq!(model["multi_agent_version"], "v2");
+        assert_eq!(model["context_window"], 272_000);
+        assert_eq!(model["max_context_window"], 921_000);
+        assert_eq!(model["auto_compact_token_limit"], 244_800);
         assert_eq!(model["service_tiers"], json!([]));
         assert_eq!(model["additional_speed_tiers"], json!([]));
     }

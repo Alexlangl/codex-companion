@@ -31,6 +31,7 @@
 - **专注 Codex**：围绕 ChatGPT / Codex Desktop 与 Codex CLI 的真实配置、登录材料、Responses API 和会话文件工作。
 - **账号池而不是单一配置**：官方 OAuth、Agent Identity、API Key 和第三方中转可以放进同一个分组。
 - **请求级可靠性**：支持优先级、轮询、随机、权重、最低负载、手动选择、模型冷却和失败切换。
+- **模型能力可见**：对比官方缓存、官方账号和中转来源，展示 reasoning、上下文窗口与自动压缩阈值，避免路由和成本估算使用过期模型信息。
 - **切换时保留上下文**：提供会话亲和、历史 namespace 修复、插件状态修复和 `codex resume` 入口。
 - **本地可观测**：查看账号健康、可识别额度、结构化请求审计，以及主会话和子代理的 token 用量。
 - **三种使用界面**：桌面 App 负责日常操作，CLI 适合脚本，TUI 适合纯终端环境。
@@ -350,7 +351,7 @@ codex-companion-tui
 }
 ```
 
-价格单位为每百万 Token 的美元估算值。价格和倍率可写为 JSON 数字或十进制字符串；字符串更适合需要精确保留小数位的配置。`models` 中的 `model` 如果与内置模型相同，就会覆盖该模型的内置价格；因此也可以手动修正 OpenAI 降价或中转站实际价格。`cacheWriteInputPerMillion` 可省略，省略时按普通输入价格计算。修改文件后重新刷新或重建用量统计即可生效。未匹配价格的模型会显示为“未定价”，不会静默当作 `$0`。内置 OpenAI 价格快照截至 `2026-08-09`，来源为 [官方 API 定价表](https://developers.openai.com/api/docs/pricing)。
+价格单位为每百万 Token 的美元估算值。价格和倍率可写为 JSON 数字或十进制字符串；字符串更适合需要精确保留小数位的配置。`models` 中的 `model` 如果与内置模型相同，就会覆盖该模型的内置价格；因此也可以手动修正 OpenAI 降价或中转站实际价格。`cacheWriteInputPerMillion` 可省略，省略时按普通输入价格计算。修改文件后重新刷新或重建用量统计即可生效。未匹配价格的模型会显示为“未定价”，不会静默当作 `$0`。内置 OpenAI 价格快照截至 `2026-09-25`，来源为 [官方 API 定价表](https://developers.openai.com/api/docs/pricing)。
 
 </details>
 

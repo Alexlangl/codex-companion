@@ -27,13 +27,14 @@ pub(crate) fn merge_codex_catalogs(primary: &mut Value, catalogs: Vec<Value>) {
     // Provider affinity or round-robin must not change the model picker's order.
     models.sort_by(|a, b| {
         let rank = |value: &Value| match value.get("slug").and_then(Value::as_str).unwrap_or("") {
-            "gpt-6-astra" => 0,
-            "gpt-6-sol" => 1,
-            "gpt-6-luna" => 2,
-            "gpt-5.6-sol" => 3,
-            "gpt-5.6-terra" => 4,
-            "gpt-5.6-luna" => 5,
-            _ => 6,
+            "gpt-6.1-sol" => 0,
+            "gpt-6-astra" => 1,
+            "gpt-6-sol" => 2,
+            "gpt-6-luna" => 3,
+            "gpt-5.6-sol" => 4,
+            "gpt-5.6-terra" => 5,
+            "gpt-5.6-luna" => 6,
+            _ => 7,
         };
         rank(a)
             .cmp(&rank(b))
@@ -68,13 +69,30 @@ pub(crate) fn adapt_codex_model_catalog(value: &mut Value) {
             model["slug"] = json!(slug);
             model["display_name"] = json!(slug);
             model["description"] = json!(slug);
+            if slug == "gpt-6.1-sol" {
+                if let Some(fields) = model.as_object_mut() {
+                    for field in [
+                        "context_window",
+                        "max_context_window",
+                        "auto_compact_token_limit",
+                        "default_reasoning_level",
+                        "supported_reasoning_levels",
+                    ] {
+                        fields.remove(field);
+                    }
+                }
+            }
             // A model id alone does not establish Codex-specific capabilities.
             if !codex_companion_core::known_codex_ultra_model(slug) {
                 model.as_object_mut().unwrap().remove("multi_agent_version");
-                model["supported_reasoning_levels"]
-                    .as_array_mut()
-                    .unwrap()
-                    .retain(|level| level.get("effort").and_then(Value::as_str) != Some("ultra"));
+                if let Some(levels) = model
+                    .get_mut("supported_reasoning_levels")
+                    .and_then(Value::as_array_mut)
+                {
+                    levels.retain(|level| {
+                        level.get("effort").and_then(Value::as_str) != Some("ultra")
+                    });
+                }
             }
             codex_companion_core::repair_codex_model_metadata(&mut model);
             Some(model)
@@ -96,6 +114,21 @@ mod tests {
             .unwrap()
             .iter()
             .any(|v| v["effort"] == "ultra"));
+    }
+
+    #[test]
+    fn id_only_new_sol_gets_its_own_capabilities() {
+        let mut catalog = json!({"data":[{"id":"gpt-6.1-sol"}]});
+        adapt_codex_model_catalog(&mut catalog);
+        let model = &catalog["models"][0];
+        assert_eq!(model["context_window"], 1_050_000);
+        assert_eq!(model["default_reasoning_level"], "medium");
+        assert!(model.get("multi_agent_version").is_none());
+        assert!(model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|level| level["effort"] != "ultra"));
     }
 
     #[test]

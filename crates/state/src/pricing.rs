@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-pub const PRICING_AS_OF: &str = "2026-09-23";
+pub const PRICING_AS_OF: &str = "2026-09-30";
 
 pub fn read_pricing_settings(data_dir: &Path) -> Result<PricingSettingsSnapshot> {
     let path = data_dir.join("model-pricing.json");
@@ -101,6 +101,7 @@ pub struct ModelPricing {
     cached_input_per_million: Decimal,
     cache_write_input_per_million: Decimal,
     output_per_million: Decimal,
+    long_context_pricing: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -187,11 +188,12 @@ impl PricingCatalog {
             override_path: None,
         };
         for (model, input, cached_input, cache_write_input, output) in [
-            ("gpt-6-astra", "10.00", "1.00", "10.00", "50.00"),
-            ("gpt-6-sol", "2.00", "0.20", "2.00", "10.00"),
-            ("gpt-6-luna", "0.10", "0.01", "0.10", "0.50"),
-            ("gpt-5.6-sol", "5.00", "0.50", "6.25", "30.00"),
-            ("gpt-5.6", "5.00", "0.50", "6.25", "30.00"),
+            ("gpt-6.1-sol", "2.00", "0.10", "2.50", "10.00"),
+            ("gpt-6-astra", "10.00", "1.00", "12.50", "50.00"),
+            ("gpt-6-sol", "2.00", "0.20", "2.50", "10.00"),
+            ("gpt-6-luna", "0.10", "0.01", "0.125", "0.50"),
+            ("gpt-5.6-sol", "4.00", "0.40", "5.00", "20.00"),
+            ("gpt-5.6", "4.00", "0.40", "5.00", "20.00"),
             ("gpt-5.6-terra", "2.00", "0.20", "2.50", "12.00"),
             ("gpt-5.6-luna", "0.20", "0.02", "0.25", "1.20"),
             ("gpt-5.5", "5.00", "0.50", "5.00", "30.00"),
@@ -208,6 +210,10 @@ impl PricingCatalog {
                 decimal(cached_input),
                 decimal(cache_write_input),
                 decimal(output),
+                matches!(
+                    model,
+                    "gpt-6.1-sol" | "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+                ),
                 &[],
             );
         }
@@ -263,6 +269,7 @@ impl PricingCatalog {
                 cached_input,
                 cache_write_input,
                 output,
+                false,
                 &model.aliases,
             );
         }
@@ -309,7 +316,7 @@ impl PricingCatalog {
             .and_then(|provider_id| self.provider_multipliers.get(&provider_id).copied())
             .unwrap_or(Decimal::ONE);
         let per_million = Decimal::from(TOKENS_PER_MILLION);
-        let cost = CostBreakdown {
+        let mut cost = CostBreakdown {
             fresh_input_usd: Decimal::from(fresh_input_tokens) * pricing.input_per_million
                 / per_million
                 * multiplier,
@@ -323,6 +330,17 @@ impl PricingCatalog {
             output_usd: Decimal::from(output_tokens) * pricing.output_per_million / per_million
                 * multiplier,
         };
+        if pricing.long_context_pricing
+            && fresh_input_tokens
+                .saturating_add(cached_input_tokens)
+                .saturating_add(cache_write_input_tokens)
+                > 272_000
+        {
+            cost.fresh_input_usd *= Decimal::from(2);
+            cost.cached_input_usd *= Decimal::from(2);
+            cost.cache_write_input_usd *= Decimal::from(2);
+            cost.output_usd *= Decimal::new(15, 1);
+        }
         Some((pricing, cost))
     }
 
@@ -333,6 +351,7 @@ impl PricingCatalog {
         cached_input: Decimal,
         cache_write_input: Decimal,
         output: Decimal,
+        long_context_pricing: bool,
         aliases: &[String],
     ) {
         let canonical = normalize_model_key(model);
@@ -342,6 +361,7 @@ impl PricingCatalog {
             cached_input_per_million: cached_input,
             cache_write_input_per_million: cache_write_input,
             output_per_million: output,
+            long_context_pricing,
         };
         self.models.insert(canonical, pricing.clone());
         for alias in aliases {
@@ -556,23 +576,42 @@ mod tests {
     }
 
     #[test]
-    fn current_openai_snapshot_prices_terra_and_luna() {
+    fn current_openai_snapshot_prices_new_sol_and_existing_models() {
         let catalog = PricingCatalog::builtin();
         for (model, input, cached_input, cache_write_input, output) in [
-            ("gpt-6-astra", "10.00", "1.00", "10.00", "50.00"),
-            ("gpt-6-sol", "2.00", "0.20", "2.00", "10.00"),
-            ("gpt-6-luna", "0.10", "0.01", "0.10", "0.50"),
+            ("gpt-6.1-sol", "2.00", "0.10", "2.50", "10.00"),
+            ("gpt-6-astra", "10.00", "1.00", "12.50", "50.00"),
+            ("gpt-6-sol", "2.00", "0.20", "2.50", "10.00"),
+            ("gpt-6-luna", "0.10", "0.01", "0.125", "0.50"),
+            ("gpt-5.6-sol", "4.00", "0.40", "5.00", "20.00"),
             ("gpt-5.6-terra", "2.00", "0.20", "2.50", "12.00"),
             ("gpt-5.6-luna", "0.20", "0.02", "0.25", "1.20"),
         ] {
-            let (_, cost) = catalog
-                .estimate(model, None, 1_000_000, 1_000_000, 1_000_000, 1_000_000)
-                .expect("pricing");
-            assert_eq!(cost.fresh_input_usd, decimal(input));
-            assert_eq!(cost.cached_input_usd, decimal(cached_input));
-            assert_eq!(cost.cache_write_input_usd, decimal(cache_write_input));
-            assert_eq!(cost.output_usd, decimal(output));
+            let pricing = catalog.find(model).expect("pricing");
+            assert_eq!(pricing.input_per_million, decimal(input));
+            assert_eq!(pricing.cached_input_per_million, decimal(cached_input));
+            assert_eq!(
+                pricing.cache_write_input_per_million,
+                decimal(cache_write_input)
+            );
+            assert_eq!(pricing.output_per_million, decimal(output));
         }
+    }
+
+    #[test]
+    fn gpt_6_long_context_surcharge_applies_to_entire_request() {
+        let catalog = PricingCatalog::builtin();
+        let (_, cost) = catalog
+            .estimate("openai/gpt-6.1-sol@high", None, 272_000, 0, 0, 100_000)
+            .expect("pricing");
+        assert_eq!(cost.fresh_input_usd, decimal("0.544"));
+        assert_eq!(cost.output_usd, decimal("1"));
+
+        let (_, cost) = catalog
+            .estimate("gpt-6.1-sol", None, 200_000, 72_001, 1, 100_000)
+            .expect("pricing");
+        assert_eq!(cost.fresh_input_usd, decimal("0.8"));
+        assert_eq!(cost.output_usd, decimal("1.5"));
     }
 
     #[test]

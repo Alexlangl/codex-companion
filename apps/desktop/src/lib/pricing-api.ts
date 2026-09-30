@@ -4,9 +4,12 @@ import type { PricingSettings, PricingSettingsSnapshot } from "../types/domain";
 export const pricingPreview = !("__TAURI_INTERNALS__" in window);
 const PREVIEW_KEY = "companion-pricing-preview-v1";
 const previewDefaults: PricingSettingsSnapshot = {
-  builtinModels: [{ model: "gpt-5.4", inputPerMillion: "2.50", cachedInputPerMillion: "0.25", cacheWriteInputPerMillion: "2.50", outputPerMillion: "15.00", aliases: [] }],
+  builtinModels: [
+    { model: "gpt-6.1-sol", inputPerMillion: "2.00", cachedInputPerMillion: "0.10", cacheWriteInputPerMillion: "2.50", outputPerMillion: "10.00", aliases: [] },
+    { model: "gpt-5.4", inputPerMillion: "2.50", cachedInputPerMillion: "0.25", cacheWriteInputPerMillion: "2.50", outputPerMillion: "15.00", aliases: [] },
+  ],
   overrides: { models: [], providerMultipliers: {} },
-  pricingAsOf: "2026-08-09",
+  pricingAsOf: "2026-09-30",
 };
 
 export function getPricingSettings(): Promise<PricingSettingsSnapshot> {

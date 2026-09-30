@@ -242,6 +242,14 @@ export function Models({ active }: ModelsProps) {
                       <div className="model-capability-cell">
                         <span>{model.reasoningEfforts.length ? model.reasoningEfforts.join(" · ") : "未声明"}</span>
                         {model.multiAgentVersion ? <small>Multi-agent {model.multiAgentVersion}</small> : null}
+                        {model.contextWindow ? (
+                          <small title={`自动压缩阈值 ${formatTokenCount(model.autoCompactTokenLimit)}`}>
+                            上下文 {formatTokenCount(model.contextWindow)}
+                            {model.maxContextWindow && model.maxContextWindow !== model.contextWindow
+                              ? ` · 上限 ${formatTokenCount(model.maxContextWindow)}`
+                              : ""}
+                          </small>
+                        ) : null}
                       </div>
                     </td>
                     {snapshot.sources.map((source) => (
@@ -259,6 +267,13 @@ export function Models({ active }: ModelsProps) {
       </section>
     </div>
   );
+}
+
+function formatTokenCount(value?: number | null) {
+  if (!value || value <= 0) return "未知";
+  return value >= 1_000_000
+    ? `${(value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 2)}M`
+    : `${Math.round(value / 1_000)}K`;
 }
 
 function SummaryItem({ label, value }: { label: string; value: string | number }) {

@@ -353,6 +353,9 @@ export interface ModelMatrixModel {
   multiAgentVersion?: string | null;
   ultraCapable: boolean;
   visibility?: string | null;
+  contextWindow?: number | null;
+  maxContextWindow?: number | null;
+  autoCompactTokenLimit?: number | null;
 }
 
 export interface ModelMatrixSnapshot {

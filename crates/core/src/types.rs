@@ -80,6 +80,9 @@ pub struct ModelMatrixModel {
     pub multi_agent_version: Option<String>,
     pub ultra_capable: bool,
     pub visibility: Option<String>,
+    pub context_window: Option<i64>,
+    pub max_context_window: Option<i64>,
+    pub auto_compact_token_limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

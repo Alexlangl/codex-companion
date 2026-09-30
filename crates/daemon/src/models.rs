@@ -29,6 +29,9 @@ struct DiscoveredModel {
     reasoning_efforts: Vec<String>,
     multi_agent_version: Option<String>,
     visibility: Option<String>,
+    context_window: Option<i64>,
+    max_context_window: Option<i64>,
+    auto_compact_token_limit: Option<i64>,
     priority: Option<i64>,
     trusted_capabilities: bool,
 }
@@ -47,6 +50,9 @@ struct ModelAccumulator {
     multi_agent_version: Option<String>,
     ultra_capable: bool,
     visibility: Option<String>,
+    context_window: Option<i64>,
+    max_context_window: Option<i64>,
+    auto_compact_token_limit: Option<i64>,
     priority: Option<i64>,
     trusted_name: bool,
 }
@@ -481,11 +487,6 @@ fn parse_model_entry(
     fallback_id: Option<&str>,
     trusted_capabilities: bool,
 ) -> Option<DiscoveredModel> {
-    let mut normalized = entry.clone();
-    if trusted_capabilities {
-        codex_companion_core::repair_codex_model_metadata(&mut normalized);
-    }
-    let entry = &normalized;
     if let Some(id) = entry.as_str().and_then(non_empty) {
         return Some(DiscoveredModel {
             id: id.clone(),
@@ -493,6 +494,9 @@ fn parse_model_entry(
             reasoning_efforts: Vec::new(),
             multi_agent_version: None,
             visibility: None,
+            context_window: None,
+            max_context_window: None,
+            auto_compact_token_limit: None,
             priority: None,
             trusted_capabilities,
         });
@@ -508,13 +512,22 @@ fn parse_model_entry(
     .find_map(Value::as_str)
     .and_then(non_empty)
     .or_else(|| fallback_id.and_then(non_empty))?;
-    let display_name = [entry.get("display_name"), entry.get("name")]
+    let mut normalized = entry.clone();
+    if normalized.get("slug").and_then(Value::as_str).is_none() {
+        normalized["slug"] = Value::String(id.clone());
+    }
+    if trusted_capabilities {
+        codex_companion_core::repair_codex_model_metadata(&mut normalized);
+    } else {
+        codex_companion_core::repair_codex_context_metadata(&mut normalized);
+    }
+    let display_name = [normalized.get("display_name"), normalized.get("name")]
         .into_iter()
         .flatten()
         .find_map(Value::as_str)
         .and_then(non_empty)
         .unwrap_or_else(|| id.clone());
-    let reasoning_efforts = entry
+    let reasoning_efforts = normalized
         .get("supported_reasoning_levels")
         .and_then(Value::as_array)
         .map(|levels| {
@@ -535,15 +548,20 @@ fn parse_model_entry(
         id,
         display_name,
         reasoning_efforts,
-        multi_agent_version: entry
+        multi_agent_version: normalized
             .get("multi_agent_version")
             .and_then(Value::as_str)
             .and_then(non_empty),
-        visibility: entry
+        visibility: normalized
             .get("visibility")
             .and_then(Value::as_str)
             .and_then(non_empty),
-        priority: entry.get("priority").and_then(Value::as_i64),
+        context_window: normalized.get("context_window").and_then(Value::as_i64),
+        max_context_window: normalized.get("max_context_window").and_then(Value::as_i64),
+        auto_compact_token_limit: normalized
+            .get("auto_compact_token_limit")
+            .and_then(Value::as_i64),
+        priority: normalized.get("priority").and_then(Value::as_i64),
         trusted_capabilities,
     })
 }
@@ -577,6 +595,9 @@ fn build_matrix(discoveries: Vec<SourceDiscovery>) -> ModelMatrixSnapshot {
                     multi_agent_version: None,
                     ultra_capable: false,
                     visibility: None,
+                    context_window: None,
+                    max_context_window: None,
+                    auto_compact_token_limit: None,
                     priority: None,
                     trusted_name: false,
                 });
@@ -607,6 +628,15 @@ fn build_matrix(discoveries: Vec<SourceDiscovery>) -> ModelMatrixSnapshot {
                     (current, None) => current,
                 };
             }
+            if model.trusted_capabilities || row.context_window.is_none() {
+                row.context_window = model.context_window;
+            }
+            if model.trusted_capabilities || row.max_context_window.is_none() {
+                row.max_context_window = model.max_context_window;
+            }
+            if model.trusted_capabilities || row.auto_compact_token_limit.is_none() {
+                row.auto_compact_token_limit = model.auto_compact_token_limit;
+            }
         }
     }
 
@@ -631,6 +661,9 @@ fn build_matrix(discoveries: Vec<SourceDiscovery>) -> ModelMatrixSnapshot {
                     multi_agent_version: row.multi_agent_version,
                     ultra_capable: row.ultra_capable,
                     visibility: row.visibility,
+                    context_window: row.context_window,
+                    max_context_window: row.max_context_window,
+                    auto_compact_token_limit: row.auto_compact_token_limit,
                 },
             )
         })
@@ -708,6 +741,39 @@ mod tests {
         assert_eq!(official[0].id, "gpt-test");
         assert_eq!(official[0].reasoning_efforts, vec!["high"]);
         assert_eq!(relay[0].id, "relay-model");
+    }
+
+    #[test]
+    fn carries_codex_context_metadata_without_inventing_relay_capabilities() {
+        let official = parse_model_response(&json!({"models": [{"slug": "gpt-6-sol"}]}), true)
+            .expect("official models");
+        assert_eq!(official[0].context_window, Some(256_000));
+        assert_eq!(official[0].max_context_window, Some(256_000));
+        assert_eq!(official[0].auto_compact_token_limit, Some(230_400));
+
+        let relay = parse_model_response(
+            &json!({"data": [{"id": "relay-model", "context_window": 64_000}]}),
+            false,
+        )
+        .expect("relay models");
+        assert_eq!(relay[0].context_window, Some(64_000));
+        assert_eq!(relay[0].max_context_window, None);
+        assert_eq!(relay[0].auto_compact_token_limit, None);
+
+        let relay_only = build_matrix(vec![source("relay", ModelSourceKind::Relay, relay.clone())]);
+        assert_eq!(relay_only.models[0].context_window, Some(64_000));
+
+        let relay_codex = parse_model_response(
+            &json!({"data": [{"id": "gpt-6-sol", "context_window": 64_000}]}),
+            false,
+        )
+        .expect("relay codex model");
+        let merged = build_matrix(vec![
+            source("relay", ModelSourceKind::Relay, relay_codex),
+            source("official", ModelSourceKind::OfficialOauth, official),
+        ]);
+        assert_eq!(merged.models[0].context_window, Some(256_000));
+        assert_eq!(merged.models[0].auto_compact_token_limit, Some(230_400));
     }
 
     #[test]
