@@ -1,3 +1,4 @@
+use crate::models::discover_relay_model_slugs;
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
     default_codex_dir, provider_direct_auth_ref, provider_endpoint_is_chat_completions,
@@ -89,7 +90,8 @@ impl CompanionDaemon {
         );
         let selected = selected_providers_for_group(&previous_config, &group);
         let token_source = group_relay_token_source(&group, &selected);
-        let models = relay_model_slugs(&selected);
+        let models =
+            relay_model_slugs_with_discovery(&selected, &previous_config.relay.account_protection);
         let official_auth_provider = relay_official_auth_provider(&previous_config, &selected);
         let relay_install = install_relay_for_launch(
             &codex_dir,
@@ -256,7 +258,10 @@ impl CompanionDaemon {
             pending_relay_restart,
         );
         let token_source = provider_relay_token_source(&provider);
-        let models = relay_model_slugs(std::slice::from_ref(&provider));
+        let models = relay_model_slugs_with_discovery(
+            std::slice::from_ref(&provider),
+            &config_snapshot.relay.account_protection,
+        );
         let selected = std::slice::from_ref(&provider);
         let official_auth_provider = relay_official_auth_provider(&config_snapshot, selected);
         let relay_install = install_relay_for_launch(
@@ -775,6 +780,25 @@ pub(crate) fn relay_model_slugs(providers: &[ProviderConfig]) -> Vec<String> {
             continue;
         }
         models.push(model.to_string());
+    }
+    models
+}
+
+pub(crate) fn relay_model_slugs_with_discovery(
+    providers: &[ProviderConfig],
+    policy: &codex_companion_core::AccountProtection,
+) -> Vec<String> {
+    let mut models = relay_model_slugs(providers);
+    if providers
+        .iter()
+        .any(|provider| matches!(provider.kind, ProviderKind::OfficialCodex))
+    {
+        return models;
+    }
+    for slug in discover_relay_model_slugs(providers, policy) {
+        if !models.contains(&slug) {
+            models.push(slug);
+        }
     }
     models
 }

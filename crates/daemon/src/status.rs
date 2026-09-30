@@ -1,4 +1,6 @@
-use crate::launch::{provider_can_direct_connect, relay_model_slugs, relay_official_auth_provider};
+use crate::launch::{
+    provider_can_direct_connect, relay_model_slugs_with_discovery, relay_official_auth_provider,
+};
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
     default_codex_dir, CompanionConfig, CompanionStatus, DataRootStatus, ProviderConfig,
@@ -60,7 +62,7 @@ impl CompanionDaemon {
     ) -> Result<codex_companion_core::CodexInstallStatus> {
         let config = self.store.load()?;
         let selected = selected_providers(&config);
-        let models = relay_model_slugs(&selected);
+        let models = relay_model_slugs_with_discovery(&selected, &config.relay.account_protection);
         let official_auth_provider = relay_official_auth_provider(&config, &selected);
         Ok(install_companion_provider_for_relay(
             codex_dir,

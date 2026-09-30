@@ -1,9 +1,9 @@
 use crate::runtime::CompanionDaemon;
 use chrono::{DateTime, Utc};
 use codex_companion_core::{
-    default_codex_dir, http_client_builder, provider_api_base_url, redact_sensitive_text,
-    ModelMatrixModel, ModelMatrixSnapshot, ModelMatrixSource, ModelSourceKind, ModelSourceStatus,
-    ProviderConfig, ProviderKind, Result,
+    account_policy_block_reason, default_codex_dir, http_client_builder, provider_api_base_url,
+    redact_sensitive_text, AccountProtection, ModelMatrixModel, ModelMatrixSnapshot,
+    ModelMatrixSource, ModelSourceKind, ModelSourceStatus, ProviderConfig, ProviderKind, Result,
 };
 use codex_companion_provider::{
     ensure_codex_auth_snapshot, provider_uses_agent_identity, provider_uses_codex_oauth,
@@ -21,6 +21,70 @@ const MODEL_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const MODEL_RESPONSE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const MODEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PICKER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) fn discover_relay_model_slugs(
+    providers: &[ProviderConfig],
+    policy: &AccountProtection,
+) -> Vec<String> {
+    let providers = providers
+        .iter()
+        .filter(|provider| provider.enabled && provider.kind != ProviderKind::OfficialCodex)
+        .filter(|provider| provider.model_map.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if providers.is_empty() {
+        return Vec::new();
+    }
+    let policy = policy.clone();
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return Vec::new();
+        };
+        runtime.block_on(async move {
+            let Ok(client) = http_client_builder()
+                .timeout(PICKER_DISCOVERY_TIMEOUT)
+                .connect_timeout(PICKER_DISCOVERY_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+            else {
+                return Vec::new();
+            };
+            let mut tasks = JoinSet::new();
+            for provider in providers {
+                let client = client.clone();
+                tasks.spawn(async move {
+                    let models = fetch_provider_model_response(&client, &provider, true)
+                        .await
+                        .and_then(|value| parse_model_response(&value, false))
+                        .unwrap_or_default();
+                    (provider, models)
+                });
+            }
+            let mut slugs = BTreeSet::new();
+            while let Some(Ok((provider, models))) = tasks.join_next().await {
+                for model in models {
+                    if model.visibility.as_deref() != Some("hide")
+                        && account_policy_block_reason(
+                            &policy,
+                            &provider,
+                            Some(&model.id),
+                            Utc::now(),
+                        ) != Some("account_model_excluded")
+                    {
+                        slugs.insert(model.id);
+                    }
+                }
+            }
+            slugs.into_iter().collect()
+        })
+    })
+    .join()
+    .unwrap_or_default()
+}
 
 #[derive(Debug, Clone)]
 struct DiscoveredModel {
@@ -241,7 +305,7 @@ async fn discover_provider_models(
         };
     }
 
-    let result = fetch_provider_model_response(client, &provider).await;
+    let result = fetch_provider_model_response(client, &provider, false).await;
     match result.and_then(|value| parse_model_response(&value, kind != ModelSourceKind::Relay)) {
         Ok(models) => {
             source.status = ModelSourceStatus::Available;
@@ -263,6 +327,7 @@ async fn discover_provider_models(
 async fn fetch_provider_model_response(
     client: &Client,
     provider: &ProviderConfig,
+    codex_catalog: bool,
 ) -> std::result::Result<Value, String> {
     if provider.kind == ProviderKind::OfficialCodex {
         if provider_uses_agent_identity(provider) {
@@ -308,7 +373,16 @@ async fn fetch_provider_model_response(
         return parse_provider_response(response).await;
     }
 
-    let urls = relay_model_url_candidates(&provider.base_url)?;
+    let mut urls = relay_model_url_candidates(&provider.base_url)?;
+    if codex_catalog {
+        for url in &mut urls {
+            let mut parsed = Url::parse(url).map_err(|_| "Provider Base URL 无效".to_string())?;
+            parsed
+                .query_pairs_mut()
+                .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+            *url = parsed.to_string();
+        }
+    }
     let token = resolve_auth_token(provider);
     let mut last_error = None;
     for (index, url) in urls.iter().enumerate() {
@@ -702,6 +776,8 @@ fn reasoning_effort_rank(effort: &str) -> usize {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     fn source(id: &str, kind: ModelSourceKind, models: Vec<DiscoveredModel>) -> SourceDiscovery {
         SourceDiscovery {
@@ -718,6 +794,56 @@ mod tests {
             },
             models,
         }
+    }
+
+    #[test]
+    fn picker_discovers_provider_models_without_inventing_membership() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request");
+            let mut request = [0; 1024];
+            let size = stream.read(&mut request).expect("read request");
+            assert!(String::from_utf8_lossy(&request[..size])
+                .starts_with("GET /v1/models?client_version="));
+            let body = json!({"data": [
+                {"id": "gpt-6.1-sol"},
+                {"id": "hidden-model", "visibility": "hide"},
+                {"id": "blocked-model"}
+            ]})
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("response");
+        });
+        let provider = ProviderConfig {
+            id: "relay".into(),
+            name: "Relay".into(),
+            kind: ProviderKind::RelayProvider,
+            base_url: format!("http://{address}/v1"),
+            websocket_url: None,
+            auth_ref: None,
+            direct_auth_ref: None,
+            model_map: BTreeMap::new(),
+            priority: 100,
+            enabled: true,
+            refresh_interval_seconds: 60,
+            account: None,
+        };
+        let policy = AccountProtection {
+            excluded_models: vec!["blocked-model".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            discover_relay_model_slugs(&[provider], &policy),
+            vec!["gpt-6.1-sol"]
+        );
+        server.join().expect("server");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::launch::{
-    direct_repair_target_provider_id, provider_can_direct_connect, relay_model_slugs,
-    relay_official_auth_provider, restart_codex_if_running,
+    direct_repair_target_provider_id, provider_can_direct_connect,
+    relay_model_slugs_with_discovery, relay_official_auth_provider, restart_codex_if_running,
 };
 use crate::runtime::CompanionDaemon;
 use codex_companion_core::{
@@ -70,7 +70,7 @@ impl CompanionDaemon {
             return Ok(false);
         }
         let selected = selected_providers(&config);
-        let models = relay_model_slugs(&selected);
+        let models = relay_model_slugs_with_discovery(&selected, &config.relay.account_protection);
         let auth_repair_needed = config.app.preserve_official_codex_auth
             && (relay_auth_has_legacy_mirror_ownership(&codex_dir)?
                 || !relay_preserved_official_auth_is_ready(&codex_dir)?);
@@ -112,7 +112,8 @@ impl CompanionDaemon {
         let relay_reinstalled = if preserve && relay_active {
             let selected = selected_providers(&config);
             let source = relay_official_auth_provider(&config, &selected);
-            let models = relay_model_slugs(&selected);
+            let models =
+                relay_model_slugs_with_discovery(&selected, &config.relay.account_protection);
             let snapshot = CodexInstallSnapshot::capture(&codex_dir)?;
             install_companion_provider_for_relay(
                 Some(codex_dir.clone()),
