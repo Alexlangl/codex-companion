@@ -264,7 +264,10 @@ async fn proxy_dispatch(
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            return Ok(allowed_models_response(&models, is_codex_catalog_request(&uri)));
+            return Ok(allowed_models_response(
+                &models,
+                is_codex_catalog_request(&uri),
+            ));
         }
     }
     if normalize_health(&mut config) {
@@ -348,7 +351,10 @@ async fn proxy_dispatch(
                 started_at,
                 None,
             );
-            return Ok(allowed_models_response(&models, is_codex_catalog_request(&uri)));
+            return Ok(allowed_models_response(
+                &models,
+                is_codex_catalog_request(&uri),
+            ));
         }
     }
     let affinity_preference = affinity_key.as_deref().and_then(|key| {
@@ -603,45 +609,84 @@ async fn proxy_dispatch(
                     .map(String::as_str)
                     .unwrap_or(model)
             });
-            let _ = state.api_service.record_upstream_metadata(
-                request_id,
-                attempt,
-                upstream_model,
-            );
+            let _ = state
+                .api_service
+                .record_upstream_metadata(request_id, attempt, upstream_model);
         }
         match upstream_result {
             Ok(mut response) if response.status().is_success() => {
                 if method == Method::GET && uri.path() == "/v1/models" {
                     response
-                        .filter_model_catalog(&config.relay.account_protection, &provider, is_codex_catalog_request(&uri))
+                        .filter_model_catalog(
+                            &config.relay.account_protection,
+                            &provider,
+                            is_codex_catalog_request(&uri),
+                        )
                         .await?;
                     if is_codex_catalog_request(&uri) {
-                        let requests = selected.iter()
+                        let requests = selected
+                            .iter()
                             .filter(|other| other.id != provider.id)
                             .map(|other| async {
-                                if !other.model_map.is_empty() && other.model_map.keys().any(|key| key != "default") {
-                                    let data = other.model_map.keys().filter(|key| key.as_str() != "default")
-                                        .filter(|key| codex_companion_core::account_policy_block_reason(
-                                            &config.relay.account_protection, other, Some(key), chrono::Utc::now(),
-                                        ) != Some("account_model_excluded"))
-                                        .map(|key| serde_json::json!({"id":key})).collect::<Vec<_>>();
+                                if !other.model_map.is_empty()
+                                    && other.model_map.keys().any(|key| key != "default")
+                                {
+                                    let data = other
+                                        .model_map
+                                        .keys()
+                                        .filter(|key| key.as_str() != "default")
+                                        .filter(|key| {
+                                            codex_companion_core::account_policy_block_reason(
+                                                &config.relay.account_protection,
+                                                other,
+                                                Some(key),
+                                                chrono::Utc::now(),
+                                            ) != Some("account_model_excluded")
+                                        })
+                                        .map(|key| serde_json::json!({"id":key}))
+                                        .collect::<Vec<_>>();
                                     return Some(serde_json::json!({"data":data}));
                                 }
                                 let fetch = async {
                                     let url = upstream_url(other, &uri);
-                                    let mut catalog = send_upstream(&state.client, &state.api_service,
-                                        UpstreamRequest::new(other, &method, &uri, &headers, Bytes::new(), &url))
-                                        .await.ok()?;
-                                    if !catalog.status().is_success() { return None }
-                                    catalog.filter_model_catalog(&config.relay.account_protection, other, true).await.ok()?;
+                                    let mut catalog = send_upstream(
+                                        &state.client,
+                                        &state.api_service,
+                                        UpstreamRequest::new(
+                                            other,
+                                            &method,
+                                            &uri,
+                                            &headers,
+                                            Bytes::new(),
+                                            &url,
+                                        ),
+                                    )
+                                    .await
+                                    .ok()?;
+                                    if !catalog.status().is_success() {
+                                        return None;
+                                    }
+                                    catalog
+                                        .filter_model_catalog(
+                                            &config.relay.account_protection,
+                                            other,
+                                            true,
+                                        )
+                                        .await
+                                        .ok()?;
                                     catalog.buffered_catalog()
                                 };
-                                tokio::time::timeout(Duration::from_secs(5), fetch).await.ok().flatten()
-                            }).collect::<Vec<_>>();
+                                tokio::time::timeout(Duration::from_secs(5), fetch)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            })
+                            .collect::<Vec<_>>();
                         let catalogs = futures_util::stream::iter(requests)
                             .buffered(4)
                             .filter_map(|catalog| async { catalog })
-                            .collect::<Vec<_>>().await;
+                            .collect::<Vec<_>>()
+                            .await;
                         response.merge_model_catalogs(catalogs);
                     }
                 }
@@ -792,7 +837,11 @@ async fn proxy_dispatch(
                     );
                     // 守卫随响应体流存活，LeastLoaded 才统计得到流式生成期间的真实负载。
                     let downstream = crate::usage_capture::capture_usage(
-                        downstream, state.store.clone(), request_id, session_id.as_deref(), &provider.id,
+                        downstream,
+                        state.store.clone(),
+                        request_id,
+                        session_id.as_deref(),
+                        &provider.id,
                     );
                     return Ok(attach_request_guard(downstream, request_guard));
                 }
@@ -1622,7 +1671,9 @@ fn allowed_models_response(models: &[String], codex_catalog: bool) -> Response {
         .map(|model| serde_json::json!({"id": model, "object": "model", "owned_by": "codex-companion"}))
         .collect::<Vec<_>>();
     let mut catalog = serde_json::json!({"object": "list", "data": data});
-    if codex_catalog { crate::model_catalog::adapt_codex_model_catalog(&mut catalog); }
+    if codex_catalog {
+        crate::model_catalog::adapt_codex_model_catalog(&mut catalog);
+    }
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -1914,25 +1965,59 @@ mod tests {
 
     #[tokio::test]
     async fn codex_versioned_models_accepts_third_party_catalogs_and_filters_exclusions() {
-        let upstream = spawn_mock_server(StatusCode::OK, r#"{"object":"list","data":[{"id":"allowed"},{"id":"blocked"}]}"#, None).await;
+        let upstream = spawn_mock_server(
+            StatusCode::OK,
+            r#"{"object":"list","data":[{"id":"allowed"},{"id":"blocked"}]}"#,
+            None,
+        )
+        .await;
         let store = store_with_group(vec![provider("a", &upstream)]);
-        store.update(|config| {
-            config.relay.account_protection.excluded_models.push("blocked".into());
-            Ok(())
-        }).unwrap();
+        store
+            .update(|config| {
+                config
+                    .relay
+                    .account_protection
+                    .excluded_models
+                    .push("blocked".into());
+                Ok(())
+            })
+            .unwrap();
         let state = RelayState::new(store.clone(), reqwest::Client::new());
-        let response = proxy_inner(state.clone(), Method::GET, "/v1/models?client_version=0.155.0".parse().unwrap(), HeaderMap::new(), Bytes::new()).await.unwrap();
+        let response = proxy_inner(
+            state.clone(),
+            Method::GET,
+            "/v1/models?client_version=0.155.0".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
         let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
         let catalog: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(catalog["models"].as_array().unwrap().len(), 1);
         assert_eq!(catalog["models"][0]["slug"], "allowed");
         assert_eq!(catalog["data"][0]["id"], "allowed");
         // The same native shape is required when model maps are served locally.
-        store.update(|config| {
-            config.providers.get_mut("a").unwrap().model_map.insert("local-model".into(), "actual-model".into());
-            Ok(())
-        }).unwrap();
-        let response = proxy_inner(state, Method::GET, "/v1/models?client_version=0.155.0".parse().unwrap(), HeaderMap::new(), Bytes::new()).await.unwrap();
+        store
+            .update(|config| {
+                config
+                    .providers
+                    .get_mut("a")
+                    .unwrap()
+                    .model_map
+                    .insert("local-model".into(), "actual-model".into());
+                Ok(())
+            })
+            .unwrap();
+        let response = proxy_inner(
+            state,
+            Method::GET,
+            "/v1/models?client_version=0.155.0".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
         let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
         let catalog: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(catalog["models"][0]["slug"], "local-model");
@@ -2028,17 +2113,27 @@ mod tests {
     async fn codex_catalog_merges_group_models_and_repairs_none_reasoning() {
         let sol = spawn_mock_server(StatusCode::OK,
             r#"{"models":[{"slug":"gpt-6-sol","default_reasoning_level":"none","supported_reasoning_levels":[{"effort":"none"}]}]}"#, None).await;
-        let luna = spawn_mock_server(StatusCode::OK,
-            r#"{"data":[{"id":"gpt-6-luna"}]}"#, None).await;
+        let luna =
+            spawn_mock_server(StatusCode::OK, r#"{"data":[{"id":"gpt-6-luna"}]}"#, None).await;
         let store = store_with_group(vec![provider("sol", &sol), provider("luna", &luna)]);
         let state = RelayState::new(store.clone(), reqwest::Client::new());
         for order in [vec!["sol", "luna"], vec!["luna", "sol"]] {
-            store.update(|config| {
-                config.groups.get_mut("test").unwrap().provider_order = order.iter().map(|s| s.to_string()).collect();
-                Ok(())
-            }).unwrap();
-            let response = proxy_inner(state.clone(), Method::GET,
-                "/v1/models?client_version=0.155.0".parse().unwrap(), HeaderMap::new(), Bytes::new()).await.unwrap();
+            store
+                .update(|config| {
+                    config.groups.get_mut("test").unwrap().provider_order =
+                        order.iter().map(|s| s.to_string()).collect();
+                    Ok(())
+                })
+                .unwrap();
+            let response = proxy_inner(
+                state.clone(),
+                Method::GET,
+                "/v1/models?client_version=0.155.0".parse().unwrap(),
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await
+            .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
             let catalog: Value = serde_json::from_slice(&bytes).unwrap();
@@ -2047,7 +2142,11 @@ mod tests {
             assert_eq!(models[0]["slug"], "gpt-6-sol");
             assert_eq!(models[1]["slug"], "gpt-6-luna");
             for model in models {
-                assert!(model["supported_reasoning_levels"].as_array().unwrap().iter().any(|level| level["effort"] == "high"));
+                assert!(model["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|level| level["effort"] == "high"));
             }
         }
     }
@@ -4375,7 +4474,9 @@ mod tests {
             Method::POST,
             "/v1/responses".parse().expect("uri"),
             HeaderMap::new(),
-            Bytes::from_static(br#"{"model":"gpt-test","input":"hello","metadata":{"session_id":"usage-http"}}"#),
+            Bytes::from_static(
+                br#"{"model":"gpt-test","input":"hello","metadata":{"session_id":"usage-http"}}"#,
+            ),
         )
         .await
         .expect("proxy");
@@ -4384,12 +4485,19 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024).await.expect("body");
         let value: Value = serde_json::from_slice(&body).expect("response json");
         assert_eq!(value["status"], "completed");
-        crate::ApiServiceStore::from_config_store(&store).clear_request_logs().expect("clear disposable logs");
+        crate::ApiServiceStore::from_config_store(&store)
+            .clear_request_logs()
+            .expect("clear disposable logs");
         let mut events = vec![codex_companion_core::TokenUsageEvent {
-            session_id: Some("usage-http".into()), timestamp: Some(chrono::Utc::now().to_rfc3339()),
-            input_tokens: 20, cached_input_tokens: 80, output_tokens: 20, ..Default::default()
+            session_id: Some("usage-http".into()),
+            timestamp: Some(chrono::Utc::now().to_rfc3339()),
+            input_tokens: 20,
+            cached_input_tokens: 80,
+            output_tokens: 20,
+            ..Default::default()
         }];
-        codex_companion_core::apply_usage_attribution(&store.data_dir(), &mut events).expect("attribute");
+        codex_companion_core::apply_usage_attribution(&store.data_dir(), &mut events)
+            .expect("attribute");
         assert_eq!(events[0].provider_id.as_deref(), Some("b"));
         assert_eq!(hits_a.load(Ordering::SeqCst), 1);
         assert_eq!(hits_b.load(Ordering::SeqCst), 1);

@@ -8,8 +8,9 @@ mod events;
 mod http_client;
 mod model_capabilities;
 pub use model_capabilities::{
-    derived_auto_compact_token_limit, known_codex_context_limits, known_codex_ultra_model,
-    repair_codex_context_metadata, repair_codex_model_metadata,
+    apply_codex_compaction_metadata, derived_auto_compact_token_limit, known_codex_context_limits,
+    known_codex_ultra_model, repair_codex_context_metadata, repair_codex_model_metadata,
+    AUTO_COMPACT_RATIO_PERCENT, CODEX_CLIENT_COMP_HASH,
 };
 mod paths;
 mod private_file;

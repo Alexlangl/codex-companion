@@ -2724,16 +2724,31 @@ mod tests {
             serde_json::json!({"type":"session_meta","payload":{"id":"s1","model_provider":"codex-companion"}}),
             serde_json::json!({"timestamp":timestamp,"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":20}}}}),
         ];
-        fs::write(sessions.join("session.jsonl"), lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        fs::write(
+            sessions.join("session.jsonl"),
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
         let cache = temp.path().join("cache");
         let before = collect_token_usage_cached(temp.path().into(), cache.clone()).unwrap();
-        assert_eq!(before.by_provider[0].key,"codex-companion");
+        assert_eq!(before.by_provider[0].key, "codex-companion");
         codex_companion_core::record_usage_attribution(temp.path(), "req", "s1", "my-provider", &serde_json::json!({"status":"completed","usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":80}}})).unwrap();
-        let after = collect_token_usage_cached_with_filters(temp.path().into(),cache,&TokenUsageDateRange::default(),&TokenUsageFilters::parse(Some("my-provider"),None)).unwrap();
-        assert_eq!(after.total_tokens,before.total_tokens);
-        assert_eq!(after.by_provider[0].key,"my-provider");
-        assert_eq!(after.available_providers,vec!["my-provider"]);
-        assert_eq!(after.events,1);
+        let after = collect_token_usage_cached_with_filters(
+            temp.path().into(),
+            cache,
+            &TokenUsageDateRange::default(),
+            &TokenUsageFilters::parse(Some("my-provider"), None),
+        )
+        .unwrap();
+        assert_eq!(after.total_tokens, before.total_tokens);
+        assert_eq!(after.by_provider[0].key, "my-provider");
+        assert_eq!(after.available_providers, vec!["my-provider"]);
+        assert_eq!(after.events, 1);
     }
 
     #[test]

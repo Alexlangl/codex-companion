@@ -362,7 +362,8 @@ mod tests {
                     &classify_failure(status, message),
                     message.into(),
                 );
-                let expected = health.cooldown_until.is_some() && kind == ProviderKind::OfficialCodex;
+                let expected =
+                    health.cooldown_until.is_some() && kind == ProviderKind::OfficialCodex;
                 assert_eq!(provider_cooldown_active(&kind, &health), expected);
                 normalize_provider_cooldown(&kind, &mut health);
                 assert_eq!(cooldown_active(&health), expected);

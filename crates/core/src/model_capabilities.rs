@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 
-const AUTO_COMPACT_RATIO_PERCENT: i64 = 90;
+/// Keep the compaction format consistent across managed and upstream catalogs.
+pub const CODEX_CLIENT_COMP_HASH: &str = "3000";
+pub const AUTO_COMPACT_RATIO_PERCENT: i64 = 90;
 
 /// Return known model context limits when a provider omits them. The first
 /// value is the default window and the second is the opt-in maximum window.
@@ -19,6 +21,31 @@ pub fn derived_auto_compact_token_limit(context_window: i64) -> i64 {
         return 0;
     }
     context_window.saturating_mul(AUTO_COMPACT_RATIO_PERCENT) / 100
+}
+
+/// Preserve explicit valid thresholds, deriving only missing or invalid ones.
+pub fn apply_codex_compaction_metadata(model: &mut Value) {
+    let Some(object) = model.as_object_mut() else {
+        return;
+    };
+    object.insert("comp_hash".to_string(), json!(CODEX_CLIENT_COMP_HASH));
+    let Some(context_window) = object
+        .get("context_window")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+    else {
+        return;
+    };
+    let valid_compact_limit = object
+        .get("auto_compact_token_limit")
+        .and_then(Value::as_i64)
+        .is_some_and(|value| value > 0 && value < context_window);
+    if !valid_compact_limit {
+        object.insert(
+            "auto_compact_token_limit".to_string(),
+            json!(derived_auto_compact_token_limit(context_window)),
+        );
+    }
 }
 
 /// Fill the context metadata used by Codex clients without replacing an
@@ -47,20 +74,7 @@ pub fn repair_codex_context_metadata(model: &mut Value) {
     {
         model["max_context_window"] = json!(known_max_context_window);
     }
-    let Some(context_window) = model
-        .get("context_window")
-        .and_then(Value::as_i64)
-        .filter(|value| *value > 0)
-    else {
-        return;
-    };
-    let valid_compact_limit = model
-        .get("auto_compact_token_limit")
-        .and_then(Value::as_i64)
-        .is_some_and(|value| value > 0 && value < context_window);
-    if !valid_compact_limit {
-        model["auto_compact_token_limit"] = json!(derived_auto_compact_token_limit(context_window));
-    }
+    apply_codex_compaction_metadata(model);
 }
 
 pub fn known_codex_ultra_model(slug: &str) -> bool {
@@ -77,6 +91,7 @@ pub fn repair_codex_model_metadata(model: &mut Value) {
         return;
     };
     repair_codex_context_metadata(model);
+    apply_codex_compaction_metadata(model);
     let name = match slug.as_str() {
         "gpt-6.1-sol" => "GPT-6.1 Sol",
         "gpt-6-astra" => "GPT-6 Astra",
@@ -196,6 +211,7 @@ mod tests {
         assert_eq!(model["context_window"], 1_050_000);
         assert_eq!(model["max_context_window"], 1_050_000);
         assert_eq!(model["auto_compact_token_limit"], 945_000);
+        assert_eq!(model["comp_hash"], CODEX_CLIENT_COMP_HASH);
         assert_eq!(
             model["supported_reasoning_levels"]
                 .as_array()
@@ -219,5 +235,19 @@ mod tests {
         assert_eq!(model["context_window"], 516_000);
         assert_eq!(model["max_context_window"], 1_000_000);
         assert_eq!(model["auto_compact_token_limit"], 460_000);
+    }
+
+    #[test]
+    fn compaction_metadata_is_unified_and_threshold_is_derived() {
+        let mut model = json!({"slug":"custom", "context_window":516_000});
+        repair_codex_model_metadata(&mut model);
+        assert_eq!(model["comp_hash"], CODEX_CLIENT_COMP_HASH);
+        assert_eq!(model["auto_compact_token_limit"], 464_400);
+        model["auto_compact_token_limit"] = json!(460_000);
+        repair_codex_model_metadata(&mut model);
+        assert_eq!(model["auto_compact_token_limit"], 460_000);
+        model["auto_compact_token_limit"] = json!(516_000);
+        repair_codex_model_metadata(&mut model);
+        assert_eq!(model["auto_compact_token_limit"], 464_400);
     }
 }

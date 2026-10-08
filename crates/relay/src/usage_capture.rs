@@ -145,8 +145,7 @@ pub(crate) fn capture_usage(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let sse = content_type.contains("text/event-stream");
-    let capture =
-        UsageCapture::new(store, request.into(), session.into(), provider.into(), sse);
+    let capture = UsageCapture::new(store, request.into(), session.into(), provider.into(), sse);
     let (parts, body) = response.into_parts();
     let stream = futures_util::stream::unfold(
         (body.into_data_stream(), capture),

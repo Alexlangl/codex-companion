@@ -23,14 +23,14 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 
-use std::{
-    fmt, io,
-    time::{Duration, Instant},
-};
+use std::{fmt, io, time::Duration};
+use tokio::time::Instant;
 
-const STREAM_PREFLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const STREAM_PREFLIGHT_MAX_DURATION: Duration = Duration::from_secs(120);
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+// Long-context generation/compaction can be silent while the upstream is working.
+// Keep an inactivity limit and a separate cap for metadata-only streams.
+const STREAM_PREFLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const STREAM_PREFLIGHT_MAX_DURATION: Duration = Duration::from_secs(900);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_STREAM_PREFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 // These protocol bridges must materialize the full upstream response before
@@ -109,7 +109,8 @@ impl UpstreamResponse {
         provider: &ProviderConfig,
         codex_catalog: bool,
     ) -> Result<(), String> {
-        if !codex_catalog && policy.excluded_models.is_empty()
+        if !codex_catalog
+            && policy.excluded_models.is_empty()
             && policy
                 .providers
                 .get(&provider.id)
@@ -149,7 +150,9 @@ impl UpstreamResponse {
                 });
             }
         }
-        if codex_catalog { crate::model_catalog::adapt_codex_model_catalog(&mut value); }
+        if codex_catalog {
+            crate::model_catalog::adapt_codex_model_catalog(&mut value);
+        }
         self.buffered_body = Some(Bytes::from(value.to_string()));
         self.headers.remove(header::CONTENT_LENGTH);
         self.headers.remove(header::CONTENT_ENCODING);
@@ -160,8 +163,12 @@ impl UpstreamResponse {
     }
 
     pub(crate) fn merge_model_catalogs(&mut self, catalogs: Vec<Value>) {
-        let Some(body) = &self.buffered_body else { return };
-        let Ok(mut primary) = serde_json::from_slice::<Value>(body) else { return };
+        let Some(body) = &self.buffered_body else {
+            return;
+        };
+        let Ok(mut primary) = serde_json::from_slice::<Value>(body) else {
+            return;
+        };
         crate::model_catalog::merge_codex_catalogs(&mut primary, catalogs);
         self.buffered_body = Some(Bytes::from(primary.to_string()));
         self.headers.remove(header::ETAG);
@@ -232,25 +239,16 @@ impl UpstreamResponse {
         let mut prefetched_bytes = 0_usize;
         let started_at = Instant::now();
         loop {
-            let remaining = STREAM_PREFLIGHT_MAX_DURATION
-                .checked_sub(started_at.elapsed())
-                .ok_or_else(|| {
-                    StreamPreflightError::Network("等待上游在可见输出前开始生成超时".to_string())
-                })?;
             let next_chunk = self
                 .response
                 .as_mut()
                 .expect("response checked above")
                 .chunk();
-            let chunk =
-                tokio::time::timeout(remaining.min(STREAM_PREFLIGHT_IDLE_TIMEOUT), next_chunk)
-                    .await
-                    .map_err(|_| {
-                        StreamPreflightError::Network("等待上游 SSE 后续事件超时".to_string())
-                    })?
-                    .map_err(|error| {
-                        StreamPreflightError::Network(format!("读取上游 SSE 首帧失败: {error}"))
-                    })?;
+            let chunk = wait_for_preflight_chunk(next_chunk, started_at)
+                .await?
+                .map_err(|error| {
+                    StreamPreflightError::Network(format!("读取上游 SSE 首帧失败: {error}"))
+                })?;
             let Some(chunk) = chunk else {
                 match preflight_sse_blocks(&mut inspection, has_fallback_candidate, false, true)? {
                     StreamPreflightProgress::Ready => return Ok(()),
@@ -424,6 +422,27 @@ impl fmt::Display for UpstreamRequestError {
 
 impl std::error::Error for UpstreamRequestError {}
 
+async fn wait_for_preflight_chunk<T>(
+    next_chunk: impl std::future::Future<Output = T>,
+    started_at: Instant,
+) -> Result<T, StreamPreflightError> {
+    let remaining = STREAM_PREFLIGHT_MAX_DURATION.saturating_sub(started_at.elapsed());
+    let wait = remaining.min(STREAM_PREFLIGHT_IDLE_TIMEOUT);
+    tokio::time::timeout(wait, next_chunk).await.map_err(|_| {
+        StreamPreflightError::Network(if remaining <= STREAM_PREFLIGHT_IDLE_TIMEOUT {
+            format!(
+                "本地等待有效输出达到 {} 秒上限；上游是否完成尚未确认",
+                STREAM_PREFLIGHT_MAX_DURATION.as_secs()
+            )
+        } else {
+            format!(
+                "本地等待上游 SSE 事件超时（连续等待 {} 秒）；上游是否完成尚未确认",
+                wait.as_secs()
+            )
+        })
+    })
+}
+
 fn preflight_buffered_sse(
     body: &[u8],
     hold_reasoning_for_fallback: bool,
@@ -553,7 +572,14 @@ fn preflight_sse_block(block: &str) -> StreamPreflight {
             .and_then(Value::as_str)
             .is_some_and(|item_type| item_type == "reasoning");
     if reasoning_event {
-        return StreamPreflight::Reasoning;
+        // An empty reasoning item is metadata, not a reason to commit HTTP 200.
+        return if value.get("delta").is_some_and(nonempty_json_value)
+            || value.get("text").is_some_and(nonempty_json_value)
+        {
+            StreamPreflight::Reasoning
+        } else {
+            StreamPreflight::Continue
+        };
     }
     if has_visible_stream_output(&value, event_type) {
         return StreamPreflight::OutputStarted;
@@ -1282,7 +1308,7 @@ fn normalize_official_responses_input(
         if object
             .get("service_tier")
             .and_then(Value::as_str)
-            .is_some_and(|tier| tier != "priority")
+            .is_some_and(|tier| !matches!(tier, "priority" | "ultrafast"))
         {
             object.remove("service_tier");
         }
@@ -1371,7 +1397,8 @@ fn normalize_official_input_item_id(item: &mut Value) -> bool {
     };
     let expected_prefix = match object.get("type").and_then(Value::as_str) {
         Some("custom_tool_call") => "ctc_",
-        Some("reasoning") => "rs_",
+        // Reasoning IDs can be bound to encrypted content by the upstream.
+        Some("reasoning") => return false,
         Some("function_call") => "fc_",
         Some("message") => "msg_",
         _ => return false,
@@ -1566,7 +1593,12 @@ pub(crate) async fn stream_response(
         );
     }
     if transform == ResponseTransform::OfficialCodexStreamToResponse && status.is_success() {
-        let body = collect_response_bytes(response, buffered_body, prefetched_body).await;
+        let body = collect_terminal_response_bytes(response_byte_stream(
+            response,
+            buffered_body,
+            prefetched_body,
+        ))
+        .await;
         return match body.and_then(|body| terminal_response_from_sse(&body)) {
             Ok(value) => Response::builder()
                 .status(status)
@@ -1697,6 +1729,27 @@ async fn collect_response_bytes(
     Ok(Bytes::from(bytes))
 }
 
+async fn collect_terminal_response_bytes(mut stream: ResponseByteStream) -> Result<Bytes, String> {
+    let mut bytes = Vec::new();
+    let mut inspection = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        append_limited_success_response_chunk(&mut bytes, &chunk)?;
+        inspection.extend_from_slice(&chunk);
+        while let Some(boundary) = next_sse_block_boundary(&inspection, false) {
+            let terminal = matches!(
+                preflight_sse_block(&String::from_utf8_lossy(&inspection[..boundary.block_end])),
+                StreamPreflight::Terminal | StreamPreflight::Failure(_)
+            );
+            inspection.drain(..boundary.drain_len);
+            if terminal {
+                return Ok(Bytes::from(bytes));
+            }
+        }
+    }
+    Ok(Bytes::from(bytes))
+}
+
 fn chat_sse_response(
     provider_id: String,
     status: StatusCode,
@@ -1775,6 +1828,9 @@ fn responses_sse_observer_stream(
         |(mut state, mut upstream)| async move {
             if let Some(bytes) = state.pending.pop_front() {
                 return Some((Ok(bytes), (state, upstream)));
+            }
+            if state.terminal {
+                return None;
             }
             match upstream.next().await {
                 Some(Ok(chunk)) => {
@@ -1879,6 +1935,9 @@ impl ResponsesSseObserverState {
     }
 
     fn process_block(&mut self, block: &str) {
+        if self.terminal {
+            return;
+        }
         let data = block
             .split(['\r', '\n'])
             .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
@@ -1997,7 +2056,10 @@ pub(crate) struct SseBlockBoundary {
     pub(crate) drain_len: usize,
 }
 
-pub(crate) fn next_sse_block_boundary(buffer: &[u8], end_of_stream: bool) -> Option<SseBlockBoundary> {
+pub(crate) fn next_sse_block_boundary(
+    buffer: &[u8],
+    end_of_stream: bool,
+) -> Option<SseBlockBoundary> {
     let mut index = 0;
     while index < buffer.len() {
         let Some(first_len) = sse_line_ending_len(buffer, index, end_of_stream) else {
@@ -2165,12 +2227,13 @@ fn compact_json_error(value: &Value) -> String {
         .pointer("/response/error")
         .or_else(|| value.get("error"))
         .unwrap_or(value);
-    let codes = ["code", "type"]
+    let mut codes = ["code", "type"]
         .into_iter()
         .filter_map(|key| error.get(key).and_then(Value::as_str))
         .map(|s| s.chars().take(80).collect::<String>())
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect::<Vec<_>>();
+    codes.dedup();
+    let codes = codes.join(" ");
     let message = value
         .get("message")
         .and_then(Value::as_str)
@@ -5377,7 +5440,7 @@ mod tests {
 
         let value: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(value["input"][0]["id"], "ctc_custom");
-        assert_eq!(value["input"][1]["id"], "rs_reasoning");
+        assert_eq!(value["input"][1]["id"], "item_reasoning");
         assert_eq!(value["input"][2]["id"], "fc_function");
         assert_eq!(value["input"][3]["id"], "msg_message");
         assert_eq!(value["input"][4]["id"], "ctc_already_valid");

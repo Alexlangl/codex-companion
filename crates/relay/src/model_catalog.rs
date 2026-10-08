@@ -163,14 +163,19 @@ mod tests {
         }
     }
     #[test]
-    fn native_catalog_is_unchanged_including_empty_catalog() {
+    fn native_catalog_keeps_shape_while_receiving_compaction_metadata() {
         for mut value in [
             json!({"models":[],"data":[{"id":"excluded"}]}),
             json!({"models":[{"slug":"native","custom":true}]}),
         ] {
-            let before = value.clone();
             adapt_codex_model_catalog(&mut value);
-            assert_eq!(value, before);
+            if let Some(model) = value["models"].as_array().and_then(|models| models.first()) {
+                assert_eq!(model["slug"], "native");
+                assert_eq!(
+                    model["comp_hash"],
+                    codex_companion_core::CODEX_CLIENT_COMP_HASH
+                );
+            }
         }
     }
 }

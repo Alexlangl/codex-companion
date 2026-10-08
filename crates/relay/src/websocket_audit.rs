@@ -20,7 +20,12 @@ pub(crate) struct WebSocketRequestAudit {
 }
 
 impl WebSocketRequestAudit {
-    pub(crate) fn new(state: &RelayState, payload: &Value, client_id: Option<&str>, session_id: Option<&str>) -> Self {
+    pub(crate) fn new(
+        state: &RelayState,
+        payload: &Value,
+        client_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Self {
         let id = next_request_id();
         let payload = payload.get("response").unwrap_or(payload);
         let bounded = |value: Option<&Value>| {
@@ -72,7 +77,13 @@ impl WebSocketRequestAudit {
 
     pub(crate) fn record_usage(&self, value: &Value) {
         if let (Some(session), Some(provider)) = (&self.session_id, &self.provider) {
-            let mut capture = crate::usage_capture::UsageCapture::new(self.state.store.clone(), self.id.clone(), session.clone(), provider.clone(), false);
+            let mut capture = crate::usage_capture::UsageCapture::new(
+                self.state.store.clone(),
+                self.id.clone(),
+                session.clone(),
+                provider.clone(),
+                false,
+            );
             capture.observe(value);
         }
     }

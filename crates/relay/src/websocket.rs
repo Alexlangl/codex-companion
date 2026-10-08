@@ -1466,7 +1466,9 @@ async fn bridge_websocket(
                                 UpstreamMessage::Binary(bytes) => bytes.as_ref(),
                                 _ => &[],
                             };
-                            if let Ok(value) = serde_json::from_slice(bytes) { audit.record_usage(&value); }
+                            if let Ok(value) = serde_json::from_slice(bytes) {
+                                audit.record_usage(&value);
+                            }
                         }
                         if flush_pending_messages(&mut client_sink, &mut pending)
                             .await
@@ -3508,11 +3510,13 @@ mod tests {
             let _ = axum::serve(relay_listener, app).await;
         });
 
-        let mut request = format!("ws://{relay_addr}/v1/responses").into_client_request().expect("request");
-        request.headers_mut().insert("session_id", HeaderValue::from_static("usage-websocket"));
-        let (mut client, _) = connect_async(request)
-            .await
-            .expect("relay handshake");
+        let mut request = format!("ws://{relay_addr}/v1/responses")
+            .into_client_request()
+            .expect("request");
+        request
+            .headers_mut()
+            .insert("session_id", HeaderValue::from_static("usage-websocket"));
+        let (mut client, _) = connect_async(request).await.expect("relay handshake");
         client
             .send(UpstreamMessage::Text(
                 r#"{"type":"response.create","response":{"model":"gpt-test","input":"hello"}}"#
@@ -3536,10 +3540,15 @@ mod tests {
             }
         }
         let mut events = vec![codex_companion_core::TokenUsageEvent {
-            session_id: Some("usage-websocket".into()), timestamp: Some(Utc::now().to_rfc3339()),
-            input_tokens: 20, cached_input_tokens: 80, output_tokens: 20, ..Default::default()
+            session_id: Some("usage-websocket".into()),
+            timestamp: Some(Utc::now().to_rfc3339()),
+            input_tokens: 20,
+            cached_input_tokens: 80,
+            output_tokens: 20,
+            ..Default::default()
         }];
-        codex_companion_core::apply_usage_attribution(&state.store.data_dir(), &mut events).expect("attribute");
+        codex_companion_core::apply_usage_attribution(&state.store.data_dir(), &mut events)
+            .expect("attribute");
         assert_eq!(events[0].provider_id.as_deref(), Some("second"));
         assert!(output.contains("from second"));
         assert!(!output.contains("upstream capacity temporarily unavailable"));

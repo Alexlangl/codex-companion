@@ -604,15 +604,19 @@ impl ApiServiceStore {
         upstream_model: Option<&str>,
     ) -> Result<()> {
         let connection = self.connection()?;
-        connection.execute(
-            "UPDATE api_requests SET upstream_model = ?2 WHERE request_id = ?1",
-            params![request_id, upstream_model],
-        ).map_err(database_error)?;
-        connection.execute(
-            "UPDATE api_request_attempts SET upstream_model = ?3 \
+        connection
+            .execute(
+                "UPDATE api_requests SET upstream_model = ?2 WHERE request_id = ?1",
+                params![request_id, upstream_model],
+            )
+            .map_err(database_error)?;
+        connection
+            .execute(
+                "UPDATE api_request_attempts SET upstream_model = ?3 \
              WHERE request_id = ?1 AND attempt = ?2",
-            params![request_id, attempt, upstream_model],
-        ).map_err(database_error)?;
+                params![request_id, attempt, upstream_model],
+            )
+            .map_err(database_error)?;
         Ok(())
     }
 
@@ -1008,11 +1012,20 @@ fn api_request_from_row(row: &Row<'_>) -> rusqlite::Result<ApiRequestLog> {
 }
 
 fn ensure_request_metadata_columns(connection: &Connection) -> Result<()> {
-    for column in ["reasoning_effort", "service_tier", "upstream_model", "turn_state_length"] {
+    for column in [
+        "reasoning_effort",
+        "service_tier",
+        "upstream_model",
+        "turn_state_length",
+    ] {
         if api_requests_has_column(connection, column)? {
             continue;
         }
-        let kind = if column == "turn_state_length" { "INTEGER" } else { "TEXT" };
+        let kind = if column == "turn_state_length" {
+            "INTEGER"
+        } else {
+            "TEXT"
+        };
         connection
             .execute(
                 &format!("ALTER TABLE api_requests ADD COLUMN {column} {kind}"),
@@ -1025,12 +1038,23 @@ fn ensure_request_metadata_columns(connection: &Connection) -> Result<()> {
 
 fn ensure_attempt_metadata_columns(connection: &Connection) -> Result<()> {
     for (column, kind) in [("upstream_model", "TEXT"), ("turn_state_length", "INTEGER")] {
-        let mut statement = connection.prepare("PRAGMA table_info(api_request_attempts)").map_err(database_error)?;
-        let columns = statement.query_map([], |row| row.get::<_, String>(1)).map_err(database_error)?;
-        let found = columns.collect::<std::result::Result<Vec<_>, _>>().map_err(database_error)?
-            .iter().any(|existing| existing == column);
+        let mut statement = connection
+            .prepare("PRAGMA table_info(api_request_attempts)")
+            .map_err(database_error)?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(database_error)?;
+        let found = columns
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(database_error)?
+            .iter()
+            .any(|existing| existing == column);
         if !found {
-            connection.execute(&format!("ALTER TABLE api_request_attempts ADD COLUMN {column} {kind}"), [])
+            connection
+                .execute(
+                    &format!("ALTER TABLE api_request_attempts ADD COLUMN {column} {kind}"),
+                    [],
+                )
                 .map_err(database_error)?;
         }
     }
@@ -1354,7 +1378,8 @@ mod tests {
                 error: None,
             })
             .expect("second attempt finish");
-        store.record_upstream_metadata("request-1", 2, Some("gpt-upstream"))
+        store
+            .record_upstream_metadata("request-1", 2, Some("gpt-upstream"))
             .expect("derived metadata");
         store
             .record_request_finish(RequestLogFinish {
@@ -1382,10 +1407,19 @@ mod tests {
             Some("priority")
         );
         assert_eq!(snapshot.recent_requests[0].attempts, 2);
-        assert_eq!(snapshot.recent_requests[0].upstream_model.as_deref(), Some("gpt-upstream"));
+        assert_eq!(
+            snapshot.recent_requests[0].upstream_model.as_deref(),
+            Some("gpt-upstream")
+        );
         assert_eq!(snapshot.recent_requests[0].turn_state_length, None);
-        assert_eq!(snapshot.recent_requests[0].attempt_log[0].turn_state_length, None);
-        assert_eq!(snapshot.recent_requests[0].attempt_log[1].turn_state_length, None);
+        assert_eq!(
+            snapshot.recent_requests[0].attempt_log[0].turn_state_length,
+            None
+        );
+        assert_eq!(
+            snapshot.recent_requests[0].attempt_log[1].turn_state_length,
+            None
+        );
         assert_eq!(snapshot.recent_requests[0].attempt_log.len(), 2);
         assert_eq!(
             snapshot.recent_requests[0].attempt_log[0].provider_id,
