@@ -19,6 +19,7 @@ export function apiRequestLogsEqual(left: ApiRequestLog[], right: ApiRequestLog[
       && request.outcome === candidate.outcome
       && request.attempts === candidate.attempts
       && request.latencyMs === candidate.latencyMs
+      && request.firstResponseMs === candidate.firstResponseMs
       && request.error === candidate.error
       && request.upstreamModel === candidate.upstreamModel
       && request.turnStateLength === candidate.turnStateLength
@@ -42,6 +43,7 @@ function requestAttemptsEqual(
       && attempt.statusCode === candidate.statusCode
       && attempt.outcome === candidate.outcome
       && attempt.latencyMs === candidate.latencyMs
+      && attempt.firstResponseMs === candidate.firstResponseMs
       && attempt.error === candidate.error
       && attempt.upstreamModel === candidate.upstreamModel
       && attempt.turnStateLength === candidate.turnStateLength;

@@ -105,6 +105,7 @@ impl ApiServiceStore {
                     outcome TEXT NOT NULL DEFAULT 'processing',
                     attempts INTEGER NOT NULL DEFAULT 0,
                     latency_ms INTEGER,
+                    first_response_ms INTEGER,
                     error TEXT,
                     FOREIGN KEY(client_id) REFERENCES api_clients(id) ON DELETE SET NULL
                 );
@@ -122,6 +123,7 @@ impl ApiServiceStore {
                     status_code INTEGER,
                     outcome TEXT NOT NULL DEFAULT 'processing',
                     latency_ms INTEGER,
+                    first_response_ms INTEGER,
                     error TEXT,
                     upstream_model TEXT,
                     turn_state_length INTEGER,
@@ -577,6 +579,24 @@ impl ApiServiceStore {
         Ok(())
     }
 
+    pub fn record_first_response(&self, request_id: &str, elapsed_ms: u64) -> Result<()> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "UPDATE api_requests SET first_response_ms = COALESCE(first_response_ms, ?2) WHERE request_id = ?1",
+                params![request_id, elapsed_ms],
+            )
+            .map_err(database_error)?;
+        connection
+            .execute(
+                "UPDATE api_request_attempts SET first_response_ms = COALESCE(first_response_ms, ?2) \
+                 WHERE request_id = ?1 AND attempt = (SELECT MAX(attempt) FROM api_request_attempts WHERE request_id = ?1)",
+                params![request_id, elapsed_ms],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     pub fn record_request_attempt_start(&self, input: RequestAttemptStart<'_>) -> Result<()> {
         let connection = self.connection()?;
         connection
@@ -675,7 +695,7 @@ impl ApiServiceStore {
             .prepare(
                 "SELECT r.request_id, r.started_at, r.method, r.path, r.model, \
                  r.reasoning_effort, r.service_tier, r.client_id, c.name, r.provider_id, \
-                 r.status_code, r.outcome, r.attempts, r.latency_ms, r.error, \
+                 r.status_code, r.outcome, r.attempts, r.latency_ms, r.first_response_ms, r.error, \
                  r.upstream_model, r.turn_state_length \
                  FROM api_requests r LEFT JOIN api_clients c ON c.id = r.client_id \
                  ORDER BY r.started_at DESC LIMIT ?1",
@@ -1004,9 +1024,10 @@ fn api_request_from_row(row: &Row<'_>) -> rusqlite::Result<ApiRequestLog> {
         outcome: row.get(11)?,
         attempts: row.get(12)?,
         latency_ms: row.get(13)?,
-        error: row.get(14)?,
-        upstream_model: row.get(15)?,
-        turn_state_length: row.get(16)?,
+        first_response_ms: row.get(14)?,
+        error: row.get(15)?,
+        upstream_model: row.get(16)?,
+        turn_state_length: row.get(17)?,
         attempt_log: Vec::new(),
     })
 }
@@ -1017,11 +1038,12 @@ fn ensure_request_metadata_columns(connection: &Connection) -> Result<()> {
         "service_tier",
         "upstream_model",
         "turn_state_length",
+        "first_response_ms",
     ] {
         if api_requests_has_column(connection, column)? {
             continue;
         }
-        let kind = if column == "turn_state_length" {
+        let kind = if matches!(column, "turn_state_length" | "first_response_ms") {
             "INTEGER"
         } else {
             "TEXT"
@@ -1037,7 +1059,11 @@ fn ensure_request_metadata_columns(connection: &Connection) -> Result<()> {
 }
 
 fn ensure_attempt_metadata_columns(connection: &Connection) -> Result<()> {
-    for (column, kind) in [("upstream_model", "TEXT"), ("turn_state_length", "INTEGER")] {
+    for (column, kind) in [
+        ("upstream_model", "TEXT"),
+        ("turn_state_length", "INTEGER"),
+        ("first_response_ms", "INTEGER"),
+    ] {
         let mut statement = connection
             .prepare("PRAGMA table_info(api_request_attempts)")
             .map_err(database_error)?;
@@ -1083,7 +1109,7 @@ fn request_attempts(
     let mut statement = connection
         .prepare(
             "SELECT attempt, provider_id, route_reason, started_at, finished_at, status_code, \
-             outcome, latency_ms, error, upstream_model, turn_state_length FROM api_request_attempts \
+             outcome, latency_ms, first_response_ms, error, upstream_model, turn_state_length FROM api_request_attempts \
              WHERE request_id = ?1 ORDER BY attempt ASC",
         )
         .map_err(database_error)?;
@@ -1109,9 +1135,10 @@ fn api_request_attempt_from_row(row: &Row<'_>) -> rusqlite::Result<ApiRequestAtt
         status_code: row.get(5)?,
         outcome: row.get(6)?,
         latency_ms: row.get(7)?,
-        error: row.get(8)?,
-        upstream_model: row.get(9)?,
-        turn_state_length: row.get(10)?,
+        first_response_ms: row.get(8)?,
+        error: row.get(9)?,
+        upstream_model: row.get(10)?,
+        turn_state_length: row.get(11)?,
     })
 }
 

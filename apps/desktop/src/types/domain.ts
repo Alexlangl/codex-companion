@@ -119,6 +119,7 @@ export interface ApiRequestAttemptLog {
   statusCode?: number | null;
   outcome: string;
   latencyMs?: number | null;
+  firstResponseMs?: number | null;
   error?: string | null;
   upstreamModel?: string | null;
   turnStateLength?: number | null;
@@ -139,6 +140,7 @@ export interface ApiRequestLog {
   outcome: string;
   attempts: number;
   latencyMs?: number | null;
+  firstResponseMs?: number | null;
   error?: string | null;
   upstreamModel?: string | null;
   turnStateLength?: number | null;

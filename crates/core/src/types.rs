@@ -489,6 +489,8 @@ pub struct ApiRequestAttemptLog {
     pub status_code: Option<u16>,
     pub outcome: String,
     pub latency_ms: Option<u64>,
+    #[serde(default)]
+    pub first_response_ms: Option<u64>,
     pub error: Option<String>,
     #[serde(default)]
     pub upstream_model: Option<String>,
@@ -513,6 +515,8 @@ pub struct ApiRequestLog {
     pub outcome: String,
     pub attempts: u16,
     pub latency_ms: Option<u64>,
+    #[serde(default)]
+    pub first_response_ms: Option<u64>,
     pub error: Option<String>,
     #[serde(default)]
     pub upstream_model: Option<String>,

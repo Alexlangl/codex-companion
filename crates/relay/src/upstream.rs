@@ -1864,6 +1864,8 @@ struct ResponsesSseObserverState {
     inspection_disabled: bool,
     terminal: bool,
     failure_recorded: bool,
+    first_response_recorded: bool,
+    started_at: Instant,
     response_id: String,
     model: String,
     store: ConfigStore,
@@ -1881,6 +1883,8 @@ impl ResponsesSseObserverState {
             inspection_disabled: false,
             terminal: false,
             failure_recorded: false,
+            first_response_recorded: false,
+            started_at: Instant::now(),
             response_id: "resp_codex_companion".to_string(),
             model: String::new(),
             api_service: ApiServiceStore::from_config_store(&store),
@@ -1965,10 +1969,30 @@ impl ResponsesSseObserverState {
             self.model = model.to_string();
         }
         match value.get("type").and_then(Value::as_str) {
-            Some("response.completed" | "response.incomplete") => self.terminal = true,
-            Some("response.failed" | "error") => {
-                self.terminal = true;
-                self.record_failure(&compact_json_error(&value));
+            Some(event_type) => {
+                if !self.first_response_recorded
+                    && (event_type.starts_with("response.output")
+                        || event_type.starts_with("response.content")
+                        || event_type == "response.completed")
+                {
+                    self.first_response_recorded = true;
+                    let _ = self.api_service.record_first_response(
+                        &self.request_id,
+                        self.started_at
+                            .elapsed()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX),
+                    );
+                }
+                match event_type {
+                    "response.completed" | "response.incomplete" => self.terminal = true,
+                    "response.failed" | "error" => {
+                        self.terminal = true;
+                        self.record_failure(&compact_json_error(&value));
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -3658,6 +3682,11 @@ fn chat_json_to_responses_json(value: Value, tool_context: &ChatToolContext) -> 
         .and_then(Value::as_i64)
         .unwrap_or_else(unix_now);
     let usage = chat_usage_to_responses_usage(value.get("usage"));
+    let annotations = message
+        .and_then(|message| message.get("annotations"))
+        .filter(|annotations| annotations.is_array())
+        .cloned()
+        .unwrap_or_else(|| json!([]));
     let mut output = Vec::new();
     if !text.is_empty() {
         output.push(json!({
@@ -3668,7 +3697,7 @@ fn chat_json_to_responses_json(value: Value, tool_context: &ChatToolContext) -> 
             "content": [{
                 "type": "output_text",
                 "text": text,
-                "annotations": []
+                "annotations": annotations
             }]
         }));
     }
@@ -3835,11 +3864,28 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
         .get("total_tokens")
         .and_then(Value::as_i64)
         .unwrap_or(input + output);
-    json!({
+    let cached = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| usage.get("cached_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .or_else(|| usage.get("cache_write_input_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let mut response_usage = json!({
         "input_tokens": input,
         "output_tokens": output,
         "total_tokens": total
-    })
+    });
+    if cached > 0 {
+        response_usage["input_tokens_details"] = json!({"cached_tokens": cached});
+    }
+    if cache_creation > 0 {
+        response_usage["cache_creation_input_tokens"] = json!(cache_creation);
+    }
+    response_usage
 }
 
 type ResponseByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
@@ -3901,6 +3947,8 @@ struct ChatSseTransformState {
     started: bool,
     completed: bool,
     saw_terminal_signal: bool,
+    first_response_recorded: bool,
+    started_at: Instant,
     latest_usage: Value,
     provider_id: String,
     observer: Option<(ConfigStore, ApiServiceStore, String)>,
@@ -3945,6 +3993,8 @@ impl ChatSseTransformState {
             started: false,
             completed: false,
             saw_terminal_signal: false,
+            first_response_recorded: false,
+            started_at: Instant::now(),
             latest_usage: Value::Null,
             provider_id,
             observer: None,
@@ -4060,6 +4110,7 @@ impl ChatSseTransformState {
         if let Some(delta) = choice.and_then(|choice| choice.get("delta")) {
             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                 if !text.is_empty() {
+                    self.record_first_response();
                     if !self.ensure_started() || !self.reserve_retained_output_bytes(text.len()) {
                         return;
                     }
@@ -4075,12 +4126,32 @@ impl ChatSseTransformState {
                 }
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                if !tool_calls.is_empty() {
+                    self.record_first_response();
+                }
                 for tool_call in tool_calls {
                     if !self.append_tool_call_delta(tool_call) {
                         return;
                     }
                 }
             }
+        }
+    }
+
+    fn record_first_response(&mut self) {
+        if self.first_response_recorded {
+            return;
+        }
+        self.first_response_recorded = true;
+        if let Some((_, api_service, request_id)) = self.observer.as_ref() {
+            let _ = api_service.record_first_response(
+                request_id,
+                self.started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            );
         }
     }
 
@@ -6254,6 +6325,33 @@ mod tests {
         assert_eq!(response["output"][2]["type"], "function_call");
         assert_eq!(response["output"][2]["name"], "search_issues");
         assert_eq!(response["output"][2]["namespace"], "github");
+    }
+
+    #[test]
+    fn preserves_chat_url_citations_and_cached_usage_in_responses() {
+        let response = chat_json_to_responses_json(
+            json!({
+                "id": "chatcmpl_citation",
+                "model": "gpt-6.1-sol",
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": "See source",
+                    "annotations": [{"type":"url_citation","url":"https://example.com","title":"Source","start_index":4,"end_index":10}]
+                }}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+                    "prompt_tokens_details": {"cached_tokens": 80}, "cache_creation_input_tokens": 5}
+            }),
+            &ChatToolContext::default(),
+        );
+        assert_eq!(
+            response["output"][0]["content"][0]["annotations"][0]["url"],
+            "https://example.com"
+        );
+        assert_eq!(
+            response["usage"]["input_tokens_details"]["cached_tokens"],
+            80
+        );
+        assert_eq!(response["usage"]["cache_creation_input_tokens"], 5);
     }
 
     #[test]

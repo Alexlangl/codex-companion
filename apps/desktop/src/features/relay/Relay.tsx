@@ -931,6 +931,9 @@ function RequestRow(props: {
           {request.statusCode ?? "—"} · {outcomeLabel(request.outcome)}
         </Badge>
         <span>{request.latencyMs ?? 0} ms</span>
+        {request.firstResponseMs != null ? (
+          <span>首响 {request.firstResponseMs} ms</span>
+        ) : null}
       </div>
       {showTrace ? (
         <RequestAuditTrace

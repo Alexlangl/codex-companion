@@ -152,7 +152,9 @@ function defaultKind(resolvedApp) {
 function resolveLanguage() {
   const configured = envValue("DEV_CLIENT_LANG", "DEVCODEX_LANG");
   if (/^(system|none|off|0)$/i.test(configured || "")) return "";
-  if (!configured || /^auto$/i.test(configured)) return detectSystemLocale();
+  // Leave the desktop client's own language preference untouched unless the
+  // launcher was explicitly configured to inject a locale.
+  if (!configured || /^auto$/i.test(configured)) return "";
   return normalizeLocale(configured);
 }
 
