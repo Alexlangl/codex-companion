@@ -30,7 +30,12 @@ use tokio::time::Instant;
 // Keep an inactivity limit and a separate cap for metadata-only streams.
 const STREAM_PREFLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const STREAM_PREFLIGHT_MAX_DURATION: Duration = Duration::from_secs(900);
+// Preserve fast failover, but do not hide a live SSE stream from the client's
+// idle timer while waiting for visible output (notably during compaction).
+const STREAM_PREFLIGHT_MAX_HOLD: Duration = Duration::from_secs(10);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const STREAM_KEEPALIVE: &[u8] = b"event: keepalive\ndata: {\"type\":\"keepalive\"}\n\n";
 const MAX_STREAM_PREFLIGHT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 // These protocol bridges must materialize the full upstream response before
@@ -222,6 +227,15 @@ impl UpstreamResponse {
         &mut self,
         has_fallback_candidate: bool,
     ) -> Result<(), StreamPreflightError> {
+        self.preflight_stream_failure_with_hold(has_fallback_candidate, STREAM_PREFLIGHT_MAX_HOLD)
+            .await
+    }
+
+    async fn preflight_stream_failure_with_hold(
+        &mut self,
+        has_fallback_candidate: bool,
+        max_hold: Duration,
+    ) -> Result<(), StreamPreflightError> {
         if !self.status.is_success() {
             return Ok(());
         }
@@ -238,17 +252,27 @@ impl UpstreamResponse {
         let mut inspection = Vec::new();
         let mut prefetched_bytes = 0_usize;
         let started_at = Instant::now();
+        let flush_at = (self.transform == ResponseTransform::None).then_some(started_at + max_hold);
         loop {
             let next_chunk = self
                 .response
                 .as_mut()
                 .expect("response checked above")
                 .chunk();
-            let chunk = wait_for_preflight_chunk(next_chunk, started_at)
-                .await?
-                .map_err(|error| {
-                    StreamPreflightError::Network(format!("读取上游 SSE 首帧失败: {error}"))
-                })?;
+            let next_chunk = wait_for_preflight_chunk(next_chunk, started_at);
+            let chunk = if let Some(flush_at) = flush_at {
+                match tokio::time::timeout_at(flush_at, next_chunk).await {
+                    Ok(chunk) => chunk?,
+                    // Once committed, later failures are reported as SSE failures,
+                    // not silently retried against another billable upstream.
+                    Err(_) => return Ok(()),
+                }
+            } else {
+                next_chunk.await?
+            }
+            .map_err(|error| {
+                StreamPreflightError::Network(format!("读取上游 SSE 首帧失败: {error}"))
+            })?;
             let Some(chunk) = chunk else {
                 match preflight_sse_blocks(&mut inspection, has_fallback_candidate, false, true)? {
                     StreamPreflightProgress::Ready => return Ok(()),
@@ -480,8 +504,11 @@ fn preflight_sse_blocks(
         match preflight_sse_block(&block) {
             StreamPreflight::Continue => {}
             StreamPreflight::Reasoning if hold_reasoning_for_fallback => {}
+            StreamPreflight::Progress if hold_output_for_fallback => {}
             StreamPreflight::OutputStarted if hold_output_for_fallback => {}
-            StreamPreflight::Reasoning | StreamPreflight::OutputStarted => {
+            StreamPreflight::Reasoning
+            | StreamPreflight::Progress
+            | StreamPreflight::OutputStarted => {
                 return Ok(StreamPreflightProgress::Ready);
             }
             StreamPreflight::Terminal => return Ok(StreamPreflightProgress::Ready),
@@ -527,6 +554,7 @@ fn inspect_non_sse_body(body: &[u8], end_of_stream: bool) -> NonSsePreflight {
 enum StreamPreflight {
     Continue,
     Reasoning,
+    Progress,
     OutputStarted,
     Terminal,
     Failure(String),
@@ -559,6 +587,16 @@ fn preflight_sse_block(block: &str) -> StreamPreflight {
         .unwrap_or_default();
     if matches!(event_type, "response.completed" | "response.incomplete") {
         return StreamPreflight::Terminal;
+    }
+    if matches!(
+        event_type,
+        "response.compaction.compacting" | "response.compaction.completed"
+    ) || (matches!(
+        event_type,
+        "response.output_item.added" | "response.output_item.done"
+    ) && value.pointer("/item/type").and_then(Value::as_str) == Some("compaction"))
+    {
+        return StreamPreflight::Progress;
     }
     if value
         .pointer("/choices/0/finish_reason")
@@ -1577,7 +1615,7 @@ pub(crate) async fn stream_response(
         prefetched_body,
         opaque_event_stream,
         status,
-        headers,
+        mut headers,
         oauth_refresh_error: _,
         oauth_refresh_failure: _,
         transform,
@@ -1681,6 +1719,8 @@ pub(crate) async fn stream_response(
             .is_some_and(|body| looks_like_sse(body));
     let stream = response_byte_stream(response, buffered_body, prefetched_body);
     let stream = if observe_responses_stream {
+        // The relay may add keepalives, so the upstream length no longer applies.
+        headers.remove(header::CONTENT_LENGTH);
         responses_sse_observer_stream(
             stream,
             ResponsesSseObserverState::new(store, provider_id.clone(), request_id),
@@ -1801,13 +1841,20 @@ fn response_byte_stream(
 }
 
 fn idle_timeout_stream(upstream: ResponseByteStream) -> ResponseByteStream {
+    idle_timeout_stream_with_timeout(upstream, STREAM_IDLE_TIMEOUT)
+}
+
+fn idle_timeout_stream_with_timeout(
+    upstream: ResponseByteStream,
+    idle_timeout: Duration,
+) -> ResponseByteStream {
     Box::pin(stream::unfold(
         (upstream, false),
-        |(mut upstream, timed_out)| async move {
+        move |(mut upstream, timed_out)| async move {
             if timed_out {
                 return None;
             }
-            match tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream.next()).await {
+            match tokio::time::timeout(idle_timeout, upstream.next()).await {
                 Ok(Some(chunk)) => Some((chunk, (upstream, false))),
                 Ok(None) => None,
                 Err(_) => Some((
@@ -1823,16 +1870,36 @@ fn responses_sse_observer_stream(
     upstream: ResponseByteStream,
     state: ResponsesSseObserverState,
 ) -> ResponseByteStream {
+    responses_sse_observer_stream_with_keepalive(upstream, state, STREAM_KEEPALIVE_INTERVAL)
+}
+
+fn responses_sse_observer_stream_with_keepalive(
+    upstream: ResponseByteStream,
+    state: ResponsesSseObserverState,
+    keepalive_interval: Duration,
+) -> ResponseByteStream {
     Box::pin(stream::unfold(
         (state, upstream),
-        |(mut state, mut upstream)| async move {
+        move |(mut state, mut upstream)| async move {
             if let Some(bytes) = state.pending.pop_front() {
                 return Some((Ok(bytes), (state, upstream)));
             }
             if state.terminal {
                 return None;
             }
-            match upstream.next().await {
+            // Never inject bytes inside an unfinished upstream SSE frame. A data
+            // event (not just a comment) also wakes clients timing parsed events.
+            let next = if state.buffer.is_empty() && !state.inspection_disabled {
+                match tokio::time::timeout(keepalive_interval, upstream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        return Some((Ok(Bytes::from_static(STREAM_KEEPALIVE)), (state, upstream)));
+                    }
+                }
+            } else {
+                upstream.next().await
+            };
+            match next {
                 Some(Ok(chunk)) => {
                     state.push_chunk(&chunk);
                     Some((Ok(chunk), (state, upstream)))
@@ -5405,6 +5472,76 @@ mod tests {
         );
     }
 
+    fn streaming_upstream_for_test(stream: ResponseByteStream) -> UpstreamResponse {
+        let response = axum::http::Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(reqwest::Body::wrap_stream(stream))
+            .expect("response");
+        let response = reqwest::Response::from(response);
+        UpstreamResponse {
+            status: response.status(),
+            headers: response.headers().clone(),
+            response: Some(response),
+            buffered_body: None,
+            prefetched_body: VecDeque::new(),
+            opaque_event_stream: false,
+            oauth_refresh_error: None,
+            oauth_refresh_failure: None,
+            transform: ResponseTransform::None,
+            tool_context: ChatToolContext::default(),
+            chat_messages: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_preflight_releases_progress_before_completion() {
+        let progress =
+            Bytes::from_static(b"data: {\"type\":\"response.compaction.compacting\"}\n\n");
+        let source = stream::iter([Ok(progress.clone())]).chain(stream::pending());
+        let mut upstream = streaming_upstream_for_test(Box::pin(source));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            upstream.preflight_stream_failure(true),
+        )
+        .await
+        .expect("compaction progress must not wait for output")
+        .expect("preflight");
+        assert_eq!(upstream.prefetched_body, VecDeque::from([progress]));
+    }
+
+    #[tokio::test]
+    async fn compaction_preflight_bounds_silent_and_metadata_only_streams() {
+        for prefix in [
+            Vec::new(),
+            vec![Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.created\"}\n\n",
+            ))],
+        ] {
+            let source = stream::iter(prefix).chain(stream::pending());
+            let mut upstream = streaming_upstream_for_test(Box::pin(source));
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                upstream.preflight_stream_failure_with_hold(true, Duration::from_millis(10)),
+            )
+            .await
+            .expect("preflight must not hide a live stream indefinitely")
+            .expect("preflight");
+        }
+    }
+
+    #[test]
+    fn compaction_buffered_progress_does_not_hide_a_later_failure() {
+        let body = concat!(
+            "data: {\"type\":\"response.compaction.compacting\"}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"rate limit\"}}}\n\n"
+        );
+        assert!(matches!(
+            preflight_buffered_sse(body.as_bytes(), true),
+            Err(StreamPreflightError::Semantic(_))
+        ));
+    }
+
     #[test]
     fn distinguishes_partial_sse_prefixes_from_opaque_streams() {
         for prefix in [
@@ -6792,6 +6929,100 @@ data: [DONE]
                 .and_then(|health| health.last_failure_kind.clone()),
             Some(codex_companion_core::HealthFailureKind::UpstreamFailed)
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_stream_keepalive_preserves_output_and_waits_for_terminal_event() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store.load().expect("initialize config");
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let source = stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|chunk| (chunk, receiver))
+        });
+        let state = ResponsesSseObserverState::new(store, "p".into(), "request-keepalive".into());
+        let mut output = responses_sse_observer_stream_with_keepalive(
+            Box::pin(source),
+            state,
+            Duration::from_millis(10),
+        );
+        // There may be no upstream body bytes yet after HTTP 200.
+        assert_eq!(output.next().await.unwrap().unwrap(), STREAM_KEEPALIVE);
+        assert_eq!(output.next().await.unwrap().unwrap(), STREAM_KEEPALIVE);
+
+        let partial = Bytes::from_static(b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"");
+        sender.send(Ok(partial.clone())).await.unwrap();
+        assert_eq!(output.next().await.unwrap().unwrap(), partial);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), output.next())
+                .await
+                .is_err()
+        );
+
+        let remainder = Bytes::from_static(b"fixture-encrypted\"}}\n\n");
+        sender.send(Ok(remainder.clone())).await.unwrap();
+        assert_eq!(output.next().await.unwrap().unwrap(), remainder);
+        assert_eq!(output.next().await.unwrap().unwrap(), STREAM_KEEPALIVE);
+
+        let terminal = Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture\",\"status\":\"completed\"}}\n\n");
+        sender.send(Ok(terminal.clone())).await.unwrap();
+        assert_eq!(output.next().await.unwrap().unwrap(), terminal);
+        assert!(
+            output.next().await.is_none(),
+            "do not wait for transport EOF or emit more keepalives"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_stream_keepalive_does_not_mask_upstream_failure() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store.load().expect("initialize config");
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let source = stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|chunk| (chunk, receiver))
+        });
+        let state = ResponsesSseObserverState::new(store, "p".into(), "request-failure".into());
+        let mut output = responses_sse_observer_stream_with_keepalive(
+            Box::pin(source),
+            state,
+            Duration::from_millis(10),
+        );
+        assert_eq!(output.next().await.unwrap().unwrap(), STREAM_KEEPALIVE);
+        sender
+            .send(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "fixture timeout",
+            )))
+            .await
+            .unwrap();
+        let failure = output.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&failure).contains("response.failed"));
+        assert!(!String::from_utf8_lossy(&failure).contains("response.completed"));
+        assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn compaction_stream_keepalive_does_not_reset_upstream_idle_timeout() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        store.load().expect("initialize config");
+        let source = idle_timeout_stream_with_timeout(
+            Box::pin(stream::pending()),
+            Duration::from_millis(50),
+        );
+        let state = ResponsesSseObserverState::new(store, "p".into(), "request-idle".into());
+        let output =
+            responses_sse_observer_stream_with_keepalive(source, state, Duration::from_millis(5));
+        let chunks = tokio::time::timeout(Duration::from_secs(1), output.collect::<Vec<_>>())
+            .await
+            .expect("local keepalives must not keep a dead upstream alive");
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.as_ref().unwrap() == STREAM_KEEPALIVE));
+        let last = String::from_utf8_lossy(chunks.last().unwrap().as_ref().unwrap());
+        assert!(last.contains("response.failed"));
+        assert!(!last.contains("response.completed"));
     }
 
     #[test]
