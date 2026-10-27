@@ -8,7 +8,7 @@ pub const AUTO_COMPACT_RATIO_PERCENT: i64 = 90;
 /// value is the default window and the second is the opt-in maximum window.
 pub fn known_codex_context_limits(slug: &str) -> Option<(i64, i64)> {
     match slug {
-        "gpt-6.1-sol" => Some((1_050_000, 1_050_000)),
+        "gpt-6.1-sol" | "gpt-6.1-terra" => Some((1_050_000, 1_050_000)),
         "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna" => Some((256_000, 256_000)),
         "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => Some((272_000, 921_000)),
         "gpt-5.5" => Some((272_000, 272_000)),
@@ -36,14 +36,21 @@ pub fn apply_codex_compaction_metadata(model: &mut Value) {
     else {
         return;
     };
+    // Terra's total context includes 128K output; compact before its 922K
+    // input ceiling rather than deriving a threshold from the full 1.05M.
+    let input_window = if object.get("slug").and_then(Value::as_str) == Some("gpt-6.1-terra") {
+        context_window.min(922_000)
+    } else {
+        context_window
+    };
     let valid_compact_limit = object
         .get("auto_compact_token_limit")
         .and_then(Value::as_i64)
-        .is_some_and(|value| value > 0 && value < context_window);
+        .is_some_and(|value| value > 0 && value < input_window);
     if !valid_compact_limit {
         object.insert(
             "auto_compact_token_limit".to_string(),
-            json!(derived_auto_compact_token_limit(context_window)),
+            json!(derived_auto_compact_token_limit(input_window)),
         );
     }
 }
@@ -94,6 +101,7 @@ pub fn repair_codex_model_metadata(model: &mut Value) {
     apply_codex_compaction_metadata(model);
     let name = match slug.as_str() {
         "gpt-6.1-sol" => "GPT-6.1 Sol",
+        "gpt-6.1-terra" => "GPT-6.1 Terra",
         "gpt-6-astra" => "GPT-6 Astra",
         "gpt-6-sol" => "GPT-6 Sol",
         "gpt-6-luna" => "GPT-6 Luna",
@@ -119,9 +127,10 @@ pub fn repair_codex_model_metadata(model: &mut Value) {
                 })
         });
     if placeholder {
-        let levels = ["low", "medium", "high", "xhigh", "max", "ultra"]
+        let levels = ["none", "low", "medium", "high", "xhigh", "max", "ultra"]
             .into_iter()
-            .filter(|effort| (*effort != "ultra" || known_codex_ultra_model(&slug))
+            .filter(|effort| (*effort != "none" || slug == "gpt-6.1-terra")
+                && (*effort != "ultra" || known_codex_ultra_model(&slug))
                 && (*effort != "max" || slug != "gpt-5.5"))
             .map(|effort| json!({"effort": effort, "description": format!("Reasoning effort: {effort}")}))
             .collect::<Vec<_>>();
@@ -221,6 +230,62 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["low", "medium", "high", "xhigh", "max"]
         );
+    }
+
+    #[test]
+    fn gpt_6_1_terra_uses_long_context_without_ultra() {
+        let mut model = json!({"slug":"gpt-6.1-terra", "display_name":"gpt-6.1-terra",
+            "default_reasoning_level":"none", "supported_reasoning_levels":[{"effort":"none"}]});
+        repair_codex_model_metadata(&mut model);
+        assert_eq!(model["display_name"], "GPT-6.1 Terra");
+        assert_eq!(model["default_reasoning_level"], "medium");
+        assert_eq!(model["context_window"], 1_050_000);
+        assert_eq!(model["max_context_window"], 1_050_000);
+        assert_eq!(model["auto_compact_token_limit"], 829_800);
+        assert_eq!(model["comp_hash"], CODEX_CLIENT_COMP_HASH);
+        assert_eq!(
+            model["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn gpt_6_1_terra_preserves_provider_limits_and_reasoning_subset() {
+        let mut model = json!({
+            "slug":"gpt-6.1-terra", "display_name":"Custom Terra",
+            "context_window":516_000, "max_context_window":1_000_000,
+            "auto_compact_token_limit":460_000,
+            "default_reasoning_level":"high", "supported_reasoning_levels":[{"effort":"high"}]
+        });
+        repair_codex_model_metadata(&mut model);
+        assert_eq!(model["display_name"], "Custom Terra");
+        assert_eq!(model["context_window"], 516_000);
+        assert_eq!(model["max_context_window"], 1_000_000);
+        assert_eq!(model["auto_compact_token_limit"], 460_000);
+        assert_eq!(
+            model["supported_reasoning_levels"],
+            json!([{"effort":"high"}])
+        );
+        assert_eq!(model["default_reasoning_level"], "high");
+    }
+
+    #[test]
+    fn terra_compaction_rejects_thresholds_above_its_input_ceiling() {
+        for threshold in [922_000, 945_000, 1_050_000] {
+            let mut model = json!({"slug":"gpt-6.1-terra", "context_window":1_050_000,
+                "auto_compact_token_limit":threshold});
+            repair_codex_context_metadata(&mut model);
+            assert_eq!(model["auto_compact_token_limit"], 829_800);
+        }
+        let mut model = json!({"slug":"gpt-6.1-terra", "context_window":1_050_000,
+            "auto_compact_token_limit":900_000});
+        repair_codex_context_metadata(&mut model);
+        assert_eq!(model["auto_compact_token_limit"], 900_000);
     }
 
     #[test]

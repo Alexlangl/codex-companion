@@ -66,8 +66,11 @@ pub(crate) fn build_model_catalog(codex_dir: &Path, model_slugs: &[String]) -> R
             let mut entry = exact
                 .or_else(|| cached_template.clone())
                 .unwrap_or_else(|| fallback.clone());
+            if exact_match && slug == "gpt-6.1-terra" {
+                codex_companion_core::repair_codex_model_metadata(&mut entry);
+            }
             merge_missing_fields(&mut entry, &fallback);
-            if !exact_match && slug == "gpt-6.1-sol" {
+            if !exact_match && matches!(slug.as_str(), "gpt-6.1-sol" | "gpt-6.1-terra") {
                 if let Some(fields) = entry.as_object_mut() {
                     for field in [
                         "context_window",
@@ -241,6 +244,57 @@ mod tests {
             .unwrap()
             .iter()
             .all(|level| level["effort"] != "ultra"));
+    }
+
+    #[test]
+    fn new_terra_does_not_inherit_old_sol_limits_or_reasoning() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = build_model_catalog(temp.path(), &["gpt-6.1-terra".into()]).unwrap();
+        let catalog: Value = serde_json::from_slice(&bytes).unwrap();
+        let model = &catalog["models"][0];
+        assert_eq!(model["display_name"], "GPT-6.1 Terra");
+        assert_eq!(model["context_window"], 1_050_000);
+        assert_eq!(model["auto_compact_token_limit"], 829_800);
+        assert_eq!(model["default_reasoning_level"], "medium");
+        assert!(model.get("multi_agent_version").is_none());
+        assert!(model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|level| level["effort"] != "ultra"));
+    }
+
+    #[test]
+    fn terra_catalog_uses_own_defaults_with_borrowed_or_incomplete_cache() {
+        for cached in [
+            json!({"slug":"gpt-5.6-sol", "context_window":64_000,
+                "auto_compact_token_limit":50_000, "default_reasoning_level":"low",
+                "supported_reasoning_levels":[{"effort":"ultra"}]}),
+            json!({"slug":"gpt-6.1-terra"}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(
+                temp.path().join(MODELS_CACHE_FILENAME),
+                json!({"models":[cached]}).to_string(),
+            )
+            .unwrap();
+            let bytes = build_model_catalog(temp.path(), &["gpt-6.1-terra".into()]).unwrap();
+            let catalog: Value = serde_json::from_slice(&bytes).unwrap();
+            let model = &catalog["models"][0];
+            assert_eq!(model["context_window"], 1_050_000);
+            assert_eq!(model["max_context_window"], 1_050_000);
+            assert_eq!(model["auto_compact_token_limit"], 829_800);
+            assert!(model.get("multi_agent_version").is_none());
+            assert_eq!(
+                model["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|level| level["effort"].as_str())
+                    .collect::<Vec<_>>(),
+                vec!["none", "low", "medium", "high", "xhigh", "max"]
+            );
+        }
     }
 
     #[test]

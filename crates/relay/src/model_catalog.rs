@@ -28,13 +28,14 @@ pub(crate) fn merge_codex_catalogs(primary: &mut Value, catalogs: Vec<Value>) {
     models.sort_by(|a, b| {
         let rank = |value: &Value| match value.get("slug").and_then(Value::as_str).unwrap_or("") {
             "gpt-6.1-sol" => 0,
-            "gpt-6-astra" => 1,
-            "gpt-6-sol" => 2,
-            "gpt-6-luna" => 3,
-            "gpt-5.6-sol" => 4,
-            "gpt-5.6-terra" => 5,
-            "gpt-5.6-luna" => 6,
-            _ => 7,
+            "gpt-6.1-terra" => 1,
+            "gpt-6-astra" => 2,
+            "gpt-6-sol" => 3,
+            "gpt-6-luna" => 4,
+            "gpt-5.6-sol" => 5,
+            "gpt-5.6-terra" => 6,
+            "gpt-5.6-luna" => 7,
+            _ => 8,
         };
         rank(a)
             .cmp(&rank(b))
@@ -69,7 +70,7 @@ pub(crate) fn adapt_codex_model_catalog(value: &mut Value) {
             model["slug"] = json!(slug);
             model["display_name"] = json!(slug);
             model["description"] = json!(slug);
-            if slug == "gpt-6.1-sol" {
+            if matches!(slug, "gpt-6.1-sol" | "gpt-6.1-terra") {
                 if let Some(fields) = model.as_object_mut() {
                     for field in [
                         "context_window",
@@ -129,6 +130,46 @@ mod tests {
             .unwrap()
             .iter()
             .all(|level| level["effort"] != "ultra"));
+    }
+
+    #[test]
+    fn id_only_new_terra_gets_its_own_capabilities() {
+        let mut catalog = json!({"data":[{"id":"gpt-6.1-terra"}]});
+        adapt_codex_model_catalog(&mut catalog);
+        let model = &catalog["models"][0];
+        assert_eq!(model["display_name"], "GPT-6.1 Terra");
+        assert_eq!(model["context_window"], 1_050_000);
+        assert_eq!(model["auto_compact_token_limit"], 829_800);
+        assert_eq!(model["default_reasoning_level"], "medium");
+        assert!(model.get("multi_agent_version").is_none());
+        assert!(model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|level| level["effort"] == "none"));
+        assert!(model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|level| level["effort"] != "ultra"));
+    }
+
+    #[test]
+    fn merged_catalog_orders_terra_after_sol_without_adding_unavailable_models() {
+        let mut catalog =
+            json!({"data":[{"id":"gpt-6.1-terra"},{"id":"gpt-5.6-luna"},{"id":"aaa-custom"}]});
+        let sol = json!({"data":[{"id":"gpt-6.1-sol"},{"id":"gpt-6.1-terra"}]});
+        merge_codex_catalogs(&mut catalog, vec![sol]);
+        let slugs = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["slug"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slugs,
+            vec!["gpt-6.1-sol", "gpt-6.1-terra", "gpt-5.6-luna", "aaa-custom"]
+        );
     }
 
     #[test]

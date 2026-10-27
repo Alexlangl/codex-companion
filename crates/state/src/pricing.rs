@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-pub const PRICING_AS_OF: &str = "2026-09-30";
+pub const PRICING_AS_OF: &str = "2026-10-26";
 
 pub fn read_pricing_settings(data_dir: &Path) -> Result<PricingSettingsSnapshot> {
     let path = data_dir.join("model-pricing.json");
@@ -189,6 +189,7 @@ impl PricingCatalog {
         };
         for (model, input, cached_input, cache_write_input, output) in [
             ("gpt-6.1-sol", "2.00", "0.10", "2.50", "10.00"),
+            ("gpt-6.1-terra", "1.00", "0.05", "1.25", "5.00"),
             ("gpt-6-astra", "10.00", "1.00", "12.50", "50.00"),
             ("gpt-6-sol", "2.00", "0.20", "2.50", "10.00"),
             ("gpt-6-luna", "0.10", "0.01", "0.125", "0.50"),
@@ -212,7 +213,7 @@ impl PricingCatalog {
                 decimal(output),
                 matches!(
                     model,
-                    "gpt-6.1-sol" | "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+                    "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
                 ),
                 &[],
             );
@@ -580,6 +581,7 @@ mod tests {
         let catalog = PricingCatalog::builtin();
         for (model, input, cached_input, cache_write_input, output) in [
             ("gpt-6.1-sol", "2.00", "0.10", "2.50", "10.00"),
+            ("gpt-6.1-terra", "1.00", "0.05", "1.25", "5.00"),
             ("gpt-6-astra", "10.00", "1.00", "12.50", "50.00"),
             ("gpt-6-sol", "2.00", "0.20", "2.50", "10.00"),
             ("gpt-6-luna", "0.10", "0.01", "0.125", "0.50"),
@@ -612,6 +614,32 @@ mod tests {
             .expect("pricing");
         assert_eq!(cost.fresh_input_usd, decimal("0.8"));
         assert_eq!(cost.output_usd, decimal("1.5"));
+    }
+
+    #[test]
+    fn terra_pricing_handles_cached_input_and_the_long_context_boundary() {
+        let catalog = PricingCatalog::builtin();
+        let (_, standard) = catalog
+            .estimate(
+                "openai/gpt-6.1-terra@max",
+                None,
+                200_000,
+                72_000,
+                0,
+                100_000,
+            )
+            .expect("terra pricing");
+        assert_eq!(standard.fresh_input_usd, decimal("0.2"));
+        assert_eq!(standard.cached_input_usd, decimal("0.0036"));
+        assert_eq!(standard.output_usd, decimal("0.5"));
+
+        let (_, long) = catalog
+            .estimate("gpt-6.1-terra", None, 200_000, 72_000, 1, 100_000)
+            .expect("terra long-context pricing");
+        assert_eq!(long.fresh_input_usd, decimal("0.4"));
+        assert_eq!(long.cached_input_usd, decimal("0.0072"));
+        assert_eq!(long.cache_write_input_usd, decimal("0.0000025"));
+        assert_eq!(long.output_usd, decimal("0.75"));
     }
 
     #[test]

@@ -716,7 +716,24 @@ fn build_matrix(discoveries: Vec<SourceDiscovery>) -> ModelMatrixSnapshot {
 
     let mut models = rows
         .into_iter()
-        .map(|(id, row)| {
+        .map(|(id, mut row)| {
+            // Known Terra defaults come from our registry, not capability claims
+            // made by a relay. Keep actual source membership and trusted subsets.
+            if id == "gpt-6.1-terra" {
+                let builtin = parse_model_entry(&serde_json::json!({"slug":id}), None, true)
+                    .expect("built-in Terra metadata");
+                if !row.trusted_name {
+                    row.display_name = builtin.display_name;
+                }
+                if row.reasoning_efforts.is_empty() {
+                    row.reasoning_efforts.extend(builtin.reasoning_efforts);
+                }
+                row.context_window = row.context_window.or(builtin.context_window);
+                row.max_context_window = row.max_context_window.or(builtin.max_context_window);
+                row.auto_compact_token_limit = row
+                    .auto_compact_token_limit
+                    .or(builtin.auto_compact_token_limit);
+            }
             let mut source_ids = row.source_ids.into_iter().collect::<Vec<_>>();
             source_ids.sort_by_key(|source_id| source_order.get(source_id).copied());
             let mut reasoning_efforts = row.reasoning_efforts.into_iter().collect::<Vec<_>>();
@@ -761,7 +778,7 @@ fn build_matrix(discoveries: Vec<SourceDiscovery>) -> ModelMatrixSnapshot {
 
 fn reasoning_effort_rank(effort: &str) -> usize {
     match effort {
-        "minimal" => 0,
+        "none" | "minimal" => 0,
         "low" => 1,
         "medium" => 2,
         "high" => 3,
@@ -973,6 +990,46 @@ mod tests {
 
         assert!(!matrix.models[0].ultra_capable);
         assert!(matrix.models[0].reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn relay_only_terra_uses_builtin_capabilities_without_claiming_official_membership() {
+        for entry in [
+            json!("gpt-6.1-terra"),
+            json!({"id":"gpt-6.1-terra",
+            "multi_agent_version":"v2", "supported_reasoning_levels":[{"effort":"ultra"}]}),
+        ] {
+            let models = parse_model_response(&json!({"data":[entry]}), false).unwrap();
+            let matrix = build_matrix(vec![source("relay", ModelSourceKind::Relay, models)]);
+            let model = &matrix.models[0];
+            assert_eq!(model.display_name, "GPT-6.1 Terra");
+            assert_eq!(model.source_ids, vec!["relay"]);
+            assert_eq!(
+                model.reasoning_efforts,
+                vec!["none", "low", "medium", "high", "xhigh", "max"]
+            );
+            assert_eq!(model.context_window, Some(1_050_000));
+            assert_eq!(model.auto_compact_token_limit, Some(829_800));
+            assert!(!model.ultra_capable);
+            assert!(model.multi_agent_version.is_none());
+        }
+    }
+
+    #[test]
+    fn terra_matrix_preserves_official_reasoning_subset() {
+        let models = parse_model_response(
+            &json!({"models":[{"slug":"gpt-6.1-terra",
+            "display_name":"Custom Terra", "supported_reasoning_levels":[{"effort":"high"}]}]}),
+            true,
+        )
+        .unwrap();
+        let matrix = build_matrix(vec![source(
+            "official",
+            ModelSourceKind::OfficialOauth,
+            models,
+        )]);
+        assert_eq!(matrix.models[0].display_name, "Custom Terra");
+        assert_eq!(matrix.models[0].reasoning_efforts, vec!["high"]);
     }
 
     #[test]
