@@ -49,6 +49,12 @@ pub(crate) fn merge_codex_catalogs(primary: &mut Value, catalogs: Vec<Value>) {
 /// Keep native capabilities, repairing only known generic reasoning placeholders.
 pub(crate) fn adapt_codex_model_catalog(value: &mut Value) {
     if let Some(models) = value.get_mut("models").and_then(Value::as_array_mut) {
+        models.retain(|model| {
+            model
+                .get("slug")
+                .and_then(Value::as_str)
+                .is_some_and(|slug| slug.starts_with("gpt-"))
+        });
         for model in models {
             codex_companion_core::repair_codex_model_metadata(model);
         }
@@ -63,7 +69,7 @@ pub(crate) fn adapt_codex_model_catalog(value: &mut Value) {
         .iter()
         .filter_map(|item| {
             let slug = item.get("id").and_then(Value::as_str)?.trim();
-            if slug.is_empty() {
+            if !slug.starts_with("gpt-") {
                 return None;
             }
             let mut model = template.clone();
@@ -166,10 +172,7 @@ mod tests {
             .iter()
             .map(|model| model["slug"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(
-            slugs,
-            vec!["gpt-6.1-sol", "gpt-6.1-terra", "gpt-5.6-luna", "aaa-custom"]
-        );
+        assert_eq!(slugs, vec!["gpt-6.1-sol", "gpt-6.1-terra", "gpt-5.6-luna"]);
     }
 
     #[test]
@@ -187,12 +190,13 @@ mod tests {
     }
     #[test]
     fn adds_native_schema_without_losing_standard_api_list() {
-        let mut value = json!({"data":[{"id":"my-model"},{"id":""},{"other":true}]});
+        let mut value =
+            json!({"data":[{"id":"gpt-custom"},{"id":"deepseek-flash"},{"id":""},{"other":true}]});
         let original = value["data"].clone();
         adapt_codex_model_catalog(&mut value);
         assert_eq!(value["data"], original);
         assert_eq!(value["models"].as_array().unwrap().len(), 1);
-        assert_eq!(value["models"][0]["slug"], "my-model");
+        assert_eq!(value["models"][0]["slug"], "gpt-custom");
         for required in [
             "shell_type",
             "visibility",
@@ -207,11 +211,12 @@ mod tests {
     fn native_catalog_keeps_shape_while_receiving_compaction_metadata() {
         for mut value in [
             json!({"models":[],"data":[{"id":"excluded"}]}),
-            json!({"models":[{"slug":"native","custom":true}]}),
+            json!({"models":[{"slug":"gpt-native","custom":true},{"slug":"kimi-k3"}]}),
         ] {
             adapt_codex_model_catalog(&mut value);
             if let Some(model) = value["models"].as_array().and_then(|models| models.first()) {
-                assert_eq!(model["slug"], "native");
+                assert_eq!(value["models"].as_array().unwrap().len(), 1);
+                assert_eq!(model["slug"], "gpt-native");
                 assert_eq!(
                     model["comp_hash"],
                     codex_companion_core::CODEX_CLIENT_COMP_HASH

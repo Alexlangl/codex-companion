@@ -11,7 +11,7 @@ use codex_companion_core::{
 use codex_companion_provider::selected_providers;
 use codex_companion_state::{
     collect_token_usage_cached, collect_token_usage_cached_with_filters,
-    companion_managed_model_catalog_is_active, doctor, install_companion_provider_for_relay,
+    companion_model_catalog_needs_refresh, doctor, install_companion_provider_for_relay,
     rebuild_token_usage_cached_with_filters, relay_auth_has_legacy_mirror_ownership,
     relay_preserved_official_auth_is_ready, repair_state, CodexInstallSnapshot,
     TokenUsageDateRange, TokenUsageFilters,
@@ -74,8 +74,7 @@ impl CompanionDaemon {
         let auth_repair_needed = config.app.preserve_official_codex_auth
             && (relay_auth_has_legacy_mirror_ownership(&codex_dir)?
                 || !relay_preserved_official_auth_is_ready(&codex_dir)?);
-        let catalog_repair_needed =
-            models.is_empty() && companion_managed_model_catalog_is_active(&codex_dir)?;
+        let catalog_repair_needed = companion_model_catalog_needs_refresh(&codex_dir, &models)?;
         let transport_repair_needed =
             codex_companion_state::relay_transport_needs_migration(&codex_dir, &config.relay)?;
         if !auth_repair_needed && !catalog_repair_needed && !transport_repair_needed {
@@ -90,9 +89,9 @@ impl CompanionDaemon {
             source.as_ref(),
             config.app.preserve_official_codex_auth,
         )?;
-        // Old sessions negotiate HTTP through the relay's 426 response. A
-        // transport-only upgrade must not interrupt unrelated running tasks.
-        if auth_repair_needed || catalog_repair_needed {
+        // Catalog and transport updates must not interrupt running tasks.
+        // Codex loads the refreshed picker catalog on its next launch.
+        if auth_repair_needed {
             restart_codex_if_running();
         }
         Ok(true)
@@ -494,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_reconciliation_removes_an_old_managed_catalog_when_oauth_is_ready() {
+    fn startup_reconciliation_keeps_the_catalog_when_model_discovery_fails() {
         let temp = tempfile::tempdir().expect("tempdir");
         let codex_dir = temp.path().join("codex");
         let source_path = temp.path().join("official-auth.json");
@@ -510,6 +509,7 @@ mod tests {
         )
         .expect("official auth");
         let mut official = provider(ProviderKind::OfficialCodex);
+        official.base_url = "http://127.0.0.1:0".into();
         official.auth_ref = Some(format!("file:{}", source_path.display()));
         let store = ConfigStore::new(temp.path().join("config.json"));
         store
@@ -532,19 +532,20 @@ mod tests {
         )
         .expect("old-style relay install");
         assert!(
-            companion_managed_model_catalog_is_active(&codex_dir).expect("managed catalog state")
+            codex_companion_state::companion_managed_model_catalog_is_active(&codex_dir)
+                .expect("managed catalog state")
         );
         assert!(relay_preserved_official_auth_is_ready(&codex_dir).expect("oauth ready"));
         let daemon = CompanionDaemon::new(store);
 
-        assert!(daemon
+        assert!(!daemon
             .reconcile_preserved_official_codex_auth_in_dir(codex_dir.clone())
             .expect("reconcile catalog"));
 
         let codex_config =
             std::fs::read_to_string(codex_dir.join("config.toml")).expect("live Codex config");
-        assert!(!codex_config.contains("model_catalog_json"));
-        assert!(!codex_dir
+        assert!(codex_config.contains("model_catalog_json"));
+        assert!(codex_dir
             .join("codex-companion-model-catalog.json")
             .exists());
         assert!(relay_preserved_official_auth_is_ready(&codex_dir).expect("oauth remains ready"));

@@ -761,14 +761,6 @@ fn group_relay_token_source(group: &ProviderGroup, providers: &[ProviderConfig])
 }
 
 pub(crate) fn relay_model_slugs(providers: &[ProviderConfig]) -> Vec<String> {
-    // A mixed group with an official account must keep Codex's native catalog
-    // authoritative; third-party aliases must not collapse the model picker.
-    if providers
-        .iter()
-        .any(|provider| matches!(provider.kind, ProviderKind::OfficialCodex))
-    {
-        return Vec::new();
-    }
     let mut seen = BTreeSet::new();
     let mut models = Vec::new();
     for model in providers
@@ -776,7 +768,7 @@ pub(crate) fn relay_model_slugs(providers: &[ProviderConfig]) -> Vec<String> {
         .flat_map(|provider| provider.model_map.keys())
     {
         let model = model.trim();
-        if model.is_empty() || model == "default" || !seen.insert(model.to_string()) {
+        if !model.starts_with("gpt-") || !seen.insert(model.to_string()) {
             continue;
         }
         models.push(model.to_string());
@@ -789,12 +781,9 @@ pub(crate) fn relay_model_slugs_with_discovery(
     policy: &codex_companion_core::AccountProtection,
 ) -> Vec<String> {
     let mut models = relay_model_slugs(providers);
-    if providers
-        .iter()
-        .any(|provider| matches!(provider.kind, ProviderKind::OfficialCodex))
-    {
-        return models;
-    }
+    // The relay is a custom Codex provider even when it routes to official
+    // accounts. Codex can use its bundled list instead of querying /models,
+    // so mixed groups need the discovered union in model_catalog_json too.
     for slug in discover_relay_model_slugs(providers, policy) {
         if !models.contains(&slug) {
             models.push(slug);
@@ -1883,14 +1872,14 @@ mod tests {
     }
 
     #[test]
-    fn relay_group_with_official_account_uses_the_native_model_catalog() {
+    fn relay_group_with_official_account_keeps_declared_relay_models() {
         let official = provider(ProviderKind::OfficialCodex, None);
         let mut relay = provider(ProviderKind::RelayProvider, None);
         relay
             .model_map
             .insert("gpt-5.6-sol".to_string(), "gpt-5.6-sol".to_string());
 
-        assert!(relay_model_slugs(&[official, relay]).is_empty());
+        assert_eq!(relay_model_slugs(&[official, relay]), vec!["gpt-5.6-sol"]);
     }
 
     #[test]

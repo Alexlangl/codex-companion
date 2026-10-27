@@ -35,7 +35,7 @@ pub(crate) fn normalized_model_slugs(
         .chain(requested.iter().map(String::as_str))
     {
         let model = model.trim();
-        if model.is_empty() || model == "default" || !seen.insert(model.to_string()) {
+        if !model.starts_with("gpt-") || !seen.insert(model.to_string()) {
             continue;
         }
         models.push(model.to_string());

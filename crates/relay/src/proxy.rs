@@ -1967,7 +1967,7 @@ mod tests {
     async fn codex_versioned_models_accepts_third_party_catalogs_and_filters_exclusions() {
         let upstream = spawn_mock_server(
             StatusCode::OK,
-            r#"{"object":"list","data":[{"id":"allowed"},{"id":"blocked"}]}"#,
+            r#"{"object":"list","data":[{"id":"gpt-allowed"},{"id":"gpt-blocked"},{"id":"deepseek-flash"}]}"#,
             None,
         )
         .await;
@@ -1978,7 +1978,7 @@ mod tests {
                     .relay
                     .account_protection
                     .excluded_models
-                    .push("blocked".into());
+                    .push("gpt-blocked".into());
                 Ok(())
             })
             .unwrap();
@@ -1995,8 +1995,8 @@ mod tests {
         let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
         let catalog: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(catalog["models"].as_array().unwrap().len(), 1);
-        assert_eq!(catalog["models"][0]["slug"], "allowed");
-        assert_eq!(catalog["data"][0]["id"], "allowed");
+        assert_eq!(catalog["models"][0]["slug"], "gpt-allowed");
+        assert_eq!(catalog["data"][0]["id"], "gpt-allowed");
         // The same native shape is required when model maps are served locally.
         store
             .update(|config| {
@@ -2005,7 +2005,7 @@ mod tests {
                     .get_mut("a")
                     .unwrap()
                     .model_map
-                    .insert("local-model".into(), "actual-model".into());
+                    .insert("gpt-local-model".into(), "actual-model".into());
                 Ok(())
             })
             .unwrap();
@@ -2020,7 +2020,7 @@ mod tests {
         .unwrap();
         let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
         let catalog: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(catalog["models"][0]["slug"], "local-model");
+        assert_eq!(catalog["models"][0]["slug"], "gpt-local-model");
     }
 
     #[tokio::test]

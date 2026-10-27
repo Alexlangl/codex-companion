@@ -29,8 +29,10 @@ pub(crate) fn discover_relay_model_slugs(
 ) -> Vec<String> {
     let providers = providers
         .iter()
-        .filter(|provider| provider.enabled && provider.kind != ProviderKind::OfficialCodex)
-        .filter(|provider| provider.model_map.is_empty())
+        .filter(|provider| provider.enabled)
+        .filter(|provider| {
+            provider.kind == ProviderKind::OfficialCodex || provider.model_map.is_empty()
+        })
         .cloned()
         .collect::<Vec<_>>();
     if providers.is_empty() {
@@ -59,7 +61,12 @@ pub(crate) fn discover_relay_model_slugs(
                 tasks.spawn(async move {
                     let models = fetch_provider_model_response(&client, &provider, true)
                         .await
-                        .and_then(|value| parse_model_response(&value, false))
+                        .and_then(|value| {
+                            parse_model_response(
+                                &value,
+                                provider.kind == ProviderKind::OfficialCodex,
+                            )
+                        })
                         .unwrap_or_default();
                     (provider, models)
                 });
@@ -67,7 +74,8 @@ pub(crate) fn discover_relay_model_slugs(
             let mut slugs = BTreeSet::new();
             while let Some(Ok((provider, models))) = tasks.join_next().await {
                 for model in models {
-                    if model.visibility.as_deref() != Some("hide")
+                    if model.id.starts_with("gpt-")
+                        && model.visibility.as_deref() != Some("hide")
                         && account_policy_block_reason(
                             &policy,
                             &provider,
@@ -861,6 +869,68 @@ mod tests {
             vec!["gpt-6.1-sol"]
         );
         server.join().expect("server");
+    }
+
+    #[test]
+    fn mixed_picker_discovers_official_and_relay_models() {
+        fn serve(body: Value) -> (String, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let size = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..size])
+                    .starts_with("GET /v1/models?client_version="));
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            (format!("http://{address}/v1"), server)
+        }
+        let (official_url, official_server) = serve(json!({"models": [
+            {"slug":"gpt-6.1-sol"}, {"slug":"gpt-official-only"}, {"slug":"codex-auto-review"}
+        ]}));
+        let (relay_url, relay_server) = serve(json!({"data": [
+            {"id":"gpt-6.1-sol"}, {"id":"gpt-6.1-terra"}, {"id":"deepseek-flash"}
+        ]}));
+        let temp = tempfile::tempdir().unwrap();
+        let auth = temp.path().join("official-auth.json");
+        fs::write(
+            &auth,
+            r#"{"auth_mode":"pat","personal_access_token":"synthetic-test-token"}"#,
+        )
+        .unwrap();
+        let official = ProviderConfig {
+            id: "official".into(),
+            name: "Official".into(),
+            kind: ProviderKind::OfficialCodex,
+            base_url: official_url,
+            websocket_url: None,
+            auth_ref: Some(format!("file:{}", auth.display())),
+            direct_auth_ref: None,
+            model_map: BTreeMap::new(),
+            priority: 100,
+            enabled: true,
+            refresh_interval_seconds: 60,
+            account: None,
+        };
+        let relay = ProviderConfig {
+            id: "relay".into(),
+            name: "Relay".into(),
+            kind: ProviderKind::RelayProvider,
+            base_url: relay_url,
+            auth_ref: None,
+            ..official.clone()
+        };
+        assert_eq!(
+            crate::launch::relay_model_slugs_with_discovery(
+                &[official, relay],
+                &AccountProtection::default()
+            ),
+            vec!["gpt-6.1-sol", "gpt-6.1-terra", "gpt-official-only"]
+        );
+        official_server.join().unwrap();
+        relay_server.join().unwrap();
     }
 
     #[test]

@@ -86,6 +86,41 @@ pub fn companion_managed_model_catalog_is_active(codex_dir: &Path) -> Result<boo
     Ok(hash_file(&catalog_path)? == expected_hash)
 }
 
+pub fn companion_model_catalog_needs_refresh(
+    codex_dir: &Path,
+    requested_models: &[String],
+) -> Result<bool> {
+    // A failed discovery must not remove the last working model list.
+    if requested_models.is_empty() {
+        return Ok(false);
+    }
+    let config_path = codex_dir.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .map_err(|source| CompanionError::io(&config_path, source))?
+        .parse::<DocumentMut>()
+        .map_err(|source| {
+            CompanionError::InvalidConfig(format!("invalid Codex config TOML: {source}"))
+        })?;
+    if let Some(pointer) = config.get("model_catalog_json") {
+        if !pointer
+            .as_str()
+            .is_some_and(|path| managed_model_catalog_pointer(codex_dir, path))
+            || !companion_managed_model_catalog_is_active(codex_dir)?
+        {
+            return Ok(false);
+        }
+    } else {
+        return Ok(true);
+    }
+    let path = managed_model_catalog_path(codex_dir);
+    let Ok(current) = fs::read(&path) else {
+        return Ok(true);
+    };
+    let models =
+        normalized_model_slugs(requested_models, config.get("model").and_then(Item::as_str));
+    Ok(current != build_model_catalog(codex_dir, &models)?)
+}
+
 pub fn relay_preserved_official_auth_is_ready(codex_dir: &Path) -> Result<bool> {
     let config_path = codex_dir.join("config.toml");
     if !config_path.exists() {
@@ -4391,6 +4426,54 @@ wire_api = "responses"
 
         assert!(!companion_managed_model_catalog_is_active(temp.path())
             .expect("user-owned catalog state"));
+        assert!(
+            !companion_model_catalog_needs_refresh(temp.path(), &["gpt-6.1-terra".into()]).unwrap()
+        );
+    }
+
+    #[test]
+    fn discovered_models_refresh_missing_and_outdated_managed_catalogs() {
+        let temp = tempfile::tempdir().unwrap();
+        let models = vec!["gpt-6.1-sol".into(), "gpt-6.1-terra".into()];
+        install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &[],
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(companion_model_catalog_needs_refresh(temp.path(), &models).unwrap());
+        install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &models[..1],
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(companion_model_catalog_needs_refresh(temp.path(), &models).unwrap());
+        install_companion_provider_for_relay(
+            Some(temp.path().to_path_buf()),
+            &RelayConfig::default(),
+            None,
+            &models,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(!companion_model_catalog_needs_refresh(temp.path(), &models).unwrap());
+        assert!(!companion_model_catalog_needs_refresh(temp.path(), &[]).unwrap());
+        fs::remove_file(managed_model_catalog_path(temp.path())).unwrap();
+        assert!(companion_model_catalog_needs_refresh(temp.path(), &models).unwrap());
+        fs::write(
+            temp.path().join("config.toml"),
+            "model_catalog_json = \"my-models.json\"\n",
+        )
+        .unwrap();
+        assert!(!companion_model_catalog_needs_refresh(temp.path(), &models).unwrap());
     }
 
     #[test]
