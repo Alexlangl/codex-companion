@@ -1,4 +1,5 @@
 use crate::api_service::ApiServiceStore;
+use crate::tool_identity::ToolIdentity;
 use axum::{
     body::Body,
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
@@ -55,6 +56,7 @@ const MAX_CHAT_SSE_PENDING_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CHAT_SSE_TOOL_CALLS: usize = 512;
 const MAX_UPSTREAM_ERROR_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_UPSTREAM_ERROR_MESSAGE_CHARS: usize = 512;
+const CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const UPSTREAM_ERROR_RESPONSE_TRUNCATED: &[u8] = b"\n[upstream error response truncated]\n";
 const UPSTREAM_ERROR_RESPONSE_OMITTED: &[u8] =
     b"[upstream error response omitted: exceeded 128 KiB limit]";
@@ -70,6 +72,7 @@ pub(crate) struct UpstreamResponse {
     oauth_refresh_failure: Option<FailureClassification>,
     transform: ResponseTransform,
     tool_context: ChatToolContext,
+    tool_identity: ToolIdentity,
     chat_messages: Vec<Value>,
 }
 
@@ -839,6 +842,22 @@ pub(crate) async fn send_upstream(
     } else if let Some(token) = resolve_auth_token(provider) {
         authorization = Some(format!("Bearer {token}"));
     }
+    let tool_identity = ToolIdentity::from_request(&body);
+    let mut lite_headers = headers.clone();
+    if provider.kind == ProviderKind::OfficialCodex
+        && method == Method::POST
+        && is_responses_generation_url(uri.path())
+        && serde_json::from_slice::<Value>(&body)
+            .ok()
+            .as_ref()
+            .is_some_and(responses_lite_metadata_enabled)
+    {
+        lite_headers.insert(
+            CODEX_RESPONSES_LITE_HEADER,
+            HeaderValue::from_static("true"),
+        );
+    }
+    let headers = &lite_headers;
     let session_identity = official_codex_session_identity(provider, method, uri, headers, &body);
     let body = normalize_official_responses_input(
         provider,
@@ -847,6 +866,7 @@ pub(crate) async fn send_upstream(
         body,
         session_identity.as_deref(),
     );
+    let body = normalize_responses_lite_input(method, uri, headers, body);
     let body = rewrite_model(provider, body);
     let (body, tool_context, chat_messages) =
         if transform == ResponseTransform::ChatCompletionsToResponses {
@@ -918,6 +938,7 @@ pub(crate) async fn send_upstream(
                 oauth_refresh_failure: None,
                 transform,
                 tool_context,
+                tool_identity,
                 chat_messages,
             });
         }
@@ -980,6 +1001,7 @@ pub(crate) async fn send_upstream(
                         oauth_refresh_failure: Some(refresh_failure),
                         transform,
                         tool_context,
+                        tool_identity,
                         chat_messages,
                     });
                 }
@@ -997,12 +1019,13 @@ pub(crate) async fn send_upstream(
                 oauth_refresh_failure: None,
                 transform,
                 tool_context,
+                tool_identity,
                 chat_messages,
             });
         }
     }
     let status = response.status();
-    let headers = response.headers().clone();
+    let mut headers = response.headers().clone();
     let inspect_body = status.is_success()
         && method == Method::POST
         && uri
@@ -1012,7 +1035,12 @@ pub(crate) async fn send_upstream(
     let (response, buffered_body) = if inspect_body {
         let body = read_limited_success_response_body(response).await?;
         validate_successful_responses_body(transform, &body)?;
-        (None, Some(body))
+        let restored = tool_identity.restore_json(body.clone());
+        if restored != body {
+            headers.remove(header::CONTENT_LENGTH);
+            headers.remove(header::ETAG);
+        }
+        (None, Some(restored))
     } else {
         (Some(response), buffered_error)
     };
@@ -1027,6 +1055,7 @@ pub(crate) async fn send_upstream(
         oauth_refresh_failure: None,
         transform,
         tool_context,
+        tool_identity,
         chat_messages,
     })
 }
@@ -1209,6 +1238,7 @@ fn build_upstream_request(
             *name,
             header::HOST | header::AUTHORIZATION | header::CONTENT_LENGTH | header::ACCEPT_ENCODING
         ) || name.as_str() == "x-api-key"
+            || (!official_codex && name.as_str() == CODEX_RESPONSES_LITE_HEADER)
             || (official_codex
                 && matches!(
                     name.as_str(),
@@ -1296,6 +1326,42 @@ fn valid_codex_client_version(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+}
+
+fn responses_lite_metadata_enabled(value: &Value) -> bool {
+    value
+        .pointer("/client_metadata/ws_request_header_x_openai_internal_codex_responses_lite")
+        .is_some_and(|value| {
+            value == true
+                || value
+                    .as_str()
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+        })
+}
+
+fn normalize_responses_lite_input(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Bytes {
+    if method != Method::POST || !is_responses_generation_url(uri.path()) {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    let metadata_lite = responses_lite_metadata_enabled(&value);
+    if !headers.contains_key(CODEX_RESPONSES_LITE_HEADER) && !metadata_lite {
+        return body;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return body;
+    };
+    // Lite uses client-side tools sequentially. Apply this after official
+    // normalization, including requests with no tools, and before Chat conversion.
+    object.insert("parallel_tool_calls".into(), Value::Bool(false));
+    serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
 }
 
 fn normalize_official_responses_input(
@@ -1620,6 +1686,7 @@ pub(crate) async fn stream_response(
         oauth_refresh_failure: _,
         transform,
         tool_context,
+        tool_identity,
         chat_messages,
     } = upstream;
     if opaque_event_stream {
@@ -1637,7 +1704,12 @@ pub(crate) async fn stream_response(
             prefetched_body,
         ))
         .await;
-        return match body.and_then(|body| terminal_response_from_sse(&body)) {
+        return match body
+            .and_then(|body| terminal_response_from_sse(&body))
+            .map(|mut value| {
+                tool_identity.restore(&mut value);
+                value
+            }) {
             Ok(value) => Response::builder()
                 .status(status)
                 .header(
@@ -1722,7 +1794,7 @@ pub(crate) async fn stream_response(
         // The relay may add keepalives, so the upstream length no longer applies.
         headers.remove(header::CONTENT_LENGTH);
         responses_sse_observer_stream(
-            stream,
+            tool_identity.restore_stream(stream),
             ResponsesSseObserverState::new(store, provider_id.clone(), request_id),
         )
     } else {
@@ -3955,7 +4027,8 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
     response_usage
 }
 
-type ResponseByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
+pub(crate) type ResponseByteStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
 
 fn chat_sse_to_responses_stream(
     upstream: impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
@@ -4844,6 +4917,75 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn official_lite_request_reaches_upstream_with_serial_tools() {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/backend-api/codex/responses",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers[CODEX_RESPONSES_LITE_HEADER], "true");
+                assert_eq!(body["parallel_tool_calls"], false);
+                assert_eq!(body["input"][0]["encrypted_content"], "opaque-fixture");
+                Json(
+                    json!({"id":"resp_fixture","object":"response","status":"completed","output":[{
+                        "type":"function_call","id":"fc_fixture","call_id":"call_fixture",
+                        "name":"collaboration-optimize__wait_agent","arguments":"{}"
+                    }]}),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.json"));
+        let api_service = ApiServiceStore::from_config_store(&store);
+        let mut provider = official_provider(&format!("http://{address}/backend-api/codex"));
+        let auth_path = temp.path().join("pat.json");
+        std::fs::write(&auth_path, r#"{"codex_companion_auth_mode":"pat","tokens":{"personal_access_token":"synthetic-fixture"}}"#).unwrap();
+        provider.auth_ref = Some(format!("file:{}", auth_path.display()));
+        let uri: Uri = "/v1/responses".parse().unwrap();
+        for metadata in [false, true] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            let mut value = json!({"model":"gpt-6.1-sol","stream":true,"parallel_tool_calls":true,
+                "tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"wait_agent"}]}],
+                "input":[{"type":"reasoning","encrypted_content":"opaque-fixture"}]});
+            if metadata {
+                value["client_metadata"] =
+                    json!({"ws_request_header_x_openai_internal_codex_responses_lite":"true"});
+            } else {
+                headers.insert(
+                    CODEX_RESPONSES_LITE_HEADER,
+                    HeaderValue::from_static("true"),
+                );
+            }
+            let response = send_upstream(
+                &reqwest::Client::new(),
+                &api_service,
+                UpstreamRequest::new(
+                    &provider,
+                    &Method::POST,
+                    &uri,
+                    &headers,
+                    Bytes::from(value.to_string()),
+                    &upstream_url(&provider, &uri),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!response.headers.contains_key(header::CONTENT_LENGTH));
+            let value: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+            assert_eq!(value["output"][0]["name"], "wait_agent");
+            assert_eq!(value["output"][0]["namespace"], "collaboration");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn upstream_connection_error_has_a_user_facing_network_message() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -5365,6 +5507,106 @@ mod tests {
     }
 
     #[test]
+    fn responses_lite_requires_serial_tools_without_changing_history() {
+        let provider = official_provider("https://chatgpt.com/backend-api/codex");
+        let uri: Uri = "/v1/responses".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CODEX_RESPONSES_LITE_HEADER,
+            HeaderValue::from_static("true"),
+        );
+        for tools in [json!([]), json!([{"type":"function","name":"lookup"}])] {
+            for parallel in [Some(true), Some(false), None] {
+                let mut original = json!({
+                    "model":"gpt-6.1-sol", "tools":tools,
+                    "input":[{"type":"reasoning","id":"rs_test","encrypted_content":"opaque-fixture"},
+                        {"type":"function_call_output","call_id":"call_test","output":"retained result"}]
+                });
+                if let Some(parallel) = parallel {
+                    original["parallel_tool_calls"] = json!(parallel);
+                }
+                let body = normalize_official_responses_input(
+                    &provider,
+                    &Method::POST,
+                    &uri,
+                    Bytes::from(original.to_string()),
+                    None,
+                );
+                let body = normalize_responses_lite_input(&Method::POST, &uri, &headers, body);
+                let normalized: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(normalized["parallel_tool_calls"], false);
+                assert_eq!(normalized["input"], original["input"]);
+                assert_eq!(normalized["tools"], original["tools"]);
+            }
+        }
+    }
+
+    #[test]
+    fn responses_lite_metadata_and_non_lite_requests_keep_their_contracts() {
+        let uri: Uri = "/v1/responses".parse().unwrap();
+        for flag in [json!(true), json!(" TRUE ")] {
+            let original = json!({"parallel_tool_calls":true,"client_metadata":{
+                "ws_request_header_x_openai_internal_codex_responses_lite":flag
+            }});
+            let body = normalize_responses_lite_input(
+                &Method::POST,
+                &uri,
+                &HeaderMap::new(),
+                Bytes::from(original.to_string()),
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["parallel_tool_calls"],
+                false
+            );
+        }
+        for uri in [
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/chat/completions",
+        ] {
+            let original = Bytes::from_static(br#"{"parallel_tool_calls":true,"input":"hello"}"#);
+            assert_eq!(
+                normalize_responses_lite_input(
+                    &Method::POST,
+                    &uri.parse().unwrap(),
+                    &HeaderMap::new(),
+                    original.clone()
+                ),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn responses_lite_header_is_official_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CODEX_RESPONSES_LITE_HEADER,
+            HeaderValue::from_static("true"),
+        );
+        for official_codex in [true, false] {
+            let request = build_upstream_request(
+                &reqwest::Client::new(),
+                &reqwest::Method::POST,
+                "https://api.example.test/v1/responses",
+                &headers,
+                UpstreamRequestHeaders {
+                    official_codex,
+                    authorization: None,
+                    chatgpt_account_id: None,
+                    session_identity: None,
+                },
+            )
+            .build()
+            .unwrap();
+            assert_eq!(
+                request.headers().contains_key(CODEX_RESPONSES_LITE_HEADER),
+                official_codex
+            );
+        }
+    }
+
+    #[test]
     fn official_requests_preserve_reasoning_history_and_tool_context() {
         let provider = official_provider("https://chatgpt.com/backend-api/codex");
         let original = json!({
@@ -5489,6 +5731,7 @@ mod tests {
             oauth_refresh_failure: None,
             transform: ResponseTransform::None,
             tool_context: ChatToolContext::default(),
+            tool_identity: ToolIdentity::default(),
             chat_messages: Vec::new(),
         }
     }

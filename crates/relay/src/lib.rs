@@ -6,6 +6,7 @@ mod moderation;
 mod proxy;
 mod server;
 mod state;
+mod tool_identity;
 mod upstream;
 mod websocket;
 mod websocket_audit;

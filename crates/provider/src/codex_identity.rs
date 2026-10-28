@@ -24,18 +24,25 @@ fn system_output(program: &str, args: &[&str]) -> Option<String> {
 
 static INSTALLED_VERSION: LazyLock<Option<String>> = LazyLock::new(|| {
     #[cfg(target_os = "macos")]
-    return system_output(
-        "/usr/bin/plutil",
-        &[
-            "-extract",
-            "CFBundleShortVersionString",
-            "raw",
-            "-o",
-            "-",
-            "/Applications/Codex.app/Contents/Info.plist",
-        ],
-    )
-    .filter(|v| valid_version(v));
+    return [
+        "/Applications/ChatGPT.app/Contents/Info.plist",
+        "/Applications/Codex.app/Contents/Info.plist",
+    ]
+    .into_iter()
+    .find_map(|path| {
+        system_output(
+            "/usr/bin/plutil",
+            &[
+                "-extract",
+                "CFBundleShortVersionString",
+                "raw",
+                "-o",
+                "-",
+                path,
+            ],
+        )
+        .filter(|v| valid_version(v))
+    });
     #[cfg(not(target_os = "macos"))]
     None
 });
@@ -140,7 +147,8 @@ async fn fetch_version(url: &str) -> Option<String> {
         .ok()?;
     let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     payload
-        .get("codexOauthAppVersion")
+        .get("codexOAuthAppVersion")
+        .or_else(|| payload.get("codexOauthAppVersion"))
         .and_then(serde_json::Value::as_str)
         .filter(|v| valid_version(v))
         .map(str::to_owned)
@@ -162,7 +170,7 @@ mod tests {
                     get(|headers: axum::http::HeaderMap| async move {
                         assert!(!headers.contains_key("authorization"));
                         assert!(!headers.contains_key("chatgpt-account-id"));
-                        r#"{"codexOauthAppVersion":"26.900.12345"}"#
+                        r#"{"codexOAuthAppVersion":"26.900.12345"}"#
                     }),
                 ),
             )
