@@ -19,3 +19,4 @@ thiserror.workspace = true
 toml_edit.workspace = true
 walkdir.workspace = true
 tempfile.workspace = true
+zstd.workspace = true

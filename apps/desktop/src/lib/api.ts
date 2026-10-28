@@ -961,7 +961,7 @@ export function importLocalCodexProvider(codexDir?: string) {
   });
 }
 
-export function startCodexOAuth() {
+export function startCodexOAuth(plan = false, providerId?: string) {
   if (!isTauri()) {
     const now = Math.floor(Date.now() / 1000);
     if (mockOAuthPending && mockOAuthPending.expiresAt > now) {
@@ -970,6 +970,7 @@ export function startCodexOAuth() {
     const loginId = `mock-login-${Date.now()}`;
     const callbackUrl = "http://localhost:1455/auth/callback";
     mockOAuthPending = {
+      plan,
       loginId,
       authUrl: `https://auth.openai.com/oauth/authorize?response_type=code&state=${encodeURIComponent(loginId)}`,
       callbackUrl,
@@ -979,7 +980,16 @@ export function startCodexOAuth() {
     };
     return Promise.resolve<CodexOAuthStartResponse>(structuredClone(mockOAuthPending));
   }
-  return invoke<CodexOAuthStartResponse>("start_codex_oauth");
+  return invoke<CodexOAuthStartResponse>("start_codex_oauth", { plan, providerId: providerId || null });
+}
+
+export function revokeChatgptPlan(providerId: string): Promise<void> {
+  if (!isTauri()) {
+    const provider = mockStatus.config.providers[providerId];
+    if (provider) provider.enabled = false;
+    return Promise.resolve();
+  }
+  return invoke<void>("revoke_chatgpt_plan", { providerId });
 }
 
 export function getCodexOAuthStatus() {
@@ -989,6 +999,7 @@ export function getCodexOAuthStatus() {
       return Promise.resolve<CodexOAuthStatus | null>(null);
     }
     return Promise.resolve<CodexOAuthStatus>({
+      plan: mockOAuthPending.plan,
       loginId: mockOAuthPending.loginId,
       authUrl: mockOAuthPending.authUrl,
       callbackUrl: mockOAuthPending.callbackUrl,
@@ -1047,7 +1058,14 @@ export async function completeCodexOAuth(loginId: string): Promise<ProviderImpor
     }
     const providerName = "oauth-user@example.com";
     const accountId = mockOAuthPending.loginId;
+    const plan = mockOAuthPending.plan;
     mockOAuthPending = null;
+    if (plan) {
+      const provider: ProviderConfig = { id: `chatgpt-plan-${accountId}`, name: `ChatGPT · ${providerName}`, kind: "openai_compatible", baseUrl: "https://api.openai.com/v1", websocketUrl: "wss://api.openai.com/v1/responses", modelMap: {}, priority: 0, enabled: true, refreshIntervalSeconds: 300, account: { authMode: "chatgpt_plan", email: providerName, userId: accountId } };
+      mockStatus.config.providers[provider.id] = provider;
+      mockStatus = syncMockDerived(mockStatus);
+      return { provider, created: true, importKind: "chatgpt_plan", accountId, authPath: `${mockStatus.dataDir}/auth/accounts/${provider.id}.json`, message: "已添加 ChatGPT 套餐授权" };
+    }
     return importProviderJson(
       JSON.stringify({
         tokens: {
@@ -2443,4 +2461,9 @@ function syncMockDerived(status: CompanionStatus): CompanionStatus {
     activeProviders,
     directConnectProviderIds,
   };
+}
+
+export function repairHistoryIndex(codexDir: string, dryRun: boolean): Promise<import("../types/domain").HistoryIndexRepairReport> {
+  if (!isTauri()) return Promise.resolve({ dryRun, scannedSessions: 0, affectedSessions: [], repairedSessions: 0, backupPath: null });
+  return invoke("repair_history_index", { codexDir, dryRun });
 }

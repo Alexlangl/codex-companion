@@ -20,6 +20,11 @@ pub fn export_provider_json(
         .providers
         .get(id)
         .ok_or_else(|| CompanionError::InvalidConfig(format!("unknown provider: {id}")))?;
+    if crate::chatgpt_plan::is_chatgpt_plan(provider) {
+        return Err(CompanionError::InvalidConfig(
+            "ChatGPT 套餐凭据不能导出为 API Key".into(),
+        ));
+    }
     let format = format.unwrap_or(ProviderExportFormat::CodexCompanion);
     let json_value = if matches!(provider.kind, ProviderKind::OfficialCodex) {
         export_official_provider(provider, format)?

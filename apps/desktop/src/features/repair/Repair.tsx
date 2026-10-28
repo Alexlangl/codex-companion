@@ -2,8 +2,10 @@ import { Hammer, LoaderCircle, Search } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Button, Field, Panel } from "../../components/ui";
 import { currentApplication } from "../../lib/current-application";
+import { repairHistoryIndex } from "../../lib/api";
+import { userFacingError } from "../../lib/errors";
 import { compactPath } from "../../lib/format";
-import type { CompanionStatus, RepairOutcome } from "../../types/domain";
+import type { CompanionStatus, HistoryIndexRepairReport, RepairOutcome } from "../../types/domain";
 
 export function Repair({
   status,
@@ -20,6 +22,9 @@ export function Repair({
     targetProviderId?: string,
   ) => Promise<void>;
 }) {
+  const [indexReport, setIndexReport] = useState<HistoryIndexRepairReport | null>(null);
+  const [indexError, setIndexError] = useState("");
+  const [indexPending, setIndexPending] = useState(false);
   const [codexDir, setCodexDir] = useState(status.codex.codexDir);
   const [history, setHistory] = useState(true);
   const [plugins, setPlugins] = useState(true);
@@ -61,6 +66,19 @@ export function Repair({
     return () => window.clearInterval(timer);
   }, [repairing, startedAt]);
 
+  async function runIndexRepair(dryRun: boolean) {
+    setIndexPending(true);
+    setIndexError("");
+    setIndexReport(null);
+    try {
+      setIndexReport(await repairHistoryIndex(codexDir, dryRun));
+    } catch (error) {
+      setIndexError(userFacingError(error));
+    } finally {
+      setIndexPending(false);
+    }
+  }
+
   async function runRepair(dryRun: boolean) {
     setPendingMode(dryRun ? "dry-run" : "repair");
     setStartedAt(Date.now());
@@ -93,11 +111,11 @@ export function Repair({
           <span>插件状态</span>
         </label>
         <div className="actions">
-          <Button disabled={repairing} onClick={() => void runRepair(true)} variant="secondary">
+          <Button disabled={repairing || indexPending} onClick={() => void runRepair(true)} variant="secondary">
             {repairing && pendingMode === "dry-run" ? <LoaderCircle className="spin-icon" size={15} /> : <Search size={15} />}
             {repairing && pendingMode === "dry-run" ? "扫描中" : "Dry-run"}
           </Button>
-          <Button disabled={repairing} onClick={() => void runRepair(false)}>
+          <Button disabled={repairing || indexPending} onClick={() => void runRepair(false)}>
             {repairing && pendingMode === "repair" ? <LoaderCircle className="spin-icon" size={15} /> : <Hammer size={15} />}
             {repairing && pendingMode === "repair" ? "修复中" : "执行修复"}
           </Button>
@@ -113,6 +131,25 @@ export function Repair({
             <p>正在扫描 Codex 历史、插件状态和 SQLite，完成后会自动刷新结果。</p>
           </div>
         ) : null}
+      </Panel>
+
+      <Panel eyebrow="聊天记录" title="会话分页索引修复">
+        <p>聊天记录加载不全时，检查原始会话和祖先记录，备份后重建异常分页索引。可在 Codex 运行时操作；扫描期间记录变化会停止修复。</p>
+        <div className="actions">
+          <Button variant="secondary" disabled={indexPending || repairing} onClick={() => void runIndexRepair(true)}>
+            {indexPending ? <LoaderCircle className="spin-icon" size={15} /> : <Search size={15} />}预览索引
+          </Button>
+          <Button disabled={indexPending || repairing} onClick={() => void runIndexRepair(false)}><Hammer size={15} />修复异常索引</Button>
+        </div>
+        <div aria-live="polite">
+          {indexPending ? <p>正在检查会话索引…</p> : null}
+          {indexReport ? <dl className="details-grid details-top">
+            <dt>检查会话</dt><dd>{indexReport.scannedSessions}</dd>
+            <dt>{indexReport.dryRun ? "待修复" : "已修复"}</dt><dd>{indexReport.dryRun ? indexReport.affectedSessions.length : indexReport.repairedSessions}</dd>
+            <dt>备份</dt><dd>{indexReport.backupPath ? compactPath(indexReport.backupPath) : "无"}</dd>
+          </dl> : null}
+        </div>
+        {indexError ? <p className="field-error" role="alert">{indexError}</p> : null}
       </Panel>
 
       <Panel eyebrow="结果" title="修复结果">

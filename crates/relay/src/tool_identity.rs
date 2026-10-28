@@ -23,6 +23,11 @@ impl ToolIdentity {
     }
 
     fn read_tools(&mut self, value: &Value) {
+        for field in ["response", "session"] {
+            if let Some(nested) = value.get(field).filter(|v| v.is_object()) {
+                self.read_tools(nested);
+            }
+        }
         for tool in value
             .get("tools")
             .and_then(Value::as_array)

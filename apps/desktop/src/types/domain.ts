@@ -39,6 +39,7 @@ export interface PricingSettingsSnapshot {
 }
 
 export interface RelayConfig {
+  mapSessionIds?: boolean;
   accountProtection?: AccountProtection;
   host: string;
   port: number;
@@ -51,6 +52,7 @@ export interface RelayConfig {
 }
 
 export interface RelaySettingsUpdate {
+  mapSessionIds?: boolean;
   accountProtection?: AccountProtection;
   host: string;
   requireApiKey: boolean;
@@ -126,6 +128,7 @@ export interface ApiRequestAttemptLog {
 }
 
 export interface ApiRequestLog {
+  actualServiceTier?: string | null;
   requestId: string;
   startedAt: string;
   method: string;
@@ -556,6 +559,7 @@ export interface ProviderImportOutcome {
 }
 
 export interface CodexOAuthStartResponse {
+  plan: boolean;
   loginId: string;
   authUrl: string;
   callbackUrl: string;
@@ -564,6 +568,7 @@ export interface CodexOAuthStartResponse {
 }
 
 export interface CodexOAuthStatus {
+  plan: boolean;
   loginId: string;
   authUrl: string;
   callbackUrl: string;
@@ -658,3 +663,11 @@ export interface RepairOutcome {
 }
 
 export type BusyState = "idle" | "loading" | "saving" | "repairing" | "launching";
+
+export interface HistoryIndexRepairReport {
+  dryRun: boolean;
+  scannedSessions: number;
+  affectedSessions: string[];
+  repairedSessions: number;
+  backupPath?: string | null;
+}

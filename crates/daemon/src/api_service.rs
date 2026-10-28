@@ -149,6 +149,9 @@ impl CompanionDaemon {
             config.relay.host = input.host.trim().to_string();
             validate_relay_auth_scope(&config.relay, input.require_api_key)?;
             config.relay.require_api_key = input.require_api_key;
+            if let Some(enabled) = input.map_session_ids {
+                config.relay.map_session_ids = enabled;
+            }
             config.relay.retry_budget = input.retry_budget;
             config.relay.model_cooldown_seconds = input.model_cooldown_seconds;
             config.relay.session_affinity_ttl_seconds = input.session_affinity_ttl_seconds;
@@ -339,6 +342,7 @@ mod tests {
     #[test]
     fn rejects_dangerous_or_unbounded_settings() {
         let valid = RelaySettingsUpdate {
+            map_session_ids: None,
             host: "127.0.0.1".to_string(),
             require_api_key: false,
             retry_budget: 3,

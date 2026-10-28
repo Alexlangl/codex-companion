@@ -100,6 +100,19 @@ pub(crate) async fn proxy(
     }
 }
 
+struct RequestCancellation {
+    store: crate::ApiServiceStore,
+    request: String,
+    finished: bool,
+}
+impl Drop for RequestCancellation {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.store.record_cancelled_before_headers(&self.request);
+        }
+    }
+}
+
 async fn proxy_inner(
     state: RelayState,
     method: Method,
@@ -108,15 +121,24 @@ async fn proxy_inner(
     body: Bytes,
 ) -> std::result::Result<Response, String> {
     let request_id = next_request_id();
+    let mut cancellation = RequestCancellation {
+        store: state.api_service.clone(),
+        request: request_id.clone(),
+        finished: false,
+    };
     let mut response = proxy_dispatch(state, method, uri, headers, body, &request_id)
         .await
         .unwrap_or_else(|message| {
+            let _ = cancellation
+                .store
+                .record_stream_outcome(&request_id, "failed", Some(&message));
             api_error_response(
                 StatusCode::BAD_GATEWAY,
                 "proxy_internal_error",
                 &compact_error_body(&message),
             )
         });
+    cancellation.finished = true;
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response
             .headers_mut()
@@ -312,11 +334,60 @@ async fn proxy_dispatch(
     {
         selected.push(preferred_provider.clone());
     }
+    let plan_capability_error = (method == Method::POST)
+        .then(|| {
+            if uri.path() != "/v1/responses" {
+                return Some("ChatGPT 套餐仅支持 Responses 生成接口".to_string());
+            }
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|_| "请求 JSON 无效".to_string())
+                .and_then(|value| crate::plan_request::validate(&value, false))
+                .err()
+        })
+        .flatten();
+    if let Some(message) = plan_capability_error.as_deref() {
+        let primary = explicit_preferred_provider
+            .as_deref()
+            .and_then(|id| selected.iter().find(|p| p.id == id))
+            .or_else(|| selected.first());
+        let only_plans = selected
+            .iter()
+            .all(codex_companion_provider::chatgpt_plan::is_chatgpt_plan);
+        if only_plans
+            || !group.fallback_enabled
+                && primary.is_some_and(codex_companion_provider::chatgpt_plan::is_chatgpt_plan)
+        {
+            record_request_finish(
+                &state,
+                request_id,
+                primary.map(|p| p.id.as_str()),
+                Some(StatusCode::BAD_REQUEST),
+                "rejected",
+                0,
+                started_at,
+                Some(message),
+            );
+            return Ok(api_error_response(
+                StatusCode::BAD_REQUEST,
+                "unsupported_capability",
+                message,
+            ));
+        }
+        selected
+            .retain(|provider| !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider));
+    }
+    for provider in &selected {
+        if provider.enabled {
+            crate::account_models::warm_plan_catalog(&state, provider, requested_model.as_deref())
+                .await;
+        }
+    }
     let official_model_catalog_request = method == Method::GET
         && uri.path() == "/v1/models"
-        && selected
-            .iter()
-            .any(|provider| matches!(provider.kind, ProviderKind::OfficialCodex));
+        && selected.iter().any(|provider| {
+            matches!(provider.kind, ProviderKind::OfficialCodex)
+                || codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider)
+        });
     // Third-party model maps remain useful for third-party-only groups, but
     // they must not replace the native catalog of an official account.
     if method == Method::GET && uri.path() == "/v1/models" && !official_model_catalog_request {
@@ -433,11 +504,22 @@ async fn proxy_dispatch(
             );
         }
     }
+    if explicit_preferred_provider.is_none() {
+        prioritize_bound_plans(&mut candidates);
+    }
     if official_model_catalog_request {
         // Catalog discovery is group-wide rather than session-affine. Keep an
         // available official account authoritative after every generic route
         // ordering step, after unavailable accounts have been excluded.
-        candidates.sort_by_key(|provider| !matches!(provider.kind, ProviderKind::OfficialCodex));
+        candidates.sort_by_key(|provider| {
+            if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+                0
+            } else if provider.kind == ProviderKind::OfficialCodex {
+                1
+            } else {
+                2
+            }
+        });
     }
     if !group.fallback_enabled {
         candidates.truncate(1);
@@ -591,7 +673,8 @@ async fn proxy_dispatch(
             send_upstream(
                 &state.client,
                 &state.api_service,
-                UpstreamRequest::new(&provider, &method, &uri, &headers, body.clone(), &upstream),
+                UpstreamRequest::new(&provider, &method, &uri, &headers, body.clone(), &upstream)
+                    .with_session_mapping(config.relay.map_session_ids),
             ),
         )
         .await
@@ -621,9 +704,12 @@ async fn proxy_dispatch(
                             &config.relay.account_protection,
                             &provider,
                             is_codex_catalog_request(&uri),
+                            &state.api_service,
                         )
                         .await?;
-                    if is_codex_catalog_request(&uri) {
+                    if is_codex_catalog_request(&uri)
+                        && !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider)
+                    {
                         let requests = selected
                             .iter()
                             .filter(|other| other.id != provider.id)
@@ -671,6 +757,7 @@ async fn proxy_dispatch(
                                             &config.relay.account_protection,
                                             other,
                                             true,
+                                            &state.api_service,
                                         )
                                         .await
                                         .ok()?;
@@ -692,11 +779,28 @@ async fn proxy_dispatch(
                 }
                 let upstream_status = response.status();
                 let preflight = response
-                    .preflight_stream_failure(group.fallback_enabled && index + 1 < candidate_count)
+                    .preflight_stream_failure(
+                        !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider)
+                            && group.fallback_enabled
+                            && index + 1 < candidate_count,
+                    )
                     .await;
+                let preflight = preflight.and_then(|()| {
+                    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
+                        response.validate_plan_terminal()
+                    } else {
+                        Ok(())
+                    }
+                });
                 if let Err(error) = preflight {
                     let failure = classify_failure(None, &error.classification_text());
                     let message = error.to_string();
+                    let downstream_status =
+                        if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
+                            crate::plan_request::error_status(&message)
+                        } else {
+                            StatusCode::BAD_GATEWAY
+                        };
                     if codex_companion_health::is_content_moderation_failure(&message) {
                         record_request_attempt_finish(
                             &state,
@@ -743,14 +847,16 @@ async fn proxy_dispatch(
                         &state,
                         request_id,
                         attempt,
-                        Some(StatusCode::BAD_GATEWAY),
+                        Some(downstream_status),
                         "failed",
                         attempt_started_at,
                         Some(&message),
                     );
-                    let can_retry = fallback_eligible(&failure)
-                        && index + 1 < candidate_count
-                        && group.fallback_enabled;
+                    let can_retry =
+                        !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider)
+                            && fallback_eligible(&failure)
+                            && index + 1 < candidate_count
+                            && group.fallback_enabled;
                     if can_retry {
                         append_event(
                             &state.store,
@@ -764,14 +870,14 @@ async fn proxy_dispatch(
                         &state,
                         request_id,
                         Some(&provider.id),
-                        Some(StatusCode::BAD_GATEWAY),
+                        Some(downstream_status),
                         "failed",
                         (index + 1) as u16,
                         started_at,
                         Some(&message),
                     );
                     return Ok(api_error_response(
-                        StatusCode::BAD_GATEWAY,
+                        downstream_status,
                         failure_error_code(&failure.kind),
                         &message,
                     ));
@@ -866,7 +972,10 @@ async fn proxy_dispatch(
                     Some(&message),
                 );
                 last_error = Some(message.clone());
-                if index + 1 < candidate_count && group.fallback_enabled {
+                if !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider)
+                    && index + 1 < candidate_count
+                    && group.fallback_enabled
+                {
                     append_event(
                         &state.store,
                         "fallback",
@@ -902,6 +1011,7 @@ async fn proxy_dispatch(
                 let oauth_refresh_error = response.oauth_refresh_error().map(str::to_string);
                 let oauth_refresh_failure = response.oauth_refresh_failure().cloned();
                 let retry_after = response.retry_after_seconds();
+                let error_headers = response.public_error_headers();
                 let body_text = match tokio::time::timeout(
                     UPSTREAM_ERROR_BODY_TIMEOUT,
                     response.text(),
@@ -912,6 +1022,34 @@ async fn proxy_dispatch(
                     Ok(Err(error)) => format!("读取上游错误响应失败: {error}"),
                     Err(_) => "读取上游错误响应超时".to_string(),
                 };
+                if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
+                    let message = compact_error_body(&body_text);
+                    record_request_attempt_finish(
+                        &state,
+                        request_id,
+                        attempt,
+                        Some(status),
+                        "failed",
+                        attempt_started_at,
+                        Some(&message),
+                    );
+                    record_request_finish(
+                        &state,
+                        request_id,
+                        Some(&provider.id),
+                        Some(status),
+                        "failed",
+                        attempt,
+                        started_at,
+                        Some(&message),
+                    );
+                    let mut downstream = Response::builder()
+                        .status(status)
+                        .body(Body::from(body_text))
+                        .map_err(|e| e.to_string())?;
+                    downstream.headers_mut().extend(error_headers);
+                    return Ok(downstream);
+                }
                 let failure = oauth_refresh_failure
                     .unwrap_or_else(|| classify_failure(Some(status.as_u16()), &body_text));
                 if !matches!(status.as_u16(), 401 | 429)
@@ -1018,7 +1156,8 @@ async fn proxy_dispatch(
                 // 上游在尚未提交任何响应前返回了明确的 HTTP 失败。无论本地能否
                 // 精确识别其语义，都应给组内下一个 provider 一个机会；否则诸如
                 // 404/405/422 的兼容层差异会直接终止 Codex 对话。
-                let can_retry = !client_version_incompatible
+                let can_retry = !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider)
+                    && !client_version_incompatible
                     && !codex_companion_health::is_content_moderation_failure(&body_text)
                     && index + 1 < candidate_count
                     && group.fallback_enabled;
@@ -1102,6 +1241,32 @@ async fn proxy_dispatch(
                         codex_companion_health::extend_cooldown(health, seconds)
                     });
                 }
+                if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
+                    record_request_attempt_finish(
+                        &state,
+                        request_id,
+                        attempt,
+                        None,
+                        "failed",
+                        attempt_started_at,
+                        Some(&message),
+                    );
+                    record_request_finish(
+                        &state,
+                        request_id,
+                        Some(&provider.id),
+                        Some(StatusCode::BAD_GATEWAY),
+                        "failed",
+                        attempt,
+                        started_at,
+                        Some(&message),
+                    );
+                    return Ok(api_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "chatgpt_plan_request_failed",
+                        &message,
+                    ));
+                }
                 last_error = Some(message.clone());
                 record_request_attempt_finish(
                     &state,
@@ -1112,7 +1277,8 @@ async fn proxy_dispatch(
                     attempt_started_at,
                     Some(&message),
                 );
-                let can_retry = fallback_eligible(&failure)
+                let can_retry = !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider)
+                    && fallback_eligible(&failure)
                     && index + 1 < candidate_count
                     && group.fallback_enabled;
                 if can_retry {
@@ -1441,6 +1607,29 @@ fn unavailable_providers_message(
     format!("{prefix}；{}", reasons.join("；"))
 }
 
+pub(crate) fn prioritize_bound_plans(candidates: &mut Vec<ProviderConfig>) {
+    // Move only a bound authorization ahead of its source, preserving group order.
+    let bindings = candidates
+        .iter()
+        .filter(|p| codex_companion_provider::chatgpt_plan::is_chatgpt_plan(p))
+        .filter_map(|p| {
+            codex_companion_provider::chatgpt_plan::bound_source(p)
+                .map(|source| (p.id.clone(), source))
+        })
+        .collect::<Vec<_>>();
+    for (plan, source) in bindings {
+        if let (Some(p), Some(s)) = (
+            candidates.iter().position(|p| p.id == plan),
+            candidates.iter().position(|p| p.id == source),
+        ) {
+            if p > s {
+                let provider = candidates.remove(p);
+                candidates.insert(s, provider);
+            }
+        }
+    }
+}
+
 pub(crate) fn provider_available(
     state: &RelayState,
     provider: &ProviderConfig,
@@ -1460,6 +1649,31 @@ pub(crate) fn provider_available(
             chrono::Utc::now(),
         )
         .is_none()
+        && codex_companion_provider::chatgpt_plan::bound_source(current).is_none_or(|id| {
+            config.providers.get(&id).is_some_and(|source| {
+                source.enabled
+                    && codex_companion_core::account_policy_block_reason(
+                        &config.relay.account_protection,
+                        source,
+                        model,
+                        chrono::Utc::now(),
+                    )
+                    .is_none()
+                    && config.health.get(&id).is_none_or(|health| {
+                        health.status != HealthStatusKind::AuthFailed
+                            && !codex_companion_health::provider_cooldown_active(
+                                &source.kind,
+                                health,
+                            )
+                    })
+                    && model.is_none_or(|m| {
+                        !state
+                            .api_service
+                            .model_cooldown_active(&id, m)
+                            .unwrap_or(true)
+                    })
+            })
+        })
         && current.auth_ref == provider.auth_ref
         && current.direct_auth_ref == provider.direct_auth_ref
         && current.websocket_url == provider.websocket_url
@@ -1469,6 +1683,10 @@ pub(crate) fn provider_available(
             health.status != HealthStatusKind::AuthFailed
                 && !codex_companion_health::provider_cooldown_active(&current.kind, health)
         })
+        && (!codex_companion_provider::chatgpt_plan::is_chatgpt_plan(current)
+            || codex_companion_provider::chatgpt_plan::plan_binding_valid(&state.store, current))
+        && model
+            .is_none_or(|model| crate::account_models::allowed(&state.api_service, current, model))
         && (current.kind != ProviderKind::OfficialCodex
             || model.is_none_or(|model| {
                 !state
@@ -3021,7 +3239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_when_sse_frame_reaches_the_eight_mib_limit() {
+    async fn falls_back_when_sse_frame_reaches_the_fifty_mib_limit() {
         let provider_a_hits = Arc::new(AtomicUsize::new(0));
         let provider_b_hits = Arc::new(AtomicUsize::new(0));
         let mut frame = Vec::with_capacity(MAX_SSE_FRAME_BYTES);

@@ -4,7 +4,7 @@ use codex_companion_core::{append_diagnostic_log, record_usage_attribution, Conf
 use futures_util::StreamExt;
 use serde_json::Value;
 
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = crate::upstream::MAX_SSE_FRAME_BYTES;
 
 pub(crate) struct UsageCapture {
     store: ConfigStore,
@@ -14,6 +14,9 @@ pub(crate) struct UsageCapture {
     sse: bool,
     buffer: Vec<u8>,
     done: bool,
+    terminal: bool,
+    finished: bool,
+    track_lifecycle: bool,
 }
 
 impl UsageCapture {
@@ -32,14 +35,30 @@ impl UsageCapture {
             sse,
             buffer: Vec::new(),
             done: false,
+            terminal: false,
+            finished: false,
+            track_lifecycle: false,
         }
     }
 
     pub(crate) fn observe(&mut self, value: &Value) {
+        let response = value.get("response").unwrap_or(value);
+        if let Some(tier) = response.get("service_tier").and_then(Value::as_str) {
+            let _ = crate::ApiServiceStore::from_config_store(&self.store)
+                .record_actual_service_tier(&self.request, tier);
+        }
+        if matches!(
+            value["type"].as_str(),
+            Some("response.completed" | "response.incomplete" | "response.failed" | "error")
+        ) || matches!(
+            response["status"].as_str(),
+            Some("completed" | "incomplete" | "failed" | "cancelled")
+        ) {
+            self.terminal = true;
+        }
         if self.done {
             return;
         }
-        let response = value.get("response").unwrap_or(value);
         if !matches!(
             response.get("status").and_then(Value::as_str),
             Some("completed" | "incomplete")
@@ -47,6 +66,9 @@ impl UsageCapture {
             return;
         }
         self.done = true;
+        if self.session.is_empty() {
+            return;
+        }
         if let Err(error) = record_usage_attribution(
             &self.store.data_dir(),
             &self.request,
@@ -60,6 +82,7 @@ impl UsageCapture {
     }
 
     fn finish(&mut self) {
+        self.finished = true;
         if self.done || !self.sse {
             return;
         }
@@ -120,6 +143,18 @@ impl UsageCapture {
     }
 }
 
+impl Drop for UsageCapture {
+    fn drop(&mut self) {
+        if self.track_lifecycle && !self.finished && !self.terminal {
+            let _ = crate::ApiServiceStore::from_config_store(&self.store).record_stream_outcome(
+                &self.request,
+                "cancelled",
+                Some("client_cancelled"),
+            );
+        }
+    }
+}
+
 /// Observe the converted downstream body without changing forwarded bytes.
 pub(crate) fn capture_usage(
     response: Response,
@@ -128,9 +163,7 @@ pub(crate) fn capture_usage(
     session: Option<&str>,
     provider: &str,
 ) -> Response {
-    let Some(session) = session else {
-        return response;
-    };
+    let session = session.unwrap_or("");
     // Compressed bytes cannot be inspected without changing the transport.
     if response
         .headers()
@@ -145,7 +178,9 @@ pub(crate) fn capture_usage(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let sse = content_type.contains("text/event-stream");
-    let capture = UsageCapture::new(store, request.into(), session.into(), provider.into(), sse);
+    let mut capture =
+        UsageCapture::new(store, request.into(), session.into(), provider.into(), sse);
+    capture.track_lifecycle = true;
     let (parts, body) = response.into_parts();
     let stream = futures_util::stream::unfold(
         (body.into_data_stream(), capture),
@@ -155,6 +190,13 @@ pub(crate) fn capture_usage(
                     match &chunk {
                         Ok(bytes) => capture.push(bytes),
                         Err(_) => {
+                            capture.finished = true;
+                            let _ = crate::ApiServiceStore::from_config_store(&capture.store)
+                                .record_stream_outcome(
+                                    &capture.request,
+                                    "failed",
+                                    Some("upstream_stream_read_failed"),
+                                );
                             capture.done = true;
                             capture.buffer.clear();
                         }

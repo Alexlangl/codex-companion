@@ -1,6 +1,7 @@
 mod account_refresh;
 mod agent_identity;
 mod auth;
+pub mod chatgpt_plan;
 mod codex_identity;
 mod codex_oauth;
 mod export;
@@ -115,7 +116,7 @@ pub(crate) fn with_private_auth_file_lock<T>(
     operation()
 }
 
-fn lock_private_auth_file(path: &Path) -> Result<fs::File> {
+pub(crate) fn lock_private_auth_file(path: &Path) -> Result<fs::File> {
     let parent = path
         .parent()
         .map(Path::to_path_buf)

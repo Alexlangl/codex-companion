@@ -700,6 +700,7 @@ dependencies = [
  "codex-companion-core",
  "codex-companion-daemon",
  "codex-companion-provider",
+ "codex-companion-state",
  "rand 0.9.4",
  "reqwest 0.12.28",
  "serde",
@@ -738,7 +739,9 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "futures-util",
+ "rand 0.9.4",
  "reqwest 0.12.28",
+ "ring",
  "rquickjs",
  "serde",
  "serde_json",
@@ -765,6 +768,7 @@ dependencies = [
  "codex-companion-provider",
  "flate2",
  "futures-util",
+ "memchr",
  "rand 0.9.4",
  "reqwest 0.12.28",
  "rusqlite",
@@ -796,6 +800,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml_edit 0.23.10+spec-1.0.0",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]

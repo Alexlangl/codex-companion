@@ -45,6 +45,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rquickjs = { version = "0.8", features = ["array-buffer", "classes"] }
 rand = "0.9"
 regex = "1.12"
+ring = "0.17"
+memchr = "2"
 rust_decimal = { version = "1.39", default-features = false, features = ["std"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 serde = { version = "1.0", features = ["derive"] }

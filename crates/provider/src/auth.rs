@@ -5,6 +5,9 @@ use codex_companion_core::{
 use std::fs;
 
 pub fn resolve_auth_token(provider: &ProviderConfig) -> Option<String> {
+    if crate::chatgpt_plan::is_chatgpt_plan(provider) {
+        return None;
+    }
     let auth_ref = provider_relay_auth_ref(provider)?;
     if let Some(name) = auth_ref.strip_prefix("env:") {
         return std::env::var(name).ok().filter(|value| !value.is_empty());
@@ -47,6 +50,11 @@ pub fn resolve_auth_token(provider: &ProviderConfig) -> Option<String> {
 
 /// Prefer credential identity so aliases cannot evade account-wide admission.
 pub fn account_identity_key(provider: &ProviderConfig) -> String {
+    if crate::chatgpt_plan::is_chatgpt_plan(provider) {
+        if let Some(key) = crate::chatgpt_plan::bound_concurrency_key(provider) {
+            return key;
+        }
+    }
     if provider.kind == ProviderKind::OfficialCodex {
         if let Some(path) = provider_relay_auth_ref(provider).and_then(|s| s.strip_prefix("file:"))
         {

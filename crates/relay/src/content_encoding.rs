@@ -4,7 +4,7 @@ use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use std::fmt;
 use std::io::{Cursor, Read};
 
-pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 200 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BODY_BYTES: usize = usize::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequestBodyDecodeError {

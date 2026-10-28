@@ -13,6 +13,7 @@ export function resolveProviderLaunchMode(
 }
 
 export function canDirectLaunch(provider: ProviderConfig, directConnectProviderIds?: readonly string[]): boolean {
+  if (provider.account?.authMode === "chatgpt_plan") return false;
   if (directConnectProviderIds !== undefined) {
     return directConnectProviderIds.includes(provider.id);
   }

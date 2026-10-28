@@ -151,6 +151,8 @@ pub struct RelayConfig {
     pub host: String,
     pub port: u16,
     pub active_group_id: String,
+    #[serde(default = "enabled_by_default")]
+    pub map_session_ids: bool,
     #[serde(default)]
     pub require_api_key: bool,
     #[serde(default)]
@@ -197,6 +199,7 @@ impl Default for RelayConfig {
             host: DEFAULT_RELAY_HOST.to_string(),
             port: DEFAULT_RELAY_PORT,
             active_group_id: DEFAULT_GROUP_ID.to_string(),
+            map_session_ids: true,
             require_api_key: false,
             retry_budget: 0,
             model_cooldown_seconds: default_model_cooldown_seconds(),
@@ -399,6 +402,8 @@ pub fn default_request_log_retention_days() -> u16 {
 #[serde(rename_all = "camelCase")]
 pub struct RelaySettingsUpdate {
     pub host: String,
+    #[serde(default)]
+    pub map_session_ids: Option<bool>,
     pub require_api_key: bool,
     pub retry_budget: u16,
     pub model_cooldown_seconds: u64,
@@ -501,6 +506,8 @@ pub struct ApiRequestAttemptLog {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiRequestLog {
+    #[serde(default)]
+    pub actual_service_tier: Option<String>,
     pub request_id: String,
     pub started_at: DateTime<Utc>,
     pub method: String,
@@ -985,4 +992,8 @@ pub struct PricingSettingsSnapshot {
     pub builtin_models: Vec<ModelPriceSettings>,
     pub overrides: PricingSettings,
     pub pricing_as_of: String,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }

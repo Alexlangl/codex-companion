@@ -1,6 +1,8 @@
+mod history_index_repair;
 mod model_catalog;
 mod pricing;
 mod repair_history;
+pub use history_index_repair::{repair_history_index, HistoryIndexRepairReport};
 mod session_index;
 mod token_usage;
 

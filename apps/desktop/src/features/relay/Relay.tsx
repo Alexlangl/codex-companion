@@ -411,6 +411,13 @@ export function Relay({ active, status }: RelayProps) {
                   无感连接；浏览器跨域请求始终需要有效密钥。开启严格模式前请先创建
                   client。
                 </p>
+                <label className="check-row">
+                  <input type="checkbox" checked={settings.mapSessionIds ?? true} onChange={(event) => {
+                    setSettingsSaved(false);
+                    setSettings((current) => ({ ...current, mapSessionIds: event.target.checked }));
+                  }} />
+                  <span>按账号隔离会话 ID（关闭后转发原始 Session-Id 和 Thread-Id）</span>
+                </label>
                 <div className="form-grid">
                   <NumberSetting
                     label="重试预算"
@@ -950,7 +957,8 @@ function requestParameterSummary(request: ApiRequestLog): string {
   const parameters = [
     request.model ?? "未指定模型",
     request.reasoningEffort ? `推理 ${request.reasoningEffort}` : null,
-    request.serviceTier ? `服务 ${request.serviceTier}` : null,
+    request.serviceTier ? `请求服务 ${request.serviceTier}` : null,
+    request.actualServiceTier ? `实际服务 ${request.actualServiceTier}` : null,
   ].filter((value): value is string => value !== null);
   return parameters.join(" · ");
 }
@@ -1127,6 +1135,7 @@ function relaySettingsFromStatus(status: CompanionStatus): RelaySettingsUpdate {
   const relay = status.config.relay;
   return {
     host: relay.host,
+    mapSessionIds: relay.mapSessionIds ?? true,
     requireApiKey: relay.requireApiKey,
     retryBudget: relay.retryBudget,
     modelCooldownSeconds: relay.modelCooldownSeconds,
@@ -1169,6 +1178,8 @@ function outcomeLabel(outcome: string) {
       return "本地";
     case "failed":
       return "失败";
+    case "cancelled":
+      return "已取消";
     case "rejected":
       return "拒绝";
     case "processing":
@@ -1180,7 +1191,7 @@ function outcomeLabel(outcome: string) {
 
 function requestOutcomeTone(outcome: string): BadgeTone {
   if (outcome === "succeeded" || outcome === "local") return "ok";
-  if (outcome === "processing") return "info";
+  if (outcome === "processing" || outcome === "cancelled") return "info";
   return "danger";
 }
 

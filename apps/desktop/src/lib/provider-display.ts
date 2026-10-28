@@ -72,6 +72,7 @@ export function providerSecondaryLine(provider: ProviderConfig) {
 }
 
 export function providerRunMode(provider: ProviderConfig, directConnectionAvailable?: boolean) {
+  if (providerUsesChatgptPlan(provider)) return "仅代理（ChatGPT 套餐）";
   if (providerEndpointIsChatCompletions(provider.baseUrl)) return "仅代理（Chat Completions）";
   if (provider.kind === "official_codex") {
     const authMode = provider.account?.authMode?.trim().toLowerCase();
@@ -91,7 +92,12 @@ export function providerRunMode(provider: ProviderConfig, directConnectionAvaila
   return "可本地代理";
 }
 
+export function providerUsesChatgptPlan(provider: ProviderConfig): boolean {
+  return provider.account?.authMode === "chatgpt_plan";
+}
+
 export function providerTypeLabel(provider: ProviderConfig) {
+  if (providerUsesChatgptPlan(provider)) return "ChatGPT 套餐授权";
   if (provider.kind === "official_codex") return "Codex 官方账号";
   return "API Key";
 }

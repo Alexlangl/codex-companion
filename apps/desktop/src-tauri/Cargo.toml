@@ -24,6 +24,7 @@ chrono.workspace = true
 codex-companion-core.workspace = true
 codex-companion-daemon.workspace = true
 codex-companion-provider.workspace = true
+codex-companion-state.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

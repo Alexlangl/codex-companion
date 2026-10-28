@@ -38,7 +38,6 @@ use tokio_tungstenite::{
 
 const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WEBSOCKET_PREFLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const WEBSOCKET_PREFLIGHT_MAX_DURATION: Duration = Duration::from_secs(120);
 const WEBSOCKET_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_WEBSOCKET_PREFLIGHT_MESSAGES: usize = 128;
 const MAX_WEBSOCKET_PREFLIGHT_BYTES: usize = 1024 * 1024;
@@ -63,7 +62,7 @@ struct ConnectedWebSocket {
 }
 
 pub(crate) async fn responses_websocket(
-    State(state): State<RelayState>,
+    State(mut state): State<RelayState>,
     websocket: WebSocketUpgrade,
     headers: HeaderMap,
 ) -> Response {
@@ -91,6 +90,8 @@ pub(crate) async fn responses_websocket(
     let allowed_models = api_client
         .map(|api_client| api_client.allowed_models)
         .unwrap_or_default();
+    state.websocket_session_headers = headers.clone();
+    let lite = headers.contains_key(crate::responses_lite::HEADER);
     let session_id = websocket_session_id(&headers);
     let preferred_provider = session_id.as_deref().and_then(|session_id| {
         state
@@ -147,6 +148,7 @@ pub(crate) async fn responses_websocket(
                 allowed_models,
                 client_id,
                 session_id,
+                lite,
             )
         })
         .into_response();
@@ -343,6 +345,9 @@ fn websocket_candidates_from_selected(
         let preferred = candidates.remove(index);
         candidates.insert(0, preferred);
     }
+    if preferred_provider.is_none() {
+        crate::proxy::prioritize_bound_plans(&mut candidates);
+    }
     if !group.fallback_enabled {
         candidates.truncate(1);
     }
@@ -355,6 +360,8 @@ fn websocket_candidates_from_selected(
 fn websocket_session_id(headers: &HeaderMap) -> Option<String> {
     [
         "session_id",
+        "session-id",
+        "thread-id",
         "x-session-id",
         "x-amp-thread-id",
         "x-client-request-id",
@@ -405,6 +412,35 @@ impl WebSocketConnectError {
     }
 }
 
+fn forward_session_headers(
+    state: &RelayState,
+    provider: &ProviderConfig,
+    request: &mut tokio_tungstenite::tungstenite::http::Request<()>,
+) {
+    let mut headers = HeaderMap::new();
+    for key in [
+        "session-id",
+        "session_id",
+        "thread-id",
+        "thread_id",
+        "x-session-id",
+        "x-amp-thread-id",
+    ] {
+        if let Some(value) = state.websocket_session_headers.get(key) {
+            headers.insert(key, value.clone());
+        }
+    }
+    crate::session_identity::headers(provider, &mut headers, session_mapping_enabled(state));
+    request.headers_mut().extend(headers);
+}
+fn session_mapping_enabled(state: &RelayState) -> bool {
+    state
+        .store
+        .load()
+        .map(|c| c.relay.map_session_ids)
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 async fn connect_provider_websocket(
     state: &RelayState,
@@ -446,7 +482,14 @@ async fn connect_provider_websocket_with_options(
         .as_ref()
         .and_then(|account| account.account_id.clone())
         .filter(|account_id| !account_id.trim().is_empty());
-    let mut authorization = if provider.kind == ProviderKind::OfficialCodex {
+    let mut authorization = if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+        Some(format!(
+            "Bearer {}",
+            codex_companion_provider::chatgpt_plan::ensure_plan_access(provider)
+                .await
+                .map_err(WebSocketConnectError::message)?
+        ))
+    } else if provider.kind == ProviderKind::OfficialCodex {
         if provider_uses_agent_identity(provider) {
             let auth = ensure_agent_identity_authorization(&state.client, provider, None)
                 .await
@@ -466,12 +509,13 @@ async fn connect_provider_websocket_with_options(
     } else {
         resolve_auth_token(provider).map(|token| format!("Bearer {token}"))
     };
-    let request = websocket_request_with_account_id(
+    let mut request = websocket_request_with_account_id(
         provider,
         authorization.as_deref(),
         chatgpt_account_id.as_deref(),
     )
     .map_err(WebSocketConnectError::message)?;
+    forward_session_headers(state, provider, &mut request);
     let websocket = match connect_websocket_with_timeout(request).await {
         Ok(websocket) => websocket,
         Err(error)
@@ -485,12 +529,13 @@ async fn connect_provider_websocket_with_options(
             )
             .await
             .map_err(|error| WebSocketConnectError::message(error.to_string()))?;
-            let request = websocket_request_with_account_id(
+            let mut request = websocket_request_with_account_id(
                 provider,
                 Some(&auth.header),
                 chatgpt_account_id.as_deref(),
             )
             .map_err(WebSocketConnectError::message)?;
+            forward_session_headers(state, provider, &mut request);
             connect_websocket_with_timeout(request)
                 .await
                 .map_err(|error| error.with_prefix("WebSocket task 恢复后仍连接失败"))?
@@ -515,12 +560,13 @@ async fn connect_provider_websocket_with_options(
                     .map_err(|refresh_error| refresh_error.with_prefix("OAuth 401 后刷新失败"))?;
             chatgpt_account_id = auth.account_id.or(chatgpt_account_id);
             authorization = Some(format!("Bearer {}", auth.access_token));
-            let request = websocket_request_with_account_id(
+            let mut request = websocket_request_with_account_id(
                 provider,
                 authorization.as_deref(),
                 chatgpt_account_id.as_deref(),
             )
             .map_err(WebSocketConnectError::message)?;
+            forward_session_headers(state, provider, &mut request);
             connect_websocket_with_timeout(request)
                 .await
                 .map_err(|error| error.with_prefix("OAuth 刷新后仍连接失败"))?
@@ -669,7 +715,11 @@ async fn connect_candidate_websocket_from(
         .cloned()
         .collect::<Vec<_>>();
     while !remaining.is_empty() {
-        remaining.retain(|p| websocket_provider_available(state, p, replay));
+        remaining.retain(|p| {
+            websocket_provider_available(state, p, replay)
+                && !(codex_companion_provider::chatgpt_plan::is_chatgpt_plan(p)
+                    && replay.is_some_and(|f| frame_previous_response(f).is_some()))
+        });
         if remaining.is_empty() {
             break;
         }
@@ -707,7 +757,11 @@ async fn connect_candidate_websocket_from(
                 if let Some(frame) = replay {
                     if let Err(error) = upstream
                         .websocket
-                        .send(client_to_upstream_for_provider(frame.clone(), provider))
+                        .send(client_to_upstream_for_provider(
+                            frame.clone(),
+                            provider,
+                            session_mapping_enabled(state),
+                        ))
                         .await
                     {
                         let message = format!("WebSocket 重放请求失败: {error}");
@@ -764,7 +818,11 @@ async fn connect_next_websocket(
         .map(|index| candidates[index].clone())
         .collect::<Vec<_>>();
     while !remaining.is_empty() {
-        remaining.retain(|p| websocket_provider_available(state, p, replay));
+        remaining.retain(|p| {
+            websocket_provider_available(state, p, replay)
+                && !(codex_companion_provider::chatgpt_plan::is_chatgpt_plan(p)
+                    && replay.is_some_and(|f| frame_previous_response(f).is_some()))
+        });
         if remaining.is_empty() {
             break;
         }
@@ -798,7 +856,11 @@ async fn connect_next_websocket(
                 if let Some(frame) = replay {
                     if let Err(error) = upstream
                         .websocket
-                        .send(client_to_upstream_for_provider(frame.clone(), provider))
+                        .send(client_to_upstream_for_provider(
+                            frame.clone(),
+                            provider,
+                            session_mapping_enabled(state),
+                        ))
                         .await
                     {
                         let message = format!("WebSocket 重放请求失败: {error}");
@@ -848,6 +910,9 @@ fn websocket_request(
 // Third-party providers still opt in with an explicit endpoint because many
 // Responses-compatible HTTP APIs do not expose a WebSocket transport.
 fn effective_websocket_url(provider: &ProviderConfig) -> Option<String> {
+    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+        return Some("wss://api.openai.com/v1/responses".into());
+    }
     if let Some(url) = provider
         .websocket_url
         .as_deref()
@@ -956,6 +1021,7 @@ async fn bridge_websocket(
     allowed_models: Vec<String>,
     client_id: Option<String>,
     session_id: Option<String>,
+    lite: bool,
 ) {
     let (mut client_sink, mut client_stream) = client.split();
     let ConnectedWebSocket {
@@ -968,6 +1034,8 @@ async fn bridge_websocket(
     let mut upstream_stream = Some(upstream_stream);
     let mut pending = PendingWebSocketResponse::default();
     let mut session_model: Option<String> = None;
+    let mut session_tools: Option<Value> = None;
+    let mut connection_responses = HashSet::<String>::new();
     let mut attempted = HashSet::from([candidate_index]);
     let mut request_guard = state.begin_provider_request(&provider.id);
     request_guard.account_permit = Some(permit);
@@ -982,16 +1050,7 @@ async fn bridge_websocket(
                     } else {
                         WEBSOCKET_PREFLIGHT_IDLE_TIMEOUT
                     };
-                if pending.visible_output {
-                    idle_deadline
-                } else {
-                    pending
-                        .started_at
-                        .map(|started_at| {
-                            idle_deadline.min(started_at + WEBSOCKET_PREFLIGHT_MAX_DURATION)
-                        })
-                        .unwrap_or(idle_deadline)
-                }
+                idle_deadline
             });
             let disabled_deadline = tokio::time::Instant::now() + Duration::from_secs(86_400);
             tokio::select! {
@@ -1009,6 +1068,7 @@ async fn bridge_websocket(
                     break;
                 };
                 let message = inherit_session_model(message, session_model.as_deref());
+                let message = inherit_session_tools(message, &mut session_tools, lite);
                 let response_create = frame_has_type(&message, "response.create");
                 if frame_has_type(&message, "session.update")
                     && !websocket_provider_available(&state, &provider, Some(&message))
@@ -1021,6 +1081,29 @@ async fn bridge_websocket(
                         break;
                     }
                     continue;
+                }
+                if response_create {
+                    let model = frame_model(&message);
+                    for candidate in &candidates {
+                        crate::account_models::warm_plan_catalog(
+                            &state,
+                            candidate,
+                            model.as_deref(),
+                        )
+                        .await;
+                    }
+                    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
+                        if frame_previous_response(&message).is_some_and(|id| {
+                            upstream_sink.is_none() || !connection_responses.contains(&id)
+                        }) {
+                            let _ = client_sink
+                                .send(websocket_failed_event(
+                                    "ChatGPT 套餐续接 ID 不属于当前连接，请发送完整 input 历史",
+                                ))
+                                .await;
+                            continue;
+                        }
+                    }
                 }
                 if response_create
                     && !websocket_provider_available(&state, &provider, Some(&message))
@@ -1084,6 +1167,7 @@ async fn bridge_websocket(
                     break;
                 }
                 if upstream_sink.is_none() {
+                    connection_responses.clear();
                     if response_cancel {
                         continue;
                     }
@@ -1139,7 +1223,11 @@ async fn bridge_websocket(
                 let send_result = upstream_sink
                     .as_mut()
                     .expect("upstream sink checked above")
-                    .send(client_to_upstream_for_provider(message.clone(), &provider))
+                    .send(client_to_upstream_for_provider(
+                        message.clone(),
+                        &provider,
+                        session_mapping_enabled(&state),
+                    ))
                     .await;
                 if let Err(error) = send_result {
                     let detail = format!("向上游发送 WebSocket 帧失败: {error}");
@@ -1283,7 +1371,10 @@ async fn bridge_websocket(
                     UpstreamMessage::Ping(_) | UpstreamMessage::Pong(_)
                 ) {
                     if client_sink
-                        .send(upstream_to_client(upstream_message))
+                        .send(restore_websocket_tools(
+                            upstream_message,
+                            &pending.tool_identity,
+                        ))
                         .await
                         .is_err()
                     {
@@ -1319,7 +1410,36 @@ async fn bridge_websocket(
                 }
                 last_upstream_activity = tokio::time::Instant::now();
 
-                let upstream_event = inspect_upstream_message(&upstream_message);
+                let upstream_event =
+                    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
+                        let payload = match &upstream_message {
+                            UpstreamMessage::Text(t) => t.as_bytes(),
+                            UpstreamMessage::Binary(b) => b.as_ref(),
+                            _ => &[],
+                        };
+                        let value: Value = serde_json::from_slice(payload).unwrap_or(Value::Null);
+                        if value["type"] == "response.completed" {
+                            if let Some(id) = value.pointer("/response/id").and_then(Value::as_str)
+                            {
+                                connection_responses.insert(id.to_string());
+                            }
+                        }
+                        if matches!(
+                            value["type"].as_str(),
+                            Some("response.done" | "response.incomplete")
+                        ) {
+                            let detail = "ChatGPT 套餐响应缺少 response.completed 完成事件";
+                            if let Some(audit) = pending.audit.as_mut() {
+                                audit.finish(Some(502), "failed", Some(detail));
+                            }
+                            let _ = client_sink.send(websocket_failed_event(detail)).await;
+                            pending.clear();
+                            continue;
+                        }
+                        inspect_upstream_message(&upstream_message)
+                    } else {
+                        inspect_upstream_message(&upstream_message)
+                    };
                 let terminal_failure =
                     matches!(&upstream_event, WebSocketUpstreamEvent::Failure { .. });
                 match upstream_event {
@@ -1445,7 +1565,10 @@ async fn bridge_websocket(
                                 break;
                             }
                             if client_sink
-                                .send(upstream_to_client(upstream_message))
+                                .send(restore_websocket_tools(
+                                    upstream_message,
+                                    &pending.tool_identity,
+                                ))
                                 .await
                                 .is_err()
                             {
@@ -1477,7 +1600,10 @@ async fn bridge_websocket(
                             break;
                         }
                         if client_sink
-                            .send(upstream_to_client(upstream_message))
+                            .send(restore_websocket_tools(
+                                upstream_message,
+                                &pending.tool_identity,
+                            ))
                             .await
                             .is_err()
                         {
@@ -1537,7 +1663,10 @@ async fn bridge_websocket(
                     break;
                 }
                 if client_sink
-                    .send(upstream_to_client(upstream_message))
+                    .send(restore_websocket_tools(
+                        upstream_message,
+                        &pending.tool_identity,
+                    ))
                     .await
                     .is_err()
                 {
@@ -1584,6 +1713,7 @@ async fn bridge_websocket(
 #[derive(Default)]
 struct PendingWebSocketResponse {
     audit: Option<WebSocketRequestAudit>,
+    tool_identity: crate::tool_identity::ToolIdentity,
     request: Option<ClientMessage>,
     started_at: Option<tokio::time::Instant>,
     visible_output: bool,
@@ -1594,6 +1724,12 @@ struct PendingWebSocketResponse {
 
 impl PendingWebSocketResponse {
     fn begin(&mut self, request: ClientMessage) {
+        let payload: &[u8] = match &request {
+            ClientMessage::Text(t) => t.as_bytes(),
+            ClientMessage::Binary(b) => b.as_ref(),
+            _ => &[],
+        };
+        self.tool_identity = crate::tool_identity::ToolIdentity::from_request(payload);
         self.request = Some(request);
         self.started_at = Some(tokio::time::Instant::now());
         self.visible_output = false;
@@ -1682,11 +1818,14 @@ async fn recover_websocket_before_output(
     allow_current_provider_reconnect: bool,
 ) -> bool {
     record_websocket_failure(state, provider, status, failure, detail);
-    if !pending.can_replay() || codex_companion_health::is_content_moderation_failure(detail) {
-        return false;
-    }
     if let Some(audit) = pending.audit.as_mut() {
         audit.fail(status, detail);
+    }
+    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider)
+        || !pending.can_replay()
+        || codex_companion_health::is_content_moderation_failure(detail)
+    {
+        return false;
     }
     let replay = pending.request.as_ref();
     match connect_next_websocket(
@@ -1810,6 +1949,7 @@ async fn reconnect_current_websocket(
             .send(client_to_upstream_for_provider(
                 frame.clone(),
                 &current_provider,
+                session_mapping_enabled(state),
             ))
             .await
         {
@@ -1877,6 +2017,7 @@ async fn refresh_and_reconnect_current_oauth_websocket(
             .send(client_to_upstream_for_provider(
                 frame.clone(),
                 &current_provider,
+                session_mapping_enabled(state),
             ))
             .await
             .map_err(|error| {
@@ -2039,7 +2180,7 @@ async fn flush_pending_messages(
 ) -> Result<(), ()> {
     while let Some(message) = pending.prefetched.pop_front() {
         client_sink
-            .send(upstream_to_client(message))
+            .send(restore_websocket_tools(message, &pending.tool_identity))
             .await
             .map_err(|_| ())?;
     }
@@ -2218,8 +2359,13 @@ fn client_to_upstream(message: ClientMessage, provider_kind: &ProviderKind) -> U
 fn client_to_upstream_for_provider(
     message: ClientMessage,
     provider: &ProviderConfig,
+    map_session_ids: bool,
 ) -> UpstreamMessage {
-    client_message_to_upstream(normalize_client_frame_for_provider(message, provider))
+    client_message_to_upstream(normalize_client_frame_for_provider(
+        message,
+        provider,
+        map_session_ids,
+    ))
 }
 
 fn client_message_to_upstream(message: ClientMessage) -> UpstreamMessage {
@@ -2232,16 +2378,81 @@ fn client_message_to_upstream(message: ClientMessage) -> UpstreamMessage {
     }
 }
 
+fn frame_previous_response(message: &ClientMessage) -> Option<String> {
+    let payload: &[u8] = match message {
+        ClientMessage::Text(t) => t.as_bytes(),
+        ClientMessage::Binary(b) => b.as_ref(),
+        _ => return None,
+    };
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    value
+        .get("response")
+        .unwrap_or(&value)
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn inherit_session_tools(
+    message: ClientMessage,
+    session_tools: &mut Option<Value>,
+    lite: bool,
+) -> ClientMessage {
+    let payload: &[u8] = match &message {
+        ClientMessage::Text(t) => t.as_bytes(),
+        ClientMessage::Binary(b) => b.as_ref(),
+        _ => return message,
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(payload) else {
+        return message;
+    };
+    match value["type"].as_str() {
+        Some("session.update") => {
+            let session = value.get("session").unwrap_or(&value);
+            if let Some(tools) = session.get("tools") {
+                *session_tools = Some(tools.clone());
+            }
+        }
+        Some("response.create") => {
+            let request = if value["response"].is_object() {
+                &mut value["response"]
+            } else {
+                &mut value
+            };
+            if let Some(object) = request.as_object_mut() {
+                if let Some(tools) = session_tools.as_ref() {
+                    object.entry("tools").or_insert_with(|| tools.clone());
+                }
+                if lite {
+                    let metadata = object.entry("client_metadata").or_insert_with(|| json!({}));
+                    if !metadata.is_object() {
+                        *metadata = json!({});
+                    }
+                    metadata["ws_request_header_x_openai_internal_codex_responses_lite"] =
+                        json!(true);
+                }
+            }
+        }
+        _ => return message,
+    }
+    match message {
+        ClientMessage::Binary(_) => ClientMessage::Binary(value.to_string().into_bytes().into()),
+        _ => ClientMessage::Text(value.to_string().into()),
+    }
+}
+
 fn normalize_client_frame_for_provider(
     message: ClientMessage,
     provider: &ProviderConfig,
+    map_session_ids: bool,
 ) -> ClientMessage {
     match message {
         ClientMessage::Text(text) => {
             let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
                 return ClientMessage::Text(text);
             };
-            if !normalize_client_json_for_provider(&mut value, provider) {
+            crate::session_identity::body(provider, &mut value, map_session_ids);
+            if !normalize_client_json_for_provider(&mut value, provider) && !map_session_ids {
                 return ClientMessage::Text(text);
             }
             ClientMessage::Text(value.to_string().into())
@@ -2250,7 +2461,8 @@ fn normalize_client_frame_for_provider(
             let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
                 return ClientMessage::Binary(bytes);
             };
-            if !normalize_client_json_for_provider(&mut value, provider) {
+            crate::session_identity::body(provider, &mut value, map_session_ids);
+            if !normalize_client_json_for_provider(&mut value, provider) && !map_session_ids {
                 return ClientMessage::Binary(bytes);
             }
             serde_json::to_vec(&value)
@@ -2263,6 +2475,27 @@ fn normalize_client_frame_for_provider(
 
 fn normalize_client_json_for_provider(value: &mut Value, provider: &ProviderConfig) -> bool {
     let mut changed = false;
+    if value["type"] == "response.create" {
+        let mut headers = HeaderMap::new();
+        crate::responses_lite::normalize(
+            &mut headers,
+            value,
+            provider.kind == ProviderKind::OfficialCodex,
+            false,
+        );
+        if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+            let request = if value["response"].is_object() {
+                &mut value["response"]
+            } else {
+                &mut *value
+            };
+            // Admission already validated the unchanged request.
+            if crate::plan_request::normalize(request, true).is_err() {
+                return false;
+            }
+        }
+        changed = true;
+    }
     if provider.kind == ProviderKind::OfficialCodex {
         changed |= normalize_official_input_item_ids(value);
     }
@@ -2319,6 +2552,17 @@ fn websocket_provider_available(
         };
         serde_json::from_slice::<Value>(bytes).ok()
     });
+    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider)
+        && value.as_ref().is_some_and(|value| {
+            let request = value
+                .get("response")
+                .or_else(|| value.get("session"))
+                .unwrap_or(value);
+            crate::plan_request::validate(request, true).is_err()
+        })
+    {
+        return false;
+    }
     let models = value
         .as_ref()
         .map(|value| {
@@ -2420,6 +2664,20 @@ fn normalize_official_client_frame(message: ClientMessage) -> ClientMessage {
                 .unwrap_or(ClientMessage::Binary(bytes))
         }
         message => message,
+    }
+}
+
+fn restore_websocket_tools(
+    message: UpstreamMessage,
+    identity: &crate::tool_identity::ToolIdentity,
+) -> ClientMessage {
+    match message {
+        UpstreamMessage::Text(text) => {
+            let bytes = identity.restore_json(bytes::Bytes::copy_from_slice(text.as_bytes()));
+            ClientMessage::Text(String::from_utf8_lossy(&bytes).into_owned().into())
+        }
+        UpstreamMessage::Binary(bytes) => ClientMessage::Binary(identity.restore_json(bytes)),
+        message => upstream_to_client(message),
     }
 }
 
@@ -3125,7 +3383,8 @@ mod tests {
             r#"{"type":"response.create","model":"gpt-5.6-sol","response":{"model":"gpt-5.6-sol","reasoning":{"effort":"ultra"}},"session":{"model":"gpt-5.6-sol"},"reasoning_effort":"ultra"}"#.into(),
         );
 
-        let UpstreamMessage::Text(text) = client_to_upstream_for_provider(message, &provider)
+        let UpstreamMessage::Text(text) =
+            client_to_upstream_for_provider(message, &provider, false)
         else {
             panic!("expected text frame");
         };
@@ -3826,5 +4085,26 @@ mod tests {
         let _ = client.close(None).await;
         first.await.expect("first provider task");
         relay.abort();
+    }
+    #[test]
+    fn session_tools_and_lite_flags_survive_until_websocket_output_restoration() {
+        let mut tools = None;
+        inherit_session_tools(ClientMessage::Text(json!({"type":"session.update","session":{"tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"wait_agent"}]}]}}).to_string().into()), &mut tools, true);
+        let request = inherit_session_tools(
+            ClientMessage::Text(
+                json!({"type":"response.create","response":{"client_metadata":"invalid"}})
+                    .to_string()
+                    .into(),
+            ),
+            &mut tools,
+            true,
+        );
+        let mut pending = PendingWebSocketResponse::default();
+        pending.begin(request);
+        let mut item = json!({"type":"function_call","name":"collaboration-optimize__wait_agent","arguments":"opaque"});
+        assert!(pending.tool_identity.restore(&mut item));
+        assert_eq!(item["name"], "wait_agent");
+        assert_eq!(item["namespace"], "collaboration");
+        assert_eq!(item["arguments"], "opaque");
     }
 }

@@ -706,10 +706,44 @@ fn import_local_codex_provider(
 }
 
 #[tauri::command]
-fn start_codex_oauth(app: AppHandle) -> Result<codex_oauth::OAuthStartResponse, String> {
+fn start_codex_oauth(
+    app: AppHandle,
+    plan: Option<bool>,
+    provider_id: Option<String>,
+) -> Result<codex_oauth::OAuthStartResponse, String> {
     let daemon = daemon()?;
     codex_oauth::configure_event_emitter(&app);
-    codex_oauth::start(daemon.store().data_dir())
+    if plan.unwrap_or(false) {
+        codex_oauth::start_plan(daemon.store(), provider_id.as_deref())
+    } else {
+        codex_oauth::start(daemon.store().data_dir())
+    }
+}
+
+#[tauri::command]
+async fn revoke_chatgpt_plan(provider_id: String) -> Result<(), String> {
+    let daemon = daemon()?;
+    let provider = daemon
+        .store()
+        .load()
+        .map_err(|e| e.to_string())?
+        .providers
+        .get(&provider_id)
+        .cloned()
+        .ok_or("账号不存在")?;
+    if !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
+        return Err("所选账号不是 ChatGPT 套餐授权".into());
+    }
+    daemon
+        .store()
+        .update(|config| {
+            if let Some(provider) = config.providers.get_mut(&provider_id) {
+                provider.enabled = false;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    codex_companion_provider::chatgpt_plan::revoke_plan(&provider).await
 }
 
 #[tauri::command]
@@ -843,6 +877,18 @@ fn launch_cli(
     daemon()?
         .launch_cli(input)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn repair_history_index(
+    codex_dir: String,
+    dry_run: bool,
+) -> Result<codex_companion_state::HistoryIndexRepairReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_companion_state::repair_history_index(&PathBuf::from(codex_dir), dry_run)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1201,6 +1247,7 @@ pub fn run() {
             import_api_key_provider,
             import_local_codex_provider,
             start_codex_oauth,
+            revoke_chatgpt_plan,
             get_codex_oauth_status,
             open_codex_oauth,
             submit_codex_oauth_callback,
@@ -1219,6 +1266,7 @@ pub fn run() {
             preview_cli_command,
             launch_cli,
             repair,
+            repair_history_index,
             set_theme,
             set_provider_view_mode,
             set_preserve_official_codex_auth,

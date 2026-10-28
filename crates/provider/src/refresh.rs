@@ -111,6 +111,46 @@ pub async fn test_provider(provider: &ProviderConfig) -> std::result::Result<(),
 pub async fn test_provider_detailed(
     provider: &ProviderConfig,
 ) -> std::result::Result<(), ProviderTestFailure> {
+    if crate::chatgpt_plan::is_chatgpt_plan(provider) {
+        let token = crate::chatgpt_plan::ensure_plan_access(provider)
+            .await
+            .map_err(ProviderTestFailure::auth)?;
+        let client = http_client_builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| ProviderTestFailure::network("无法创建 ChatGPT 套餐检查客户端".into()))?;
+        let response = client
+            .get("https://api.openai.com/v1/models")
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| ProviderTestFailure::network("ChatGPT 套餐模型目录连接失败".into()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ProviderTestFailure {
+                status: Some(status.as_u16()),
+                retry_after_seconds: None,
+                message: format!("ChatGPT 套餐模型目录返回 {status}"),
+                classification: Some(classify_failure(
+                    Some(status.as_u16()),
+                    "ChatGPT plan model catalog unavailable",
+                )),
+            });
+        }
+        let bytes = read_response_bytes_limited(response, 4 * 1024 * 1024)
+            .await
+            .map_err(|_| ProviderTestFailure::network("ChatGPT 套餐模型目录读取失败".into()))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| ProviderTestFailure::network("ChatGPT 套餐模型目录格式无效".into()))?;
+        return if value["models"].is_array() {
+            Ok(())
+        } else {
+            Err(ProviderTestFailure::network(
+                "ChatGPT 套餐模型目录缺少 models 数组".into(),
+            ))
+        };
+    }
     if provider.kind == ProviderKind::OfficialCodex {
         if provider_uses_agent_identity(provider) {
             let client = http_client_builder()
@@ -224,7 +264,15 @@ pub(crate) async fn refresh_provider_status_inner(
     let provider = snapshot.provider.clone();
     let mut account_result = None;
     let mut api_usage_error = None;
-    let result = if provider.kind == ProviderKind::OfficialCodex {
+    let result = if crate::chatgpt_plan::is_chatgpt_plan(&provider) {
+        if !crate::chatgpt_plan::plan_binding_valid(store, &provider) {
+            Err(ProviderTestFailure::auth(
+                "绑定的官方账号不可用，请重新绑定授权",
+            ))
+        } else {
+            test_provider_detailed(&provider).await
+        }
+    } else if provider.kind == ProviderKind::OfficialCodex {
         let health_result = test_provider_detailed(&provider).await;
         if health_result.is_ok() && provider_uses_codex_oauth(&provider) {
             // The check may have synchronized or refreshed this credential.

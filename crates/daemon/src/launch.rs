@@ -689,10 +689,15 @@ pub fn provider_auto_prefers_relay(provider: &ProviderConfig) -> bool {
 }
 
 fn provider_requires_relay(provider: &ProviderConfig) -> bool {
-    matches!(provider.kind, ProviderKind::OfficialCodex) && provider_uses_agent_identity(provider)
+    codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider)
+        || (matches!(provider.kind, ProviderKind::OfficialCodex)
+            && provider_uses_agent_identity(provider))
 }
 
 pub fn provider_relay_reason(provider: &ProviderConfig) -> &'static str {
+    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+        return "ChatGPT 套餐授权仅通过 Companion 本地代理使用并自动续期";
+    }
     if matches!(provider.kind, ProviderKind::OfficialCodex) {
         if provider_uses_agent_identity(provider) {
             return "Agent Identity 仅通过 Companion API 服务动态签名，不写入 Codex auth.json";

@@ -26,6 +26,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -41,12 +42,13 @@ import {
   getProviderRefreshProgress,
   openCodexOAuth,
   reviewProviderJsonMany,
+  revokeChatgptPlan,
   startCodexOAuth,
   submitCodexOAuthCallback,
 } from "../../lib/api";
 import { userFacingError } from "../../lib/errors";
 import { providerKindLabel } from "../../lib/format";
-import { providerAccountTitle, providerUsesAgentIdentity } from "../../lib/provider-display";
+import { providerAccountTitle, providerUsesAgentIdentity, providerUsesChatgptPlan } from "../../lib/provider-display";
 import type {
   ApiKeyProviderUpdate,
   BusyState,
@@ -542,6 +544,8 @@ export function Providers({
               </Dialog.Close>
             </div>
             <ProviderAddTabs
+              providers={providers}
+              onRefresh={onRefresh}
               apiKeyForm={apiKeyForm}
               disabled={disabled}
               fileInputRef={fileInputRef}
@@ -1081,6 +1085,7 @@ function oauthSessionFromStatus(
   status: CodexOAuthStatus,
 ): CodexOAuthStartResponse {
   return {
+    plan: status.plan,
     loginId: status.loginId,
     authUrl: status.authUrl,
     callbackUrl: status.callbackUrl,
@@ -1089,13 +1094,18 @@ function oauthSessionFromStatus(
   };
 }
 
-function CodexOAuthPanel({
-  disabled,
-  onComplete,
-}: {
+function CodexOAuthPanel({ disabled, providers, onComplete, onRefresh }: {
   disabled: boolean;
+  providers: ProviderConfig[];
   onComplete: (loginId: string) => Promise<void>;
+  onRefresh: (id: string) => Promise<void>;
 }) {
+  const [plan, setPlan] = useState(true);
+  const [selectedProviderId, setSelectedProviderId] = useState("");
+  const [revoking, setRevoking] = useState(false);
+  const modeId = useId();
+  const accountId = useId();
+  const selectedProvider = providers.find((provider) => provider.id === selectedProviderId);
   const [flow, setFlow] = useState<OAuthFlowState>({ phase: "idle" });
   const flowRef = useRef<OAuthFlowState>({ phase: "idle" });
   const [callbackUrl, setCallbackUrl] = useState("");
@@ -1275,7 +1285,7 @@ function CodexOAuthPanel({
     setCopied(false);
     updateFlow({ phase: "starting" });
     try {
-      const nextSession = await startCodexOAuth();
+      const nextSession = await startCodexOAuth(plan, selectedProviderId);
       updateFlow({ phase: "waiting", session: nextSession });
     } catch (unknownError) {
       updateFlow({ phase: "idle" });
@@ -1323,6 +1333,25 @@ function CodexOAuthPanel({
     }
   }
 
+  async function handleRevoke(): Promise<void> {
+    if (!selectedProvider) return;
+    setRevoking(true);
+    setError("");
+    try {
+      await revokeChatgptPlan(selectedProvider.id);
+    } catch (unknownError) {
+      setError(userFacingError(unknownError));
+    } finally {
+      try {
+        await onRefresh(selectedProvider.id);
+      } catch (unknownError) {
+        setError(userFacingError(unknownError));
+      } finally {
+        setRevoking(false);
+      }
+    }
+  }
+
   async function handleComplete(): Promise<void> {
     if (!session || !callbackReceived) return;
     await completeSession(session);
@@ -1351,19 +1380,34 @@ function CodexOAuthPanel({
         <div className="oauth-security-note">
           <ShieldCheck aria-hidden="true" size={19} />
           <div>
-            <strong>OpenAI 官方 OAuth</strong>
-            <span>使用 PKCE 授权，凭据只写入本机私密文件。</span>
+            <strong>Sign in with ChatGPT</strong>
+            <span>在 OpenAI 页面授权使用 ChatGPT 套餐，凭据保存在本机。</span>
           </div>
         </div>
-        <p className="field-hint oauth-account-hint">
-          授权后会从 OpenAI 返回的账号信息中读取邮箱和账号 ID；需要添加另一个账号时，重新发起一次授权即可。
-        </p>
+        <div className="form-grid">
+          <div className="field">
+            <label htmlFor={modeId}>授权方式</label>
+            <select id={modeId} disabled={disabled || isWorking || revoking} value={plan ? "plan" : "codex"} onChange={(event) => setPlan(event.target.value === "plan")}>
+              <option value="plan">ChatGPT 套餐授权</option>
+              <option value="codex">原生 Codex OAuth</option>
+            </select>
+          </div>
+          {plan ? <div className="field">
+            <label htmlFor={accountId}>绑定或重新授权账号</label>
+            <select id={accountId} aria-describedby={`${accountId}-hint`} disabled={disabled || isWorking || revoking} value={selectedProviderId} onChange={(event) => setSelectedProviderId(event.target.value)}>
+              <option value="">独立授权，不绑定已有账号</option>
+              {providers.filter((provider) => provider.kind === "official_codex" || providerUsesChatgptPlan(provider)).map((provider) => <option key={provider.id} value={provider.id}>{providerAccountTitle(provider)}{providerUsesChatgptPlan(provider) ? " · 重新授权" : " · 绑定官号"}</option>)}
+            </select>
+            <p className="field-hint" id={`${accountId}-hint`}>绑定时请登录相同邮箱；授权成功后优先使用套餐，未支持的能力由分组回退设置处理。</p>
+          </div> : null}
+        </div>
         {error ? <p className="field-error" role="alert">{error}</p> : null}
         <div className="actions oauth-primary-action">
-          <Button disabled={disabled || isWorking} onClick={handleStart}>
+          <Button disabled={disabled || isWorking || revoking} onClick={handleStart}>
             {startIcon}
             {flow.phase === "starting" ? "正在准备..." : "开始 OAuth 授权"}
           </Button>
+          {plan && selectedProvider && providerUsesChatgptPlan(selectedProvider) ? <Button disabled={disabled || isWorking || revoking} onClick={() => void handleRevoke()}>{revoking ? "正在撤销..." : "停用并撤销授权"}</Button> : null}
         </div>
       </div>
     );
@@ -1444,6 +1488,8 @@ function CodexOAuthPanel({
 }
 
 function ProviderAddTabs({
+  providers,
+  onRefresh,
   apiKeyForm,
   disabled,
   fileInputRef,
@@ -1466,6 +1512,8 @@ function ProviderAddTabs({
   submitApiKey,
   submitJsonBatch,
 }: {
+  providers: ProviderConfig[];
+  onRefresh: (id: string) => Promise<void>;
   apiKeyForm: ApiKeyForm;
   disabled: boolean;
   fileInputRef: RefObject<HTMLInputElement | null>;
@@ -1508,7 +1556,7 @@ function ProviderAddTabs({
       </Tabs.List>
 
       <Tabs.Content className="add-tabs-content" value="oauth">
-        <CodexOAuthPanel disabled={disabled} onComplete={onImportCodexOAuth} />
+        <CodexOAuthPanel disabled={disabled} providers={providers} onComplete={onImportCodexOAuth} onRefresh={onRefresh} />
       </Tabs.Content>
 
       <Tabs.Content className="add-tabs-content" value="api-key">

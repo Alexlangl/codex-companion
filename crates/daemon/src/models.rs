@@ -284,7 +284,9 @@ async fn discover_provider_models(
     provider: ProviderConfig,
     active_group: bool,
 ) -> SourceDiscovery {
-    let kind = if provider.kind == ProviderKind::OfficialCodex {
+    let kind = if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
+        ModelSourceKind::OfficialOauth
+    } else if provider.kind == ProviderKind::OfficialCodex {
         if provider_uses_codex_oauth(&provider) {
             ModelSourceKind::OfficialOauth
         } else if provider_uses_agent_identity(&provider) {
@@ -337,6 +339,23 @@ async fn fetch_provider_model_response(
     provider: &ProviderConfig,
     codex_catalog: bool,
 ) -> std::result::Result<Value, String> {
+    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+        let token = codex_companion_provider::chatgpt_plan::ensure_plan_access(provider).await?;
+        let response = send_model_request(
+            client
+                .get("https://api.openai.com/v1/models")
+                .bearer_auth(token),
+            "https://api.openai.com/v1/models",
+        )
+        .await?;
+        let mut value = parse_provider_response(response).await?;
+        let models = value
+            .get_mut("models")
+            .and_then(Value::as_array_mut)
+            .ok_or("ChatGPT 套餐模型目录格式无效")?;
+        models.retain(|model| model["visibility"] == "list");
+        return Ok(value);
+    }
     if provider.kind == ProviderKind::OfficialCodex {
         if provider_uses_agent_identity(provider) {
             return Err("该官方账号不是 OAuth 认证，未查询模型目录".to_string());

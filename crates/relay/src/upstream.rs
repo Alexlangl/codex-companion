@@ -30,30 +30,23 @@ use tokio::time::Instant;
 // Long-context generation/compaction can be silent while the upstream is working.
 // Keep an inactivity limit and a separate cap for metadata-only streams.
 const STREAM_PREFLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const STREAM_PREFLIGHT_MAX_DURATION: Duration = Duration::from_secs(900);
 // Preserve fast failover, but do not hide a live SSE stream from the client's
 // idle timer while waiting for visible output (notably during compaction).
 const STREAM_PREFLIGHT_MAX_HOLD: Duration = Duration::from_secs(10);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const STREAM_KEEPALIVE: &[u8] = b"event: keepalive\ndata: {\"type\":\"keepalive\"}\n\n";
-const MAX_STREAM_PREFLIGHT_BYTES: usize = 8 * 1024 * 1024;
-pub(crate) const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
-// These protocol bridges must materialize the full upstream response before
-// returning anything to the client. Keep that exceptional path bounded while
-// leaving ordinary SSE and passthrough responses streaming.
-const MAX_BUFFERED_SUCCESS_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
-// Chat Completions responses need to retain generated text and tool arguments
-// until their terminal Responses events can be emitted. Bound that retained
-// state separately from a single SSE frame.
+const MAX_STREAM_PREFLIGHT_BYTES: usize = MAX_SSE_FRAME_BYTES;
+pub(crate) const MAX_SSE_FRAME_BYTES: usize = 50 * 1024 * 1024;
+const MAX_CHAT_SSE_FRAME_BYTES: usize = 4 * 1024 * 1024;
+// Non-streaming bridges materialize their complete response. Do not impose a
+// total response cap; individual SSE frames remain bounded independently.
+const MAX_BUFFERED_SUCCESS_RESPONSE_BYTES: usize = usize::MAX;
+// Retain generated text and tool arguments until terminal Responses events.
 const MAX_CHAT_SSE_RETAINED_OUTPUT_BYTES: usize = MAX_BUFFERED_SUCCESS_RESPONSE_BYTES;
-// A single upstream transport chunk can contain many valid SSE frames. The
-// transformer emits several Responses events for some frames, so cap the
-// queued output as well when downstream backpressure prevents it from being
-// drained. The larger budget leaves room for terminal protocol events, which
-// repeat retained text and tool arguments by design.
-const MAX_CHAT_SSE_PENDING_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
-const MAX_CHAT_SSE_TOOL_CALLS: usize = 512;
+// Backpressure drains queued output between upstream reads. Total generated
+// output may exceed the per-frame bound.
+const MAX_CHAT_SSE_PENDING_OUTPUT_BYTES: usize = usize::MAX;
 const MAX_UPSTREAM_ERROR_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_UPSTREAM_ERROR_MESSAGE_CHARS: usize = 512;
 const CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
@@ -116,8 +109,13 @@ impl UpstreamResponse {
         policy: &codex_companion_core::AccountProtection,
         provider: &ProviderConfig,
         codex_catalog: bool,
+        api_service: &ApiServiceStore,
     ) -> Result<(), String> {
-        if !codex_catalog
+        let cache_plan_catalog = codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider);
+        let cache_account_catalog =
+            cache_plan_catalog || provider.kind == ProviderKind::OfficialCodex;
+        if !cache_account_catalog
+            && !codex_catalog
             && policy.excluded_models.is_empty()
             && policy
                 .providers
@@ -140,9 +138,15 @@ impl UpstreamResponse {
         .map_err(|e| e.to_string())?;
         let mut value: Value =
             serde_json::from_slice(&body).map_err(|_| "上游模型目录格式无效".to_string())?;
+        if cache_account_catalog {
+            crate::account_models::cache(api_service, provider, &value)?;
+        }
         for field in ["data", "models"] {
             if let Some(models) = value.get_mut(field).and_then(Value::as_array_mut) {
                 models.retain(|model| {
+                    if cache_plan_catalog && model["visibility"] != "list" {
+                        return false;
+                    }
                     let name = model
                         .get("id")
                         .or_else(|| model.get("slug"))
@@ -224,6 +228,51 @@ impl UpstreamResponse {
             .await
             .map_err(|error| error.to_string())?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub(crate) fn validate_plan_terminal(&self) -> Result<(), StreamPreflightError> {
+        let buffered;
+        let bytes = if let Some(body) = &self.buffered_body {
+            body.as_ref()
+        } else {
+            buffered = self
+                .prefetched_body
+                .iter()
+                .flat_map(|chunk| chunk.iter().copied())
+                .collect::<Vec<_>>();
+            &buffered
+        };
+        for line in bytes.split(|b| *b == b'\n') {
+            let Some(data) = line.strip_prefix(b"data:") else {
+                continue;
+            };
+            if let Ok(value) = serde_json::from_slice::<Value>(data) {
+                if matches!(
+                    value["type"].as_str(),
+                    Some("response.done" | "response.incomplete")
+                ) {
+                    return Err(StreamPreflightError::Protocol(
+                        "ChatGPT 套餐缺少 response.completed 完成事件".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn public_error_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for key in [
+            "content-type",
+            "x-request-id",
+            "openai-request-id",
+            "retry-after",
+        ] {
+            if let Some(value) = self.headers.get(key) {
+                headers.insert(key, value.clone());
+            }
+        }
+        headers
     }
 
     pub(crate) async fn preflight_stream_failure(
@@ -453,21 +502,15 @@ async fn wait_for_preflight_chunk<T>(
     next_chunk: impl std::future::Future<Output = T>,
     started_at: Instant,
 ) -> Result<T, StreamPreflightError> {
-    let remaining = STREAM_PREFLIGHT_MAX_DURATION.saturating_sub(started_at.elapsed());
-    let wait = remaining.min(STREAM_PREFLIGHT_IDLE_TIMEOUT);
-    tokio::time::timeout(wait, next_chunk).await.map_err(|_| {
-        StreamPreflightError::Network(if remaining <= STREAM_PREFLIGHT_IDLE_TIMEOUT {
-            format!(
-                "本地等待有效输出达到 {} 秒上限；上游是否完成尚未确认",
-                STREAM_PREFLIGHT_MAX_DURATION.as_secs()
-            )
-        } else {
-            format!(
+    let _ = started_at;
+    tokio::time::timeout(STREAM_PREFLIGHT_IDLE_TIMEOUT, next_chunk)
+        .await
+        .map_err(|_| {
+            StreamPreflightError::Network(format!(
                 "本地等待上游 SSE 事件超时（连续等待 {} 秒）；上游是否完成尚未确认",
-                wait.as_secs()
-            )
+                STREAM_PREFLIGHT_IDLE_TIMEOUT.as_secs()
+            ))
         })
-    })
 }
 
 fn preflight_buffered_sse(
@@ -744,6 +787,7 @@ pub(crate) struct UpstreamRequest<'a> {
     headers: &'a HeaderMap,
     body: Bytes,
     upstream: &'a str,
+    map_session_ids: bool,
 }
 
 impl<'a> UpstreamRequest<'a> {
@@ -762,7 +806,12 @@ impl<'a> UpstreamRequest<'a> {
             headers,
             body,
             upstream,
+            map_session_ids: true,
         }
+    }
+    pub(crate) fn with_session_mapping(mut self, enabled: bool) -> Self {
+        self.map_session_ids = enabled;
+        self
     }
 }
 
@@ -786,7 +835,43 @@ pub(crate) async fn send_upstream(
         headers,
         body,
         upstream,
+        map_session_ids,
     } = request;
+    let plan_client;
+    let client = if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+        if !(method == Method::GET && uri.path() == "/v1/models"
+            || method == Method::POST && uri.path() == "/v1/responses")
+        {
+            return Err("ChatGPT 套餐仅支持公共模型目录与 Responses 生成接口"
+                .to_string()
+                .into());
+        }
+        let expected = format!("https://api.openai.com{}", uri.path());
+        if upstream != expected {
+            return Err("ChatGPT 套餐不允许覆盖公共 API 地址".to_string().into());
+        }
+        plan_client = codex_companion_core::http_client_builder()
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| "无法创建 ChatGPT 套餐请求客户端".to_string())?;
+        &plan_client
+    } else {
+        client
+    };
+    let mut mapped_headers = headers.clone();
+    crate::session_identity::headers(provider, &mut mapped_headers, map_session_ids);
+    let headers = &mapped_headers;
+    let body = if method == Method::POST && map_session_ids {
+        if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
+            crate::session_identity::body(provider, &mut value, true);
+            Bytes::from(value.to_string())
+        } else {
+            body
+        }
+    } else {
+        body
+    };
     let mut catalog_headers;
     let headers = if method == Method::GET && uri.path() == "/v1/models" {
         // Local catalog repairs change the payload independently of the
@@ -817,7 +902,12 @@ pub(crate) async fn send_upstream(
     let mut agent_identity_task_id = None;
     let mut official_oauth = false;
     let mut chatgpt_account_id = None;
-    if provider.kind == ProviderKind::OfficialCodex {
+    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+        authorization = Some(format!(
+            "Bearer {}",
+            codex_companion_provider::chatgpt_plan::ensure_plan_access(provider).await?
+        ));
+    } else if provider.kind == ProviderKind::OfficialCodex {
         chatgpt_account_id = provider
             .account
             .as_ref()
@@ -844,20 +934,15 @@ pub(crate) async fn send_upstream(
     }
     let tool_identity = ToolIdentity::from_request(&body);
     let mut lite_headers = headers.clone();
-    if provider.kind == ProviderKind::OfficialCodex
-        && method == Method::POST
-        && is_responses_generation_url(uri.path())
-        && serde_json::from_slice::<Value>(&body)
-            .ok()
-            .as_ref()
-            .is_some_and(responses_lite_metadata_enabled)
-    {
-        lite_headers.insert(
-            CODEX_RESPONSES_LITE_HEADER,
-            HeaderValue::from_static("true"),
-        );
+    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+        for key in [
+            "chatgpt-account-id",
+            "openai-organization",
+            "openai-project",
+        ] {
+            lite_headers.remove(key);
+        }
     }
-    let headers = &lite_headers;
     let session_identity = official_codex_session_identity(provider, method, uri, headers, &body);
     let body = normalize_official_responses_input(
         provider,
@@ -866,7 +951,68 @@ pub(crate) async fn send_upstream(
         body,
         session_identity.as_deref(),
     );
-    let body = normalize_responses_lite_input(method, uri, headers, body);
+    let body = if method == Method::POST && is_responses_generation_url(uri.path()) {
+        if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
+            crate::responses_lite::normalize(
+                &mut lite_headers,
+                &mut value,
+                provider.kind == ProviderKind::OfficialCodex,
+                false,
+            );
+            Bytes::from(value.to_string())
+        } else {
+            body
+        }
+    } else {
+        body
+    };
+    let body = if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider)
+        && method == Method::POST
+    {
+        if !is_responses_generation_url(uri.path()) {
+            return Err("ChatGPT 套餐仅支持 Responses 生成接口".to_string().into());
+        }
+        let mut value: Value =
+            serde_json::from_slice(&body).map_err(|_| "ChatGPT 套餐请求 JSON 无效".to_string())?;
+        crate::plan_request::normalize(&mut value, false)?;
+        for key in [
+            "chatgpt-account-id",
+            "openai-organization",
+            "openai-project",
+            "x-openai-internal-codex-responses-lite",
+        ] {
+            lite_headers.remove(key);
+        }
+        Bytes::from(value.to_string())
+    } else {
+        body
+    };
+    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+        let internal = lite_headers
+            .keys()
+            .filter(|key| {
+                matches!(
+                    key.as_str(),
+                    "originator"
+                        | "openai-beta"
+                        | "version"
+                        | "chatgpt-account-id"
+                        | "openai-organization"
+                        | "openai-project"
+                ) || key.as_str().starts_with("x-codex-")
+                    || key.as_str().starts_with("x-openai-internal-")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in internal {
+            lite_headers.remove(key);
+        }
+        lite_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("CodexCompanion"),
+        );
+    }
+    let headers = &lite_headers;
     let body = rewrite_model(provider, body);
     let (body, tool_context, chat_messages) =
         if transform == ResponseTransform::ChatCompletionsToResponses {
@@ -1328,17 +1474,7 @@ fn valid_codex_client_version(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
 }
 
-fn responses_lite_metadata_enabled(value: &Value) -> bool {
-    value
-        .pointer("/client_metadata/ws_request_header_x_openai_internal_codex_responses_lite")
-        .is_some_and(|value| {
-            value == true
-                || value
-                    .as_str()
-                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
-        })
-}
-
+#[cfg(test)]
 fn normalize_responses_lite_input(
     method: &Method,
     uri: &Uri,
@@ -1351,7 +1487,7 @@ fn normalize_responses_lite_input(
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
         return body;
     };
-    let metadata_lite = responses_lite_metadata_enabled(&value);
+    let metadata_lite = crate::responses_lite::enabled(&value);
     if !headers.contains_key(CODEX_RESPONSES_LITE_HEADER) && !metadata_lite {
         return body;
     }
@@ -1528,7 +1664,8 @@ fn official_codex_session_identity(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Option<String> {
-    if provider.kind != ProviderKind::OfficialCodex
+    if (provider.kind != ProviderKind::OfficialCodex
+        && !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider))
         || method != Method::POST
         || !uri
             .path_and_query()
@@ -1536,7 +1673,13 @@ fn official_codex_session_identity(
     {
         return None;
     }
-    for header in ["session_id", "x-session-id", "x-client-request-id"] {
+    for header in [
+        "session_id",
+        "session-id",
+        "thread-id",
+        "x-session-id",
+        "x-client-request-id",
+    ] {
         if let Some(value) = headers
             .get(header)
             .and_then(|value| value.to_str().ok())
@@ -1569,7 +1712,8 @@ fn official_codex_needs_non_stream_bridge(
     uri: &Uri,
     body: &[u8],
 ) -> bool {
-    if provider.kind != ProviderKind::OfficialCodex
+    if (provider.kind != ProviderKind::OfficialCodex
+        && !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider))
         || method != Method::POST
         || !uri
             .path_and_query()
@@ -1704,8 +1848,18 @@ pub(crate) async fn stream_response(
             prefetched_body,
         ))
         .await;
+        let strict_plan = store
+            .load()
+            .ok()
+            .and_then(|c| c.providers.get(&provider_id).cloned())
+            .is_some_and(|p| codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&p));
         return match body
-            .and_then(|body| terminal_response_from_sse(&body))
+            .and_then(|body| {
+                if strict_plan && !sse_has_completed_event(&body) {
+                    return Err("ChatGPT 套餐响应缺少 response.completed 完成事件".into());
+                }
+                terminal_response_from_sse(&body)
+            })
             .map(|mut value| {
                 tool_identity.restore(&mut value);
                 value
@@ -1974,6 +2128,14 @@ fn responses_sse_observer_stream_with_keepalive(
             match next {
                 Some(Ok(chunk)) => {
                     state.push_chunk(&chunk);
+                    if state.strict_plan && !state.pending.is_empty() {
+                        // Do not let an invalid terminal event reach the client
+                        // before its replacement failure frame.
+                        return state
+                            .pending
+                            .pop_front()
+                            .map(|bytes| (Ok(bytes), (state, upstream)));
+                    }
                     Some((Ok(chunk), (state, upstream)))
                 }
                 Some(Err(error)) => {
@@ -2004,6 +2166,7 @@ struct ResponsesSseObserverState {
     terminal: bool,
     failure_recorded: bool,
     first_response_recorded: bool,
+    strict_plan: bool,
     started_at: Instant,
     response_id: String,
     model: String,
@@ -2023,6 +2186,11 @@ impl ResponsesSseObserverState {
             terminal: false,
             failure_recorded: false,
             first_response_recorded: false,
+            strict_plan: store
+                .load()
+                .ok()
+                .and_then(|c| c.providers.get(&provider_id).cloned())
+                .is_some_and(|p| codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&p)),
             started_at: Instant::now(),
             response_id: "resp_codex_companion".to_string(),
             model: String::new(),
@@ -2125,6 +2293,9 @@ impl ResponsesSseObserverState {
                     );
                 }
                 match event_type {
+                    "response.incomplete" | "response.done" if self.strict_plan => {
+                        self.fail_incomplete("ChatGPT 套餐响应缺少 response.completed 完成事件")
+                    }
                     "response.completed" | "response.incomplete" => self.terminal = true,
                     "response.failed" | "error" => {
                         self.terminal = true;
@@ -2225,6 +2396,10 @@ pub(crate) fn next_sse_block_boundary(
 ) -> Option<SseBlockBoundary> {
     let mut index = 0;
     while index < buffer.len() {
+        let Some(offset) = memchr::memchr2(b'\r', b'\n', &buffer[index..]) else {
+            return None;
+        };
+        index += offset;
         let Some(first_len) = sse_line_ending_len(buffer, index, end_of_stream) else {
             index += 1;
             continue;
@@ -2300,6 +2475,15 @@ fn could_start_sse_frame(body: &[u8]) -> bool {
     .into_iter()
     .any(|prefix| body.starts_with(prefix) || prefix.starts_with(body))
         || body.starts_with(b":")
+}
+
+fn sse_has_completed_event(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body)
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|v| v["type"] == "response.completed")
+        })
 }
 
 fn terminal_response_from_sse(body: &[u8]) -> Result<Value, String> {
@@ -4120,7 +4304,7 @@ impl ChatSseTransformState {
             buffer: Vec::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
-            max_frame_bytes: MAX_SSE_FRAME_BYTES,
+            max_frame_bytes: MAX_CHAT_SSE_FRAME_BYTES,
             max_pending_bytes: MAX_CHAT_SSE_PENDING_OUTPUT_BYTES,
             max_retained_output_bytes: MAX_CHAT_SSE_RETAINED_OUTPUT_BYTES,
             retained_output_bytes: 0,
@@ -4398,10 +4582,6 @@ impl ChatSseTransformState {
             return true;
         }
         let existing = self.tools.get(&index);
-        if existing.is_none() && self.tools.len() >= MAX_CHAT_SSE_TOOL_CALLS {
-            self.fail_retained_output_limit();
-            return false;
-        }
         let existing = existing.cloned().unwrap_or_default();
         let next_call_id_len = call_id.map_or(existing.call_id.len(), str::len);
         let next_name_len = name.map_or(existing.name.len(), str::len);
@@ -4835,6 +5015,9 @@ pub(crate) fn text_response(status: StatusCode, text: impl Into<String>) -> Resp
 }
 
 pub(crate) fn upstream_url(provider: &ProviderConfig, uri: &Uri) -> String {
+    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+        return format!("https://api.openai.com{}", uri.path());
+    }
     if provider_base_url_is_endpoint(&provider.base_url) {
         if uri.path().ends_with("/responses/compact") {
             let (endpoint, query) = provider
@@ -5682,8 +5865,8 @@ mod tests {
     }
 
     #[test]
-    fn enforces_the_configured_eight_mib_sse_frame_boundary() {
-        assert_eq!(MAX_SSE_FRAME_BYTES, 8 * 1024 * 1024);
+    fn enforces_the_configured_fifty_mib_sse_frame_boundary() {
+        assert_eq!(MAX_SSE_FRAME_BYTES, 50 * 1024 * 1024);
         assert!(!sse_frame_limit_reached(
             MAX_SSE_FRAME_BYTES - 1,
             MAX_SSE_FRAME_BYTES
@@ -7428,5 +7611,37 @@ data: [DONE]
         let first_id = first.get("id").and_then(Value::as_str).expect("first id");
         assert_eq!(second.get("id").and_then(Value::as_str), Some(first_id));
         assert!(first_id.starts_with("resp_cc_"));
+    }
+    #[tokio::test]
+    async fn plan_incomplete_is_replaced_before_the_client_sees_a_terminal() {
+        for terminal in ["response.incomplete", "response.done"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = ConfigStore::new(dir.path().join("config.json"));
+            let mut state =
+                ResponsesSseObserverState::new(store, "plan".into(), "request-plan".into());
+            state.strict_plan = true;
+            let upstream: ResponseByteStream = Box::pin(stream::iter([Ok(Bytes::from(format!(
+                "data: {{\"type\":\"{terminal}\",\"response\":{{\"status\":\"incomplete\"}}}}\n\n"
+            )))]));
+            let chunks = responses_sse_observer_stream(upstream, state)
+                .collect::<Vec<_>>()
+                .await;
+            let output = chunks
+                .into_iter()
+                .map(|c| String::from_utf8_lossy(&c.unwrap()).into_owned())
+                .collect::<String>();
+            assert!(output.contains("response.failed"));
+            assert!(!output.contains(terminal));
+            assert!(!output.contains("\"type\":\"response.completed\""));
+        }
+    }
+
+    #[test]
+    fn chat_tool_calls_are_not_truncated_at_the_old_item_count() {
+        let mut state = ChatSseTransformState::default();
+        for index in 0..600 {
+            assert!(state.append_tool_call_delta(&json!({"index":index,"id":format!("call-{index}"),"function":{"name":"fixture","arguments":"{}"}})));
+        }
+        assert_eq!(state.tools.len(), 600);
     }
 }

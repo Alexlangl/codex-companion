@@ -65,6 +65,16 @@ pub fn update_api_key_provider(
 ) -> Result<ProviderConfig> {
     validate_id(&input.id)?;
     validate_base_url(&input.base_url)?;
+    if store
+        .load()?
+        .providers
+        .get(&input.id)
+        .is_some_and(crate::chatgpt_plan::is_chatgpt_plan)
+    {
+        return Err(CompanionError::InvalidConfig(
+            "ChatGPT 套餐账号请通过重新授权更新，不能改为 API Key".into(),
+        ));
+    }
     if matches!(input.kind, ProviderKind::OfficialCodex) {
         return Err(CompanionError::InvalidConfig(
             "官方 Codex 账号不能按 API Key provider 编辑".to_string(),

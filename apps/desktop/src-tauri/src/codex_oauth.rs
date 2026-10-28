@@ -48,6 +48,10 @@ struct OAuthState {
     expires_at: i64,
     code: Option<String>,
     error: Option<String>,
+    #[serde(default)]
+    plan: Option<codex_companion_provider::chatgpt_plan::PlanLogin>,
+    #[serde(default)]
+    issued_client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +62,7 @@ pub struct OAuthStartResponse {
     pub callback_url: String,
     pub expires_at: i64,
     pub callback_server_ready: bool,
+    pub plan: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +74,7 @@ pub struct OAuthStatusResponse {
     pub expires_at: i64,
     pub callback_received: bool,
     pub callback_server_ready: bool,
+    pub plan: bool,
     pub error: Option<String>,
 }
 
@@ -243,10 +249,23 @@ fn token() -> String {
 }
 
 fn validate_pending_state(data_dir: &Path, state: &OAuthState) -> Result<(), String> {
-    let expected_redirect = format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}");
+    let expected_redirect = if state.plan.is_some() {
+        format!("http://127.0.0.1:{CALLBACK_PORT}{CALLBACK_PATH}")
+    } else {
+        format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}")
+    };
     let auth_url =
         Url::parse(&state.auth_url).map_err(|_| "OAuth 状态中的授权地址无效".to_string())?;
-    let expected_auth_url = build_auth_url(&expected_redirect, &state.code_verifier, &state.state);
+    let expected_auth_url = if let Some(plan) = &state.plan {
+        codex_companion_provider::chatgpt_plan::plan_authorize_url(
+            plan,
+            &expected_redirect,
+            &state.code_verifier,
+            &state.state,
+        )
+    } else {
+        build_auth_url(&expected_redirect, &state.code_verifier, &state.state)
+    };
     if state.data_dir != data_dir
         || state.redirect_uri != expected_redirect
         || state.login_id.is_empty()
@@ -254,7 +273,12 @@ fn validate_pending_state(data_dir: &Path, state: &OAuthState) -> Result<(), Str
         || state.state.is_empty()
         || auth_url.scheme() != "https"
         || auth_url.host_str() != Some("auth.openai.com")
-        || auth_url.path() != "/oauth/authorize"
+        || auth_url.path()
+            != if state.plan.is_some() {
+                "/api/accounts/authorize"
+            } else {
+                "/oauth/authorize"
+            }
         || state.auth_url != expected_auth_url
     {
         return Err("OAuth pending 状态校验失败，请重新开始授权".to_string());
@@ -289,6 +313,7 @@ fn response_for(state: &OAuthState, callback_server_ready: bool) -> OAuthStartRe
         callback_url: state.redirect_uri.clone(),
         expires_at: state.expires_at,
         callback_server_ready,
+        plan: state.plan.is_some(),
     }
 }
 
@@ -300,6 +325,7 @@ fn status_for(state: &OAuthState, callback_server_ready: bool) -> OAuthStatusRes
         expires_at: state.expires_at,
         callback_received: state.code.is_some(),
         callback_server_ready,
+        plan: state.plan.is_some(),
         error: state.error.clone(),
     }
 }
@@ -391,8 +417,13 @@ fn handle_callback_request(request: Request, expected: &OAuthState) {
     } else if request.url().len() > MAX_CALLBACK_TARGET_BYTES {
         Err("回调地址过长".to_string())
     } else {
-        parse_callback_target(request.url())
-            .and_then(|callback| apply_callback(expected, &callback))
+        parse_callback_target(request.url()).and_then(|mut callback| {
+            let redirect = Url::parse(&expected.redirect_uri).map_err(|_| "回调地址无效")?;
+            callback
+                .set_host(redirect.host_str())
+                .map_err(|_| "回调主机无效")?;
+            apply_callback(expected, &callback)
+        })
     };
     match result {
         Ok(()) => respond_to_callback(
@@ -478,6 +509,9 @@ fn callback_query_value(url: &Url, key: &str) -> Result<Option<String>, String> 
 
 fn apply_callback(expected: &OAuthState, callback: &Url) -> Result<(), String> {
     validate_callback_url(callback)?;
+    if expected.plan.is_some() && callback.host_str() != Some("127.0.0.1") {
+        return Err("ChatGPT 授权回调必须使用 127.0.0.1".into());
+    }
     let state = callback_query_value(callback, "state")?.unwrap_or_default();
     if state != expected.state {
         return Err("回调 state 校验失败，请确认使用的是当前授权会话".to_string());
@@ -517,6 +551,18 @@ fn apply_callback(expected: &OAuthState, callback: &Url) -> Result<(), String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "回调地址缺少 code 参数".to_string())?;
+    if let Some(plan) = &current.plan {
+        let returned = callback_query_value(callback, "client_id")?;
+        current.issued_client_id = Some(
+            codex_companion_provider::chatgpt_plan::plan_callback_client(
+                plan,
+                returned.as_deref(),
+            )?,
+        );
+        if callback.host_str() != Some("127.0.0.1") {
+            return Err("ChatGPT 授权回调必须使用 127.0.0.1".into());
+        }
+    }
     current.code = Some(code.to_string());
     current.error = None;
     let result = persist_pending(Some(current));
@@ -593,21 +639,64 @@ impl Drop for CompletionGuard {
 }
 
 pub fn start(data_dir: PathBuf) -> Result<OAuthStartResponse, String> {
+    start_inner(data_dir, None)
+}
+
+pub fn start_plan(
+    store: &codex_companion_core::ConfigStore,
+    selected: Option<&str>,
+) -> Result<OAuthStartResponse, String> {
+    start_inner(
+        store.data_dir(),
+        Some(codex_companion_provider::chatgpt_plan::prepare_plan_login(
+            store, selected,
+        )?),
+    )
+}
+
+fn start_inner(
+    data_dir: PathBuf,
+    plan: Option<codex_companion_provider::chatgpt_plan::PlanLogin>,
+) -> Result<OAuthStartResponse, String> {
     hydrate(&data_dir)?;
     let mut guard = state_lock()
         .lock()
         .map_err(|_| "获取 OAuth 状态锁失败".to_string())?;
     if let Some(current) = guard.as_ref().filter(|state| state.expires_at > now()) {
+        if current
+            .plan
+            .as_ref()
+            .map(|p| (&p.source_provider_id, &p.provider_id))
+            != plan
+                .as_ref()
+                .map(|p| (&p.source_provider_id, &p.provider_id))
+        {
+            return Err("请先取消当前授权，再开始另一种授权".into());
+        }
         let callback_server_ready = spawn_callback_listener(current);
         return Ok(response_for(current, callback_server_ready));
     }
-    let redirect_uri = format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}");
+    let redirect_uri = if plan.is_some() {
+        format!("http://127.0.0.1:{CALLBACK_PORT}{CALLBACK_PATH}")
+    } else {
+        format!("http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}")
+    };
     let server = try_bind_callback_server()?;
     let verifier = token();
     let state_token = token();
     let state = OAuthState {
         login_id: token(),
-        auth_url: build_auth_url(&redirect_uri, &verifier, &state_token),
+        auth_url: plan
+            .as_ref()
+            .map(|p| {
+                codex_companion_provider::chatgpt_plan::plan_authorize_url(
+                    p,
+                    &redirect_uri,
+                    &verifier,
+                    &state_token,
+                )
+            })
+            .unwrap_or_else(|| build_auth_url(&redirect_uri, &verifier, &state_token)),
         redirect_uri,
         code_verifier: verifier,
         state: state_token,
@@ -615,6 +704,8 @@ pub fn start(data_dir: PathBuf) -> Result<OAuthStartResponse, String> {
         expires_at: now() + OAUTH_TIMEOUT_SECONDS,
         code: None,
         error: None,
+        plan,
+        issued_client_id: None,
     };
     persist_pending(Some(&state))?;
     *guard = Some(state.clone());
@@ -723,7 +814,7 @@ pub async fn complete(
 ) -> Result<ProviderImportOutcome, String> {
     hydrate(&daemon.store().data_dir())?;
     let _completion = CompletionGuard::acquire(login_id)?;
-    let (code, verifier, redirect_uri, data_dir) = {
+    let (code, verifier, redirect_uri, data_dir, plan, issued_client_id) = {
         let guard = state_lock()
             .lock()
             .map_err(|_| "获取 OAuth 状态锁失败".to_string())?;
@@ -745,8 +836,26 @@ pub async fn complete(
             state.code_verifier.clone(),
             state.redirect_uri.clone(),
             state.data_dir.clone(),
+            state.plan.clone(),
+            state.issued_client_id.clone(),
         )
     };
+    if let Some(plan) = plan {
+        let client_id = issued_client_id
+            .as_deref()
+            .ok_or("ChatGPT 注册未完成，请重新授权")?;
+        let result = codex_companion_provider::chatgpt_plan::complete_plan_login(
+            daemon.store(),
+            &plan,
+            client_id,
+            &code,
+            &verifier,
+            &redirect_uri,
+        )
+        .await;
+        let _ = clear_state_for_login(&data_dir, login_id);
+        return result;
+    }
     let tokens = exchange_code(&code, &verifier, &redirect_uri).await?;
     let refresh_token = match tokens
         .refresh_token
@@ -940,6 +1049,8 @@ mod tests {
             expires_at: now() + 60,
             code: None,
             error: None,
+            plan: None,
+            issued_client_id: None,
         }
     }
 
@@ -1320,5 +1431,37 @@ mod tests {
         assert!(try_bind_callback_server_on(port)
             .expect("bind callback server")
             .is_none());
+    }
+    #[test]
+    fn plan_callback_requires_issued_registration_and_exact_loopback_host() {
+        let _test = OAUTH_TEST_LOCK.lock().unwrap();
+        let data_dir = test_data_dir("plan-callback");
+        let store = codex_companion_core::ConfigStore::new(data_dir.join("config.json"));
+        let mut state = test_state(data_dir.clone());
+        state.plan =
+            Some(codex_companion_provider::chatgpt_plan::prepare_plan_login(&store, None).unwrap());
+        state.redirect_uri = format!("http://127.0.0.1:{CALLBACK_PORT}{CALLBACK_PATH}");
+        *state_lock().lock().unwrap() = Some(state.clone());
+        for callback in [
+            "http://localhost:1455/auth/callback?code=fixture&state=test-state&client_id=oaiapp_fixture",
+            "http://127.0.0.1:1455/auth/callback?code=fixture&state=test-state",
+            "http://127.0.0.1:1455/auth/callback?code=fixture&state=test-state&client_id=dynamic_agent_client",
+        ] { assert!(apply_callback(&state,&Url::parse(callback).unwrap()).is_err()); }
+        assert!(state_lock()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .code
+            .is_none());
+        apply_callback(&state,&Url::parse("http://127.0.0.1:1455/auth/callback?code=fixture&state=test-state&client_id=oaiapp_fixture").unwrap()).unwrap();
+        let guard = state_lock().lock().unwrap();
+        assert_eq!(
+            guard.as_ref().unwrap().issued_client_id.as_deref(),
+            Some("oaiapp_fixture")
+        );
+        drop(guard);
+        *state_lock().lock().unwrap() = None;
+        let _ = fs::remove_dir_all(data_dir);
     }
 }

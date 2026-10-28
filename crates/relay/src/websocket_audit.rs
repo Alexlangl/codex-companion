@@ -76,6 +76,17 @@ impl WebSocketRequestAudit {
     }
 
     pub(crate) fn record_usage(&self, value: &Value) {
+        if let Some(tier) = value
+            .get("response")
+            .unwrap_or(value)
+            .get("service_tier")
+            .and_then(Value::as_str)
+        {
+            let _ = self
+                .state
+                .api_service
+                .record_actual_service_tier(&self.id, tier);
+        }
         if let (Some(session), Some(provider)) = (&self.session_id, &self.provider) {
             let mut capture = crate::usage_capture::UsageCapture::new(
                 self.state.store.clone(),
@@ -192,11 +203,11 @@ impl WebSocketRequestAudit {
 impl Drop for WebSocketRequestAudit {
     fn drop(&mut self) {
         if !self.finished {
-            let (status, detail) = self
-                .failure
-                .take()
-                .unwrap_or((None, "WebSocket 请求未完成即中断或取消".to_owned()));
-            self.finish(status, "failed", Some(&detail));
+            if let Some((status, detail)) = self.failure.take() {
+                self.finish(status, "failed", Some(&detail));
+            } else {
+                self.finish(Some(499), "cancelled", Some("client_cancelled"));
+            }
         }
     }
 }

@@ -15,6 +15,7 @@ import {
   providerHealthTone,
   providerTypeLabel,
   providerUsesAgentIdentity,
+  providerUsesChatgptPlan,
   providerUsesWebSocket,
   quotaInfo,
   validityLabel,
@@ -72,7 +73,7 @@ export function ProviderCompactItem({
     launchMode,
     status.directConnectProviderIds,
   );
-  const canEdit = provider.kind !== "official_codex";
+  const canEdit = provider.kind !== "official_codex" && !providerUsesChatgptPlan(provider);
   const showPlanBadge =
     provider.kind === "official_codex" &&
     Boolean(provider.account?.subscriptionType);
@@ -187,13 +188,9 @@ export function ProviderCompactItem({
             <Pencil size={14} />
           </IconButton>
         ) : null}
-        <IconButton
-          disabled={disabled}
-          label="导出 JSON"
-          onClick={() => onExport(provider)}
-        >
-          <Download size={14} />
-        </IconButton>
+        {!providerUsesChatgptPlan(provider) ? <IconButton disabled={disabled} label="导出 JSON" onClick={() => onExport(provider)}>
+          <Download aria-hidden="true" size={14} />
+        </IconButton> : null}
         <IconButton
           disabled={disabled}
           label="删除账号"
@@ -251,7 +248,7 @@ export function ProviderCard({
   const showQuota = hasQuotaInfo(quota);
   const quotaIsBalance = showQuota && account?.quotaLabel?.includes("余额") === true;
   const showPlanBadge = provider.kind === "official_codex" && Boolean(account?.subscriptionType);
-  const canEdit = provider.kind !== "official_codex";
+  const canEdit = provider.kind !== "official_codex" && !providerUsesChatgptPlan(provider);
   const lastRefreshAt = account?.lastRefreshAt ? formatTime(account.lastRefreshAt) : null;
   const usesAgentIdentity = providerUsesAgentIdentity(provider);
   const usesWebSocket = providerUsesWebSocket(provider);
@@ -293,9 +290,9 @@ export function ProviderCard({
               <Pencil size={16} />
             </IconButton>
           ) : null}
-          <IconButton disabled={disabled} label="导出 JSON" onClick={() => onExport(provider)}>
-            <Download size={16} />
-          </IconButton>
+          {!providerUsesChatgptPlan(provider) ? <IconButton disabled={disabled} label="导出 JSON" onClick={() => onExport(provider)}>
+            <Download aria-hidden="true" size={16} />
+          </IconButton> : null}
           <IconButton disabled={disabled} label="删除账号" onClick={() => void onRemove(provider.id)}>
             <Trash2 size={16} />
           </IconButton>
@@ -380,7 +377,9 @@ function LaunchModeControl({
   const usesAgentIdentity = providerUsesAgentIdentity(provider);
   const isOfficialPat = providerUsesOfficialPat(provider);
   let directTitle = "直连需要 API Key 文件、官方账号 auth 文件或环境变量";
-  if (provider.kind === "official_codex") {
+  if (providerUsesChatgptPlan(provider)) {
+    directTitle = "ChatGPT 套餐授权由 Companion 代理使用并续期；重新授权和撤销入口位于添加账号的 OAuth 页面";
+  } else if (provider.kind === "official_codex") {
     if (canDirect) {
       directTitle = "官方个人访问令牌可直连；选择本地代理可由 Companion 注入账号材料";
     } else if (isOfficialPat) {

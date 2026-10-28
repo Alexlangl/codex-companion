@@ -156,6 +156,12 @@ impl ApiServiceStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_chat_history_updated_at
                     ON chat_history(updated_at DESC);
+                CREATE TABLE IF NOT EXISTS account_model_catalogs (
+                    provider_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    models_json TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS model_cooldowns (
                     provider_id TEXT NOT NULL,
                     model TEXT NOT NULL,
@@ -662,6 +668,31 @@ impl ApiServiceStore {
         Ok(())
     }
 
+    pub fn record_actual_service_tier(&self, request_id: &str, tier: &str) -> Result<()> {
+        if !matches!(
+            tier,
+            "auto" | "default" | "priority" | "ultrafast" | "flex" | "scale"
+        ) {
+            return Ok(());
+        }
+        self.connection()?
+            .execute(
+                "UPDATE api_requests SET actual_service_tier=?2 WHERE request_id=?1",
+                params![request_id, tier],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn record_cancelled_before_headers(&self, request_id: &str) -> Result<()> {
+        let connection = self.connection()?;
+        let changed = connection.execute("UPDATE api_requests SET outcome='cancelled',status_code=499,error='client_cancelled',latency_ms=CAST((julianday('now')-julianday(started_at))*86400000 AS INTEGER) WHERE request_id=?1 AND outcome='processing'", params![request_id]).map_err(database_error)?;
+        if changed > 0 {
+            connection.execute("UPDATE api_request_attempts SET outcome='cancelled',status_code=499,error='client_cancelled',finished_at=?2 WHERE request_id=?1 AND outcome='processing'", params![request_id, timestamp(Utc::now())]).map_err(database_error)?;
+        }
+        Ok(())
+    }
+
     pub fn record_stream_outcome(
         &self,
         request_id: &str,
@@ -672,13 +703,13 @@ impl ApiServiceStore {
         let connection = self.connection()?;
         connection
             .execute(
-                "UPDATE api_requests SET outcome = ?2, error = ?3 WHERE request_id = ?1",
+                "UPDATE api_requests SET outcome = ?2, error = ?3, status_code = CASE WHEN ?2 = 'cancelled' THEN 499 WHEN ?2 = 'failed' THEN 502 ELSE status_code END WHERE request_id = ?1",
                 params![request_id, outcome, error],
             )
             .map_err(database_error)?;
         connection
             .execute(
-                "UPDATE api_request_attempts SET finished_at = ?3, outcome = ?2, error = ?4 \
+                "UPDATE api_request_attempts SET finished_at = ?3, outcome = ?2, error = ?4, status_code = CASE WHEN ?2 = 'cancelled' THEN 499 WHEN ?2 = 'failed' THEN 502 ELSE status_code END \
                  WHERE request_id = ?1 AND attempt = (\
                     SELECT MAX(attempt) FROM api_request_attempts WHERE request_id = ?1\
                  )",
@@ -696,7 +727,7 @@ impl ApiServiceStore {
                 "SELECT r.request_id, r.started_at, r.method, r.path, r.model, \
                  r.reasoning_effort, r.service_tier, r.client_id, c.name, r.provider_id, \
                  r.status_code, r.outcome, r.attempts, r.latency_ms, r.first_response_ms, r.error, \
-                 r.upstream_model, r.turn_state_length \
+                 r.upstream_model, r.turn_state_length, r.actual_service_tier \
                  FROM api_requests r LEFT JOIN api_clients c ON c.id = r.client_id \
                  ORDER BY r.started_at DESC LIMIT ?1",
             )
@@ -942,6 +973,47 @@ impl ApiServiceStore {
         })
     }
 
+    pub fn cache_account_models(
+        &self,
+        provider_id: &str,
+        fingerprint: &str,
+        models: &[String],
+    ) -> Result<()> {
+        let json = serde_json::to_string(models)
+            .map_err(|e| CompanionError::InvalidConfig(e.to_string()))?;
+        self.connection()?.execute(
+            "INSERT INTO account_model_catalogs(provider_id,fingerprint,models_json,fetched_at) VALUES(?1,?2,?3,?4) ON CONFLICT(provider_id) DO UPDATE SET fingerprint=excluded.fingerprint,models_json=excluded.models_json,fetched_at=excluded.fetched_at",
+            params![provider_id, fingerprint, json, timestamp(Utc::now())],
+        ).map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn account_model_allowed(
+        &self,
+        provider_id: &str,
+        fingerprint: &str,
+        model: &str,
+    ) -> Result<Option<bool>> {
+        let connection = self.connection()?;
+        let row: Option<(String, String, String)> = connection.query_row(
+            "SELECT fingerprint,models_json,fetched_at FROM account_model_catalogs WHERE provider_id=?1",
+            params![provider_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional().map_err(database_error)?;
+        let Some((stored, models, fetched_at)) = row else {
+            return Ok(None);
+        };
+        if stored != fingerprint
+            || parse_timestamp(&fetched_at).map_or(true, |at| {
+                Utc::now().signed_duration_since(at).num_minutes() > 30
+            })
+        {
+            return Ok(None);
+        }
+        let models: Vec<String> = serde_json::from_str(&models)
+            .map_err(|e| CompanionError::InvalidConfig(e.to_string()))?;
+        Ok(Some(models.iter().any(|allowed| allowed == model)))
+    }
+
     fn connection(&self) -> Result<Connection> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| CompanionError::io(parent, source))?;
@@ -1010,6 +1082,7 @@ fn percentage(successful: u64, total: u64) -> u8 {
 fn api_request_from_row(row: &Row<'_>) -> rusqlite::Result<ApiRequestLog> {
     let started_at: String = row.get(1)?;
     Ok(ApiRequestLog {
+        actual_service_tier: row.get(18)?,
         request_id: row.get(0)?,
         started_at: parse_timestamp_sql(1, &started_at)?,
         method: row.get(2)?,
@@ -1036,6 +1109,7 @@ fn ensure_request_metadata_columns(connection: &Connection) -> Result<()> {
     for column in [
         "reasoning_effort",
         "service_tier",
+        "actual_service_tier",
         "upstream_model",
         "turn_state_length",
         "first_response_ms",
@@ -1625,5 +1699,44 @@ mod tests {
             .expect("entry");
         assert_eq!(stored_messages, messages);
         assert_eq!(stored_tools, tools);
+    }
+    #[test]
+    fn cancellation_is_scoped_and_actual_tier_does_not_overwrite_requested_tier() {
+        let (_dir, store) = test_store();
+        for request in ["cancelled-fixture", "other-fixture"] {
+            store
+                .record_request_start(RequestLogStart {
+                    request_id: request,
+                    method: "POST",
+                    path: "/v1/responses",
+                    model: Some("gpt-fixture"),
+                    reasoning_effort: None,
+                    service_tier: Some("priority"),
+                    client_id: None,
+                })
+                .unwrap();
+        }
+        store
+            .record_actual_service_tier("cancelled-fixture", "default")
+            .unwrap();
+        store
+            .record_cancelled_before_headers("cancelled-fixture")
+            .unwrap();
+        let rows = store.list_requests(10).unwrap();
+        let cancelled = rows
+            .iter()
+            .find(|r| r.request_id == "cancelled-fixture")
+            .unwrap();
+        assert_eq!(cancelled.status_code, Some(499));
+        assert_eq!(cancelled.outcome, "cancelled");
+        assert_eq!(cancelled.service_tier.as_deref(), Some("priority"));
+        assert_eq!(cancelled.actual_service_tier.as_deref(), Some("default"));
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.request_id == "other-fixture")
+                .unwrap()
+                .outcome,
+            "processing"
+        );
     }
 }
