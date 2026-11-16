@@ -22,6 +22,41 @@ const MODEL_RESPONSE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const MODEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PICKER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+// A protocol baseline for headless installs without a native model cache.
+// Once Codex has run, use the version it recorded instead of Companion's
+// unrelated package version, which can make the official catalog omit models.
+const FALLBACK_CODEX_CLI_VERSION: &str = "0.166.0";
+
+fn cached_codex_client_version(codex_dir: &Path) -> Option<String> {
+    let path = codex_dir.join("models_cache.json");
+    if fs::metadata(&path).ok()?.len() > MODEL_CACHE_MAX_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() as u64 > MODEL_CACHE_MAX_BYTES {
+        return None;
+    }
+    let cache: Value = serde_json::from_slice(&bytes).ok()?;
+    let version = cache.get("client_version")?.as_str()?.trim();
+    let release = version.split(['-', '+']).next()?;
+    let parts = release.split('.').collect::<Vec<_>>();
+    (version.len() <= 64
+        && parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')))
+    .then(|| version.to_string())
+}
+
+fn model_discovery_client_version() -> String {
+    default_codex_dir()
+        .ok()
+        .and_then(|path| cached_codex_client_version(&path))
+        .unwrap_or_else(|| FALLBACK_CODEX_CLI_VERSION.to_string())
+}
 
 pub(crate) fn discover_relay_model_slugs(
     providers: &[ProviderConfig],
@@ -375,11 +410,15 @@ async fn fetch_provider_model_response(
                 plan_type: None,
             }
         };
-        let url = format!(
-            "{}/models?client_version={}",
-            provider.base_url.trim_end_matches('/'),
-            env!("CARGO_PKG_VERSION")
-        );
+        let client_version = model_discovery_client_version();
+        let mut url = Url::parse(&format!(
+            "{}/models",
+            provider.base_url.trim_end_matches('/')
+        ))
+        .map_err(|_| "Provider Base URL 无效".to_string())?;
+        url.query_pairs_mut()
+            .append_pair("client_version", &client_version);
+        let url = url.to_string();
         let account_id = auth.account_id.or_else(|| {
             provider
                 .account
@@ -392,7 +431,7 @@ async fn fetch_provider_model_response(
             .get(&url)
             .bearer_auth(auth.access_token)
             .header("originator", "codex_cli_rs")
-            .header("version", "0.144.1");
+            .header("version", &client_version);
         if let Some(account_id) = account_id {
             request = request.header("ChatGPT-Account-Id", account_id);
         }
@@ -402,11 +441,12 @@ async fn fetch_provider_model_response(
 
     let mut urls = relay_model_url_candidates(&provider.base_url)?;
     if codex_catalog {
+        let client_version = model_discovery_client_version();
         for url in &mut urls {
             let mut parsed = Url::parse(url).map_err(|_| "Provider Base URL 无效".to_string())?;
             parsed
                 .query_pairs_mut()
-                .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+                .append_pair("client_version", &client_version);
             *url = parsed.to_string();
         }
     }
@@ -823,6 +863,26 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    #[test]
+    fn model_discovery_uses_the_native_cache_client_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("models_cache.json");
+        assert_eq!(cached_codex_client_version(temp.path()), None);
+        for version in ["0.167.0", "0.168.0-alpha.4.1", "1.0.0+build.1"] {
+            fs::write(&path, json!({"client_version":version}).to_string()).unwrap();
+            assert_eq!(
+                cached_codex_client_version(temp.path()).as_deref(),
+                Some(version)
+            );
+        }
+        for version in ["", "unknown", "0.167", "0.167.0\r\nInjected: value"] {
+            fs::write(&path, json!({"client_version":version}).to_string()).unwrap();
+            assert_eq!(cached_codex_client_version(temp.path()), None);
+        }
+        fs::write(&path, "{broken cache").unwrap();
+        assert_eq!(cached_codex_client_version(temp.path()), None);
+    }
+
     fn source(id: &str, kind: ModelSourceKind, models: Vec<DiscoveredModel>) -> SourceDiscovery {
         SourceDiscovery {
             source: ModelMatrixSource {
@@ -899,8 +959,24 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0; 2048];
                 let size = stream.read(&mut request).unwrap();
-                assert!(String::from_utf8_lossy(&request[..size])
-                    .starts_with("GET /v1/models?client_version="));
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(request.starts_with("GET /v1/models?client_version="));
+                let version = request
+                    .split("client_version=")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap();
+                assert_ne!(version, env!("CARGO_PKG_VERSION"));
+                if request
+                    .to_ascii_lowercase()
+                    .contains("originator: codex_cli_rs")
+                {
+                    assert!(request
+                        .to_ascii_lowercase()
+                        .contains(&format!("\r\nversion: {version}\r\n")));
+                }
                 let body = body.to_string();
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
             });
