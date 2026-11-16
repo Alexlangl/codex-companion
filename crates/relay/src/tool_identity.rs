@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 pub(crate) struct ToolIdentity {
     names: BTreeSet<String>,
     flat_names: BTreeSet<String>,
+    plan_search: Option<std::sync::Arc<std::sync::Mutex<crate::plan_tool_search::SearchRestore>>>,
 }
 
 impl ToolIdentity {
@@ -20,6 +21,19 @@ impl ToolIdentity {
         let mut context = Self::default();
         context.read_tools(&value);
         context
+    }
+
+    pub(crate) fn disable_plan_search(&mut self) {
+        self.plan_search = None;
+    }
+    pub(crate) fn enable_plan_search(&mut self, body: &[u8]) {
+        if self.plan_search.is_some() {
+            return;
+        }
+        if let Ok(value) = serde_json::from_slice::<Value>(body) {
+            self.plan_search = crate::plan_tool_search::SearchRestore::from_request(&value)
+                .map(|context| std::sync::Arc::new(std::sync::Mutex::new(context)));
+        }
     }
 
     fn read_tools(&mut self, value: &Value) {
@@ -65,7 +79,7 @@ impl ToolIdentity {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.names.is_empty() && self.plan_search.is_none()
     }
 
     pub(crate) fn restore_json(&self, body: Bytes) -> Bytes {
@@ -111,6 +125,9 @@ impl ToolIdentity {
                 result.push_str("data: ");
                 result.push_str(&value.to_string());
                 wrote_data = true;
+            } else if line.starts_with("event:") {
+                result.push_str("event: ");
+                result.push_str(value["type"].as_str().unwrap_or("message"));
             } else {
                 result.push_str(line);
             }
@@ -190,6 +207,15 @@ impl ToolIdentity {
     }
 
     pub(crate) fn restore(&self, value: &mut Value) -> bool {
+        let search_changed = self.plan_search.as_ref().is_some_and(|context| {
+            context
+                .lock()
+                .is_ok_and(|mut context| context.restore(value))
+        });
+        self.restore_identity(value) || search_changed
+    }
+
+    fn restore_identity(&self, value: &mut Value) -> bool {
         match value.get("type").and_then(Value::as_str) {
             Some("function_call" | "custom_tool_call") => {
                 let Some(name) = value["name"].as_str() else {

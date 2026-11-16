@@ -37,8 +37,11 @@ use tokio_tungstenite::{
 };
 
 const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const WEBSOCKET_PREFLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const WEBSOCKET_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const WEBSOCKET_PREFLIGHT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const WEBSOCKET_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const WEBSOCKET_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+const HEARTBEAT_PAYLOAD: &[u8] = b"companion-liveness";
 const MAX_WEBSOCKET_PREFLIGHT_MESSAGES: usize = 128;
 const MAX_WEBSOCKET_PREFLIGHT_BYTES: usize = 1024 * 1024;
 
@@ -137,6 +140,8 @@ pub(crate) async fn responses_websocket(
     let provider_id = provider.id.clone();
     let bridge_state = state.clone();
     let mut response = websocket
+        .max_frame_size(64 * 1024 * 1024)
+        .max_message_size(128 * 1024 * 1024)
         .on_upgrade(move |client| {
             bridge_websocket(
                 client,
@@ -1007,6 +1012,7 @@ enum WebSocketBridgeEvent {
     Client(Option<Result<ClientMessage, axum::Error>>),
     Upstream(Option<Result<UpstreamMessage, tokio_tungstenite::tungstenite::Error>>),
     IdleTimeout,
+    Heartbeat,
 }
 
 // The upgrade hands off both the selected connection and client audit context.
@@ -1040,8 +1046,26 @@ async fn bridge_websocket(
     let mut request_guard = state.begin_provider_request(&provider.id);
     request_guard.account_permit = Some(permit);
     let mut last_upstream_activity = tokio::time::Instant::now();
+    let mut last_transport_activity = last_upstream_activity;
+    let mut heartbeat = tokio::time::interval_at(
+        last_upstream_activity + WEBSOCKET_HEARTBEAT_INTERVAL,
+        WEBSOCKET_HEARTBEAT_INTERVAL,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        if let Some(request) = &pending.request {
+            let bytes = match request {
+                ClientMessage::Text(t) => t.as_bytes(),
+                ClientMessage::Binary(b) => b.as_ref(),
+                _ => &[],
+            };
+            if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
+                pending.tool_identity.enable_plan_search(bytes);
+            } else {
+                pending.tool_identity.disable_plan_search();
+            }
+        }
         let event = if let Some(upstream) = upstream_stream.as_mut() {
             let idle_deadline = pending.request.as_ref().map(|_| {
                 let idle_deadline = last_upstream_activity
@@ -1054,6 +1078,7 @@ async fn bridge_websocket(
             });
             let disabled_deadline = tokio::time::Instant::now() + Duration::from_secs(86_400);
             tokio::select! {
+                _ = heartbeat.tick() => WebSocketBridgeEvent::Heartbeat,
                 client_message = client_stream.next() => WebSocketBridgeEvent::Client(client_message),
                 upstream_message = upstream.next() => WebSocketBridgeEvent::Upstream(upstream_message),
                 _ = tokio::time::sleep_until(idle_deadline.unwrap_or(disabled_deadline)), if idle_deadline.is_some() => WebSocketBridgeEvent::IdleTimeout,
@@ -1151,6 +1176,14 @@ async fn bridge_websocket(
                 let close = matches!(message, ClientMessage::Close(_));
                 if starts_tracked_response {
                     pending.begin(message.clone());
+                    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
+                        let bytes = match &message {
+                            ClientMessage::Text(t) => t.as_bytes(),
+                            ClientMessage::Binary(b) => b.as_ref(),
+                            _ => &[],
+                        };
+                        pending.tool_identity.enable_plan_search(bytes);
+                    }
                     if upstream_sink.is_some() {
                         if let Some(audit) = pending.audit.as_mut() {
                             audit.attempt(&provider.id, "policy");
@@ -1161,7 +1194,18 @@ async fn bridge_websocket(
                     last_upstream_activity = tokio::time::Instant::now();
                 }
                 if response_cancel {
+                    if pending.preload.is_some() {
+                        discard_upstream_connection(&mut upstream_sink, &mut upstream_stream);
+                    }
                     pending.clear();
+                }
+                if response_create && !starts_tracked_response && pending.preload.is_some() {
+                    let _ = client_sink
+                        .send(websocket_transport_error_event(
+                            "历史预载进行中，请等待当前响应或取消后重试",
+                        ))
+                        .await;
+                    continue;
                 }
                 if close {
                     break;
@@ -1181,14 +1225,14 @@ async fn bridge_websocket(
                         &mut upstream_sink,
                         &mut upstream_stream,
                         &mut oauth_access_token,
-                        Some(&message),
+                        None,
                         &mut pending.audit,
                     )
                     .await
                     {
                         Ok(()) => {
                             last_upstream_activity = tokio::time::Instant::now();
-                            continue;
+                            last_transport_activity = last_upstream_activity;
                         }
                         Err(error) => {
                             let detail =
@@ -1220,14 +1264,47 @@ async fn bridge_websocket(
                     }
                 }
 
+                let normalized = normalize_client_frame_for_provider(
+                    message.clone(),
+                    &provider,
+                    session_mapping_enabled(&state),
+                );
+                let mut outbound = normalized.clone();
+                if starts_tracked_response
+                    && !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider)
+                {
+                    let bytes = match &normalized {
+                        ClientMessage::Text(t) => t.as_bytes(),
+                        ClientMessage::Binary(b) => b.as_ref(),
+                        _ => &[],
+                    };
+                    if bytes.len() > crate::websocket_history::MESSAGE_LIMIT {
+                        match serde_json::from_slice(bytes)
+                            .ok()
+                            .map(crate::websocket_history::HistoryPreload::build)
+                        {
+                            Some(Ok(Some(mut preload))) => {
+                                let (frame, _) = preload.next_frame(None);
+                                outbound = ClientMessage::Text(frame.to_string().into());
+                                pending.replay_blocked = true;
+                                pending.preload = Some(preload);
+                            }
+                            Some(Err(detail)) => {
+                                if let Some(audit) = pending.audit.as_mut() {
+                                    audit.finish(Some(413), "rejected", Some(detail));
+                                }
+                                let _ = client_sink.send(websocket_failed_event(detail)).await;
+                                pending.clear();
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let send_result = upstream_sink
                     .as_mut()
                     .expect("upstream sink checked above")
-                    .send(client_to_upstream_for_provider(
-                        message.clone(),
-                        &provider,
-                        session_mapping_enabled(&state),
-                    ))
+                    .send(client_message_to_upstream(outbound))
                     .await;
                 if let Err(error) = send_result {
                     let detail = format!("向上游发送 WebSocket 帧失败: {error}");
@@ -1366,6 +1443,11 @@ async fn bridge_websocket(
                     }
                 };
 
+                last_transport_activity = tokio::time::Instant::now();
+                if matches!(&upstream_message, UpstreamMessage::Pong(bytes) if bytes.as_ref() == HEARTBEAT_PAYLOAD)
+                {
+                    continue;
+                }
                 if matches!(
                     upstream_message,
                     UpstreamMessage::Ping(_) | UpstreamMessage::Pong(_)
@@ -1410,6 +1492,48 @@ async fn bridge_websocket(
                 }
                 last_upstream_activity = tokio::time::Instant::now();
 
+                if let Some(preload) = pending.preload.as_mut() {
+                    let bytes = match &upstream_message {
+                        UpstreamMessage::Text(t) => t.as_bytes(),
+                        UpstreamMessage::Binary(b) => b.as_ref(),
+                        _ => &[],
+                    };
+                    let progress = preload.accept(bytes);
+                    let result = match progress {
+                        Ok(crate::websocket_history::Progress::Waiting) => continue,
+                        Ok(crate::websocket_history::Progress::Send { frame, final_chunk }) => {
+                            if !websocket_provider_available(
+                                &state,
+                                &provider,
+                                pending.request.as_ref(),
+                            ) {
+                                Err("账号配额或策略已禁止继续预载，未发送生成请求")
+                            } else {
+                                let result = upstream_sink
+                                    .as_mut()
+                                    .unwrap()
+                                    .send(UpstreamMessage::Text(frame.to_string().into()))
+                                    .await
+                                    .map_err(|_| "历史预载发送结果未知，未重放请求");
+                                if final_chunk && result.is_ok() {
+                                    pending.preload = None;
+                                }
+                                result
+                            }
+                        }
+                        Err(detail) => Err(detail),
+                    };
+                    if let Err(detail) = result {
+                        if let Some(audit) = pending.audit.as_mut() {
+                            audit.finish(Some(502), "failed", Some(detail));
+                        }
+                        let _ = client_sink.send(websocket_failed_event(detail)).await;
+                        pending.clear();
+                        discard_upstream_connection(&mut upstream_sink, &mut upstream_stream);
+                    }
+                    continue;
+                }
+
                 let upstream_event =
                     if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider) {
                         let payload = match &upstream_message {
@@ -1444,6 +1568,45 @@ async fn bridge_websocket(
                     matches!(&upstream_event, WebSocketUpstreamEvent::Failure { .. });
                 match upstream_event {
                     WebSocketUpstreamEvent::Failure { detail, status } => {
+                        if pending.can_replay()
+                            && !pending.history_recovery_attempted
+                            && !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider)
+                        {
+                            let bytes = match pending.request.as_ref() {
+                                Some(ClientMessage::Text(t)) => t.as_bytes(),
+                                Some(ClientMessage::Binary(b)) => b.as_ref(),
+                                _ => &[],
+                            };
+                            if let Some(body) =
+                                crate::public_responses::recover_history(bytes, &detail)
+                            {
+                                pending.history_recovery_attempted = true;
+                                let frame = ClientMessage::Text(
+                                    String::from_utf8_lossy(&body).into_owned().into(),
+                                );
+                                pending.request = Some(frame.clone());
+                                pending.reset_after_replay();
+                                if upstream_sink
+                                    .as_mut()
+                                    .unwrap()
+                                    .send(client_to_upstream_for_provider(
+                                        frame,
+                                        &provider,
+                                        session_mapping_enabled(&state),
+                                    ))
+                                    .await
+                                    .is_ok()
+                                {
+                                    continue;
+                                }
+                                pending.replay_blocked = true;
+                                discard_upstream_connection(
+                                    &mut upstream_sink,
+                                    &mut upstream_stream,
+                                );
+                            }
+                        }
+
                         if pending.can_replay()
                             && !matches!(status, Some(401 | 429))
                             && codex_companion_health::is_content_moderation_failure(&detail)
@@ -1676,6 +1839,43 @@ async fn bridge_websocket(
                     pending.clear();
                 }
             }
+            WebSocketBridgeEvent::Heartbeat => {
+                last_transport_activity = last_transport_activity.max(last_upstream_activity);
+                let expired = last_transport_activity.elapsed() >= WEBSOCKET_HEARTBEAT_TIMEOUT;
+                let sent = if expired {
+                    false
+                } else if let Some(sink) = upstream_sink.as_mut() {
+                    sink.send(UpstreamMessage::Ping(bytes::Bytes::from_static(
+                        HEARTBEAT_PAYLOAD,
+                    )))
+                    .await
+                    .is_ok()
+                } else {
+                    true
+                };
+                if !sent {
+                    if !handle_broken_upstream(
+                        &state,
+                        &candidates,
+                        &mut candidate_index,
+                        &mut provider,
+                        &mut attempted,
+                        &mut pending,
+                        &mut request_guard,
+                        &mut upstream_sink,
+                        &mut upstream_stream,
+                        &mut oauth_access_token,
+                        &mut client_sink,
+                        "上游 WebSocket 心跳失活",
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    last_upstream_activity = tokio::time::Instant::now();
+                    last_transport_activity = last_upstream_activity;
+                }
+            }
             WebSocketBridgeEvent::IdleTimeout => {
                 let detail = if pending.visible_output {
                     "上游 WebSocket 在输出开始后空闲超时"
@@ -1718,6 +1918,9 @@ struct PendingWebSocketResponse {
     started_at: Option<tokio::time::Instant>,
     visible_output: bool,
     oauth_unauthorized_refresh_attempted: bool,
+    history_recovery_attempted: bool,
+    replay_blocked: bool,
+    preload: Option<crate::websocket_history::HistoryPreload>,
     prefetched: VecDeque<UpstreamMessage>,
     prefetched_bytes: usize,
 }
@@ -1734,12 +1937,15 @@ impl PendingWebSocketResponse {
         self.started_at = Some(tokio::time::Instant::now());
         self.visible_output = false;
         self.oauth_unauthorized_refresh_attempted = false;
+        self.history_recovery_attempted = false;
+        self.replay_blocked = false;
+        self.preload = None;
         self.prefetched.clear();
         self.prefetched_bytes = 0;
     }
 
     fn can_replay(&self) -> bool {
-        self.request.is_some() && !self.visible_output
+        self.request.is_some() && !self.visible_output && !self.replay_blocked
     }
 
     fn mark_replayed(&mut self) {
@@ -1787,6 +1993,9 @@ impl PendingWebSocketResponse {
         self.started_at = None;
         self.visible_output = false;
         self.oauth_unauthorized_refresh_attempted = false;
+        self.history_recovery_attempted = false;
+        self.replay_blocked = false;
+        self.preload = None;
         self.prefetched.clear();
         self.prefetched_bytes = 0;
     }
@@ -3708,6 +3917,141 @@ mod tests {
         assert_eq!(selected.id, "healthy");
         let _ = upstream.close(None).await;
         server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn websocket_history_preload_hides_acks_and_never_replays_unknown_outcomes() {
+        for reject in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let upstream = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let mut count = 0;
+                let mut items = 0;
+                loop {
+                    let Some(Ok(UpstreamMessage::Text(text))) = socket.next().await else {
+                        panic!("missing history chunk")
+                    };
+                    assert!(text.len() < crate::websocket_history::MESSAGE_LIMIT);
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    let body = value.get("response").unwrap_or(&value);
+                    items += body["input"].as_array().unwrap().len();
+                    if count > 0 {
+                        assert_eq!(body["previous_response_id"], format!("seed-{}", count - 1));
+                    }
+                    let preload = body["generate"] == false;
+                    if reject {
+                        socket.send(UpstreamMessage::Text(json!({"type":"response.completed","response":{"id":"ambiguous","status":"completed","output":[]}}).to_string().into())).await.unwrap();
+                        let next =
+                            tokio::time::timeout(Duration::from_secs(2), socket.next()).await;
+                        assert!(!matches!(next, Ok(Some(Ok(UpstreamMessage::Text(_))))));
+                        return;
+                    }
+                    let mut response = json!({"type":"response.completed","response":{"id":format!("seed-{count}"),"status":"completed","output":[],"usage":{"output_tokens":0}}});
+                    if preload {
+                        response["response"]["generate"] = json!(false);
+                    }
+                    socket
+                        .send(UpstreamMessage::Text(response.to_string().into()))
+                        .await
+                        .unwrap();
+                    count += 1;
+                    if !preload {
+                        assert!(count > 2);
+                        assert_eq!(items, 9);
+                        return;
+                    }
+                }
+            });
+            let state = state_with_group(vec![provider(
+                "a",
+                Some(format!("ws://{address}/v1/responses")),
+            )]);
+            let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let relay_address = relay_listener.local_addr().unwrap();
+            let app = Router::new()
+                .route("/v1/responses", get(responses_websocket))
+                .with_state(state);
+            let relay =
+                tokio::spawn(async move { axum::serve(relay_listener, app).await.unwrap() });
+            let (mut client, _) = connect_async(format!("ws://{relay_address}/v1/responses"))
+                .await
+                .unwrap();
+            let request = json!({"type":"response.create","model":"gpt-test","input":(0..9).map(|_|json!({"role":"user","content":"x".repeat(4*1024*1024)})).collect::<Vec<_>>()});
+            client
+                .send(UpstreamMessage::Text(request.to_string().into()))
+                .await
+                .unwrap();
+            let frame = loop {
+                let next = tokio::time::timeout(Duration::from_secs(30), client.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                if let UpstreamMessage::Text(text) = next {
+                    break text;
+                }
+            };
+            let event: Value = serde_json::from_str(&frame).unwrap();
+            if reject {
+                assert_eq!(event["type"], "response.failed");
+            } else {
+                assert_eq!(event["type"], "response.completed");
+                assert!(event["response"].get("generate").is_none());
+            }
+            let _ = client.close(None).await;
+            upstream.await.unwrap();
+            relay.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_recovers_explicit_encrypted_rejection_on_same_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            for index in 0..2 {
+                let Some(Ok(UpstreamMessage::Text(text))) = socket.next().await else {
+                    panic!()
+                };
+                assert_eq!(text.contains("encrypted_content"), index == 0);
+                let response = if index == 0 {
+                    json!({"type":"response.failed","response":{"error":{"code":"invalid_encrypted_content","message":"invalid_encrypted_content"}}})
+                } else {
+                    json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                };
+                socket
+                    .send(UpstreamMessage::Text(response.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let state = state_with_group(vec![provider(
+            "a",
+            Some(format!("ws://{address}/v1/responses")),
+        )]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/responses", get(responses_websocket))
+            .with_state(state);
+        let relay = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut client, _) = connect_async(format!("ws://{address}/v1/responses"))
+            .await
+            .unwrap();
+        client.send(UpstreamMessage::Text(json!({"type":"response.create","model":"gpt-test","input":[{"role":"user","content":"task"},{"type":"reasoning","encrypted_content":"opaque"}]}).to_string().into())).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(frame.into_text().unwrap().contains("response.completed"));
+        let _ = client.close(None).await;
+        upstream.await.unwrap();
+        relay.abort();
     }
 
     #[tokio::test]

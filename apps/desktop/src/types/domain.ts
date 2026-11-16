@@ -668,6 +668,7 @@ export interface HistoryIndexRepairReport {
   dryRun: boolean;
   scannedSessions: number;
   affectedSessions: string[];
+  skippedSessions: { threadId: string; reason: string }[];
   repairedSessions: number;
   backupPath?: string | null;
 }

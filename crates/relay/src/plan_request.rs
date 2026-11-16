@@ -23,6 +23,11 @@ pub(crate) fn validate(value: &Value, websocket: bool) -> Result<(), String> {
     }
     tools(value.get("tools"), 0)?;
     choice(value.get("tool_choice"), 0)?;
+    if value.get("tool_choice").is_some_and(choice_uses_search)
+        && !crate::plan_tool_search::declared(value)
+    {
+        return Err("tool_choice 指定工具发现，但未声明客户端 tool_search".into());
+    }
     for item in value["input"].as_array().into_iter().flatten() {
         if item["type"] == "configuration_update" {
             let fields = item.as_object().ok_or("configuration_update 格式无效")?;
@@ -52,13 +57,34 @@ pub(crate) fn validate(value: &Value, websocket: bool) -> Result<(), String> {
             item["type"].as_str(),
             Some("tool_search_call" | "tool_search_output")
         ) {
-            return Err(
-                "ChatGPT 套餐不支持 Responses tool_search 历史，请使用 function/custom 工具".into(),
-            );
+            if item["execution"] != "client" || item["call_id"].as_str().is_none_or(str::is_empty) {
+                return Err("ChatGPT 套餐仅支持带 call_id 的客户端工具发现历史".into());
+            }
+            if item["type"] == "tool_search_call"
+                && !(item["arguments"].is_object()
+                    || item["arguments"].as_str().is_some_and(|v| {
+                        serde_json::from_str::<Value>(v).is_ok_and(|v| v.is_object())
+                    }))
+            {
+                return Err("工具发现参数必须为 JSON 对象".into());
+            }
+            if item["type"] == "tool_search_output" {
+                let discovered = crate::plan_tool_search::result_tools(item)?;
+                tools(discovered.as_ref(), 0)?;
+            }
         }
         validate_input(item)?;
     }
     Ok(())
+}
+
+fn choice_uses_search(value: &Value) -> bool {
+    value["type"] == "tool_search"
+        || value["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(choice_uses_search)
 }
 
 fn validate_input(item: &Value) -> Result<(), String> {
@@ -94,6 +120,8 @@ fn tools(value: Option<&Value>, depth: usize) -> Result<(), String> {
                 }
             }
             Some("namespace") if tool["name"].as_str().is_some_and(|n| !n.is_empty()) && tool["tools"].is_array() => tools(tool.get("tools"), depth + 1)?,
+            Some("tool_search") if depth == 0 && tool["execution"] == "client"
+                && tool.get("parameters").is_none_or(Value::is_object) => {},
             Some("web_search" | "web_search_preview" | "web_search_preview_2025_03_11") if depth == 0 => {}
             _ => return Err("ChatGPT 套餐不支持本次请求中的 hosted/tool_search 工具，请改用 function/custom 工具".into()),
         }
@@ -123,6 +151,7 @@ fn choice(value: Option<&Value>, depth: usize) -> Result<(), String> {
             | "web_search_preview"
             | "web_search_preview_2025_03_11",
         ) => Ok(()),
+        Some("tool_search") if value.get("execution").is_none_or(|v| v == "client") => Ok(()),
         Some("allowed_tools") => {
             for tool in value["tools"]
                 .as_array()
@@ -138,6 +167,7 @@ fn choice(value: Option<&Value>, depth: usize) -> Result<(), String> {
 
 pub(crate) fn normalize(value: &mut Value, websocket: bool) -> Result<(), String> {
     validate(value, websocket)?;
+    crate::plan_tool_search::lower(value)?;
     let effort = value["input"]
         .as_array()
         .into_iter()

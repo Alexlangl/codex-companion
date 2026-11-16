@@ -1,15 +1,14 @@
 //! Repair disposable pagination projections only when durable rollouts prove
 //! that their byte cursor is stale. Never rewrite the source conversation.
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 const DATABASE: &str = "thread_history_1.sqlite";
@@ -19,7 +18,6 @@ const TABLES: [&str; 4] = [
     "thread_turns",
     "thread_history_projection_state",
 ];
-const MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,8 +25,68 @@ pub struct HistoryIndexRepairReport {
     pub dry_run: bool,
     pub scanned_sessions: usize,
     pub affected_sessions: Vec<String>,
+    pub skipped_sessions: Vec<SkippedHistorySession>,
     pub repaired_sessions: usize,
     pub backup_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedHistorySession {
+    pub thread_id: String,
+    pub reason: String,
+}
+
+// Bound memory by streaming past unrelated payload fields, not by rejecting
+// large sessions. Count decoded JSONL bytes even when the source is compressed.
+struct RecordReader<'a, R> {
+    inner: &'a mut R,
+    bytes: u64,
+    ended: bool,
+}
+impl<R: BufRead> Read for RecordReader<'_, R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.ended || out.is_empty() {
+            return Ok(0);
+        }
+        let buf = self.inner.fill_buf()?;
+        let buf = &buf[..buf.len().min(out.len())];
+        let n = buf
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(buf.len(), |i| i + 1)
+            .min(out.len());
+        if n == 0 {
+            return Ok(0);
+        }
+        out[..n].copy_from_slice(&buf[..n]);
+        self.ended = out[n - 1] == b'\n';
+        self.bytes += n as u64;
+        self.inner.consume(n);
+        Ok(n)
+    }
+}
+#[derive(Deserialize)]
+struct RecordOrdinal {
+    ordinal: Option<u64>,
+}
+#[derive(Deserialize)]
+struct SessionHeader {
+    #[serde(rename = "type")]
+    kind: String,
+    ordinal: Option<u64>,
+    payload: SessionMetadata,
+}
+#[derive(Deserialize)]
+struct SessionMetadata {
+    id: String,
+    history_base: Option<HistoryBase>,
+}
+#[derive(Deserialize)]
+struct HistoryBase {
+    thread_id: String,
+    end_byte_offset: u64,
+    end_ordinal_exclusive: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -42,20 +100,6 @@ struct Source {
     initial: u64,
     next: Option<u64>,
     base: Option<(String, u64, u64)>,
-}
-
-struct ScanBudget {
-    started: Instant,
-    bytes: u64,
-}
-impl ScanBudget {
-    fn consume(&mut self, bytes: u64) -> Result<(), String> {
-        self.bytes = self.bytes.saturating_add(bytes);
-        if self.started.elapsed() > Duration::from_secs(45) || self.bytes > 2 * 1024 * 1024 * 1024 {
-            return Err("会话索引扫描超出范围，请缩小 Codex 目录后重试".into());
-        }
-        Ok(())
-    }
 }
 
 fn regular(path: &Path) -> Result<fs::Metadata, String> {
@@ -112,11 +156,8 @@ fn file_ids(path: &Path) -> Option<(String, String)> {
     Some((id(logical)?, id(physical)?))
 }
 
-fn read_source(path: &Path, budget: &mut ScanBudget) -> Result<Source, String> {
+fn read_source(path: &Path) -> Result<Source, String> {
     let metadata = regular(path)?;
-    if metadata.len() > MAX_BYTES {
-        return Err("会话文件过大，未修改索引".into());
-    }
     let modified = metadata.modified().map_err(|e| e.to_string())?;
     let mut hash = Sha256::new();
     let mut raw = fs::File::open(path).map_err(|e| e.to_string())?;
@@ -126,7 +167,6 @@ fn read_source(path: &Path, budget: &mut ScanBudget) -> Result<Source, String> {
         if count == 0 {
             break;
         }
-        budget.consume(count as u64)?;
         hash.update(&buffer[..count]);
     }
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
@@ -138,7 +178,6 @@ fn read_source(path: &Path, budget: &mut ScanBudget) -> Result<Source, String> {
         Box::new(file)
     };
     let mut reader = BufReader::new(input);
-    let mut line = Vec::new();
     let mut source = Source {
         path: path.into(),
         length: metadata.len(),
@@ -154,54 +193,53 @@ fn read_source(path: &Path, budget: &mut ScanBudget) -> Result<Source, String> {
     let mut expected = 0;
     let mut legacy = false;
     loop {
-        line.clear();
-        let count = reader
-            .by_ref()
-            .take(64 * 1024 * 1024 + 1)
-            .read_until(b'\n', &mut line)
-            .map_err(|e| e.to_string())?;
-        if count == 0 {
+        if reader
+            .fill_buf()
+            .map_err(|_| "读取原始会话失败")?
+            .is_empty()
+        {
             break;
         }
-        budget.consume(count as u64)?;
-        source.decoded += count as u64;
-        if count > 64 * 1024 * 1024 || source.decoded > MAX_BYTES || line.last() != Some(&b'\n') {
-            return Err("会话文件过大或尾部尚未写完，未修改索引".into());
-        }
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let record: Value =
-            serde_json::from_slice(&line).map_err(|_| "会话文件包含损坏记录，未修改索引")?;
-        if first {
+        let mut record = RecordReader {
+            inner: &mut reader,
+            bytes: 0,
+            ended: false,
+        };
+        let ordinal = if first {
+            let header: SessionHeader =
+                serde_json::from_reader(&mut record).map_err(|_| "原始会话元数据无效")?;
             let (logical, _) = file_ids(path).ok_or("会话文件名无效")?;
-            if record["type"] != "session_meta"
-                || record["payload"]["id"].as_str().and_then(id).as_deref() != Some(&logical)
+            if header.kind != "session_meta"
+                || id(&header.payload.id).as_deref() != Some(logical.as_str())
             {
                 return Err("会话身份与文件名不一致，未修改索引".into());
             }
-            if let Some(base) = record["payload"]
-                .get("history_base")
-                .filter(|v| !v.is_null())
-            {
-                let parent = base["thread_id"]
-                    .as_str()
-                    .and_then(id)
-                    .ok_or("祖先会话 ID 无效")?;
-                let bytes = base["end_byte_offset"].as_u64().ok_or("祖先字节范围无效")?;
-                expected = base["end_ordinal_exclusive"]
-                    .as_u64()
-                    .filter(|v| *v > 0)
-                    .ok_or("祖先序号范围无效")?;
+            if let Some(history) = header.payload.history_base {
+                let parent = id(&history.thread_id).ok_or("祖先会话标识无效")?;
+                if history.end_ordinal_exclusive == 0 {
+                    return Err("祖先记录序号无效".into());
+                }
+                expected = history.end_ordinal_exclusive;
                 source.initial = expected;
-                source.base = Some((parent, bytes, expected));
+                source.base = Some((parent, history.end_byte_offset, expected));
             }
+            header.ordinal
+        } else {
+            serde_json::from_reader::<_, RecordOrdinal>(&mut record)
+                .map_err(|_| "原始会话 JSON 无效")?
+                .ordinal
+        };
+        source.decoded += record.bytes;
+        if !record.ended {
+            return Err("原始会话尾部不完整，未修改索引".into());
+        }
+        if first {
             first = false;
-            if record.get("ordinal").is_none() {
+            if ordinal.is_none() {
                 continue;
             }
         }
-        if let Some(ordinal) = record["ordinal"].as_u64() {
+        if let Some(ordinal) = ordinal {
             if legacy || ordinal != expected {
                 return Err("会话序号不连续，未修改索引".into());
             }
@@ -237,7 +275,6 @@ fn load_chain(
     registry: &BTreeMap<String, PathBuf>,
     sources: &mut BTreeMap<String, Source>,
     visiting: &mut BTreeSet<String>,
-    budget: &mut ScanBudget,
 ) -> Result<(), String> {
     if sources.contains_key(thread) {
         return Ok(());
@@ -249,10 +286,9 @@ fn load_chain(
         registry
             .get(thread)
             .ok_or("原始会话或祖先记录缺失，未修改索引")?,
-        budget,
     )?;
     if let Some((parent, bytes, ordinal)) = &source.base {
-        load_chain(parent, registry, sources, visiting, budget)?;
+        load_chain(parent, registry, sources, visiting)?;
         let ancestor = &sources[parent];
         if *bytes > ancestor.decoded || ancestor.next.is_none_or(|next| *ordinal > next) {
             return Err("祖先会话记录不完整，未修改索引".into());
@@ -312,15 +348,12 @@ fn schema(db: &Connection) -> Result<String, String> {
 }
 
 fn cursors(db: &Connection) -> Result<Vec<(String, i64, i64)>, String> {
-    let mut statement = db.prepare("SELECT thread_id,next_rollout_byte_offset,next_rollout_ordinal FROM thread_history_projection_state ORDER BY thread_id LIMIT 100001").map_err(|e| e.to_string())?;
+    let mut statement = db.prepare("SELECT thread_id,next_rollout_byte_offset,next_rollout_ordinal FROM thread_history_projection_state ORDER BY thread_id").map_err(|e| e.to_string())?;
     let rows = statement
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(|e| e.to_string())?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())?;
-    if rows.len() > 100_000 {
-        return Err("会话索引过多，未修改数据".into());
-    }
     Ok(rows)
 }
 
@@ -338,6 +371,7 @@ pub fn repair_history_index(
         dry_run,
         scanned_sessions: 0,
         affected_sessions: vec![],
+        skipped_sessions: vec![],
         repaired_sessions: 0,
         backup_path: None,
     };
@@ -370,25 +404,13 @@ pub fn repair_history_index(
         .map_err(|e| e.to_string())?;
     let original_schema = schema(&db)?;
     let original_cursors = cursors(&db)?;
-    let mut budget = ScanBudget {
-        started: Instant::now(),
-        bytes: 0,
-    };
     let mut registry = BTreeMap::new();
     for directory in ["sessions", "archived_sessions"] {
         let base = profile.join(directory);
         if !base.exists() {
             continue;
         }
-        for (count, entry) in walkdir::WalkDir::new(base)
-            .follow_links(false)
-            .into_iter()
-            .enumerate()
-        {
-            budget.consume(0)?;
-            if count > 100_000 {
-                return Err("会话文件过多，未修改数据".into());
-            }
+        for entry in walkdir::WalkDir::new(base).follow_links(false) {
             let entry = entry.map_err(|e| e.to_string())?;
             if entry.file_type().is_symlink() {
                 return Err("会话目录包含符号链接，未修改索引".into());
@@ -403,32 +425,32 @@ pub fn repair_history_index(
     }
     let mut sources = BTreeMap::new();
     for (thread, offset, ordinal) in &original_cursors {
-        if *offset < 0 || *ordinal < 0 {
-            return Err("聊天索引游标无效，未修改数据".into());
-        }
-        load_chain(
-            thread,
-            &registry,
-            &mut sources,
-            &mut BTreeSet::new(),
-            &mut budget,
-        )?;
-        let source = &sources[thread];
-        if *offset as u64 > source.decoded {
-            if source.next.is_none_or(|next| *ordinal as u64 > next)
-                || (*ordinal as u64) < source.initial
-            {
-                return Err("原始记录不足以重建索引，未修改数据".into());
+        report.scanned_sessions += 1;
+        let result = (|| -> Result<(), String> {
+            if *offset < 0 || *ordinal < 0 {
+                return Err("聊天索引游标无效".into());
             }
-            report.affected_sessions.push(thread.clone());
+            load_chain(thread, &registry, &mut sources, &mut BTreeSet::new())?;
+            let source = &sources[thread];
+            if *offset as u64 > source.decoded {
+                if source.next.is_none_or(|next| *ordinal as u64 > next)
+                    || (*ordinal as u64) < source.initial
+                {
+                    return Err("原始记录不足以重建索引".into());
+                }
+                report.affected_sessions.push(thread.clone());
+            }
+            Ok(())
+        })();
+        if let Err(reason) = result {
+            report.skipped_sessions.push(SkippedHistorySession {
+                thread_id: thread.clone(),
+                reason,
+            });
         }
     }
-    report.scanned_sessions = sources.len();
     if dry_run || report.affected_sessions.is_empty() {
         return Ok(report);
-    }
-    if report.affected_sessions.len() > 64 {
-        return Err("异常索引超过单次修复范围，未修改数据".into());
     }
     // An online SQLite backup includes committed WAL contents. A raw file copy
     // here would lose records when the official client is running.
@@ -445,17 +467,7 @@ pub fn repair_history_index(
     let mut backup = Connection::open(temporary.path()).map_err(|e| e.to_string())?;
     {
         let copy = rusqlite::backup::Backup::new(&db, &mut backup).map_err(|e| e.to_string())?;
-        for _ in 0..4096 {
-            budget.consume(0)?;
-            if temporary
-                .as_file()
-                .metadata()
-                .map_err(|e| e.to_string())?
-                .len()
-                > 256 * 1024 * 1024
-            {
-                return Err("聊天索引备份超出范围，未修改数据".into());
-            }
+        loop {
             match copy.step(256).map_err(|e| e.to_string())? {
                 rusqlite::backup::StepResult::Done => break,
                 rusqlite::backup::StepResult::More => continue,
@@ -469,7 +481,7 @@ pub fn repair_history_index(
     drop(backup);
     temporary.as_file().sync_all().map_err(|e| e.to_string())?;
     for source in sources.values() {
-        if read_source(&source.path, &mut budget)? != *source {
+        if read_source(&source.path)? != *source {
             return Err("会话内容已变化，未修改索引".into());
         }
     }
@@ -583,10 +595,44 @@ mod tests {
             format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\"}}}}\n{{\"type\":\"event_msg\"}}\n"),
         ] {
             let dir = fixture(); fs::write(rollout(dir.path(),THREAD),source).unwrap();
-            assert!(repair_history_index(dir.path(),false).is_err());
+            let report = repair_history_index(dir.path(),false).unwrap();
+            assert_eq!(report.skipped_sessions.len(), 1);
+            assert_eq!(report.repaired_sessions, 0);
             assert_eq!(cursors(&Connection::open(dir.path().join(DATABASE)).unwrap()).unwrap().len(),2);
         }
     }
+    #[test]
+    fn missing_session_does_not_block_repairable_sessions() {
+        let dir = fixture();
+        fs::remove_file(rollout(dir.path(), PARENT)).unwrap();
+        let report = repair_history_index(dir.path(), false).unwrap();
+        assert_eq!(report.repaired_sessions, 1);
+        assert_eq!(report.skipped_sessions.len(), 1);
+        assert_eq!(report.skipped_sessions[0].thread_id, PARENT);
+        let db = Connection::open(dir.path().join(DATABASE)).unwrap();
+        assert_eq!(cursors(&db).unwrap()[0].0, PARENT);
+    }
+    #[test]
+    fn streaming_record_skips_large_payload_and_checks_tail() {
+        let dir = fixture();
+        let path = rollout(dir.path(), THREAD);
+        let mut file = fs::File::create(&path).unwrap();
+        use std::io::Write;
+        write!(file, "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\"}}}}\n{{\"ordinal\":0,\"payload\":{{\"text\":\"").unwrap();
+        let chunk = [b'x'; 64 * 1024];
+        for _ in 0..1050 {
+            file.write_all(&chunk).unwrap();
+        }
+        file.write_all(b"\"}}\n").unwrap();
+        drop(file);
+        let source = read_source(&path).unwrap();
+        assert_eq!(source.next, Some(1));
+        assert!(source.decoded > 64 * 1024 * 1024);
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(source.length - 1).unwrap();
+        assert!(read_source(&path).is_err());
+    }
+
     #[test]
     fn compressed_sources_and_ancestor_cutoffs_are_verified() {
         let dir = fixture();

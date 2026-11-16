@@ -25,3 +25,7 @@ mod usage_capture;
 
 mod model_catalog;
 mod public_responses;
+
+mod websocket_history;
+
+mod plan_tool_search;

@@ -59,6 +59,7 @@ pub(crate) struct UpstreamResponse {
     buffered_body: Option<Bytes>,
     prefetched_body: VecDeque<Bytes>,
     opaque_event_stream: bool,
+    cached_preflight: Option<Result<(), StreamPreflightError>>,
     status: StatusCode,
     headers: HeaderMap,
     oauth_refresh_error: Option<String>,
@@ -279,8 +280,48 @@ impl UpstreamResponse {
         &mut self,
         has_fallback_candidate: bool,
     ) -> Result<(), StreamPreflightError> {
+        if let Some(result) = self.cached_preflight.take() {
+            return result;
+        }
         self.preflight_stream_failure_with_hold(has_fallback_candidate, STREAM_PREFLIGHT_MAX_HOLD)
             .await
+    }
+
+    /// Inspect only the uncommitted response. Preserve both body and preflight
+    /// result so ordinary routing consumes them once if recovery is inapplicable.
+    pub(crate) async fn history_recovery_body(
+        &mut self,
+        body: &[u8],
+        fallback: bool,
+    ) -> Option<Bytes> {
+        let error = if self.status.is_success() {
+            let result = self.preflight_stream_failure(fallback).await;
+            let message = match &result {
+                Err(StreamPreflightError::Semantic(message)) => Some(message.clone()),
+                _ => None,
+            };
+            self.cached_preflight = Some(result);
+            message?
+        } else if matches!(self.status.as_u16(), 400 | 422 | 502) {
+            if self.buffered_body.is_none() {
+                let mut bytes = Vec::new();
+                let response = self.response.take()?;
+                if tokio::time::timeout(
+                    Duration::from_secs(15),
+                    append_limited_error_response_body(response, &mut bytes),
+                )
+                .await
+                .is_err()
+                {
+                    bytes = b"upstream error body timed out".to_vec();
+                }
+                self.buffered_body = Some(Bytes::from(bytes));
+            }
+            String::from_utf8_lossy(self.buffered_body.as_deref()?).into_owned()
+        } else {
+            return None;
+        };
+        crate::public_responses::recover_history(body, &error)
     }
 
     async fn preflight_stream_failure_with_hold(
@@ -932,7 +973,10 @@ pub(crate) async fn send_upstream(
     } else if let Some(token) = resolve_auth_token(provider) {
         authorization = Some(format!("Bearer {token}"));
     }
-    let tool_identity = ToolIdentity::from_request(&body);
+    let mut tool_identity = ToolIdentity::from_request(&body);
+    if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
+        tool_identity.enable_plan_search(&body);
+    }
     let mut lite_headers = headers.clone();
     if codex_companion_provider::chatgpt_plan::is_chatgpt_plan(provider) {
         for key in [
@@ -1081,6 +1125,7 @@ pub(crate) async fn send_upstream(
                 buffered_body: buffered_error,
                 prefetched_body: VecDeque::new(),
                 opaque_event_stream: false,
+                cached_preflight: None,
                 status,
                 headers: response_headers,
                 oauth_refresh_error: None,
@@ -1142,6 +1187,7 @@ pub(crate) async fn send_upstream(
                         buffered_body: Some(error_body),
                         prefetched_body: VecDeque::new(),
                         opaque_event_stream: false,
+                        cached_preflight: None,
                         status,
                         headers: response_headers,
                         oauth_refresh_error: Some(format!(
@@ -1162,6 +1208,7 @@ pub(crate) async fn send_upstream(
                 buffered_body: Some(error_body),
                 prefetched_body: VecDeque::new(),
                 opaque_event_stream: false,
+                cached_preflight: None,
                 status,
                 headers: response_headers,
                 oauth_refresh_error: None,
@@ -1198,6 +1245,7 @@ pub(crate) async fn send_upstream(
         buffered_body,
         prefetched_body: VecDeque::new(),
         opaque_event_stream: false,
+        cached_preflight: None,
         status,
         headers,
         oauth_refresh_error: None,
@@ -1835,6 +1883,7 @@ pub(crate) async fn stream_response(
         tool_context,
         tool_identity,
         chat_messages,
+        cached_preflight: _,
     } = upstream;
     if opaque_event_stream {
         return passthrough_stream_response(
@@ -5986,6 +6035,7 @@ mod tests {
             buffered_body: None,
             prefetched_body: VecDeque::new(),
             opaque_event_stream: false,
+            cached_preflight: None,
             oauth_refresh_error: None,
             oauth_refresh_failure: None,
             transform: ResponseTransform::None,

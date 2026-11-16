@@ -2464,6 +2464,6 @@ function syncMockDerived(status: CompanionStatus): CompanionStatus {
 }
 
 export function repairHistoryIndex(codexDir: string, dryRun: boolean): Promise<import("../types/domain").HistoryIndexRepairReport> {
-  if (!isTauri()) return Promise.resolve({ dryRun, scannedSessions: 0, affectedSessions: [], repairedSessions: 0, backupPath: null });
+  if (!isTauri()) return Promise.resolve({ dryRun, scannedSessions: 0, affectedSessions: [], skippedSessions: [], repairedSessions: 0, backupPath: null });
   return invoke("repair_history_index", { codexDir, dryRun });
 }

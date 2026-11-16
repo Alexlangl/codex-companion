@@ -2069,7 +2069,11 @@ fn install_managed_model_catalog(
         let catalog = build_model_catalog(codex_dir, &models)?;
         atomic_write_private_file(&catalog_path, &catalog)?;
         backup.model_catalog_write_hash = Some(hash_file(&catalog_path)?);
-        doc["model_catalog_json"] = value(MANAGED_MODEL_CATALOG_FILENAME);
+        doc["model_catalog_json"] = value(managed_catalog_config_pointer(
+            codex_dir,
+            doc,
+            cfg!(windows),
+        ));
         Ok(())
     })();
 
@@ -3991,6 +3995,24 @@ fn canonical_existing_path_within_codex_dir(codex_dir: &Path, path: &Path) -> Op
         .then_some(canonical_path)
 }
 
+// Native Codex permission-profile reloads require absolute paths. A Windows
+// configuration consumed by WSL must keep a path meaningful to its Linux reader.
+fn managed_catalog_config_pointer(codex_dir: &Path, doc: &DocumentMut, windows: bool) -> String {
+    let path = managed_model_catalog_path(codex_dir);
+    let text = path.to_string_lossy();
+    let wsl = windows
+        && doc
+            .get("desktop")
+            .and_then(|v| v.get("runCodexInWindowsSubsystemForLinux"))
+            .and_then(Item::as_bool)
+            == Some(true);
+    if wsl || text.starts_with(r"\\") || text.starts_with("//") || !path.is_absolute() {
+        MANAGED_MODEL_CATALOG_FILENAME.to_owned()
+    } else {
+        text.into_owned()
+    }
+}
+
 fn managed_model_catalog_pointer(codex_dir: &Path, value: &str) -> bool {
     let pointer = Path::new(value);
     pointer == Path::new(MANAGED_MODEL_CATALOG_FILENAME)
@@ -4299,6 +4321,31 @@ wire_api = "responses"
     }
 
     #[test]
+    fn catalog_pointer_respects_native_permissions_and_wsl_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let doc = "[desktop]\nrunCodexInWindowsSubsystemForLinux = true"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            managed_catalog_config_pointer(temp.path(), &doc, true),
+            MANAGED_MODEL_CATALOG_FILENAME
+        );
+        assert!(Path::new(&managed_catalog_config_pointer(temp.path(), &doc, false)).is_absolute());
+        assert_eq!(
+            managed_catalog_config_pointer(
+                Path::new(r"\\wsl.localhost\Ubuntu\home\user\.codex"),
+                &DocumentMut::new(),
+                true
+            ),
+            MANAGED_MODEL_CATALOG_FILENAME
+        );
+        assert_eq!(
+            managed_catalog_config_pointer(Path::new("relative"), &DocumentMut::new(), false),
+            MANAGED_MODEL_CATALOG_FILENAME
+        );
+    }
+
+    #[test]
     fn install_writes_a_catalog_for_explicit_models() {
         let temp = tempfile::tempdir().expect("tempdir");
         install_companion_provider_with_token_source_and_models(
@@ -4310,7 +4357,11 @@ wire_api = "responses"
         .expect("install");
 
         let text = fs::read_to_string(temp.path().join("config.toml")).expect("config");
-        assert!(text.contains("model_catalog_json = \"codex-companion-model-catalog.json\""));
+        let doc = text.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            doc["model_catalog_json"].as_str(),
+            managed_model_catalog_path(temp.path()).to_str()
+        );
         let catalog = read_json_value(&managed_model_catalog_path(temp.path()))
             .expect("managed model catalog");
         assert_eq!(catalog["models"][0]["slug"], "gpt-5.6-sol");

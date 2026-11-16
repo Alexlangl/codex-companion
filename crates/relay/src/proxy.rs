@@ -668,7 +668,7 @@ async fn proxy_dispatch(
         let mut request_guard = state.begin_provider_request(&provider.id);
         request_guard.account_permit = Some(permit);
         let upstream = upstream_url(&provider, &uri);
-        let upstream_result = tokio::time::timeout(
+        let mut upstream_result = tokio::time::timeout(
             UPSTREAM_RESPONSE_HEADER_TIMEOUT,
             send_upstream(
                 &state.client,
@@ -684,6 +684,40 @@ async fn proxy_dispatch(
                 provider.name
             )))
         });
+        if method == Method::POST
+            && uri.path().trim_end_matches('/') == "/v1/responses"
+            && !codex_companion_provider::chatgpt_plan::is_chatgpt_plan(&provider)
+        {
+            if let Ok(response) = &mut upstream_result {
+                if let Some(recovered) = response
+                    .history_recovery_body(
+                        &body,
+                        group.fallback_enabled && index + 1 < candidate_count,
+                    )
+                    .await
+                {
+                    // Exactly one retry against the same provider after an
+                    // explicit rejection, before any output reaches the client.
+                    upstream_result = tokio::time::timeout(
+                        UPSTREAM_RESPONSE_HEADER_TIMEOUT,
+                        send_upstream(
+                            &state.client,
+                            &state.api_service,
+                            UpstreamRequest::new(
+                                &provider, &method, &uri, &headers, recovered, &upstream,
+                            )
+                            .with_session_mapping(config.relay.map_session_ids),
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(UpstreamRequestError::from(
+                            "历史兼容恢复请求等待响应超时".to_owned(),
+                        ))
+                    });
+                }
+            }
+        }
         if upstream_result.is_ok() {
             let upstream_model = requested_model.as_deref().map(|model| {
                 provider
@@ -5178,6 +5212,54 @@ mod tests {
         assert_eq!(hits_a.load(Ordering::SeqCst), 0);
         assert_eq!(hits_b.load(Ordering::SeqCst), 1);
         assert_eq!(hits_c.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn rejected_encrypted_history_retries_same_provider_once_before_output() {
+        for (sse, always_reject, visible_first) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let observed = hits.clone();
+            let app = Router::new().route("/{*path}", any(move |body: Bytes| {
+                let hits = observed.clone();
+                async move {
+                    let index = hits.fetch_add(1, Ordering::SeqCst);
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["input"].as_array().unwrap().iter().any(|v| v["type"] == "reasoning"), index == 0);
+                    if index == 0 || always_reject {
+                        let failure = r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"invalid_encrypted_content","message":"invalid_encrypted_content"}}}"#;
+                        if sse {
+                            let prefix = if visible_first { "data: {\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}\n\n" } else { "data: {\"type\":\"response.created\",\"response\":{\"id\":\"failed\"}}\n\n" };
+                            (StatusCode::OK, [(header::CONTENT_TYPE,"text/event-stream")], format!("{prefix}data: {failure}\n\n"))
+                        } else { (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE,"application/json")], failure.to_owned()) }
+                    } else {
+                        (StatusCode::OK, [(header::CONTENT_TYPE,"text/event-stream")], "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"success\",\"status\":\"completed\"}}\n\n".to_owned())
+                    }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let state = RelayState::new(
+                store_with_group(vec![provider("a", &format!("http://{address}/v1"))]),
+                reqwest::Client::new(),
+            );
+            let response = proxy_inner(state, Method::POST, "/v1/responses".parse().unwrap(), HeaderMap::new(), Bytes::from_static(br#"{"model":"gpt-test","stream":true,"input":[{"role":"user","content":"task"},{"type":"reasoning","encrypted_content":"opaque"}]}"#)).await.unwrap();
+            let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                if visible_first { 1 } else { 2 }
+            );
+            if !always_reject && !visible_first {
+                assert!(String::from_utf8_lossy(&body).contains("success"));
+                assert!(!String::from_utf8_lossy(&body).contains("invalid_encrypted_content"));
+            }
+            server.abort();
+        }
     }
 
     async fn spawn_mock_server(

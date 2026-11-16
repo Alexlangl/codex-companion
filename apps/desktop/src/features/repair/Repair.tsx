@@ -146,9 +146,16 @@ export function Repair({
           {indexReport ? <dl className="details-grid details-top">
             <dt>检查会话</dt><dd>{indexReport.scannedSessions}</dd>
             <dt>{indexReport.dryRun ? "待修复" : "已修复"}</dt><dd>{indexReport.dryRun ? indexReport.affectedSessions.length : indexReport.repairedSessions}</dd>
+            <dt>保留未修复</dt><dd>{indexReport.skippedSessions.length}</dd>
             <dt>备份</dt><dd>{indexReport.backupPath ? compactPath(indexReport.backupPath) : "无"}</dd>
           </dl> : null}
         </div>
+        {indexReport && indexReport.skippedSessions.length > 0 ? <details>
+          <summary>查看未修复的会话和原因</summary>
+          <ul>{indexReport.skippedSessions.map((session) => <li key={session.threadId}>
+            <code>{session.threadId}</code>：{session.reason}
+          </li>)}</ul>
+        </details> : null}
         {indexError ? <p className="field-error" role="alert">{indexError}</p> : null}
       </Panel>
 
