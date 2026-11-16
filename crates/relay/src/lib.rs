@@ -24,3 +24,4 @@ pub use server::{serve, BoundRelay, RelayStartOutcome};
 mod usage_capture;
 
 mod model_catalog;
+mod public_responses;

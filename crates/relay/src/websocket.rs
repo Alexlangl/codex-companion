@@ -2476,6 +2476,9 @@ fn normalize_client_frame_for_provider(
 fn normalize_client_json_for_provider(value: &mut Value, provider: &ProviderConfig) -> bool {
     let mut changed = false;
     if value["type"] == "response.create" {
+        if provider.kind != ProviderKind::OfficialCodex {
+            crate::public_responses::normalize(value);
+        }
         let mut headers = HeaderMap::new();
         crate::responses_lite::normalize(
             &mut headers,

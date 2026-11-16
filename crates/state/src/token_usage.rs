@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-const TOKEN_USAGE_CACHE_VERSION: u32 = 10;
+const TOKEN_USAGE_CACHE_VERSION: u32 = 11;
 const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 const TOKEN_USAGE_PREFIX_BYTES: u64 = 64 * 1024;
 
@@ -909,7 +909,8 @@ fn parse_session_file_incremental(
     cached: &CachedTokenUsageFile,
     signature: &FileSignature,
 ) -> Result<Option<ParsedTokenUsageFile>> {
-    if cached.deferred
+    if crate::session_reader::compressed(path)
+        || cached.deferred
         || cached.suspected_duplicate
         || cached.replay_sensitive
         || cached.parser_state.is_none()
@@ -951,15 +952,25 @@ fn parse_session_file_incremental(
 }
 
 fn read_complete_lines(path: &Path) -> Result<(Vec<String>, u64)> {
-    let bytes = fs::read(path).map_err(|source| CompanionError::io(path, source))?;
-    let parsed_bytes = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index as u64 + 1);
-    let lines = String::from_utf8_lossy(&bytes[..parsed_bytes as usize])
-        .lines()
-        .map(str::to_string)
-        .collect();
+    let mut reader = crate::session_reader::open(path)?;
+    let mut lines = Vec::new();
+    let mut parsed_bytes = 0;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let count = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|source| CompanionError::io(path, source))?;
+        if count == 0 || line.last() != Some(&b'\n') {
+            break;
+        }
+        parsed_bytes += count as u64;
+        lines.push(
+            String::from_utf8_lossy(&line)
+                .trim_end_matches(['\r', '\n'])
+                .to_string(),
+        );
+    }
     Ok((lines, parsed_bytes))
 }
 
@@ -989,8 +1000,7 @@ fn file_prefix_digest(path: &Path) -> Option<String> {
 }
 
 fn read_first_session_identity(path: &Path) -> Result<Option<CodexSessionIdentity>> {
-    let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = crate::session_reader::open(path)?;
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -1013,8 +1023,7 @@ fn read_first_session_identity(path: &Path) -> Result<Option<CodexSessionIdentit
 }
 
 fn read_replay_parent_timeline(path: &Path) -> Result<ReplayParentTimeline> {
-    let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = crate::session_reader::open(path)?;
     let mut line = Vec::new();
     let mut timeline = ReplayParentTimeline::default();
     loop {
@@ -1613,7 +1622,9 @@ fn collect_jsonl_recursive(dir: &Path, files: &mut Vec<PathBuf>, depth: u32, max
         let path = entry.path();
         if path.is_dir() && depth < max_depth {
             collect_jsonl_recursive(&path, files, depth + 1, max_depth);
-        } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+        } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+            || crate::session_reader::compressed(&path)
+        {
             files.push(path);
         }
     }
@@ -2068,6 +2079,24 @@ mod tests {
         assert_eq!(summary.cost.cached_input_usd, "0.00000525");
         assert_eq!(summary.cost.output_usd, "0.00042");
         assert_eq!(summary.cost.total_usd, "0.00065275");
+        let plain = day.join("session.jsonl");
+        let compressed = day.join("session.jsonl.zst");
+        fs::write(
+            &compressed,
+            zstd::stream::encode_all(fs::read(&plain).unwrap().as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&plain).unwrap();
+        let compressed_summary = collect_token_usage(temp.path().to_path_buf()).unwrap();
+        assert_eq!(compressed_summary.total_tokens, summary.total_tokens);
+        assert_eq!(compressed_summary.events, summary.events);
+        assert_eq!(
+            collect_token_usage(temp.path().to_path_buf())
+                .unwrap()
+                .total_tokens,
+            summary.total_tokens
+        );
+        assert_eq!(read_complete_lines(&compressed).unwrap().0.len(), 5);
     }
 
     #[test]

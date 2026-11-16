@@ -953,6 +953,9 @@ pub(crate) async fn send_upstream(
     );
     let body = if method == Method::POST && is_responses_generation_url(uri.path()) {
         if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
+            if provider.kind != ProviderKind::OfficialCodex {
+                crate::public_responses::normalize(&mut value);
+            }
             crate::responses_lite::normalize(
                 &mut lite_headers,
                 &mut value,
@@ -3889,12 +3892,65 @@ fn normalize_chat_function_parameters(function: &mut serde_json::Map<String, Val
     let parameters = function
         .entry("parameters".to_string())
         .or_insert_with(|| json!({ "type": "object", "properties": {} }));
+    remove_null_schema_required(parameters);
     let Some(parameters) = parameters.as_object_mut() else {
         *parameters = json!({ "type": "object", "properties": {} });
         return;
     };
     if parameters.get("type").and_then(Value::as_str) != Some("object") {
         parameters.insert("type".to_string(), Value::String("object".to_string()));
+    }
+}
+
+fn remove_null_schema_required(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    if object.get("required").is_some_and(Value::is_null) {
+        object.remove("required");
+    }
+    // Traverse schema locations only; defaults/examples may contain literal data
+    // named `required` and must be preserved.
+    for key in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                remove_null_schema_required(child);
+            }
+        }
+    }
+    for key in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "unevaluatedProperties",
+    ] {
+        if let Some(child) = object.get_mut(key) {
+            if let Some(children) = child.as_array_mut() {
+                for child in children {
+                    remove_null_schema_required(child);
+                }
+            } else {
+                remove_null_schema_required(child);
+            }
+        }
+    }
+    for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for child in children {
+                remove_null_schema_required(child);
+            }
+        }
     }
 }
 
@@ -5073,6 +5129,26 @@ pub(crate) fn upstream_url(provider: &ProviderConfig, uri: &Uri) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_schema_removes_null_required_without_changing_literal_data() {
+        let mut function = json!({"parameters":{"type":"object", "required":null,
+            "properties":{"child":{"type":"object","required":null,"default":{"required":null}},
+            "required":{"type":"string"}},"allOf":[{"required":["child"]}],
+            "items":{"required":null},"examples":[{"required":null}]}});
+        normalize_chat_function_parameters(function.as_object_mut().unwrap());
+        let schema = &function["parameters"];
+        assert!(schema.get("required").is_none());
+        assert!(schema["properties"]["child"].get("required").is_none());
+        assert!(schema["items"].get("required").is_none());
+        assert_eq!(schema["allOf"][0]["required"], json!(["child"]));
+        assert_eq!(schema["properties"]["required"]["type"], "string");
+        assert_eq!(schema["examples"], json!([{"required":null}]));
+        assert_eq!(
+            schema["properties"]["child"]["default"],
+            json!({"required":null})
+        );
+    }
 
     #[test]
     fn semantic_error_preserves_code_and_server_reset() {

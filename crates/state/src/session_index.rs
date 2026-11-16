@@ -6,12 +6,12 @@ use serde_json::Value;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
-const SESSION_INDEX_VERSION: u32 = 2;
+const SESSION_INDEX_VERSION: u32 = 3;
 const RUNNING_WINDOW: Duration = Duration::from_secs(120);
 const REQUEST_MARKERS: [&str; 2] = ["## My request for Codex:", "## My request:"];
 const INJECTED_CONTEXT_TAGS: [&str; 2] = ["environment_context", "in-app-browser-context"];
@@ -138,7 +138,7 @@ fn file_signature(path: &Path) -> Option<FileSignature> {
 }
 
 fn parse_session_summary(path: &Path, signature: &FileSignature) -> Result<SessionSummary> {
-    let file = fs::File::open(path).map_err(|source| CompanionError::io(path, source))?;
+    let file = crate::session_reader::open(path)?;
     let mut id =
         session_id_from_filename(path).unwrap_or_else(|| path.to_string_lossy().to_string());
     let mut title = String::new();
@@ -148,10 +148,8 @@ fn parse_session_summary(path: &Path, signature: &FileSignature) -> Result<Sessi
     let mut parent_id = None;
     let mut is_subagent = false;
 
-    for line in BufReader::new(file)
-        .lines()
-        .map_while(std::result::Result::ok)
-    {
+    for line in file.lines() {
+        let line = line.map_err(|source| CompanionError::io(path, source))?;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -313,7 +311,10 @@ fn compact_title(value: &str) -> String {
 }
 
 fn session_id_from_filename(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
+    let name = path.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".jsonl.zst")
+        .or_else(|| name.strip_suffix(".jsonl"))?;
     let suffix = stem.rsplit('-').next()?;
     (!suffix.is_empty()).then(|| suffix.to_string())
 }
@@ -419,7 +420,7 @@ mod tests {
         fs::remove_dir(&project).expect("remove project");
         let second = list_sessions_cached(
             temp.path().join("codex"),
-            cache_dir,
+            cache_dir.clone(),
             Some("release"),
             50,
             false,
@@ -429,6 +430,24 @@ mod tests {
         assert_eq!(second.total, 1);
         assert_eq!(second.sessions[0].id, "session-a");
         assert!(!second.sessions[0].cwd_available);
+        let plain = day.join("rollout-session-a.jsonl");
+        fs::write(
+            day.join("rollout-session-a.jsonl.zst"),
+            zstd::stream::encode_all(fs::read(&plain).unwrap().as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(plain).unwrap();
+        let compressed = list_sessions_cached(
+            temp.path().join("codex"),
+            cache_dir,
+            Some("release"),
+            50,
+            false,
+        )
+        .unwrap();
+        assert_eq!(compressed.total, 1);
+        assert_eq!(compressed.sessions[0].id, "session-a");
+        assert_eq!(compressed.sessions[0].title, first.sessions[0].title);
     }
 
     #[test]

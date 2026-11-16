@@ -37,6 +37,14 @@ fn commit(temporary: tempfile::NamedTempFile, path: &Path, initial: &fs::Metadat
         .map_err(|source| CompanionError::io(path, source))?;
     temporary
         .as_file()
+        .set_modified(
+            initial
+                .modified()
+                .map_err(|source| CompanionError::io(path, source))?,
+        )
+        .map_err(|source| CompanionError::io(path, source))?;
+    temporary
+        .as_file()
         .sync_all()
         .map_err(|source| CompanionError::io(path, source))?;
     temporary
@@ -244,6 +252,13 @@ mod tests {
             let prefix = format!("{}\r\nnot-json\n{{\"type\":\"event_msg\",\"payload\":{{\"model_provider\":\"openai\",\"text\":\"session_meta\"}}}}\n", "x".repeat(2_000_000));
             let original = format!("{prefix}{META}{ending}");
             fs::write(&file, &original).unwrap();
+            let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+            fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
             let backup = temp.path().join("backup");
             let ids = BTreeSet::from(["openai".to_string()]);
             assert_eq!(
@@ -253,6 +268,7 @@ mod tests {
             let journal = backup.join(PATCH_DIR).join("sessions/session.json");
             assert!(fs::metadata(journal).unwrap().len() < 1024);
             assert!(!backup.join("sessions/session.jsonl").exists());
+            assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
             let migrated = fs::read_to_string(&file).unwrap();
             assert!(migrated.starts_with(&prefix));
             assert_eq!(migrated.ends_with('\n'), !ending.is_empty());
